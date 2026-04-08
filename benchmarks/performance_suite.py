@@ -4,6 +4,8 @@ import argparse
 import json
 import platform
 import statistics
+import sys
+import sysconfig
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -189,7 +191,14 @@ def _scenario_dedup_contention() -> ScenarioResult:
     )
 
 
-def _run_compute_many_once(workers: int, calls_count: int, sleep_seconds: float) -> float:
+def _cpu_burn(seed: int, *, iterations: int) -> int:
+    value = seed + 1
+    for step in range(iterations):
+        value = (value * 1_664_525 + 1_013_904_223 + step) & 0xFFFFFFFF
+    return value
+
+
+def _run_compute_many_once(workers: int, calls_count: int, iterations: int) -> float:
     engine = Engine()
 
     @engine.input
@@ -198,8 +207,7 @@ def _run_compute_many_once(workers: int, calls_count: int, sleep_seconds: float)
 
     @engine.query
     def job(i: int) -> int:
-        time.sleep(sleep_seconds)
-        return base(i) + 10
+        return _cpu_burn(i, iterations=iterations) + base(i)
 
     for i in range(calls_count):
         base.set(i, i)
@@ -207,25 +215,26 @@ def _run_compute_many_once(workers: int, calls_count: int, sleep_seconds: float)
     start = time.perf_counter()
     result = engine.compute_many([(job, (i,)) for i in range(calls_count)], workers=workers)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    expected = [i + 10 for i in range(calls_count)]
+    expected = [_cpu_burn(i, iterations=iterations) + i for i in range(calls_count)]
     if result != expected:
         raise AssertionError("compute_many scenario produced unexpected values")
     return elapsed_ms
 
 
 def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
-    calls_count = 48
-    sleep_seconds = 0.008
+    calls_count = 32
+    iterations = 250_000
+    workers = 8
     serial_samples = [
-        _run_compute_many_once(workers=1, calls_count=calls_count, sleep_seconds=sleep_seconds) for _ in range(3)
+        _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations) for _ in range(4)
     ]
     parallel_samples = [
-        _run_compute_many_once(workers=8, calls_count=calls_count, sleep_seconds=sleep_seconds) for _ in range(3)
+        _run_compute_many_once(workers=workers, calls_count=calls_count, iterations=iterations) for _ in range(4)
     ]
     serial_ms = _median(serial_samples)
     parallel_ms = _median(parallel_samples)
     speedup = serial_ms / max(parallel_ms, 1e-9)
-    threshold = 2.5
+    threshold = 1.15
     passed = speedup >= threshold
     return ScenarioResult(
         name="compute-many-parallel-speedup",
@@ -238,7 +247,8 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
         passed=passed,
         details={
             "calls": calls_count,
-            "sleep_seconds_per_task": sleep_seconds,
+            "iterations_per_task": iterations,
+            "workers": workers,
             "serial_ms": serial_ms,
             "parallel_ms": parallel_ms,
         },
@@ -419,6 +429,15 @@ def _scenario_prune_runtime_scaling() -> ScenarioResult:
 
 
 def run_performance_suite() -> dict[str, Any]:
+    gil_probe = getattr(sys, "_is_gil_enabled", None)
+    gil_enabled = bool(gil_probe()) if callable(gil_probe) else None
+    if gil_enabled is None:
+        runtime_mode = "unknown"
+    elif gil_enabled:
+        runtime_mode = "gil-enabled"
+    else:
+        runtime_mode = "gil-disabled"
+
     results = [
         _scenario_cache_hit_speedup(),
         _scenario_dedup_contention(),
@@ -431,6 +450,9 @@ def run_performance_suite() -> dict[str, Any]:
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "python_version": platform.python_version(),
         "platform": platform.platform(),
+        "py_gil_disabled": sysconfig.get_config_var("Py_GIL_DISABLED"),
+        "gil_enabled": gil_enabled,
+        "runtime_mode": runtime_mode,
         "results": [asdict(item) for item in results],
         "all_passed": all(item.passed for item in results),
     }
@@ -450,12 +472,18 @@ def assert_report_thresholds(report: dict[str, Any]) -> None:
 
 
 def render_markdown_report(report: dict[str, Any]) -> str:
+    runtime_mode = report.get("runtime_mode", "unknown")
+    py_gil_disabled = report.get("py_gil_disabled", "unknown")
+    gil_enabled = report.get("gil_enabled", "unknown")
     header = [
         "# Performance Report",
         "",
         f"- Generated (UTC): `{report['generated_at_utc']}`",
         f"- Python: `{report['python_version']}`",
         f"- Platform: `{report['platform']}`",
+        f"- Runtime mode: `{runtime_mode}`",
+        f"- Build flag `Py_GIL_DISABLED`: `{py_gil_disabled}`",
+        f"- Runtime GIL enabled: `{gil_enabled}`",
         "",
         "## Covered concerns",
         "",
