@@ -65,6 +65,13 @@ def symbols(file_id: str) -> tuple[str, ...]:
 - **Cycle detection**: recursive query cycles raise `CycleError`.
 - **Cancellation**: stale background queries raise `QueryCancelled`.
 
+### Limitations and enforceability boundaries
+
+- **CPython GIL and CPU-bound work**: `compute_many` and dedup execution are multi-threaded, but true CPU parallel speedup is only guaranteed when query bodies release the GIL (e.g. I/O waits, native extensions). For pure Python CPU-bound loops, overlap exists but throughput may remain effectively single-core.
+- **Process-level durability model**: persistence is an explicit point-in-time snapshot (`save`/`load`), not a transactional WAL-backed MVCC store shared by multiple live processes.
+- **Boundary of side-effect replay guarantees**: replay is guaranteed only for effects emitted through `Accumulator`; out-of-band side effects in query bodies (printing, network calls, filesystem writes) are intentionally not replayed.
+- **Cycle handling scope**: direct and long-chain dynamic query cycles are detected and raised as `CycleError`; this engine does not implement fixed-point solvers for cyclic dataflow.
+
 ### What this framework intentionally does not include
 
 To keep API surface minimal, this version does not include:
