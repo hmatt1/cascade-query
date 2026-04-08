@@ -33,7 +33,6 @@ jobs:
         run: |
           python - <<'PY'
           import json
-          import os
           import platform
           import statistics
           from datetime import datetime, timezone
@@ -44,10 +43,6 @@ jobs:
           runs = 8
           report_dir = Path("artifacts/nightly-performance")
           report_dir.mkdir(parents=True, exist_ok=True)
-          run_url = (
-              f"{os.environ.get('GITHUB_SERVER_URL')}/"
-              f"{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
-          )
 
           raw_reports = []
           for index in range(runs):
@@ -135,21 +130,6 @@ jobs:
           md_lines.extend(["", "## Raw JSON", "", "```json", json.dumps(summary, indent=2), "```", ""])
           md_path = report_dir / "nightly-performance-summary.md"
           md_path.write_text("\n".join(md_lines), encoding="utf-8")
-
-          with Path("nightly_email_body.txt").open("w", encoding="utf-8") as fh:
-              status = "PASS" if summary["all_passed"] else "FAIL"
-              fh.write("Nightly query-cascade performance results\n\n")
-              fh.write(f"Overall: {status}\n")
-              fh.write(f"Runs per scenario: {runs}\n\n")
-              for row in aggregated_rows:
-                  fh.write(
-                      f"- {row['name']}: {row['metric_name']}={row['metric_value']:.3f}{row['unit']} "
-                      f"(expected {row['comparator']} {row['threshold']:.3f}{row['unit']}) -> "
-                      f"{'PASS' if row['passed'] else 'FAIL'}\n"
-                  )
-              fh.write("\nWorkflow run: ")
-              fh.write(run_url)
-              fh.write("\nArtifacts: nightly-performance-report\n")
           PY
 
       - name: Upload nightly performance artifacts
@@ -158,24 +138,3 @@ jobs:
         with:
           name: nightly-performance-report
           path: artifacts/nightly-performance/
-
-      - name: Email nightly performance summary
-        if: ${{ always() && secrets.PERF_EMAIL_SMTP_HOST != '' && secrets.PERF_EMAIL_SMTP_USER != '' && secrets.PERF_EMAIL_SMTP_PASSWORD != '' && secrets.PERF_EMAIL_FROM != '' && secrets.PERF_EMAIL_TO != '' }}
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.PERF_EMAIL_SMTP_HOST }}
-          server_port: ${{ secrets.PERF_EMAIL_SMTP_PORT }}
-          secure: true
-          username: ${{ secrets.PERF_EMAIL_SMTP_USER }}
-          password: ${{ secrets.PERF_EMAIL_SMTP_PASSWORD }}
-          subject: >-
-            [query-cascade] Nightly performance
-            (${{ github.repository }}) run #${{ github.run_number }}
-          to: ${{ secrets.PERF_EMAIL_TO }}
-          from: ${{ secrets.PERF_EMAIL_FROM }}
-          body: file://nightly_email_body.txt
-          convert_markdown: false
-
-      - name: Skip email when SMTP secrets are missing
-        if: ${{ always() && (secrets.PERF_EMAIL_SMTP_HOST == '' || secrets.PERF_EMAIL_SMTP_USER == '' || secrets.PERF_EMAIL_SMTP_PASSWORD == '' || secrets.PERF_EMAIL_FROM == '' || secrets.PERF_EMAIL_TO == '') }}
-        run: echo "SMTP secrets not fully configured; skipping email notification."

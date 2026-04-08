@@ -176,16 +176,6 @@ A separate GitHub Actions workflow (`.github/workflows/nightly-performance.yml`)
 
 - executes the performance suite repeatedly (currently 8 runs) to improve signal quality
 - emits an aggregated summary and artifact bundle (`nightly-performance-report`)
-- sends an email with the summarized results and artifact links
-
-To enable email notifications, configure these repository secrets:
-
-- `PERF_EMAIL_SMTP_HOST`
-- `PERF_EMAIL_SMTP_PORT` (required by the mail action; use `587` for STARTTLS in most SMTP setups)
-- `PERF_EMAIL_SMTP_USER`
-- `PERF_EMAIL_SMTP_PASSWORD`
-- `PERF_EMAIL_FROM`
-- `PERF_EMAIL_TO` (set this to your watcher email address)
 
 ## Scale and stress test categories
 
