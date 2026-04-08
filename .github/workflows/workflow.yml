@@ -63,11 +63,111 @@ jobs:
             --cov-report=json:coverage.json \
             --cov-fail-under=95
 
-      - name: Generate performance report
+      - name: Generate performance report (GIL disabled)
+        env:
+          PYTHON_GIL: "0"
         run: |
           python -m benchmarks.performance_suite \
-            --report-dir artifacts/performance \
+            --report-dir artifacts/performance/gil-disabled \
             --assert-thresholds
+
+      - name: Generate performance report (GIL enabled)
+        env:
+          PYTHON_GIL: "1"
+        run: |
+          python -m benchmarks.performance_suite \
+            --report-dir artifacts/performance/gil-enabled
+
+      - name: Compare free-threaded vs GIL performance
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          perf_root = Path("artifacts/performance")
+          free_report_path = perf_root / "gil-disabled" / "performance-report.json"
+          gil_report_path = perf_root / "gil-enabled" / "performance-report.json"
+
+          free_report = json.loads(free_report_path.read_text(encoding="utf-8"))
+          gil_report = json.loads(gil_report_path.read_text(encoding="utf-8"))
+
+          if free_report.get("runtime_mode") != "gil-disabled":
+              raise SystemExit(
+                  f"Expected free-threaded run to report runtime_mode=gil-disabled, got {free_report.get('runtime_mode')!r}"
+              )
+          if gil_report.get("runtime_mode") != "gil-enabled":
+              raise SystemExit(
+                  f"Expected GIL run to report runtime_mode=gil-enabled, got {gil_report.get('runtime_mode')!r}"
+              )
+
+          scenario_name = "compute-many-parallel-speedup"
+
+          def scenario_by_name(report: dict, name: str) -> dict:
+              for row in report["results"]:
+                  if row["name"] == name:
+                      return row
+              raise SystemExit(f"Missing performance scenario: {name}")
+
+          free_row = scenario_by_name(free_report, scenario_name)
+          gil_row = scenario_by_name(gil_report, scenario_name)
+
+          free_speedup = float(free_row["metric_value"])
+          gil_speedup = float(gil_row["metric_value"])
+          improvement = free_speedup / max(gil_speedup, 1e-9)
+          min_improvement = 1.05
+          comparison = {
+              "scenario": scenario_name,
+              "metric_name": free_row["metric_name"],
+              "free_threaded": {
+                  "runtime_mode": free_report["runtime_mode"],
+                  "metric_value": free_speedup,
+                  "details": free_row.get("details", {}),
+              },
+              "gil_enabled": {
+                  "runtime_mode": gil_report["runtime_mode"],
+                  "metric_value": gil_speedup,
+                  "details": gil_row.get("details", {}),
+              },
+              "speedup_ratio_free_vs_gil": improvement,
+              "minimum_required_ratio": min_improvement,
+              "passed": improvement >= min_improvement,
+          }
+
+          comparison_json = perf_root / "performance-comparison.json"
+          comparison_md = perf_root / "performance-comparison.md"
+          comparison_json.write_text(json.dumps(comparison, indent=2, sort_keys=True), encoding="utf-8")
+          comparison_md.write_text(
+              "\n".join(
+                  [
+                      "# Free-threaded vs GIL Performance Comparison",
+                      "",
+                      f"- Scenario: `{scenario_name}`",
+                      f"- Metric: `{free_row['metric_name']}`",
+                      f"- Free-threaded speedup: `{free_speedup:.3f}x`",
+                      f"- GIL-enabled speedup: `{gil_speedup:.3f}x`",
+                      f"- Ratio (free-threaded / GIL-enabled): `{improvement:.3f}x`",
+                      f"- Required minimum ratio: `{min_improvement:.3f}x`",
+                      f"- Status: `{'PASS' if comparison['passed'] else 'FAIL'}`",
+                      "",
+                      "```json",
+                      json.dumps(comparison, indent=2),
+                      "```",
+                      "",
+                  ]
+              ),
+              encoding="utf-8",
+          )
+
+          print(f"Free-threaded speedup: {free_speedup:.3f}x")
+          print(f"GIL-enabled speedup: {gil_speedup:.3f}x")
+          print(f"Free-threaded/GIL ratio: {improvement:.3f}x")
+          if improvement < min_improvement:
+              raise SystemExit(
+                  f"Free-threaded run did not beat GIL-enabled run by required ratio "
+                  f"({improvement:.3f}x < {min_improvement:.3f}x)."
+              )
+          PY
 
       - name: Upload performance report
         if: always()
