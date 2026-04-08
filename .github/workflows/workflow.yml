@@ -129,10 +129,12 @@ jobs:
         id: semver
         run: |
           python - <<'PY'
+          import json
           import os
           import pathlib
           import re
           import subprocess
+          import urllib.request
 
           pyproject = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
           project_version_match = re.search(
@@ -144,21 +146,40 @@ jobs:
 
           pyproject_version = tuple(int(x) for x in project_version_match.groups())
 
-          latest_tag = subprocess.check_output(
+          tags = subprocess.check_output(
               ["git", "tag", "--list", "v*", "--sort=-v:refname"],
               text=True,
           ).splitlines()
 
-          if latest_tag:
-              tag_match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", latest_tag[0])
-              if not tag_match:
-                  raise SystemExit(f"Latest tag is not semantic: {latest_tag[0]}")
-              base = tuple(int(x) for x in tag_match.groups())
-          else:
-              base = pyproject_version
+          git_versions = []
+          for tag in tags:
+              tag_match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+              if tag_match:
+                  git_versions.append(tuple(int(x) for x in tag_match.groups()))
 
-          major, minor, patch = base
-          next_version = f"{major}.{minor}.{patch + 1}"
+          published_versions = set()
+          try:
+              with urllib.request.urlopen("https://pypi.org/pypi/query-cascade/json", timeout=10) as response:
+                  payload = json.load(response)
+              for version_text in payload.get("releases", {}).keys():
+                  release_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version_text)
+                  if release_match:
+                      published_versions.add(tuple(int(x) for x in release_match.groups()))
+          except Exception as exc:  # pragma: no cover - best effort in CI
+              print(f"Warning: unable to query PyPI releases: {exc}")
+
+          baselines = [pyproject_version]
+          if git_versions:
+              baselines.append(max(git_versions))
+          if published_versions:
+              baselines.append(max(published_versions))
+          major, minor, patch = max(baselines)
+
+          next_tuple = (major, minor, patch + 1)
+          while next_tuple in published_versions:
+              major, minor, patch = next_tuple
+              next_tuple = (major, minor, patch + 1)
+          next_version = ".".join(str(part) for part in next_tuple)
 
           output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
           with output.open("a", encoding="utf-8") as fh:
@@ -193,6 +214,7 @@ jobs:
           python -m build
 
       - name: Publish to PyPI
+        id: pypi_publish
         uses: pypa/gh-action-pypi-publish@release/v1
 
       - name: Verify published package install
@@ -201,10 +223,7 @@ jobs:
           for attempt in 1 2 3 4 5; do
             echo "Attempt ${attempt}: installing query-cascade==${VERSION} from PyPI"
             if python -m pip install --upgrade pip && python -m pip install --no-cache-dir "query-cascade==${VERSION}"; then
-              python - <<'PY'
-              import cascade
-              print(f"Installed cascade from: {cascade.__file__}")
-              PY
+              python -c "import cascade; print(f'Installed cascade from: {cascade.__file__}')"
               exit 0
             fi
             if [ "${attempt}" -lt 5 ]; then
@@ -216,8 +235,18 @@ jobs:
           exit 1
 
       - name: Push release tag
+        if: always() && steps.pypi_publish.outcome == 'success'
         run: |
+          TAG="${{ steps.semver.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.semver.outputs.tag }}"
-          git push origin "${{ steps.semver.outputs.tag }}"
+          if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists locally."
+          else
+            git tag "${TAG}"
+          fi
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "Tag ${TAG} already exists on origin."
+          else
+            git push origin "${TAG}"
+          fi
