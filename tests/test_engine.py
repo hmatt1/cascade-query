@@ -942,3 +942,74 @@ def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection()
     result = engine.compute_many([(plus, (i,)) for i in range(6)], workers=0)
     assert result == [i + 1 for i in range(6)]
 
+
+def test_load_missing_state_table_raises_operational_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-table.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        # Intentionally leave out cascade_state table.
+        conn.execute("create table if not exists unrelated (id integer primary key)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    engine = Engine()
+    with pytest.raises(sqlite3.OperationalError, match="no such table: cascade_state"):
+        engine.load(str(db_path))
+
+
+def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "corrupt.db"
+
+    engine = Engine()
+
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def value() -> int:
+        return source() + 1
+
+    source.set(10)
+    assert value() == 11
+    revision_before = engine.revision
+    snapshot_before = engine.snapshot()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
+        conn.execute("delete from cascade_state")
+        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-a-pickle",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(Exception):
+        engine.load(str(db_path))
+
+    # Failed load must not clobber in-memory state.
+    assert engine.revision == revision_before
+    assert value(snapshot=snapshot_before) == 11
+    assert value() == 11
+
+
+def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:
+    engine = Engine()
+
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def compute() -> int:
+        return source() + 2
+
+    source.set(5)
+    assert compute() == 7
+    assert compute() == 7
+
+    events = [event.event for event in engine.traces()]
+    # Deterministic happy-path trace ordering for one recompute then cache hit.
+    assert events == ["input_set", "recompute_start", "input_read", "recompute_done", "cache_hit"]
+
