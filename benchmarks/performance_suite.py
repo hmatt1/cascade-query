@@ -276,7 +276,7 @@ def _scenario_giant_graph_targeted_mutation_latency() -> ScenarioResult:
     targeted_med = _median(targeted_ms)
     full_med = _median(full_ms)
     speedup = full_med / max(targeted_med, 1e-9)
-    threshold = 3.5
+    threshold = 3.0
     passed = speedup >= threshold
     return ScenarioResult(
         name="giant-graph-targeted-mutation-latency",

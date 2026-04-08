@@ -181,7 +181,7 @@ A separate GitHub Actions workflow (`.github/workflows/nightly-performance.yml`)
 To enable email notifications, configure these repository secrets:
 
 - `PERF_EMAIL_SMTP_HOST`
-- `PERF_EMAIL_SMTP_PORT` (optional; defaults to `587` if unset)
+- `PERF_EMAIL_SMTP_PORT` (required by the mail action; use `587` for STARTTLS in most SMTP setups)
 - `PERF_EMAIL_SMTP_USER`
 - `PERF_EMAIL_SMTP_PASSWORD`
 - `PERF_EMAIL_FROM`

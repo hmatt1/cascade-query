@@ -164,7 +164,7 @@ jobs:
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.PERF_EMAIL_SMTP_HOST }}
-          server_port: ${{ secrets.PERF_EMAIL_SMTP_PORT || 587 }}
+          server_port: ${{ secrets.PERF_EMAIL_SMTP_PORT }}
           secure: true
           username: ${{ secrets.PERF_EMAIL_SMTP_USER }}
           password: ${{ secrets.PERF_EMAIL_SMTP_PASSWORD }}
