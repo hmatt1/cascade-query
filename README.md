@@ -76,6 +76,7 @@ def symbols(file_id: str) -> tuple[str, ...]:
 ### Limitations and enforceability boundaries
 
 - **Free-threaded runtime requirement**: this project targets free-threaded CPython (`3.14t`) with runtime GIL disabled. If a non-free-threaded interpreter is used, or if imported extensions force GIL re-enable, CPU-bound parallel scaling will degrade.
+  - **Publish/build environment vs runtime compatibility**: publishing wheels/sdists from a non-free-threaded interpreter does not, by itself, prevent installation or execution on free-threaded CPython. Compatibility is determined at install/runtime by the interpreter and dependency stack. This package is pure Python, so there is no extension ABI lock to a specific GIL mode.
 - **Process-level durability model**: persistence is an explicit point-in-time snapshot (`save`/`load`), not a transactional WAL-backed MVCC store shared by multiple live processes.
 - **Boundary of side-effect replay guarantees**: replay is guaranteed only for effects emitted through `Accumulator`; out-of-band side effects in query bodies (printing, network calls, filesystem writes) are intentionally not replayed.
 - **Cycle handling scope**: direct and long-chain dynamic query cycles are detected and raised as `CycleError`; this engine does not implement fixed-point solvers for cyclic dataflow.
