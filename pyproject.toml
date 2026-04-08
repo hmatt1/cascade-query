@@ -7,6 +7,7 @@ name = "cascade-query"
 version = "0.1.0"
 description = "Minimal demand-driven query framework for incremental computation."
 requires-python = ">=3.10"
+readme = "README.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -130,3 +130,11 @@ Your friend’s notes are largely directionally correct and align with state-of-
 python -m pip install -e . pytest
 pytest -q
 ```
+
+## CI best practices included
+
+- GitHub Actions workflow at `.github/workflows/ci.yml`.
+- Matrix test runs on Python `3.10`, `3.11`, and `3.12`.
+- Runs on both pushes and pull requests.
+- Linting with `ruff` before tests.
+- Separate package-build job (`python -m build`) to catch packaging regressions early.
