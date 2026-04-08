@@ -10,6 +10,29 @@
 
 `cascade-query` is a minimal, demand-driven incremental computation framework for Python.
 
+## Windows setup (free-threaded Python + PyPI install)
+
+`query-cascade` targets **free-threaded CPython**. On Windows, install the free-threaded build first, then install from PyPI.
+
+1. Install free-threaded Python 3.14 from https://www.python.org/downloads/windows/
+   - Use the installer entry that includes **free-threaded** (`python3.14t` / launcher target `-3.14t`).
+   - If using the standard installer, ensure the free-threaded binaries option is enabled.
+2. Install the latest `query-cascade` globally:
+
+```powershell
+py -3.14t -m pip install -U query-cascade
+```
+
+3. Verify the setup (import works + free-threaded runtime with GIL disabled):
+
+```powershell
+py -3.14t -X gil=0 -c "import cascade, sys, sysconfig; print('cascade import ok from', cascade.__file__); print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
+```
+
+Expected verification output includes:
+- `Py_GIL_DISABLED= 1`
+- `GIL enabled? False`
+
 It is designed for compiler-like workloads where you want:
 
 - lazy pull-based evaluation
