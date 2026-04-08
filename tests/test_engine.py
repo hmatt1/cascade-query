@@ -336,7 +336,7 @@ def test_multi_cpu_parallel_overlap_proof() -> None:
             active += 1
             max_active = max(max_active, active)
             thread_ids.add(threading.get_ident())
-        # Sleep releases the GIL and makes overlap directly observable.
+        # Sleep-based overlap should remain observable on free-threaded CPython.
         time.sleep(0.02)
         with lock:
             active -= 1

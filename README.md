@@ -75,7 +75,7 @@ def symbols(file_id: str) -> tuple[str, ...]:
 
 ### Limitations and enforceability boundaries
 
-- **CPython GIL and CPU-bound work**: `compute_many` and dedup execution are multi-threaded, but true CPU parallel speedup is only guaranteed when query bodies release the GIL (e.g. I/O waits, native extensions). For pure Python CPU-bound loops, overlap exists but throughput may remain effectively single-core.
+- **Free-threaded runtime requirement**: this project targets free-threaded CPython (`3.14t`) with runtime GIL disabled. If a non-free-threaded interpreter is used, or if imported extensions force GIL re-enable, CPU-bound parallel scaling will degrade.
 - **Process-level durability model**: persistence is an explicit point-in-time snapshot (`save`/`load`), not a transactional WAL-backed MVCC store shared by multiple live processes.
 - **Boundary of side-effect replay guarantees**: replay is guaranteed only for effects emitted through `Accumulator`; out-of-band side effects in query bodies (printing, network calls, filesystem writes) are intentionally not replayed.
 - **Cycle handling scope**: direct and long-chain dynamic query cycles are detected and raised as `CycleError`; this engine does not implement fixed-point solvers for cyclic dataflow.
@@ -164,16 +164,17 @@ for event in engine.traces():
 
 ## Analysis review of the uploaded notes
 
-Your friend’s notes are largely directionally correct and align with state-of-the-art incremental systems:
+This project now assumes a free-threaded CPython baseline and aligns with state-of-the-art incremental systems:
 
 - Correct: pull-based demand, red-green early bailout, dependency graph capture, dedup, MVCC snapshots, cancellation, side-effect replay, tracing, and persistence.
-- Needs qualification in Python: true CPU-bound parallelism is constrained by the GIL unless query bodies release it (I/O/native extensions).
+- CPU-bound parallelism is expected on multi-core hardware when running with free-threaded CPython and GIL disabled.
 - Overreach for this minimal implementation: unsafe-pointer lifetime tricks, red/green syntax tree internals, and fixed-point cycle solving are advanced optimizations that are not required for a practical minimal API.
 
 ## Running tests
 
 ```bash
 python -m pip install -e . pytest
+python -c "import sys, sysconfig; print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
 pytest -q
 ```
 
@@ -183,7 +184,7 @@ Performance-sensitive behavior in this project is concentrated around:
 
 - cache-hit verification (green-path checks) versus full recomputation cost
 - concurrent query deduplication under contention
-- scheduler throughput for `compute_many` on GIL-releasing workloads
+- scheduler throughput for `compute_many` on free-threaded CPU workloads
 - giant-graph targeted mutation latency versus full rebuild latency
 - mark-green verification overhead as dependency depth grows
 - prune runtime scaling from small to large graphs

@@ -17,7 +17,7 @@ def test_performance_regressions() -> None:
 def test_performance_report_is_published(tmp_path: Path) -> None:
     report = {
         "generated_at_utc": "2026-01-01T00:00:00+00:00",
-        "python_version": "3.12.0",
+        "python_version": "3.14.0 free-threading build",
         "platform": "test-platform",
         "all_passed": True,
         "results": [

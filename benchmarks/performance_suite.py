@@ -229,7 +229,7 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     passed = speedup >= threshold
     return ScenarioResult(
         name="compute-many-parallel-speedup",
-        concern="Work-stealing scheduling should provide meaningful overlap on GIL-releasing tasks.",
+        concern="Work-stealing scheduling should provide meaningful overlap on CPU-bound tasks under free-threaded Python.",
         metric_name="workers8_vs_workers1_speedup",
         metric_value=speedup,
         unit="x",
@@ -461,7 +461,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "1. Cache hit and dependency verification cost versus full recomputation.",
         "2. In-flight query deduplication behavior during heavy contention.",
-        "3. Work-stealing scheduler throughput on GIL-releasing concurrent tasks.",
+        "3. Work-stealing scheduler throughput on CPU-bound concurrent tasks under free-threaded Python.",
         "4. Targeted giant-graph mutation latency versus full-graph rebuild latency.",
         "5. Mark-green verification overhead as dependency depth increases.",
         "6. Prune runtime scaling from small to large memo graphs.",
