@@ -170,6 +170,23 @@ This writes:
 
 CI executes the same suite on each build and uploads the report as an artifact named `performance-report`.
 
+### Nightly long-running performance workflow
+
+A separate GitHub Actions workflow (`.github/workflows/nightly-performance.yml`) runs a longer perf sweep on a nightly schedule (and on demand via `workflow_dispatch`):
+
+- executes the performance suite repeatedly (currently 8 runs) to improve signal quality
+- emits an aggregated summary and artifact bundle (`nightly-performance-report`)
+- sends an email with the summarized results and artifact links
+
+To enable email notifications, configure these repository secrets:
+
+- `PERF_EMAIL_SMTP_HOST`
+- `PERF_EMAIL_SMTP_PORT` (optional; defaults to `587` if unset)
+- `PERF_EMAIL_SMTP_USER`
+- `PERF_EMAIL_SMTP_PASSWORD`
+- `PERF_EMAIL_FROM`
+- `PERF_EMAIL_TO` (set this to your watcher email address)
+
 ## Scale and stress test categories
 
 The test suite now includes scale-focused correctness tests in `tests/test_scale_behavior.py`:

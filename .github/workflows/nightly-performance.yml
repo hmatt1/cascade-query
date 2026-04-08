@@ -1,0 +1,181 @@
+name: Nightly Performance
+
+on:
+  schedule:
+    # 03:00 UTC every night.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly-perf:
+    name: Nightly long-run performance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest pytest-cov ruff
+
+      - name: Run extended nightly performance loop
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import platform
+          import statistics
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from benchmarks.performance_suite import run_performance_suite
+
+          runs = 8
+          report_dir = Path("artifacts/nightly-performance")
+          report_dir.mkdir(parents=True, exist_ok=True)
+          run_url = (
+              f"{os.environ.get('GITHUB_SERVER_URL')}/"
+              f"{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          )
+
+          raw_reports = []
+          for index in range(runs):
+              report = run_performance_suite()
+              report["run_index"] = index
+              raw_reports.append(report)
+
+          scenario_names = [row["name"] for row in raw_reports[0]["results"]]
+          matrix = {name: [] for name in scenario_names}
+          metadata = {name: None for name in scenario_names}
+          for report in raw_reports:
+              for row in report["results"]:
+                  matrix[row["name"]].append(row["metric_value"])
+                  metadata[row["name"]] = {
+                      "concern": row["concern"],
+                      "metric_name": row["metric_name"],
+                      "unit": row["unit"],
+                      "threshold": row["threshold"],
+                      "comparator": row["comparator"],
+                  }
+
+          aggregated_rows = []
+          for name in scenario_names:
+              values = matrix[name]
+              meta = metadata[name]
+              median_value = float(statistics.median(values))
+              comparator = meta["comparator"]
+              threshold = meta["threshold"]
+              if comparator == ">=":
+                  passed = median_value >= threshold
+              elif comparator == "<=":
+                  passed = median_value <= threshold
+              else:
+                  raise RuntimeError(f"unsupported comparator: {comparator}")
+              aggregated_rows.append(
+                  {
+                      "name": name,
+                      "concern": meta["concern"],
+                      "metric_name": meta["metric_name"],
+                      "metric_value": median_value,
+                      "unit": meta["unit"],
+                      "threshold": threshold,
+                      "comparator": comparator,
+                      "passed": passed,
+                      "details": {
+                          "runs": runs,
+                          "samples": values,
+                          "sample_min": min(values),
+                          "sample_max": max(values),
+                      },
+                  }
+              )
+
+          summary = {
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "python_version": platform.python_version(),
+              "platform": platform.platform(),
+              "runs": runs,
+              "results": aggregated_rows,
+              "all_passed": all(row["passed"] for row in aggregated_rows),
+              "raw_reports": raw_reports,
+          }
+
+          summary_path = report_dir / "nightly-performance-summary.json"
+          summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+          md_lines = [
+              "# Nightly Performance Summary",
+              "",
+              f"- Generated (UTC): `{summary['generated_at_utc']}`",
+              f"- Runs per scenario: `{runs}`",
+              f"- Python: `{summary['python_version']}`",
+              f"- Platform: `{summary['platform']}`",
+              "",
+              "| Scenario | Metric | Median | Threshold | Status |",
+              "| --- | --- | ---: | ---: | --- |",
+          ]
+          for row in aggregated_rows:
+              status = "PASS" if row["passed"] else "FAIL"
+              observed = f"{row['metric_value']:.3f}{row['unit']}"
+              threshold = f"{row['comparator']} {row['threshold']:.3f}{row['unit']}"
+              md_lines.append(
+                  f"| {row['name']} | {row['metric_name']} | {observed} | {threshold} | {status} |"
+              )
+          md_lines.extend(["", "## Raw JSON", "", "```json", json.dumps(summary, indent=2), "```", ""])
+          md_path = report_dir / "nightly-performance-summary.md"
+          md_path.write_text("\n".join(md_lines), encoding="utf-8")
+
+          with Path("nightly_email_body.txt").open("w", encoding="utf-8") as fh:
+              status = "PASS" if summary["all_passed"] else "FAIL"
+              fh.write("Nightly query-cascade performance results\n\n")
+              fh.write(f"Overall: {status}\n")
+              fh.write(f"Runs per scenario: {runs}\n\n")
+              for row in aggregated_rows:
+                  fh.write(
+                      f"- {row['name']}: {row['metric_name']}={row['metric_value']:.3f}{row['unit']} "
+                      f"(expected {row['comparator']} {row['threshold']:.3f}{row['unit']}) -> "
+                      f"{'PASS' if row['passed'] else 'FAIL'}\n"
+                  )
+              fh.write("\nWorkflow run: ")
+              fh.write(run_url)
+              fh.write("\nArtifacts: nightly-performance-report\n")
+          PY
+
+      - name: Upload nightly performance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-performance-report
+          path: artifacts/nightly-performance/
+
+      - name: Email nightly performance summary
+        if: ${{ always() && secrets.PERF_EMAIL_SMTP_HOST != '' && secrets.PERF_EMAIL_SMTP_USER != '' && secrets.PERF_EMAIL_SMTP_PASSWORD != '' && secrets.PERF_EMAIL_FROM != '' && secrets.PERF_EMAIL_TO != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.PERF_EMAIL_SMTP_HOST }}
+          server_port: ${{ secrets.PERF_EMAIL_SMTP_PORT || 587 }}
+          secure: true
+          username: ${{ secrets.PERF_EMAIL_SMTP_USER }}
+          password: ${{ secrets.PERF_EMAIL_SMTP_PASSWORD }}
+          subject: >-
+            [query-cascade] Nightly performance
+            (${{ github.repository }}) run #${{ github.run_number }}
+          to: ${{ secrets.PERF_EMAIL_TO }}
+          from: ${{ secrets.PERF_EMAIL_FROM }}
+          body: file://nightly_email_body.txt
+          convert_markdown: false
+
+      - name: Skip email when SMTP secrets are missing
+        if: ${{ always() && (secrets.PERF_EMAIL_SMTP_HOST == '' || secrets.PERF_EMAIL_SMTP_USER == '' || secrets.PERF_EMAIL_SMTP_PASSWORD == '' || secrets.PERF_EMAIL_FROM == '' || secrets.PERF_EMAIL_TO == '') }}
+        run: echo "SMTP secrets not fully configured; skipping email notification."
