@@ -357,6 +357,91 @@ def test_load_applies_current_trace_limit_to_persisted_trace(tmp_path: Path) -> 
     assert loaded_events == full_events[-4:]
 
 
+def test_compute_many_preserves_call_order_with_out_of_order_work() -> None:
+    engine = Engine()
+
+    @engine.query
+    def staggered(value: int) -> int:
+        # Invert durations to encourage out-of-order completion across workers.
+        time.sleep((5 - value) * 0.002)
+        return value * 10
+
+    calls = [(staggered, (value,)) for value in [4, 1, 5, 2, 3]]
+    result = engine.compute_many(calls, workers=4)
+    assert result == [40, 10, 50, 20, 30]
+
+
+def test_compute_many_snapshot_freezes_input_reads() -> None:
+    engine = Engine()
+
+    @engine.input
+    def cell(index: int) -> int:
+        return 0
+
+    @engine.query
+    def read_cell(index: int) -> int:
+        return cell(index)
+
+    for index in range(6):
+        cell.set(index, index)
+    snapshot = engine.snapshot()
+    for index in range(6):
+        cell.set(index, index + 100)
+
+    frozen = engine.compute_many([(read_cell, (index,)) for index in range(6)], snapshot=snapshot)
+    live = engine.compute_many([(read_cell, (index,)) for index in range(6)])
+    assert frozen == [0, 1, 2, 3, 4, 5]
+    assert live == [100, 101, 102, 103, 104, 105]
+
+
+def test_submit_replays_effects_on_cache_hit() -> None:
+    engine = Engine()
+    warnings = engine.accumulator("warnings")
+
+    @engine.input
+    def source() -> str:
+        return ""
+
+    @engine.query
+    def lint_len() -> int:
+        text = source()
+        if "warn" in text:
+            warnings.push("has warn")
+        return len(text)
+
+    source.set("warn me")
+
+    effects_1: dict[str, list[str]] = {}
+    assert engine.submit(lint_len, effects=effects_1).result(timeout=2.0) == len("warn me")
+    assert effects_1["warnings"] == ["has warn"]
+
+    effects_2: dict[str, list[str]] = {}
+    assert engine.submit(lint_len, effects=effects_2).result(timeout=2.0) == len("warn me")
+    assert effects_2["warnings"] == ["has warn"]
+
+
+def test_input_set_supports_keyword_and_positional_value_forms() -> None:
+    engine = Engine()
+
+    @engine.input
+    def scalar() -> int:
+        return 0
+
+    @engine.input
+    def keyed(name: str) -> str:
+        return ""
+
+    scalar.set(value=11)
+    assert scalar() == 11
+    scalar.set(13)
+    assert scalar() == 13
+
+    keyed.set("alpha", value="A")
+    keyed.set("beta", "B")
+    assert keyed("alpha") == "A"
+    assert keyed("beta") == "B"
+
+
 def test_eviction_and_prune() -> None:
     engine = Engine(max_entries=2)
 
@@ -731,4 +816,129 @@ def test_tracing_captures_events() -> None:
     assert "input_set" in kinds
     assert "recompute_start" in kinds
     assert "cache_hit" in kinds or "cache_green" in kinds
+
+
+def test_compute_many_preserves_call_order_with_mixed_durations() -> None:
+    engine = Engine()
+
+    @engine.input
+    def base(i: int) -> int:
+        return 0
+
+    @engine.query
+    def delayed(i: int) -> int:
+        time.sleep(0.002 * (8 - i))
+        return base(i) * 10
+
+    for i in range(8):
+        base.set(i, i)
+
+    calls = [(delayed, (i,)) for i in range(8)]
+    result = engine.compute_many(calls, workers=4)
+    assert result == [i * 10 for i in range(8)]
+
+
+def test_compute_many_uses_single_snapshot_for_all_calls() -> None:
+    engine = Engine()
+    gate = threading.Event()
+    started = threading.Event()
+
+    @engine.input
+    def cell(i: int) -> int:
+        return 0
+
+    @engine.query
+    def read_cell(i: int) -> int:
+        started.set()
+        gate.wait(timeout=2.0)
+        return cell(i)
+
+    width = 10
+    for i in range(width):
+        cell.set(i, i)
+
+    result_box: list[list[int]] = []
+
+    def run_batch() -> None:
+        result_box.append(engine.compute_many([(read_cell, (i,)) for i in range(width)], workers=4))
+
+    worker = threading.Thread(target=run_batch, daemon=True)
+    worker.start()
+    started.wait(timeout=1.0)
+
+    for i in range(width):
+        cell.set(i, i + 1000)
+    gate.set()
+    worker.join(timeout=3.0)
+    assert not worker.is_alive()
+    assert result_box == [list(range(width))]
+    assert engine.compute_many([(read_cell, (i,)) for i in range(width)], workers=4) == [i + 1000 for i in range(width)]
+
+
+def test_submit_replays_cached_effects_for_top_level_effects_dict() -> None:
+    engine = Engine()
+    warnings = engine.accumulator("warnings")
+    runs = 0
+
+    @engine.input
+    def source() -> str:
+        return ""
+
+    @engine.query
+    def lint() -> int:
+        nonlocal runs
+        runs += 1
+        text = source()
+        if "todo" in text:
+            warnings.push("contains todo")
+        return len(text)
+
+    source.set("todo")
+    effects_1: dict[str, list[str]] = {}
+    effects_2: dict[str, list[str]] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        assert engine.submit(lint, effects=effects_1, executor=pool).result(timeout=2.0) == len("todo")
+        assert engine.submit(lint, effects=effects_2, executor=pool).result(timeout=2.0) == len("todo")
+
+    assert effects_1["warnings"] == ["contains todo"]
+    assert effects_2["warnings"] == ["contains todo"]
+    assert runs == 1
+
+
+def test_input_set_with_keyword_value_and_no_positional_value() -> None:
+    engine = Engine()
+
+    @engine.input
+    def setting() -> int:
+        return 0
+
+    @engine.input
+    def threshold(name: str) -> int:
+        return len(name)
+
+    setting.set(value=7)
+    threshold.set("prod", value=11)
+
+    assert setting() == 7
+    assert threshold("prod") == 11
+
+
+def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection() -> None:
+    engine = Engine()
+
+    @engine.input
+    def base(i: int) -> int:
+        return 0
+
+    @engine.query
+    def plus(i: int) -> int:
+        return base(i) + 1
+
+    for i in range(6):
+        base.set(i, i)
+
+    # workers=0 uses the default worker-count branch.
+    result = engine.compute_many([(plus, (i,)) for i in range(6)], workers=0)
+    assert result == [i + 1 for i in range(6)]
 
