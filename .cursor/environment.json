@@ -1,0 +1,4 @@
+{
+  "install": ".cursor/scripts/install.sh",
+  "start": ".cursor/scripts/start.sh"
+}
