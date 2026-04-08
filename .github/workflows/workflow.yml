@@ -223,8 +223,6 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    env:
-      PYTHON_GIL: "0"
     environment: pypi
     permissions:
       contents: write
@@ -243,6 +241,8 @@ jobs:
           cache: "pip"
 
       - name: Verify free-threaded runtime
+        env:
+          PYTHON_GIL: "0"
         run: |
           python - <<'PY'
           import sys
