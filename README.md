@@ -153,6 +153,9 @@ Performance-sensitive behavior in this project is concentrated around:
 - cache-hit verification (green-path checks) versus full recomputation cost
 - concurrent query deduplication under contention
 - scheduler throughput for `compute_many` on GIL-releasing workloads
+- giant-graph targeted mutation latency versus full rebuild latency
+- mark-green verification overhead as dependency depth grows
+- prune runtime scaling from small to large graphs
 
 Run the performance suite locally:
 
@@ -166,6 +169,37 @@ This writes:
 - `artifacts/performance/performance-report.md`
 
 CI executes the same suite on each build and uploads the report as an artifact named `performance-report`.
+
+## Scale and stress test categories
+
+The test suite now includes scale-focused correctness tests in `tests/test_scale_behavior.py`:
+
+- giant graph selective invalidation with recompute-count assertions
+- dynamic dependency churn (stale edge cleanup and consistency checks)
+- prune stress (large memo graphs with narrow retention roots)
+- persistence round-trip at scale (post-load cache-hit behavior)
+- eviction policy behavior under heavy churn
+- mixed concurrency stress (`submit` + `compute_many` + frequent writes)
+
+Some of the heaviest graph and concurrency scenarios are marked `@pytest.mark.slow` to keep default CI deterministic and fast while still running a representative giant-graph test by default.
+
+Run default CI-equivalent tests:
+
+```bash
+pytest -q
+```
+
+Run only slow scale/stress tests locally:
+
+```bash
+pytest -q -m slow
+```
+
+Run all tests including slow:
+
+```bash
+pytest -q -m "slow or not slow"
+```
 
 ## CI best practices included
 

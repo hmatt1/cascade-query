@@ -15,6 +15,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = ["-m", "not slow"]
+markers = [
+    "slow: resource-intensive scale and stress scenarios",
+]
 
 [tool.coverage.run]
 branch = true
