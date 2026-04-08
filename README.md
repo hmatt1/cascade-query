@@ -146,6 +146,27 @@ python -m pip install -e . pytest
 pytest -q
 ```
 
+## Performance checks and report
+
+Performance-sensitive behavior in this project is concentrated around:
+
+- cache-hit verification (green-path checks) versus full recomputation cost
+- concurrent query deduplication under contention
+- scheduler throughput for `compute_many` on GIL-releasing workloads
+
+Run the performance suite locally:
+
+```bash
+python -m benchmarks.performance_suite --report-dir artifacts/performance --assert-thresholds
+```
+
+This writes:
+
+- `artifacts/performance/performance-report.json`
+- `artifacts/performance/performance-report.md`
+
+CI executes the same suite on each build and uploads the report as an artifact named `performance-report`.
+
 ## CI best practices included
 
 - GitHub Actions workflow at `.github/workflows/ci.yml`.

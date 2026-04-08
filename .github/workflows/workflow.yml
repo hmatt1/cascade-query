@@ -48,6 +48,19 @@ jobs:
             --cov-report=json:coverage.json \
             --cov-fail-under=95
 
+      - name: Generate performance report
+        run: |
+          python -m benchmarks.performance_suite \
+            --report-dir artifacts/performance \
+            --assert-thresholds
+
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-report
+          path: artifacts/performance/
+
       - name: Enforce branch coverage threshold
         run: |
           python - <<'PY'
