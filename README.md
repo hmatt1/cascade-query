@@ -1,5 +1,13 @@
 # Cascade Query
 
+<p align="center">
+  <a href="https://pypi.org/project/query-cascade/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/query-cascade?color=3775A9&label=PyPI"></a>
+  <a href="https://pypi.org/project/query-cascade/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/query-cascade?color=5A9"></a>
+  <a href="https://pypi.org/project/query-cascade/"><img alt="Distribution format" src="https://img.shields.io/pypi/wheel/query-cascade?color=4CAF50"></a>
+</p>
+
+**Releases:** https://pypi.org/project/query-cascade/
+
 `cascade-query` is a minimal, demand-driven incremental computation framework for Python.
 
 It is designed for compiler-like workloads where you want:
