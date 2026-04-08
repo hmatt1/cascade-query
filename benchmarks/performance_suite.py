@@ -7,6 +7,7 @@ import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,60 @@ def _median(values: list[float]) -> float:
     if not values:
         return 0.0
     return float(statistics.median(values))
+
+
+def _build_fanout_chain_pipeline(
+    engine: Engine,
+    *,
+    depth: int,
+    fanout: int,
+    counts: dict[str, int] | None = None,
+) -> tuple[Any, list[Any], Any]:
+    if depth < 1 or fanout < 1:
+        raise ValueError("depth and fanout must be >= 1")
+    call_counts = counts if counts is not None else defaultdict(int)
+
+    @engine.input
+    def leaf(branch: int) -> int:
+        return 0
+
+    levels: list[Any] = []
+    prev = None
+    for level in range(depth):
+
+        def _make_level(level_index: int, prev_level: Any) -> Any:
+            def level_query(branch: int) -> int:
+                call_counts[f"level_{level_index}"] += 1
+                base = leaf(branch) if prev_level is None else prev_level(branch)
+                return base + (level_index + 1)
+
+            level_query.__name__ = f"bench_level_{level_index}"
+            level_query.__qualname__ = f"bench_synthetic_level_{level_index}"
+            return engine.query(level_query)
+
+        current = _make_level(level, prev)
+        levels.append(current)
+        prev = current
+
+    top = levels[-1]
+
+    def aggregate_query() -> int:
+        call_counts["aggregate"] += 1
+        return sum(top(branch) for branch in range(fanout))
+
+    aggregate_query.__name__ = "bench_aggregate_query"
+    aggregate_query.__qualname__ = "bench_synthetic_aggregate_query"
+    aggregate = engine.query(aggregate_query)
+    return leaf, levels, aggregate
+
+
+def _measure_median_ms(fn: Any, *, rounds: int) -> float:
+    samples: list[float] = []
+    for _ in range(rounds):
+        start = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - start) * 1000.0)
+    return _median(samples)
 
 
 def _scenario_cache_hit_speedup() -> ScenarioResult:
@@ -190,11 +245,187 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     )
 
 
+def _scenario_giant_graph_targeted_mutation_latency() -> ScenarioResult:
+    engine = Engine()
+    depth = 10
+    fanout = 256
+    rounds = 5
+    leaf, _, aggregate = _build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
+    values = [index * 7 for index in range(fanout)]
+    for branch, value in enumerate(values):
+        leaf.set(branch, value)
+    aggregate()
+
+    targeted_ms: list[float] = []
+    full_ms: list[float] = []
+    for round_index in range(rounds):
+        target = (round_index * 13) % fanout
+        values[target] += 1
+        leaf.set(target, values[target])
+        start = time.perf_counter()
+        aggregate()
+        targeted_ms.append((time.perf_counter() - start) * 1000.0)
+
+        for branch in range(fanout):
+            values[branch] += 1
+            leaf.set(branch, values[branch])
+        start = time.perf_counter()
+        aggregate()
+        full_ms.append((time.perf_counter() - start) * 1000.0)
+
+    targeted_med = _median(targeted_ms)
+    full_med = _median(full_ms)
+    speedup = full_med / max(targeted_med, 1e-9)
+    threshold = 3.0
+    passed = speedup >= threshold
+    return ScenarioResult(
+        name="giant-graph-targeted-mutation-latency",
+        concern="Small edits should recompute only a narrow dependency cone instead of full graph rebuild.",
+        metric_name="full_rebuild_vs_targeted_speedup",
+        metric_value=speedup,
+        unit="x",
+        threshold=threshold,
+        comparator=">=",
+        passed=passed,
+        details={
+            "rounds": rounds,
+            "depth": depth,
+            "fanout": fanout,
+            "targeted_median_ms": targeted_med,
+            "full_rebuild_median_ms": full_med,
+        },
+    )
+
+
+def _scenario_mark_green_depth_overhead() -> ScenarioResult:
+    rounds = 7
+    depths = [8, 24, 48]
+    medians: dict[int, float] = {}
+
+    for depth in depths:
+        engine = Engine()
+
+        @engine.input
+        def leaf() -> int:
+            return 0
+
+        @engine.input
+        def noise(step: int) -> int:
+            return 0
+
+        previous = None
+        for level in range(depth):
+
+            def _make_level(level_index: int, prev_level: Any) -> Any:
+                def level_query() -> int:
+                    base = leaf() if prev_level is None else prev_level()
+                    return base + (level_index + 1)
+
+                level_query.__name__ = f"depth_probe_{depth}_{level_index}"
+                level_query.__qualname__ = f"depth_probe_{depth}_{level_index}"
+                return engine.query(level_query)
+
+            previous = _make_level(level, previous)
+
+        if previous is None:  # pragma: no cover - safety belt
+            raise AssertionError("expected non-empty chain")
+        top = previous
+
+        leaf.set(3)
+        assert top() > 0
+
+        verify_ms: list[float] = []
+        for step in range(rounds):
+            noise.set(step, step)
+            start = time.perf_counter()
+            top()
+            verify_ms.append((time.perf_counter() - start) * 1000.0)
+        medians[depth] = _median(verify_ms)
+
+    shallow = medians[depths[0]]
+    deep = medians[depths[-1]]
+    growth = deep / max(shallow, 1e-9)
+    threshold = 1.4
+    passed = growth >= threshold
+    return ScenarioResult(
+        name="mark-green-depth-overhead",
+        concern="Dependency verification overhead should reflect dependency depth and remain measurable at scale.",
+        metric_name=f"depth{depths[-1]}_vs_depth{depths[0]}_verification_growth",
+        metric_value=growth,
+        unit="x",
+        threshold=threshold,
+        comparator=">=",
+        passed=passed,
+        details={
+            "depth_medians_ms": {str(depth): medians[depth] for depth in depths},
+            "rounds_per_depth": rounds,
+        },
+    )
+
+
+def _scenario_prune_runtime_scaling() -> ScenarioResult:
+    rounds = 5
+    depth = 8
+    workloads = {
+        "small": 120,
+        "medium": 360,
+        "large": 900,
+    }
+    medians: dict[str, float] = {}
+    memo_counts: dict[str, int] = {}
+
+    for label, fanout in workloads.items():
+        samples: list[float] = []
+        for round_index in range(rounds):
+            engine = Engine()
+            leaf, levels, aggregate = _build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
+            for idx in range(fanout):
+                leaf.set(idx, idx + round_index)
+            aggregate()
+            memo_counts[label] = engine.inspect_graph()["memo_count"]
+            root = ("query", levels[-1].id, (fanout - 1,))
+            start = time.perf_counter()
+            engine.prune([root])
+            samples.append((time.perf_counter() - start) * 1000.0)
+        medians[label] = _median(samples)
+
+    small = medians["small"]
+    medium = medians["medium"]
+    large = medians["large"]
+    monotonic = small < medium < large
+    node_scale = memo_counts["large"] / max(memo_counts["small"], 1)
+    runtime_scale = large / max(small, 1e-9)
+    threshold = node_scale * 2.2
+    passed = monotonic and runtime_scale <= threshold
+    return ScenarioResult(
+        name="prune-runtime-scaling",
+        concern="Prune should scale with graph size without pathological blowups.",
+        metric_name="large_vs_small_runtime_scale",
+        metric_value=runtime_scale,
+        unit="x",
+        threshold=threshold,
+        comparator="<=",
+        passed=passed,
+        details={
+            "rounds": rounds,
+            "depth": depth,
+            "fanouts": workloads,
+            "memo_counts": memo_counts,
+            "median_ms": medians,
+            "monotonic_small_medium_large": monotonic,
+            "node_scale_large_vs_small": node_scale,
+        },
+    )
+
+
 def run_performance_suite() -> dict[str, Any]:
     results = [
         _scenario_cache_hit_speedup(),
         _scenario_dedup_contention(),
         _scenario_parallel_scheduler_speedup(),
+        _scenario_giant_graph_targeted_mutation_latency(),
+        _scenario_mark_green_depth_overhead(),
+        _scenario_prune_runtime_scaling(),
     ]
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -231,6 +462,9 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "1. Cache hit and dependency verification cost versus full recomputation.",
         "2. In-flight query deduplication behavior during heavy contention.",
         "3. Work-stealing scheduler throughput on GIL-releasing concurrent tasks.",
+        "4. Targeted giant-graph mutation latency versus full-graph rebuild latency.",
+        "5. Mark-green verification overhead as dependency depth increases.",
+        "6. Prune runtime scaling from small to large memo graphs.",
         "",
         "## Scenario results",
         "",
