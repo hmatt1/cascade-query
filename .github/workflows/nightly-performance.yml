@@ -18,11 +18,24 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up free-threaded Python
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14t"
           cache: "pip"
+
+      - name: Assert free-threaded runtime
+        run: |
+          python - <<'PY'
+          import sys
+          import sysconfig
+
+          if sysconfig.get_config_var("Py_GIL_DISABLED") != 1:
+              raise SystemExit("Expected free-threaded CPython build (Py_GIL_DISABLED=1)")
+          if sys._is_gil_enabled():
+              raise SystemExit("Expected runtime GIL to be disabled on free-threaded build")
+          print("Verified free-threaded runtime:", sys.version)
+          PY
 
       - name: Install dependencies
         run: |
