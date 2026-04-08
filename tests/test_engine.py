@@ -106,6 +106,49 @@ def test_query_dedup_concurrent_requests() -> None:
     assert compute_counter == 1
 
 
+def test_query_dedup_failure_propagates_and_recovers() -> None:
+    engine = Engine()
+    runs = 0
+    lock = threading.Lock()
+    started = threading.Event()
+
+    @engine.input
+    def mode() -> int:
+        return 0
+
+    @engine.query
+    def flaky() -> int:
+        nonlocal runs
+        with lock:
+            runs += 1
+        started.set()
+        time.sleep(0.06)
+        if mode() == 1:
+            raise RuntimeError("planned failure")
+        return mode() + 40
+
+    mode.set(1)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(flaky) for _ in range(8)]
+        started.wait(timeout=1.0)
+        errors = []
+        for future in futures:
+            with pytest.raises(RuntimeError, match="planned failure") as exc:
+                future.result(timeout=2.0)
+            errors.append(exc.value)
+
+    assert len(errors) == 8
+    assert runs == 1
+    assert ("query", flaky.id, ()) not in engine._in_flight  # noqa: SLF001
+
+    mode.set(2)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        values = [future.result(timeout=2.0) for future in [pool.submit(flaky) for _ in range(6)]]
+
+    assert values == [42] * 6
+    assert runs == 2
+
+
 def test_safe_task_cancellation_after_input_mutation() -> None:
     engine = Engine()
 
@@ -268,6 +311,50 @@ def test_persistence_save_and_load(tmp_path: Path) -> None:
 
     engine_b.load(str(db_path))
     assert count_lines("main") == 2
+
+
+def _run_trace_workload(engine: Engine) -> list[str]:
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def compute() -> int:
+        return source() + 1
+
+    for value in range(5):
+        source.set(value)
+        assert compute() == value + 1
+        assert compute() == value + 1
+
+    return [event.event for event in engine.traces()]
+
+
+def test_trace_limit_keeps_the_most_recent_events() -> None:
+    full = Engine(trace_limit=10_000)
+    limited = Engine(trace_limit=9)
+
+    full_events = _run_trace_workload(full)
+    limited_events = _run_trace_workload(limited)
+
+    assert len(limited_events) == 9
+    assert limited_events == full_events[-9:]
+
+
+def test_load_applies_current_trace_limit_to_persisted_trace(tmp_path: Path) -> None:
+    db_path = tmp_path / "trace-limit.db"
+
+    engine_a = Engine(trace_limit=10_000)
+    full_events = _run_trace_workload(engine_a)
+    engine_a.save(str(db_path))
+
+    engine_b = Engine(trace_limit=4)
+    _run_trace_workload(engine_b)
+    engine_b.load(str(db_path))
+    loaded_events = [event.event for event in engine_b.traces()]
+
+    assert len(loaded_events) == 4
+    assert loaded_events == full_events[-4:]
 
 
 def test_eviction_and_prune() -> None:
