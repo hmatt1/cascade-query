@@ -432,10 +432,18 @@ class Engine:
             return None
         return versions[idx]
 
-    def _set_input(self, input_id: str, args: tuple[Any, ...], value: Any) -> int:
+    def _set_input(
+        self,
+        input_id: str,
+        args: tuple[Any, ...],
+        value: Any,
+        *,
+        bump_cancel_epoch: bool = True,
+    ) -> int:
         with self._lock:
             self._revision += 1
-            self._cancel_epoch += 1
+            if bump_cancel_epoch:
+                self._cancel_epoch += 1
             key = (input_id, args)
             versions = self._inputs.setdefault(key, [])
             current = versions[-1] if versions else None
@@ -472,7 +480,7 @@ class Engine:
         version = self._input_version_at((input_id, args), use_snapshot.revision)
         if version is None:
             default = fn(*args)
-            self._set_input(input_id, args, default)
+            self._set_input(input_id, args, default, bump_cancel_epoch=False)
             version = self._latest_input_version((input_id, args))
             if version is None:  # pragma: no cover - safety belt
                 raise RuntimeError("input version missing after initialization")
