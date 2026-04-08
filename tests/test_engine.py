@@ -483,76 +483,57 @@ def test_long_chain_cycle_detection_behavior() -> None:
 def test_persistence_round_trip_robustness(tmp_path: Path) -> None:
     db_path = tmp_path / "roundtrip.db"
 
-    engine_a = Engine()
+    def build_pipeline(counter: dict[str, int] | None = None) -> tuple[Engine, object, object]:
+        engine = Engine()
 
-    @engine_a.input
-    def source(name: str) -> str:
-        return ""
+        @engine.input
+        def source(name: str) -> str:
+            return ""
 
-    @engine_a.query
-    def parse(name: str) -> tuple[str, ...]:
-        return tuple(line.strip() for line in source(name).splitlines() if line.strip())
+        @engine.query
+        def parse(name: str) -> tuple[str, ...]:
+            if counter is not None:
+                counter["parse"] += 1
+            return tuple(line.strip() for line in source(name).splitlines() if line.strip())
 
-    @engine_a.query
-    def symbol_count(name: str) -> int:
-        return len(parse(name))
+        @engine.query
+        def symbol_count(name: str) -> int:
+            if counter is not None:
+                counter["count"] += 1
+            return len(parse(name))
 
-    source.set("a", "one\ntwo")
-    source.set("b", "x")
-    assert symbol_count("a") == 2
-    assert symbol_count("b") == 1
+        return engine, source, symbol_count
+
+    engine_a, source_a, symbol_count_a = build_pipeline()
+
+    source_a.set("a", "one\ntwo")
+    source_a.set("b", "x")
+    assert symbol_count_a("a") == 2
+    assert symbol_count_a("b") == 1
     engine_a.save(str(db_path))
 
-    engine_b = Engine()
     calls = {"parse": 0, "count": 0}
-
-    @engine_b.input
-    def source(name: str) -> str:
-        return ""
-
-    @engine_b.query
-    def parse(name: str) -> tuple[str, ...]:
-        calls["parse"] += 1
-        return tuple(line.strip() for line in source(name).splitlines() if line.strip())
-
-    @engine_b.query
-    def symbol_count(name: str) -> int:
-        calls["count"] += 1
-        return len(parse(name))
+    engine_b, source_b, symbol_count_b = build_pipeline(calls)
 
     engine_b.load(str(db_path))
-    assert symbol_count("a") == 2
-    assert symbol_count("b") == 1
+    assert symbol_count_b("a") == 2
+    assert symbol_count_b("b") == 1
     assert calls == {"parse": 0, "count": 0}
 
-    source.set("a", "one\ntwo\nthree")
-    assert symbol_count("a") == 3
-    assert symbol_count("b") == 1
+    source_b.set("a", "one\ntwo\nthree")
+    assert symbol_count_b("a") == 3
+    assert symbol_count_b("b") == 1
     assert calls["parse"] == 1
     assert calls["count"] == 1
 
     engine_b.save(str(db_path))
 
-    engine_c = Engine()
     calls_c = {"parse": 0, "count": 0}
-
-    @engine_c.input
-    def source(name: str) -> str:
-        return ""
-
-    @engine_c.query
-    def parse(name: str) -> tuple[str, ...]:
-        calls_c["parse"] += 1
-        return tuple(line.strip() for line in source(name).splitlines() if line.strip())
-
-    @engine_c.query
-    def symbol_count(name: str) -> int:
-        calls_c["count"] += 1
-        return len(parse(name))
+    engine_c, _, symbol_count_c = build_pipeline(calls_c)
 
     engine_c.load(str(db_path))
-    assert symbol_count("a") == 3
-    assert symbol_count("b") == 1
+    assert symbol_count_c("a") == 3
+    assert symbol_count_c("b") == 1
     assert calls_c == {"parse": 0, "count": 0}
 
 
