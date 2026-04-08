@@ -117,9 +117,40 @@ assert lint_count() == 2
 ## Examples
 
 - `examples/compiler_pipeline.py`  
-  Tiny compiler pipeline (`source -> parse -> symbol_names -> typecheck`) with warnings accumulator.
+  Tiny compiler pipeline (`source -> parse -> symbol_names -> typecheck`) with warnings accumulator and cache-hit narration.
 - `examples/dynamic_macro_expansion.py`  
   Runtime macro-expansion query that dynamically changes downstream graph dependencies.
+- `examples/snapshot_isolation.py`  
+  Demonstrates immutable snapshot reads while live inputs continue to change.
+- `examples/concurrent_background_work.py`  
+  Shows concurrent deduplicated query execution plus stale background cancellation after input mutation.
+- `examples/persistence_and_inspection.py`  
+  Saves engine state, loads it into a new engine, and inspects memo/input graph summaries.
+
+### Running examples
+
+Install package + test dependencies once:
+
+```bash
+python -m pip install -e . pytest
+```
+
+Run a single example:
+
+```bash
+python examples/compiler_pipeline.py
+```
+
+Run all examples:
+
+```bash
+for example in examples/*.py; do
+  echo "Running $example"
+  python "$example"
+done
+```
+
+Examples print step-by-step narration while they run so you can follow each behavior they demonstrate.
 
 ## Persistence and inspection
 
