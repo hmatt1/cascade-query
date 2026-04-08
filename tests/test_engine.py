@@ -265,6 +265,39 @@ def test_work_stealing_compute_many() -> None:
     assert len(thread_ids) > 1
 
 
+def test_multi_cpu_parallel_overlap_proof() -> None:
+    engine = Engine()
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    thread_ids: set[int] = set()
+
+    @engine.input
+    def base(i: int) -> int:
+        return 0
+
+    @engine.query
+    def job(i: int) -> int:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            thread_ids.add(threading.get_ident())
+        # Sleep releases the GIL and makes overlap directly observable.
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return base(i) + 1
+
+    for i in range(32):
+        base.set(i, i)
+
+    result = engine.compute_many([(job, (i,)) for i in range(32)], workers=8)
+    assert result == [i + 1 for i in range(32)]
+    assert len(thread_ids) >= 2
+    assert max_active >= 2
+
+
 def test_tracing_captures_events() -> None:
     engine = Engine()
 
