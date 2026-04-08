@@ -683,7 +683,9 @@ class Engine:
         for name, values in effects.items():
             if runtime.root_effects is not None:
                 runtime.root_effects.setdefault(name, []).extend(values)
-            for frame in runtime.stack[:-1]:
+            # Mirror _push_effect semantics so ancestor memo entries retain
+            # transitive effects even when children are served from cache.
+            for frame in runtime.stack:
                 frame.effects[name].extend(values)
 
     def _push_effect(self, name: str, item: Any) -> None:
