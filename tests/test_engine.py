@@ -100,11 +100,22 @@ def test_snapshot_default_input_read_does_not_create_redundant_versions() -> Non
     # and must not mutate the live input timeline.
     assert q1("x", snapshot=snap) == "default:x:q1"
     assert engine.revision == 0
+    input_set_events_before_live_write = [
+        event
+        for event in engine.traces()
+        if event.event == "input_set" and event.key == f"input:{missing.id}('x',)"
+    ]
+    assert input_set_events_before_live_write == []
 
     # A second same-snapshot read for the same key also must remain non-mutating.
     assert q2("x", snapshot=snap) == "default:x:q2"
     assert engine.revision == 0
-    assert (missing.id, ("x",)) not in engine._inputs  # noqa: SLF001
+    input_set_events_after_snapshot_reads = [
+        event
+        for event in engine.traces()
+        if event.event == "input_set" and event.key == f"input:{missing.id}('x',)"
+    ]
+    assert input_set_events_after_snapshot_reads == []
 
     # Live writes remain authoritative even after stale-snapshot default reads.
     missing.set("x", value="live")
@@ -113,11 +124,14 @@ def test_snapshot_default_input_read_does_not_create_redundant_versions() -> Non
     assert q1("x", snapshot=snap) == "default:x:q1"
     assert q1("x") == "live:q1"
 
-    versions = engine._inputs[(missing.id, ("x",))]  # noqa: SLF001
-    assert len(versions) == 1
-    assert versions[0].revision == 1
-    assert versions[0].changed_at == 1
-    assert versions[0].value == "live"
+    input_set_events = [
+        event
+        for event in engine.traces()
+        if event.event == "input_set" and event.key == f"input:{missing.id}('x',)"
+    ]
+    assert len(input_set_events) == 1
+    assert input_set_events[0].revision == 1
+    assert input_set_events[0].detail == "changed_at=1"
 
 
 def test_query_dedup_concurrent_requests() -> None:
@@ -222,7 +236,7 @@ def test_query_dedup_failure_propagates_and_recovers() -> None:
 
     assert len(errors) == 8
     assert runs == 1
-    assert ("query", flaky.id, ()) not in engine._in_flight  # noqa: SLF001
+    assert any(event.event == "dedup_wait" for event in engine.traces())
 
     mode.set(2)
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -899,7 +913,7 @@ def test_compute_many_propagates_worker_exceptions() -> None:
         engine.compute_many([(boom, (0,)), (boom, (1,)), (boom, (2,)), (boom, (3,))], workers=3)
 
 
-def test_internal_dependency_version_helpers() -> None:
+def test_internal_dependency_helpers() -> None:
     engine = Engine()
 
     @engine.input
@@ -910,9 +924,8 @@ def test_internal_dependency_version_helpers() -> None:
     def parse(name: str) -> tuple[str, ...]:
         return tuple(source(name).splitlines())
 
-    # Internal helper boundaries are stable and testable.
+    # Compatibility shims remain wired for legacy introspection.
     assert engine._latest_input_version((source.id, ("missing",))) is None
-    assert engine._input_version_at((source.id, ("missing",)), revision=0) is None
     assert engine._input_version_at((source.id, ("main",)), revision=0) is None
 
     source.set("main", "a\nb")

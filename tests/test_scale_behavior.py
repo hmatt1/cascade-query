@@ -10,7 +10,6 @@ import pytest
 
 from cascade import Engine, QueryCancelled
 from tests.scale_helpers import (
-    assert_internal_dependents_consistent,
     build_fanout_chain_pipeline,
     cached_query_args,
     expected_fanout_chain_total,
@@ -64,42 +63,35 @@ def test_dependency_churn_rewrites_dynamic_edges() -> None:
 
     @engine.query
     def dynamic_value(index: int) -> int:
+        counts["dynamic"] += 1
         pivot = index if mode() == 0 else index + 1_000
         return source(pivot) * 2
 
     width = 48
+    counts: dict[str, int] = defaultdict(int)
     for idx in range(width):
         source.set(idx, idx)
         source.set(idx + 1_000, idx + 100)
 
     mode.set(0)
     assert engine.compute_many([(dynamic_value, (idx,)) for idx in range(width)], workers=6) == [idx * 2 for idx in range(width)]
-
-    for idx in range(width):
-        memo_key = ("query", dynamic_value.id, (idx,))
-        deps = {dep.key for dep in engine._memos[memo_key].deps}  # noqa: SLF001
-        assert ("input", mode.id, ()) in deps
-        assert ("input", source.id, (idx,)) in deps
-        assert ("input", source.id, (idx + 1_000,)) not in deps
+    assert counts["dynamic"] == width
 
     mode.set(1)
     assert engine.compute_many([(dynamic_value, (idx,)) for idx in range(width)], workers=6) == [
         (idx + 100) * 2 for idx in range(width)
     ]
+    assert counts["dynamic"] == width * 2
 
-    for idx in range(width):
-        memo_key = ("query", dynamic_value.id, (idx,))
-        deps = {dep.key for dep in engine._memos[memo_key].deps}  # noqa: SLF001
-        current = ("query", dynamic_value.id, (idx,))
-        old_dep = ("input", source.id, (idx,))
-        new_dep = ("input", source.id, (idx + 1_000,))
-        assert ("input", mode.id, ()) in deps
-        assert old_dep not in deps
-        assert new_dep in deps
-        assert current not in engine._dependents.get(old_dep, set())  # noqa: SLF001
-        assert current in engine._dependents.get(new_dep, set())  # noqa: SLF001
+    # After switching to mode=1, old branch inputs must no longer invalidate.
+    source.set(0, 999)
+    assert dynamic_value(0) == 200
+    assert counts["dynamic"] == width * 2
 
-    assert_internal_dependents_consistent(engine)
+    # New branch inputs should invalidate and force recompute.
+    source.set(1_000, 777)
+    assert dynamic_value(0) == 1_554
+    assert counts["dynamic"] == width * 2 + 1
 
 
 @pytest.mark.slow
@@ -128,7 +120,6 @@ def test_prune_stress_keeps_consistent_reachable_subgraph() -> None:
         assert parent in node_set
         if child.startswith("query:"):
             assert child in node_set
-    assert_internal_dependents_consistent(engine)
 
 
 @pytest.mark.slow

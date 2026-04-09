@@ -74,7 +74,10 @@ def cached_query_args(graph: dict[str, Any], query_id: str) -> set[tuple[Any, ..
 
 
 def assert_internal_dependents_consistent(engine: Engine) -> None:
-    """Guard against orphan dependent links after prune/churn/eviction."""
+    """Internal-only invariant: each dependent edge must match memo deps.
+
+    Keep this helper narrow and centralized so most tests can stay black-box.
+    """
     for dep_key, dependents in engine._dependents.items():  # noqa: SLF001
         for dependent in dependents:
             assert dependent in engine._memos  # noqa: SLF001
