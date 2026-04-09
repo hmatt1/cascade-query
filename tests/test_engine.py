@@ -1202,3 +1202,139 @@ def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:
     # Deterministic happy-path trace ordering for one recompute then cache hit.
     assert events == ["input_set", "recompute_start", "input_read", "recompute_done", "cache_hit"]
 
+
+def test_inspect_graph_full_summary_oracle_across_varied_graphs() -> None:
+    def key(kind: str, function_id: str, args: tuple[object, ...]) -> str:
+        return f"{kind}:{function_id}{args}"
+
+    def assert_graph_matches(
+        graph: dict[str, object],
+        *,
+        expected_nodes: set[str],
+        expected_edges: set[tuple[str, str]],
+        expected_memo_count: int,
+        expected_input_count: int,
+    ) -> None:
+        nodes = set(graph["nodes"])  # type: ignore[arg-type]
+        edges = set(tuple(edge) for edge in graph["edges"])  # type: ignore[arg-type]
+        assert graph["memo_count"] == expected_memo_count
+        assert graph["input_count"] == expected_input_count
+        assert nodes == expected_nodes
+        assert edges == expected_edges
+
+    # Scenario 1: linear chain.
+    linear = Engine()
+
+    @linear.input
+    def source(name: str) -> str:
+        return ""
+
+    @linear.query
+    def parse(name: str) -> tuple[str, ...]:
+        return tuple(row.strip() for row in source(name).splitlines() if row.strip())
+
+    @linear.query
+    def symbol_count(name: str) -> int:
+        return len(parse(name))
+
+    source.set("main", "a\nb")
+    assert symbol_count("main") == 2
+    assert_graph_matches(
+        linear.inspect_graph(),
+        expected_nodes={
+            key("query", parse.id, ("main",)),
+            key("query", symbol_count.id, ("main",)),
+        },
+        expected_edges={
+            (key("query", parse.id, ("main",)), key("input", source.id, ("main",))),
+            (key("query", symbol_count.id, ("main",)), key("query", parse.id, ("main",))),
+        },
+        expected_memo_count=2,
+        expected_input_count=1,
+    )
+
+    # Scenario 2: shared fan-out.
+    fanout = Engine()
+
+    @fanout.input
+    def leaf(index: int) -> int:
+        return 0
+
+    @fanout.query
+    def inc(index: int) -> int:
+        return leaf(index) + 1
+
+    @fanout.query
+    def total() -> int:
+        return inc(0) + inc(1) + inc(2)
+
+    for idx in range(3):
+        leaf.set(idx, idx * 10)
+    assert total() == 33
+    assert_graph_matches(
+        fanout.inspect_graph(),
+        expected_nodes={
+            key("query", inc.id, (0,)),
+            key("query", inc.id, (1,)),
+            key("query", inc.id, (2,)),
+            key("query", total.id, ()),
+        },
+        expected_edges={
+            (key("query", inc.id, (0,)), key("input", leaf.id, (0,))),
+            (key("query", inc.id, (1,)), key("input", leaf.id, (1,))),
+            (key("query", inc.id, (2,)), key("input", leaf.id, (2,))),
+            (key("query", total.id, ()), key("query", inc.id, (0,))),
+            (key("query", total.id, ()), key("query", inc.id, (1,))),
+            (key("query", total.id, ()), key("query", inc.id, (2,))),
+        },
+        expected_memo_count=4,
+        expected_input_count=3,
+    )
+
+    # Scenario 3: dynamic branch rewrite removes stale dependency edges.
+    dynamic = Engine()
+
+    @dynamic.input
+    def mode() -> int:
+        return 0
+
+    @dynamic.input
+    def left() -> int:
+        return 0
+
+    @dynamic.input
+    def right() -> int:
+        return 0
+
+    @dynamic.query
+    def choose() -> int:
+        return left() if mode() == 0 else right()
+
+    mode.set(0)
+    left.set(10)
+    right.set(20)
+    assert choose() == 10
+    assert_graph_matches(
+        dynamic.inspect_graph(),
+        expected_nodes={key("query", choose.id, ())},
+        expected_edges={
+            (key("query", choose.id, ()), key("input", mode.id, ())),
+            (key("query", choose.id, ()), key("input", left.id, ())),
+        },
+        expected_memo_count=1,
+        expected_input_count=3,
+    )
+
+    mode.set(1)
+    assert choose() == 20
+    assert_graph_matches(
+        dynamic.inspect_graph(),
+        expected_nodes={key("query", choose.id, ())},
+        expected_edges={
+            (key("query", choose.id, ()), key("input", mode.id, ())),
+            (key("query", choose.id, ()), key("input", right.id, ())),
+        },
+        expected_memo_count=1,
+        expected_input_count=3,
+    )
+
