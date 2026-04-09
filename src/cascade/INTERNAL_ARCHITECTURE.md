@@ -9,7 +9,7 @@ handles/types.
 - `engine.py` (facade/composition)
   - Public API surface (`Engine`, input/query/accumulator handles).
   - Delegates state and evaluation logic to internal modules.
-  - Keeps compatibility shims for existing private test introspection.
+  - Keeps a minimal private compatibility layer for legacy introspection.
 
 - `_state.py` (data model)
   - Core immutable/mutable record types:
@@ -57,3 +57,44 @@ handles/types.
   child queries preserve transitive effects for parents.
 - `dependents` must be consistent with `memo.deps` for every cached memo.
   (This is intentionally covered by a single internal-invariant test helper.)
+
+## Private internal API hygiene policy
+
+`Engine` keeps two explicit internal lists:
+
+- `_INTERNAL_TEST_API`: narrow, invariant-focused internals intentionally used by
+  tests (`_latest_input_version`, `_input_version_at`,
+  `_dependency_changed_at`, `_memos`, `_dependents`).
+- `_LEGACY_PRIVATE_SHIMS`: backward-compatible private aliases retained for
+  compatibility only (`_revision`, `_cancel_epoch`, `_next_access_id`,
+  `_max_entries`, `_inputs`, `_queries`, `_in_flight`, `_lock`).
+
+Policy:
+
+1. New tests should default to public API behavior.
+2. If a test needs internals, prefer adding assertions via the existing
+   invariant helper path and only from `_INTERNAL_TEST_API`.
+3. Avoid introducing new dependencies on `_LEGACY_PRIVATE_SHIMS`.
+4. Removing a legacy shim requires first removing all call-sites, then updating
+   the explicit policy lists and internal invariant tests in one change.
+
+## Testing strategy split
+
+- **Black-box behavior tests** stay in broad scenario suites (`tests/test_engine.py`,
+  `tests/test_scale_behavior.py`, `tests/test_dependency_parallelism.py`) and
+  exercise only public API.
+- **Internal invariant tests** stay centralized in
+  `tests/test_internal_invariants.py` and are intentionally minimal. This keeps
+  private coupling explicit and easy to audit.
+
+## Adding new internals safely
+
+When adding or exposing a new internal hook:
+
+1. Confirm the need cannot be covered by public API assertions.
+2. Add the internal to `Engine._INTERNAL_TEST_API` only if it is required for a
+   stable invariant assertion.
+3. Add/adjust one focused invariant test in
+   `tests/test_internal_invariants.py`.
+4. Document the invariant ownership in this file so future refactors preserve
+   the same boundary.

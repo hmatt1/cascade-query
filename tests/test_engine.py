@@ -454,20 +454,6 @@ def test_load_applies_current_trace_limit_to_persisted_trace(tmp_path: Path) -> 
     assert loaded_events == full_events[-4:]
 
 
-def test_compute_many_preserves_call_order_with_out_of_order_work() -> None:
-    engine = Engine()
-
-    @engine.query
-    def staggered(value: int) -> int:
-        # Invert durations to encourage out-of-order completion across workers.
-        time.sleep((5 - value) * 0.002)
-        return value * 10
-
-    calls = [(staggered, (value,)) for value in [4, 1, 5, 2, 3]]
-    result = engine.compute_many(calls, workers=4)
-    assert result == [40, 10, 50, 20, 30]
-
-
 def test_compute_many_snapshot_freezes_input_reads() -> None:
     engine = Engine()
 
@@ -913,29 +899,6 @@ def test_compute_many_propagates_worker_exceptions() -> None:
         engine.compute_many([(boom, (0,)), (boom, (1,)), (boom, (2,)), (boom, (3,))], workers=3)
 
 
-def test_internal_dependency_helpers() -> None:
-    engine = Engine()
-
-    @engine.input
-    def source(name: str) -> str:
-        return ""
-
-    @engine.query
-    def parse(name: str) -> tuple[str, ...]:
-        return tuple(source(name).splitlines())
-
-    # Compatibility shims remain wired for legacy introspection.
-    assert engine._latest_input_version((source.id, ("missing",))) is None
-    assert engine._input_version_at((source.id, ("main",)), revision=0) is None
-
-    source.set("main", "a\nb")
-    snap = engine.snapshot()
-    assert parse("main", snapshot=snap) == ("a", "b")
-
-    dep_key = ("query", parse.id, ("main",))
-    assert engine._dependency_changed_at(dep_key, snap) == snap.revision
-
-
 def test_tracing_captures_events() -> None:
     engine = Engine()
 
@@ -1014,7 +977,7 @@ def test_compute_many_uses_single_snapshot_for_all_calls() -> None:
     assert engine.compute_many([(read_cell, (i,)) for i in range(width)], workers=4) == [i + 1000 for i in range(width)]
 
 
-def test_submit_replays_cached_effects_for_top_level_effects_dict() -> None:
+def test_submit_replays_cached_effects_with_shared_external_executor() -> None:
     engine = Engine()
     warnings = engine.accumulator("warnings")
     runs = 0

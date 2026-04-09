@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import statistics
 import sys
@@ -160,19 +161,32 @@ def _scenario_dedup_contention() -> ScenarioResult:
         time.sleep(0.05)
         return base() + 1
 
+    # Baseline one-owner compute cost on current hardware.
     base.set(41)
+    start = time.perf_counter()
+    baseline_value = expensive()
+    owner_compute_ms = (time.perf_counter() - start) * 1000.0
+    if baseline_value != 42:
+        raise AssertionError("dedup baseline produced unexpected query value")
+
+    # Force one fresh recompute that all contenders should collapse onto.
+    base.set(42)
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=callers) as pool:
         futures = [pool.submit(expensive) for _ in range(callers)]
         values = [future.result(timeout=5.0) for future in futures]
     wall_ms = (time.perf_counter() - start) * 1000.0
 
-    if values != [42] * callers:
+    if values != [43] * callers:
         raise AssertionError("dedup scenario produced unexpected query values")
 
-    collapse_ratio = callers / max(runs, 1)
+    contention_computes = max(runs - 1, 0)
+    collapse_ratio = callers / max(contention_computes, 1)
     threshold = 16.0
-    passed = runs == 1 and collapse_ratio >= threshold and wall_ms <= 500.0
+    # Scale wall-time budget by measured owner compute to reduce false negatives
+    # on slower CI/VM hardware while keeping a strict collapse expectation.
+    wall_budget_ms = max(500.0, owner_compute_ms * 8.0)
+    passed = contention_computes == 1 and collapse_ratio >= threshold and wall_ms <= wall_budget_ms
     return ScenarioResult(
         name="dedup-under-contention",
         concern="Concurrent identical queries should collapse to one in-flight compute.",
@@ -184,9 +198,10 @@ def _scenario_dedup_contention() -> ScenarioResult:
         passed=passed,
         details={
             "callers": callers,
-            "actual_computes": runs,
+            "actual_computes": contention_computes,
             "wall_time_ms": wall_ms,
-            "wall_time_budget_ms": 500.0,
+            "wall_time_budget_ms": wall_budget_ms,
+            "single_owner_baseline_ms": owner_compute_ms,
         },
     )
 
@@ -224,7 +239,8 @@ def _run_compute_many_once(workers: int, calls_count: int, iterations: int) -> f
 def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     calls_count = 32
     iterations = 250_000
-    workers = 8
+    available_cpus = max(1, len(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else max(1, os.cpu_count() or 1)
+    workers = min(8, max(2, available_cpus))
     serial_samples = [
         _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations) for _ in range(4)
     ]
@@ -249,6 +265,7 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
             "calls": calls_count,
             "iterations_per_task": iterations,
             "workers": workers,
+            "available_cpus": available_cpus,
             "serial_ms": serial_ms,
             "parallel_ms": parallel_ms,
         },

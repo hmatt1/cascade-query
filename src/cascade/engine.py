@@ -87,6 +87,29 @@ class Accumulator:
 
 
 class Engine:
+    # Explicit private-policy contract for tests/introspection.
+    # Keep this list intentionally small and append-only unless a dedicated
+    # migration removes all call-sites first.
+    _INTERNAL_TEST_API: tuple[str, ...] = (
+        "_latest_input_version",
+        "_input_version_at",
+        "_dependency_changed_at",
+        "_memos",
+        "_dependents",
+    )
+    # Legacy shims kept for backward private compatibility only.
+    # New tests and internals should not add fresh dependencies on these names.
+    _LEGACY_PRIVATE_SHIMS: tuple[str, ...] = (
+        "_revision",
+        "_cancel_epoch",
+        "_next_access_id",
+        "_max_entries",
+        "_inputs",
+        "_queries",
+        "_in_flight",
+        "_lock",
+    )
+
     def __init__(self, *, max_entries: int = 10_000, trace_limit: int = 50_000) -> None:
         self._trace_limit = trace_limit
         self._store = GraphStore(max_entries=max_entries, trace_limit=trace_limit)
@@ -95,6 +118,7 @@ class Engine:
         # Backward-compatible private handles for tests/introspection.
         self._lock = self._store.lock
 
+    # --- legacy private compatibility shims ---
     @property
     def _revision(self) -> int:  # pragma: no cover - compatibility shim
         return self._store.revision
@@ -120,16 +144,18 @@ class Engine:
         return self._store.queries
 
     @property
+    def _in_flight(self) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
+        return self._store.in_flight
+
+    # --- supported internal test/introspection surface ---
+    # Keep this focused on invariant-centric introspection only.
+    @property
     def _memos(self) -> dict[QueryKey, MemoEntry]:
         return self._store.memos
 
     @property
     def _dependents(self) -> dict[QueryKey, set[QueryKey]]:
         return self._store.dependents
-
-    @property
-    def _in_flight(self) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
-        return self._store.in_flight
 
     @property
     def revision(self) -> int:
