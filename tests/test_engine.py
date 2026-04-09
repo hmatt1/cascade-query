@@ -106,6 +106,47 @@ def test_query_dedup_concurrent_requests() -> None:
     assert compute_counter == 1
 
 
+def test_query_dedup_replays_effects_to_all_concurrent_callers() -> None:
+    engine = Engine()
+    warnings = engine.accumulator("warnings")
+    runs = 0
+    lock = threading.Lock()
+    started = threading.Event()
+    release = threading.Event()
+
+    @engine.input
+    def source() -> str:
+        return ""
+
+    @engine.query
+    def lint_len() -> int:
+        nonlocal runs
+        with lock:
+            runs += 1
+        started.set()
+        release.wait(timeout=2.0)
+        text = source()
+        if "todo" in text:
+            warnings.push("contains todo")
+        time.sleep(0.01)
+        return len(text)
+
+    source.set("todo")
+    effects_by_call: list[dict[str, list[str]]] = [{} for _ in range(24)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(lint_len, effects=effects) for effects in effects_by_call]
+        assert started.wait(timeout=1.0)
+        time.sleep(0.03)
+        release.set()
+        values = [future.result(timeout=2.0) for future in futures]
+
+    assert values == [len("todo")] * 24
+    assert runs == 1
+    assert any(event.event == "dedup_wait" for event in engine.traces())
+    for effects in effects_by_call:
+        assert effects["warnings"] == ["contains todo"]
+
+
 def test_query_dedup_failure_propagates_and_recovers() -> None:
     engine = Engine()
     runs = 0
