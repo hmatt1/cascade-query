@@ -78,6 +78,48 @@ def test_snapshot_isolation_mvcc() -> None:
     assert parse("main") == ("x", "y")
 
 
+def test_snapshot_default_input_read_does_not_create_redundant_versions() -> None:
+    engine = Engine()
+
+    @engine.input
+    def missing(name: str) -> str:
+        return f"default:{name}"
+
+    @engine.query
+    def q1(name: str) -> str:
+        return missing(name) + ":q1"
+
+    @engine.query
+    def q2(name: str) -> str:
+        return missing(name) + ":q2"
+
+    snap = engine.snapshot()
+    assert engine.revision == 0
+
+    # Snapshot reads are read-only: missing defaults are virtual at that snapshot
+    # and must not mutate the live input timeline.
+    assert q1("x", snapshot=snap) == "default:x:q1"
+    assert engine.revision == 0
+
+    # A second same-snapshot read for the same key also must remain non-mutating.
+    assert q2("x", snapshot=snap) == "default:x:q2"
+    assert engine.revision == 0
+    assert (missing.id, ("x",)) not in engine._inputs  # noqa: SLF001
+
+    # Live writes remain authoritative even after stale-snapshot default reads.
+    missing.set("x", value="live")
+    assert engine.revision == 1
+    assert q1("x") == "live:q1"
+    assert q1("x", snapshot=snap) == "default:x:q1"
+    assert q1("x") == "live:q1"
+
+    versions = engine._inputs[(missing.id, ("x",))]  # noqa: SLF001
+    assert len(versions) == 1
+    assert versions[0].revision == 1
+    assert versions[0].changed_at == 1
+    assert versions[0].value == "live"
+
+
 def test_query_dedup_concurrent_requests() -> None:
     engine = Engine()
     compute_counter = 0
