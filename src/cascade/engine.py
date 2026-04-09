@@ -6,6 +6,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from ._errors import CancellationError, CycleError, QueryCancelled
 from ._evaluator import Evaluator
 from ._persistence import load_payload, save_payload
+from ._runtime import RuntimeState
 from ._scheduler import WorkStealingExecutor
 from ._state import InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 from ._store import GraphStore
