@@ -54,7 +54,7 @@ def _gil_state() -> str:
     return "unknown"
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     cpu_count = os.cpu_count() or 2
     default_workers = min(8, max(2, cpu_count))
     default_tasks = default_workers * 12
@@ -66,11 +66,11 @@ def main() -> None:
             "python3.14t + PYTHON_GIL=0 to compare."
         )
     )
-    parser.add_argument("--tasks", type=int, default=default_tasks, help="Number of independent query keys to run.")
-    parser.add_argument("--rounds", type=int, default=300_000, help="CPU loop iterations per task.")
+    parser.add_argument("--tasks", type=int, default=max(8, default_workers * 4), help="Number of independent query keys to run.")
+    parser.add_argument("--rounds", type=int, default=40_000, help="CPU loop iterations per task.")
     parser.add_argument("--workers", type=int, default=default_workers, help="Worker threads for the parallel run.")
-    parser.add_argument("--repeats", type=int, default=3, help="How many measured runs per configuration.")
-    args = parser.parse_args()
+    parser.add_argument("--repeats", type=int, default=1, help="How many measured runs per configuration.")
+    args, _unknown = parser.parse_known_args(argv)
 
     if args.tasks < 1:
         raise ValueError("--tasks must be >= 1")
@@ -82,6 +82,7 @@ def main() -> None:
         raise ValueError("--repeats must be >= 1")
 
     print("=== GIL parallel speedup example ===")
+    print("Step 1: Inspect runtime GIL configuration and benchmark settings.")
     print(f"python: {sys.version.split()[0]}")
     print(f"executable: {sys.executable}")
     print(f"Py_GIL_DISABLED build flag: {sysconfig.get_config_var('Py_GIL_DISABLED')}")
@@ -92,12 +93,14 @@ def main() -> None:
     )
     print()
 
+    print("Step 2: Measure a serial baseline with workers=1.")
     serial_times, serial_checksum = _measure_compute_many(
         task_count=args.tasks,
         rounds=args.rounds,
         workers=1,
         repeats=args.repeats,
     )
+    print(f"Step 3: Measure threaded runtime with workers={args.workers}.")
     parallel_times, parallel_checksum = _measure_compute_many(
         task_count=args.tasks,
         rounds=args.rounds,
@@ -118,9 +121,10 @@ def main() -> None:
     print(f"threaded speedup in this runtime: {speedup:.2f}x")
     print()
     print(
-        "Run the same command under python3.14 and python3.14t (with PYTHON_GIL=0), "
+        "Step 4: Run the same command under python3.14 and python3.14t (with PYTHON_GIL=0), "
         "then compare the median parallel seconds and speedup lines."
     )
+    print("Example complete.")
 
 
 if __name__ == "__main__":
