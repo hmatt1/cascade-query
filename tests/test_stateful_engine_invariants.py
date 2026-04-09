@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
-
 from hypothesis import HealthCheck, settings, strategies as st
 from hypothesis.stateful import Bundle, RuleBasedStateMachine, invariant, precondition, rule
 
@@ -24,6 +22,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         self._state_db = Path(self._tmpdir.name) / "state.db"
         self._revision = 0
         self._history: dict[tuple[str, tuple[int, ...]], list[tuple[int, int | None]]] = {}
+        self._id_to_name: dict[str, str] = {}
         self._observed_indexes: set[int] = set()
         self._choose_compute_count = 0
         self._build_engine()
@@ -67,6 +66,22 @@ class EngineStateMachine(RuleBasedStateMachine):
         self.bias = bias
         self.choose = choose
         self.pair = pair
+        self._id_to_name = {
+            self.mode.id: "mode",
+            self.left.id: "left",
+            self.right.id: "right",
+            self.bias.id: "bias",
+        }
+
+    def _sync_from_engine(self) -> None:
+        self._revision = self.engine.revision
+        rebuilt: dict[tuple[str, tuple[int, ...]], list[tuple[int, int | None]]] = {}
+        for (input_id, args), versions in self.engine._inputs.items():  # noqa: SLF001
+            name = self._id_to_name.get(input_id)
+            if name is None:
+                continue
+            rebuilt[(name, args)] = [(version.revision, version.value) for version in versions]
+        self._history = rebuilt
 
     def _default_value(self, name: str, args: tuple[int, ...]) -> int | None:
         if name == "mode":
@@ -89,9 +104,9 @@ class EngineStateMachine(RuleBasedStateMachine):
         return self._default_value(name, args)
 
     def _record_set(self, name: str, args: tuple[int, ...], value: int | None) -> None:
-        self._revision += 1
-        self._history.setdefault((name, args), []).append((self._revision, value))
-        assert self.engine.revision == self._revision
+        self._sync_from_engine()
+        timeline = self._history[(name, args)]
+        assert timeline[-1][1] == value
 
     def _expected_choose(self, index: int, revision: int) -> int:
         current_mode = self._value_at("mode", (), revision)
@@ -125,28 +140,36 @@ class EngineStateMachine(RuleBasedStateMachine):
 
     @rule(index=INDEXES)
     def read_choose_live(self, index: int) -> None:
-        assert self.choose(index) == self._expected_choose(index, self._revision)
+        actual = self.choose(index)
+        self._sync_from_engine()
+        assert actual == self._expected_choose(index, self._revision)
         self._observed_indexes.add(index)
 
     @rule(index=INDEXES)
     def read_pair_live(self, index: int) -> None:
+        actual = self.pair(index)
+        self._sync_from_engine()
         expected = self._expected_choose(index, self._revision) + self._expected_choose(index + 1, self._revision)
-        assert self.pair(index) == expected
+        assert actual == expected
         self._observed_indexes.update({index, index + 1})
 
     @rule(target=snapshots)
     def take_snapshot(self) -> Snapshot:
+        self._sync_from_engine()
         snapshot = self.engine.snapshot()
         assert snapshot.revision == self._revision
         return snapshot
 
     @rule(snapshot=snapshots, index=INDEXES)
     def read_choose_snapshot(self, snapshot: Snapshot, index: int) -> None:
+        self._sync_from_engine()
         assert self.choose(index, snapshot=snapshot) == self._expected_choose(index, snapshot.revision)
 
     @rule(index=INDEXES, value=MAYBE_INT)
     def inactive_branch_mutation_does_not_recompute_choose(self, index: int, value: int | None) -> None:
+        self._sync_from_engine()
         assert self.choose(index) == self._expected_choose(index, self._revision)
+        self._sync_from_engine()
         calls_before = self._choose_compute_count
         mode_value = self._value_at("mode", (), self._revision)
         if mode_value == 0:
@@ -157,14 +180,17 @@ class EngineStateMachine(RuleBasedStateMachine):
             self._record_set("left", (index,), value)
 
         assert self.choose(index) == self._expected_choose(index, self._revision)
+        self._sync_from_engine()
         assert self._choose_compute_count == calls_before
 
     @precondition(lambda self: self._revision > 0)
     @rule()
     def save_and_reload_engine(self) -> None:
+        self._sync_from_engine()
         self.engine.save(str(self._state_db))
         self._build_engine()
         self.engine.load(str(self._state_db))
+        self._sync_from_engine()
         assert self.engine.revision == self._revision
         assert self.engine._in_flight == {}  # noqa: SLF001
         for index in sorted(self._observed_indexes)[:3]:
@@ -172,6 +198,7 @@ class EngineStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def revision_matches_model(self) -> None:
+        self._sync_from_engine()
         assert self.engine.revision == self._revision
 
     @invariant()

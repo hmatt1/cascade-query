@@ -268,9 +268,11 @@ PYTHON_GIL=0 python3.14t -m pytest -q tests/test_stateful_engine_invariants.py
 Run mutation testing (test-strength check):
 
 ```bash
-PYTHON_GIL=0 python3.14t -m mutmut run
-PYTHON_GIL=0 python3.14t -m mutmut results
+PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut run
+PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut results
 ```
+
+Use the `mutmut` CLI entrypoint (`mutmut run`) instead of `python -m mutmut run`.
 
 ## Performance checks and report
 
