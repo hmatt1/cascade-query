@@ -214,6 +214,35 @@ def test_nested_side_effect_replay_propagates_to_parent_effects() -> None:
     assert events["child"] == 1
 
 
+def test_failed_query_does_not_leak_partial_accumulator_effects() -> None:
+    engine = Engine()
+    warnings = engine.accumulator("warnings")
+
+    @engine.input
+    def should_fail() -> bool:
+        return False
+
+    @engine.query
+    def lint() -> int:
+        warnings.push("about to fail")
+        if should_fail():
+            raise RuntimeError("planned failure")
+        return 1
+
+    should_fail.set(True)
+    effects: dict[str, list[str]] = {}
+    with pytest.raises(RuntimeError, match="planned failure"):
+        lint(effects=effects)
+
+    # Failed executions should not commit partial effects to caller output.
+    assert effects == {}
+
+    should_fail.set(False)
+    recovery_effects: dict[str, list[str]] = {}
+    assert lint(effects=recovery_effects) == 1
+    assert recovery_effects["warnings"] == ["about to fail"]
+
+
 def test_dynamic_graph_expansion() -> None:
     engine = Engine()
     expand_calls = 0

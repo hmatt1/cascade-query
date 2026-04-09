@@ -21,7 +21,13 @@ class Evaluator:
     def _run_in_runtime(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
         token = self._runtime_var.set(runtime)
         try:
-            return fn()
+            result = fn()
+            # Root effects become externally visible only after successful query
+            # completion, preventing failed executions from leaking partial output.
+            if runtime.root_effects is not None:
+                for name, values in runtime.staged_root_effects.items():
+                    runtime.root_effects.setdefault(name, []).extend(values)
+            return result
         finally:
             self._runtime_var.reset(token)
 
@@ -38,7 +44,7 @@ class Evaluator:
         if runtime is None:
             raise RuntimeError("accumulator.push() must be called inside a query")
         if runtime.root_effects is not None:
-            runtime.root_effects.setdefault(name, []).append(item)
+            runtime.staged_root_effects.setdefault(name, []).append(item)
         for frame in runtime.stack:
             frame.effects[name].append(item)
 
@@ -48,7 +54,7 @@ class Evaluator:
             return
         for name, values in effects.items():
             if runtime.root_effects is not None:
-                runtime.root_effects.setdefault(name, []).extend(values)
+                runtime.staged_root_effects.setdefault(name, []).extend(values)
             # Mirror push semantics so ancestors retain transitive effects even
             # when children are served from cache.
             for frame in runtime.stack:
@@ -115,6 +121,7 @@ class Evaluator:
                 snapshot=snapshot or self._store.snapshot(),
                 stack=[],
                 root_effects=effects,
+                staged_root_effects={},
                 cancel_epoch=cancel_epoch,
                 snapshot_pinned=snapshot is not None,
             )
@@ -214,6 +221,7 @@ class Evaluator:
                     snapshot=snapshot,
                     stack=[],
                     root_effects=None,
+                    staged_root_effects={},
                     cancel_epoch=None,
                     snapshot_pinned=True,
                 ),
@@ -225,6 +233,7 @@ class Evaluator:
                 snapshot=snapshot,
                 stack=[],
                 root_effects=None,
+                staged_root_effects={},
                 cancel_epoch=runtime.cancel_epoch,
                 snapshot_pinned=True,
             )
