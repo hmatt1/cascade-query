@@ -225,7 +225,12 @@ class Engine:
         self._queries: dict[str, Callable[..., Any]] = {}
         self._memos: dict[tuple[str, str, tuple[Any, ...]], MemoEntry] = {}
         self._dependents: dict[tuple[str, str, tuple[Any, ...]], set[tuple[str, str, tuple[Any, ...]]]] = defaultdict(set)
-        self._in_flight: dict[tuple[str, str, tuple[Any, ...]], concurrent.futures.Future[MemoEntry]] = {}
+        # Dedup only within the same logical read-view. Sharing in-flight work
+        # across snapshot revisions can return stale values.
+        self._in_flight: dict[
+            tuple[str, str, tuple[Any, ...]],
+            dict[int, concurrent.futures.Future[MemoEntry]],
+        ] = {}
         self._trace: deque[TraceEvent] = deque(maxlen=trace_limit)
 
     @property
@@ -553,10 +558,14 @@ class Engine:
                     self._trace_event("cache_green", key)
                     return existing, True
 
-            owner_future = self._in_flight.get(key)
+            in_flight_for_key = self._in_flight.get(key)
+            owner_future = None if in_flight_for_key is None else in_flight_for_key.get(runtime.snapshot.revision)
             if owner_future is None:
                 owner_future = concurrent.futures.Future()
-                self._in_flight[key] = owner_future
+                if in_flight_for_key is None:
+                    in_flight_for_key = {}
+                    self._in_flight[key] = in_flight_for_key
+                in_flight_for_key[runtime.snapshot.revision] = owner_future
                 is_owner = True
             else:
                 is_owner = False
@@ -575,7 +584,11 @@ class Engine:
             raise
         finally:
             with self._lock:
-                self._in_flight.pop(key, None)
+                in_flight_for_key = self._in_flight.get(key)
+                if in_flight_for_key is not None:
+                    in_flight_for_key.pop(runtime.snapshot.revision, None)
+                    if not in_flight_for_key:
+                        self._in_flight.pop(key, None)
 
     def _try_mark_green(
         self,

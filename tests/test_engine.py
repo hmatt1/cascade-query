@@ -625,6 +625,49 @@ def test_snapshot_reads_stable_during_concurrent_writes() -> None:
     assert parse() == ("row-79",)
 
 
+def test_in_flight_dedup_does_not_cross_snapshot_boundaries() -> None:
+    engine = Engine()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def read_source() -> int:
+        nonlocal calls
+        with lock:
+            calls += 1
+            invocation = calls
+        # Keep the first (stale-snapshot) call in flight so a newer-snapshot
+        # caller for the same key overlaps with it.
+        if invocation == 1:
+            first_started.set()
+            release_first.wait(timeout=2.0)
+        return source()
+
+    source.set(1)
+    stale_snapshot = engine.snapshot()
+    source.set(2)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        stale_future = pool.submit(read_source, snapshot=stale_snapshot)
+        assert first_started.wait(timeout=1.0)
+        live_future = pool.submit(read_source)
+        time.sleep(0.03)
+        release_first.set()
+
+        stale_value = stale_future.result(timeout=2.0)
+        live_value = live_future.result(timeout=2.0)
+
+    assert stale_value == 1
+    assert live_value == 2
+    assert calls == 2
+
+
 def test_long_chain_cycle_detection_behavior() -> None:
     engine = Engine()
     chain_length = 25
