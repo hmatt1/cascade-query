@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ._errors import CycleError, QueryCancelled
 from ._runtime import RuntimeFrame, RuntimeState
-from ._state import InputVersion, QueryKey, Snapshot
+from ._state import InputVersion, MemoEntry, QueryKey, Snapshot
 from ._store import GraphStore
 
 
@@ -17,6 +17,13 @@ class Evaluator:
         self._runtime_var: contextvars.ContextVar[RuntimeState | None] = contextvars.ContextVar(
             "cascade_runtime", default=None
         )
+
+    def _run_in_runtime(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
+        token = self._runtime_var.set(runtime)
+        try:
+            return fn()
+        finally:
+            self._runtime_var.reset(token)
 
     def check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         if runtime_cancel_epoch is None:
@@ -104,19 +111,24 @@ class Evaluator:
     ) -> Any:
         runtime = self._runtime_var.get()
         if runtime is None:
-            token = self._runtime_var.set(
-                RuntimeState(
-                    snapshot=snapshot or self._store.snapshot(),
-                    stack=[],
-                    root_effects=effects,
-                    cancel_epoch=cancel_epoch,
-                    snapshot_pinned=snapshot is not None,
-                )
+            root_runtime = RuntimeState(
+                snapshot=snapshot or self._store.snapshot(),
+                stack=[],
+                root_effects=effects,
+                cancel_epoch=cancel_epoch,
+                snapshot_pinned=snapshot is not None,
             )
-            try:
-                return self.query_call(query_id, fn, args, snapshot=snapshot, effects=effects, cancel_epoch=cancel_epoch)
-            finally:
-                self._runtime_var.reset(token)
+            return self._run_in_runtime(
+                root_runtime,
+                lambda: self.query_call(
+                    query_id,
+                    fn,
+                    args,
+                    snapshot=snapshot,
+                    effects=effects,
+                    cancel_epoch=cancel_epoch,
+                ),
+            )
 
         key: QueryKey = ("query", query_id, args)
         if any(frame.key == key for frame in runtime.stack):
@@ -135,7 +147,7 @@ class Evaluator:
         key: QueryKey,
         fn: Callable[..., Any],
         runtime: RuntimeState,
-    ) -> tuple[Any, bool]:
+    ) -> tuple[MemoEntry, bool]:
         with self._store.lock:
             existing = self._store.memos.get(key)
             if existing is not None:
@@ -175,7 +187,7 @@ class Evaluator:
             with self._store.lock:
                 self._store.in_flight.pop((key, runtime.snapshot.revision), None)
 
-    def try_mark_green(self, key: QueryKey, entry: Any, snapshot: Snapshot) -> bool:
+    def try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
         for dep in entry.deps:
             dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
@@ -191,25 +203,22 @@ class Evaluator:
 
         with self._store.lock:
             memo = self._store.memos.get(key)
-            fn = self._store.queries[fid]
+        fn = self._store.lookup_query(fid)
         if memo is not None and memo.verified_at == snapshot.revision:
             return memo.changed_at
 
         runtime = self._runtime_var.get()
         if runtime is None:
-            token = self._runtime_var.set(
+            self._run_in_runtime(
                 RuntimeState(
                     snapshot=snapshot,
                     stack=[],
                     root_effects=None,
                     cancel_epoch=None,
                     snapshot_pinned=True,
-                )
+                ),
+                lambda: self.query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None),
             )
-            try:
-                _ = self.query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None)
-            finally:
-                self._runtime_var.reset(token)
         else:
             # Dependency verification should not add edges to currently executing frame.
             shadow = RuntimeState(
@@ -219,11 +228,12 @@ class Evaluator:
                 cancel_epoch=runtime.cancel_epoch,
                 snapshot_pinned=True,
             )
-            token = self._runtime_var.set(shadow)
-            try:
-                _ = self.query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch)
-            finally:
-                self._runtime_var.reset(token)
+            self._run_in_runtime(
+                shadow,
+                lambda: self.query_call(
+                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+                ),
+            )
 
         with self._store.lock:
             refreshed = self._store.memos.get(key)
@@ -236,7 +246,7 @@ class Evaluator:
         key: QueryKey,
         fn: Callable[..., Any],
         runtime: RuntimeState,
-    ) -> Any:
+    ) -> MemoEntry:
         frame = RuntimeFrame(key=key)
         runtime.stack.append(frame)
         start = time.perf_counter()

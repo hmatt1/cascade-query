@@ -29,8 +29,25 @@ class GraphStore:
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
         self.in_flight: dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]] = {}
 
+    def register_query(self, query_id: str, fn: Callable[..., Any]) -> None:
+        with self.lock:
+            self.queries[query_id] = fn
+
+    def lookup_query(self, query_id: str) -> Callable[..., Any]:
+        with self.lock:
+            return self.queries[query_id]
+
     def snapshot(self) -> Snapshot:
-        return Snapshot(revision=self.revision)
+        with self.lock:
+            return Snapshot(revision=self.revision)
+
+    def traces(self) -> list[TraceEvent]:
+        with self.lock:
+            return list(self.trace)
+
+    def clear_traces(self) -> None:
+        with self.lock:
+            self.trace.clear()
 
     def trace_event(self, event: str, key: QueryKey, detail: str = "") -> None:
         self.trace.append(
@@ -139,18 +156,18 @@ class GraphStore:
             }
 
     def prune(self, roots: list[QueryKey]) -> None:
-        wanted: set[QueryKey] = set(roots)
-        queue = deque(roots)
-        while queue:
-            node = queue.popleft()
-            memo = self.memos.get(node)
-            if memo is None:
-                continue
-            for dep in memo.deps:
-                if dep.key[0] == "query" and dep.key not in wanted:
-                    wanted.add(dep.key)
-                    queue.append(dep.key)
         with self.lock:
+            wanted: set[QueryKey] = set(roots)
+            queue = deque(roots)
+            while queue:
+                node = queue.popleft()
+                memo = self.memos.get(node)
+                if memo is None:
+                    continue
+                for dep in memo.deps:
+                    if dep.key[0] == "query" and dep.key not in wanted:
+                        wanted.add(dep.key)
+                        queue.append(dep.key)
             remove = [k for k in self.memos.keys() if k not in wanted]
             for key in remove:
                 self.drop_memo_locked(key)
@@ -166,15 +183,16 @@ class GraphStore:
             self.next_access_id = payload["access_id"]
 
     def make_persistence_payload(self) -> dict[str, Any]:
-        return {
-            "revision": self.revision,
-            "cancel_epoch": self.cancel_epoch,
-            "inputs": self.inputs,
-            "memos": self.memos,
-            "dependents": self.dependents,
-            "trace": list(self.trace),
-            "access_id": self.next_access_id,
-        }
+        with self.lock:
+            return {
+                "revision": self.revision,
+                "cancel_epoch": self.cancel_epoch,
+                "inputs": self.inputs,
+                "memos": self.memos,
+                "dependents": self.dependents,
+                "trace": list(self.trace),
+                "access_id": self.next_access_id,
+            }
 
     @staticmethod
     def entry_from_runtime(

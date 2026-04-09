@@ -142,7 +142,7 @@ class Engine:
 
     def query(self, fn: Callable[..., Any]) -> _QueryHandle:
         handle = _QueryHandle(self, fn)
-        self._store.queries[handle.id] = fn
+        self._store.register_query(handle.id, fn)
         return handle
 
     def accumulator(self, name: str) -> Accumulator:
@@ -202,10 +202,10 @@ class Engine:
         return scheduler.run(len(calls))
 
     def traces(self) -> list[TraceEvent]:
-        return list(self._store.trace)
+        return self._store.traces()
 
     def clear_traces(self) -> None:
-        self._store.trace.clear()
+        self._store.clear_traces()
 
     def inspect_graph(self) -> dict[str, Any]:
         return self._store.inspect_graph()
@@ -287,7 +287,7 @@ class Engine:
         self,
         key: QueryKey,
         fn: Callable[..., Any],
-        runtime: Any,
+        runtime: RuntimeState,
     ) -> tuple[MemoEntry, bool]:
         return self._evaluator.compute_or_get_memo(key, fn, runtime)
 
@@ -297,7 +297,7 @@ class Engine:
     def _dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
         return self._evaluator.dependency_changed_at(key, snapshot)
 
-    def _recompute(self, key: QueryKey, fn: Callable[..., Any], runtime: Any) -> MemoEntry:
+    def _recompute(self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState) -> MemoEntry:
         return self._evaluator.recompute(key, fn, runtime)
 
     def _record_dependency(self, dep_key: QueryKey, observed_changed_at: int) -> None:
