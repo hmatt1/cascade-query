@@ -10,6 +10,16 @@ from ._scheduler import WorkStealingExecutor
 from ._state import InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 from ._store import GraphStore
 
+__all__ = [
+    "Accumulator",
+    "CancellationError",
+    "CycleError",
+    "Engine",
+    "QueryCancelled",
+    "Snapshot",
+    "TraceEvent",
+]
+
 
 class _InputHandle:
     def __init__(self, engine: Engine, fn: Callable[..., Any]) -> None:
