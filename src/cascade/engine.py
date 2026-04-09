@@ -77,6 +77,7 @@ class _RuntimeState:
     stack: list[_RuntimeFrame]
     root_effects: dict[str, list[Any]] | None
     cancel_epoch: int | None
+    snapshot_pinned: bool
 
 
 class _InputHandle:
@@ -479,16 +480,30 @@ class Engine:
     ) -> Any:
         runtime = self._runtime_var.get()
         use_snapshot = snapshot or (runtime.snapshot if runtime is not None else self.snapshot())
+        snapshot_pinned = snapshot is not None or (runtime.snapshot_pinned if runtime is not None else False)
         if runtime is not None:
             self._check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
         version = self._input_version_at((input_id, args), use_snapshot.revision)
         if version is None:
             default = fn(*args)
-            self._set_input(input_id, args, default, bump_cancel_epoch=False)
-            version = self._latest_input_version((input_id, args))
-            if version is None:  # pragma: no cover - safety belt
-                raise RuntimeError("input version missing after initialization")
+            should_materialize = False
+            if not snapshot_pinned:
+                with self._lock:
+                    latest = self._latest_input_version((input_id, args))
+                    should_materialize = latest is None and use_snapshot.revision == self._revision
+            if should_materialize:
+                self._set_input(input_id, args, default, bump_cancel_epoch=False)
+                version = self._latest_input_version((input_id, args))
+                if version is None:  # pragma: no cover - safety belt
+                    raise RuntimeError("input version missing after initialization")
+            else:
+                version = InputVersion(
+                    revision=use_snapshot.revision,
+                    changed_at=-1,
+                    value_hash=self._stable_hash(default),
+                    value=default,
+                )
         self._record_dependency(key, version.changed_at)
         self._trace_event("input_read", key)
         return version.value
@@ -519,6 +534,7 @@ class Engine:
                     stack=[],
                     root_effects=effects,
                     cancel_epoch=cancel_epoch,
+                    snapshot_pinned=snapshot is not None,
                 )
             )
             try:
@@ -617,14 +633,28 @@ class Engine:
 
         runtime = self._runtime_var.get()
         if runtime is None:
-            token = self._runtime_var.set(_RuntimeState(snapshot=snapshot, stack=[], root_effects=None, cancel_epoch=None))
+            token = self._runtime_var.set(
+                _RuntimeState(
+                    snapshot=snapshot,
+                    stack=[],
+                    root_effects=None,
+                    cancel_epoch=None,
+                    snapshot_pinned=True,
+                )
+            )
             try:
                 _ = self._query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None)
             finally:
                 self._runtime_var.reset(token)
         else:
             # Dependency verification should not add edges to currently executing frame.
-            shadow = _RuntimeState(snapshot=snapshot, stack=[], root_effects=None, cancel_epoch=runtime.cancel_epoch)
+            shadow = _RuntimeState(
+                snapshot=snapshot,
+                stack=[],
+                root_effects=None,
+                cancel_epoch=runtime.cancel_epoch,
+                snapshot_pinned=True,
+            )
             token = self._runtime_var.set(shadow)
             try:
                 _ = self._query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch)

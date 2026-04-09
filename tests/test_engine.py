@@ -96,20 +96,28 @@ def test_snapshot_default_input_read_does_not_create_redundant_versions() -> Non
     snap = engine.snapshot()
     assert engine.revision == 0
 
-    # First snapshot read materializes the missing input exactly once.
+    # Snapshot reads are read-only: missing defaults are virtual at that snapshot
+    # and must not mutate the live input timeline.
     assert q1("x", snapshot=snap) == "default:x:q1"
-    assert engine.revision == 1
+    assert engine.revision == 0
 
-    # A second query at the same snapshot should not force another input version
-    # for the same default value.
+    # A second same-snapshot read for the same key also must remain non-mutating.
     assert q2("x", snapshot=snap) == "default:x:q2"
+    assert engine.revision == 0
+    assert (missing.id, ("x",)) not in engine._inputs  # noqa: SLF001
+
+    # Live writes remain authoritative even after stale-snapshot default reads.
+    missing.set("x", value="live")
     assert engine.revision == 1
+    assert q1("x") == "live:q1"
+    assert q1("x", snapshot=snap) == "default:x:q1"
+    assert q1("x") == "live:q1"
 
     versions = engine._inputs[(missing.id, ("x",))]  # noqa: SLF001
     assert len(versions) == 1
     assert versions[0].revision == 1
     assert versions[0].changed_at == 1
-    assert versions[0].value == "default:x"
+    assert versions[0].value == "live"
 
 
 def test_query_dedup_concurrent_requests() -> None:
