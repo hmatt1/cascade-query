@@ -296,6 +296,27 @@ def test_input_set_supports_keyword_and_positional_value_forms() -> None:
     assert keyed("beta") == "B"
 
 
+def test_input_set_allows_explicit_none_values() -> None:
+    engine = Engine()
+
+    @engine.input
+    def scalar() -> object:
+        return "default"
+
+    @engine.input
+    def keyed(name: str) -> object:
+        return f"default:{name}"
+
+    # Keyword-form None is an explicit value, not "value omitted".
+    scalar.set(value=None)
+    assert scalar() is None
+
+    keyed.set("main", value=None)
+    assert keyed("main") is None
+    # Ensure the key argument was preserved and not misinterpreted as value.
+    assert keyed("other") == "default:other"
+
+
 def test_long_chain_cycle_detection_behavior() -> None:
     engine = Engine()
     chain_length = 25
