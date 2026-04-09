@@ -10,13 +10,13 @@ import sysconfig
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from cascade import Engine
+from cascade._synthetic_graph import build_fanout_chain_pipeline
 
 
 @dataclass(frozen=True)
@@ -50,51 +50,6 @@ def _median(values: list[float]) -> float:
     if not values:
         return 0.0
     return float(statistics.median(values))
-
-
-def _build_fanout_chain_pipeline(
-    engine: Engine,
-    *,
-    depth: int,
-    fanout: int,
-    counts: dict[str, int] | None = None,
-) -> tuple[Any, list[Any], Any]:
-    if depth < 1 or fanout < 1:
-        raise ValueError("depth and fanout must be >= 1")
-    call_counts = counts if counts is not None else defaultdict(int)
-
-    @engine.input
-    def leaf(branch: int) -> int:
-        return 0
-
-    levels: list[Any] = []
-    prev = None
-    for level in range(depth):
-
-        def _make_level(level_index: int, prev_level: Any) -> Any:
-            def level_query(branch: int) -> int:
-                call_counts[f"level_{level_index}"] += 1
-                base = leaf(branch) if prev_level is None else prev_level(branch)
-                return base + (level_index + 1)
-
-            level_query.__name__ = f"bench_level_{level_index}"
-            level_query.__qualname__ = f"bench_synthetic_level_{level_index}"
-            return engine.query(level_query)
-
-        current = _make_level(level, prev)
-        levels.append(current)
-        prev = current
-
-    top = levels[-1]
-
-    def aggregate_query() -> int:
-        call_counts["aggregate"] += 1
-        return sum(top(branch) for branch in range(fanout))
-
-    aggregate_query.__name__ = "bench_aggregate_query"
-    aggregate_query.__qualname__ = "bench_synthetic_aggregate_query"
-    aggregate = engine.query(aggregate_query)
-    return leaf, levels, aggregate
 
 
 def _measure_median_ms(fn: Any, *, rounds: int) -> float:
@@ -297,7 +252,12 @@ def _scenario_giant_graph_targeted_mutation_latency() -> ScenarioResult:
     depth = 10
     fanout = 256
     rounds = 5
-    leaf, _, aggregate = _build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
+    leaf, _, aggregate = build_fanout_chain_pipeline(
+        engine,
+        depth=depth,
+        fanout=fanout,
+        name_prefix="bench_synthetic",
+    )
     values = [index * 7 for index in range(fanout)]
     for branch, value in enumerate(values):
         leaf.set(branch, value)
@@ -425,7 +385,12 @@ def _scenario_prune_runtime_scaling() -> ScenarioResult:
         samples: list[float] = []
         for round_index in range(rounds):
             engine = Engine()
-            leaf, levels, aggregate = _build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
+            leaf, levels, aggregate = build_fanout_chain_pipeline(
+                engine,
+                depth=depth,
+                fanout=fanout,
+                name_prefix="bench_synthetic",
+            )
             for idx in range(fanout):
                 leaf.set(idx, idx + round_index)
             aggregate()

@@ -60,27 +60,34 @@ handles/types.
 
 ## Private internal API hygiene policy
 
-`Engine` keeps two explicit internal lists:
+`Engine` keeps two explicit internal lists and one canonical probe object:
 
 - `_INTERNAL_TEST_API`: narrow, invariant-focused internals intentionally used by
-  tests (`_latest_input_version`, `_input_version_at`,
-  `_dependency_changed_at`, `_memos`, `_dependents`).
+  tests (`_internals`).
 - `_LEGACY_PRIVATE_SHIMS`: backward-compatible private aliases retained for
-  compatibility only (`_revision`, `_cancel_epoch`, `_next_access_id`,
-  `_max_entries`, `_inputs`, `_queries`, `_in_flight`, `_lock`).
+  compatibility only (`_latest_input_version`, `_input_version_at`,
+  `_dependency_changed_at`, `_memos`, `_dependents`, `_revision`,
+  `_cancel_epoch`, `_next_access_id`, `_max_entries`, `_inputs`, `_queries`,
+  `_in_flight`, `_lock`).
+
+`engine._internals` is the ownership boundary for invariant-oriented probing
+(`latest_input_version`, `input_version_at`, `dependency_changed_at`, `memos`,
+`dependents`). Legacy names delegate to it during migration.
 
 Policy:
 
 1. New tests should default to public API behavior.
-2. If a test needs internals, prefer adding assertions via the existing
-   invariant helper path and only from `_INTERNAL_TEST_API`.
+2. If a test needs internals, prefer `engine._internals` and the existing
+   invariant helper path.
 3. Avoid introducing new dependencies on `_LEGACY_PRIVATE_SHIMS`.
 4. Removing a legacy shim requires first removing all call-sites, then updating
    the explicit policy lists and internal invariant tests in one change.
 
 ## Testing strategy split
 
-- **Black-box behavior tests** stay in broad scenario suites (`tests/test_engine.py`,
+- **Black-box behavior tests** stay in broad scenario suites
+  (`tests/test_engine.py`, `tests/test_engine_concurrency.py`,
+  `tests/test_engine_compute_many.py`, `tests/test_engine_persistence_and_tracing.py`,
   `tests/test_scale_behavior.py`, `tests/test_dependency_parallelism.py`) and
   exercise only public API.
 - **Internal invariant tests** stay centralized in

@@ -249,6 +249,9 @@ Some of the heaviest graph and concurrency scenarios are marked `@pytest.mark.sl
 Internal-invariant checks are intentionally centralized in
 `tests/test_internal_invariants.py`. This keeps private-engine coupling minimal
 while preserving a focused safety net for internal consistency.
+Invariant-oriented internal probes now flow through a single private object
+(`engine._internals`), while older private attributes remain compatibility
+aliases during migration.
 
 Run default CI-equivalent tests:
 
