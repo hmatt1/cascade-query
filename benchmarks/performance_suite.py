@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import statistics
 import sys
@@ -29,6 +30,20 @@ class ScenarioResult:
     comparator: str
     passed: bool
     details: dict[str, Any]
+
+
+def _effective_cpu_count() -> int:
+    count = max(1, os.cpu_count() or 1)
+    if hasattr(os, "sched_getaffinity"):
+        count = min(count, max(1, len(os.sched_getaffinity(0))))
+    cpu_max = Path("/sys/fs/cgroup/cpu.max")
+    if cpu_max.exists():
+        raw = cpu_max.read_text(encoding="utf-8").strip().split()
+        if len(raw) >= 2 and raw[0] != "max":
+            quota = int(raw[0])
+            period = max(int(raw[1]), 1)
+            count = min(count, max(1, quota // period))
+    return count
 
 
 def _median(values: list[float]) -> float:
@@ -160,19 +175,32 @@ def _scenario_dedup_contention() -> ScenarioResult:
         time.sleep(0.05)
         return base() + 1
 
+    # Baseline one-owner compute cost on current hardware.
     base.set(41)
+    start = time.perf_counter()
+    baseline_value = expensive()
+    owner_compute_ms = (time.perf_counter() - start) * 1000.0
+    if baseline_value != 42:
+        raise AssertionError("dedup baseline produced unexpected query value")
+
+    # Force one fresh recompute that all contenders should collapse onto.
+    base.set(42)
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=callers) as pool:
         futures = [pool.submit(expensive) for _ in range(callers)]
         values = [future.result(timeout=5.0) for future in futures]
     wall_ms = (time.perf_counter() - start) * 1000.0
 
-    if values != [42] * callers:
+    if values != [43] * callers:
         raise AssertionError("dedup scenario produced unexpected query values")
 
-    collapse_ratio = callers / max(runs, 1)
+    contention_computes = max(runs - 1, 0)
+    collapse_ratio = callers / max(contention_computes, 1)
     threshold = 16.0
-    passed = runs == 1 and collapse_ratio >= threshold and wall_ms <= 500.0
+    # Scale wall-time budget by measured owner compute to reduce false negatives
+    # on slower CI/VM hardware while keeping a strict collapse expectation.
+    wall_budget_ms = max(500.0, owner_compute_ms * 8.0)
+    passed = contention_computes == 1 and collapse_ratio >= threshold and wall_ms <= wall_budget_ms
     return ScenarioResult(
         name="dedup-under-contention",
         concern="Concurrent identical queries should collapse to one in-flight compute.",
@@ -184,9 +212,10 @@ def _scenario_dedup_contention() -> ScenarioResult:
         passed=passed,
         details={
             "callers": callers,
-            "actual_computes": runs,
+            "actual_computes": contention_computes,
             "wall_time_ms": wall_ms,
-            "wall_time_budget_ms": 500.0,
+            "wall_time_budget_ms": wall_budget_ms,
+            "single_owner_baseline_ms": owner_compute_ms,
         },
     )
 
@@ -224,22 +253,28 @@ def _run_compute_many_once(workers: int, calls_count: int, iterations: int) -> f
 def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     calls_count = 32
     iterations = 250_000
-    workers = 8
-    serial_samples = [
-        _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations) for _ in range(4)
-    ]
-    parallel_samples = [
-        _run_compute_many_once(workers=workers, calls_count=calls_count, iterations=iterations) for _ in range(4)
-    ]
+    available_cpus = _effective_cpu_count()
+    workers = min(8, max(2, available_cpus))
+    rounds = 4
+    serial_samples: list[float] = []
+    parallel_samples: list[float] = []
+    pair_speedups: list[float] = []
+    # Interleaving serial and parallel rounds dampens host-load drift noise.
+    for _ in range(rounds):
+        serial_ms = _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations)
+        parallel_ms = _run_compute_many_once(workers=workers, calls_count=calls_count, iterations=iterations)
+        serial_samples.append(serial_ms)
+        parallel_samples.append(parallel_ms)
+        pair_speedups.append(serial_ms / max(parallel_ms, 1e-9))
     serial_ms = _median(serial_samples)
     parallel_ms = _median(parallel_samples)
-    speedup = serial_ms / max(parallel_ms, 1e-9)
+    speedup = _median(pair_speedups)
     threshold = 1.15
     passed = speedup >= threshold
     return ScenarioResult(
         name="compute-many-parallel-speedup",
         concern="Work-stealing scheduling should provide meaningful overlap on CPU-bound tasks under free-threaded Python.",
-        metric_name="workers8_vs_workers1_speedup",
+        metric_name=f"workers{workers}_vs_workers1_speedup",
         metric_value=speedup,
         unit="x",
         threshold=threshold,
@@ -248,7 +283,9 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
         details={
             "calls": calls_count,
             "iterations_per_task": iterations,
+            "rounds": rounds,
             "workers": workers,
+            "available_cpus": available_cpus,
             "serial_ms": serial_ms,
             "parallel_ms": parallel_ms,
         },

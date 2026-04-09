@@ -246,6 +246,10 @@ The test suite now includes scale-focused correctness tests in `tests/test_scale
 
 Some of the heaviest graph and concurrency scenarios are marked `@pytest.mark.slow` to keep default CI deterministic and fast while still running a representative giant-graph test by default.
 
+Internal-invariant checks are intentionally centralized in
+`tests/test_internal_invariants.py`. This keeps private-engine coupling minimal
+while preserving a focused safety net for internal consistency.
+
 Run default CI-equivalent tests:
 
 ```bash
