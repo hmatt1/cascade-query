@@ -150,19 +150,21 @@ assert lint_count() == 2
   Shows concurrent deduplicated query execution plus stale background cancellation after input mutation.
 - `examples/persistence_and_inspection.py`  
   Saves engine state, loads it into a new engine, and inspects memo/input graph summaries.
+- `examples/gil_parallel_speedup.py`  
+  Benchmarks CPU-bound threaded work so you can compare `python3.14` (GIL) vs `python3.14t` (free-threaded).
 
 ### Running examples
 
 Install package + test dependencies once:
 
 ```bash
-python -m pip install -e . pytest
+python3.14t -m pip install -e . pytest
 ```
 
 Run a single example:
 
 ```bash
-python examples/compiler_pipeline.py
+python3.14t examples/compiler_pipeline.py
 ```
 
 Run all examples:
@@ -170,11 +172,47 @@ Run all examples:
 ```bash
 for example in examples/*.py; do
   echo "Running $example"
-  python "$example"
+  python3.14t "$example"
 done
 ```
 
 Examples print step-by-step narration while they run so you can follow each behavior they demonstrate.
+
+### Compare `python3.14` vs `python3.14t` performance
+
+Install both interpreters so you can run the same benchmark twice:
+
+- **CPython 3.14 (with GIL):** `python3.14`
+- **Free-threaded CPython 3.14:** `python3.14t`
+
+Example install on Ubuntu (deadsnakes):
+
+```bash
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.14 python3.14-venv python3.14t python3.14t-venv
+```
+
+Install this project for both interpreters:
+
+```bash
+python3.14 -m pip install -e .
+python3.14t -m pip install -e .
+```
+
+Run the CPU-bound benchmark example with matching arguments:
+
+```bash
+python3.14 examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
+PYTHON_GIL=0 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
+```
+
+Compare these lines from each run:
+
+- `median parallel seconds`
+- `threaded speedup in this runtime`
+
+On multi-core hardware, `python3.14t` with `PYTHON_GIL=0` should usually show substantially better threaded speedup for this CPU-bound workload.
 
 ## Persistence and inspection
 
