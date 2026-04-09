@@ -30,6 +30,13 @@ implementation model), but it tracks the state transitions that matter for:
    - Every write action bumps `cancelEpoch`.
    - `cancelEpoch` is checked to never decrease (`CancelEpochMonotone`).
 
+4. **Bounded metadata sanity checks**
+   - Changed-at markers (`modeChangedAt`, `leftChangedAt`, `rightChangedAt`,
+     `depObservedChangedAt`, `chooseChangedAt`) must stay bounded by current
+     revision.
+   - This catches regressions where version/changed-at metadata could jump ahead
+     of `rev` under write transitions.
+
 ## Running TLC locally
 
 Install any TLA+ runtime you prefer (Toolbox or `tla2tools.jar`), then run:
@@ -48,5 +55,7 @@ java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock docs/formal/cascade_core
 
 - `MaxRev` and `ValueSet` are bounded in `cascade_core.cfg` to keep model
   checking fast.
+- `cascade_core.cfg` enables `ChangedAtBoundedByRevision` in addition to the
+  original snapshot/dependency/cancellation invariants.
 - This model is a safety net for invariants, not a full proof of total engine
   behavior.
