@@ -86,20 +86,50 @@ class Accumulator:
         return f"<Accumulator {self.name}>"
 
 
+class _EngineInternals:
+    """Single invariant-oriented probe surface for internal tests.
+
+    This boundary is intentionally narrow. New invariant checks should route
+    through this object rather than adding more private attributes on Engine.
+    """
+
+    def __init__(self, store: GraphStore, evaluator: Evaluator) -> None:
+        self._store = store
+        self._evaluator = evaluator
+
+    @property
+    def memos(self) -> dict[QueryKey, MemoEntry]:
+        return self._store.memos
+
+    @property
+    def dependents(self) -> dict[QueryKey, set[QueryKey]]:
+        return self._store.dependents
+
+    def latest_input_version(self, input_key: tuple[str, tuple[Any, ...]]) -> InputVersion | None:
+        return self._store.latest_input_version(input_key)
+
+    def input_version_at(self, input_key: tuple[str, tuple[Any, ...]], revision: int) -> InputVersion | None:
+        return self._store.input_version_at(input_key, revision)
+
+    def dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
+        return self._evaluator.dependency_changed_at(key, snapshot)
+
+
 class Engine:
     # Explicit private-policy contract for tests/introspection.
-    # Keep this list intentionally small and append-only unless a dedicated
-    # migration removes all call-sites first.
+    # Invariant-oriented access should flow through the _internals probe.
     _INTERNAL_TEST_API: tuple[str, ...] = (
+        "_internals",
+    )
+    # Legacy shims kept for backward private compatibility only. These include
+    # older invariant helpers, which now delegate to _internals during
+    # migration. New tests and internals should not depend on these names.
+    _LEGACY_PRIVATE_SHIMS: tuple[str, ...] = (
         "_latest_input_version",
         "_input_version_at",
         "_dependency_changed_at",
         "_memos",
         "_dependents",
-    )
-    # Legacy shims kept for backward private compatibility only.
-    # New tests and internals should not add fresh dependencies on these names.
-    _LEGACY_PRIVATE_SHIMS: tuple[str, ...] = (
         "_revision",
         "_cancel_epoch",
         "_next_access_id",
@@ -114,6 +144,8 @@ class Engine:
         self._trace_limit = trace_limit
         self._store = GraphStore(max_entries=max_entries, trace_limit=trace_limit)
         self._evaluator = Evaluator(self._store)
+        # Single private probe for invariant-oriented internals.
+        self._internals = _EngineInternals(self._store, self._evaluator)
 
         # Backward-compatible private handles for tests/introspection.
         self._lock = self._store.lock
@@ -149,13 +181,14 @@ class Engine:
 
     # --- supported internal test/introspection surface ---
     # Keep this focused on invariant-centric introspection only.
+    # Prefer engine._internals.*; these names are legacy aliases.
     @property
     def _memos(self) -> dict[QueryKey, MemoEntry]:
-        return self._store.memos
+        return self._internals.memos
 
     @property
     def _dependents(self) -> dict[QueryKey, set[QueryKey]]:
-        return self._store.dependents
+        return self._internals.dependents
 
     @property
     def revision(self) -> int:
@@ -263,10 +296,10 @@ class Engine:
         return self._store.stable_hash(value)
 
     def _latest_input_version(self, input_key: tuple[str, tuple[Any, ...]]) -> InputVersion | None:
-        return self._store.latest_input_version(input_key)
+        return self._internals.latest_input_version(input_key)
 
     def _input_version_at(self, input_key: tuple[str, tuple[Any, ...]], revision: int) -> InputVersion | None:
-        return self._store.input_version_at(input_key, revision)
+        return self._internals.input_version_at(input_key, revision)
 
     def _set_input(
         self,
@@ -322,7 +355,7 @@ class Engine:
         return self._evaluator.try_mark_green(key, entry, snapshot)
 
     def _dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
-        return self._evaluator.dependency_changed_at(key, snapshot)
+        return self._internals.dependency_changed_at(key, snapshot)
 
     def _recompute(self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState) -> MemoEntry:
         return self._evaluator.recompute(key, fn, runtime)
