@@ -52,6 +52,7 @@ def test_giant_graph_selective_invalidation_counts() -> None:
 def test_dependency_churn_rewrites_dynamic_edges() -> None:
     # Guards against stale dependency edges surviving dynamic branch rewrites.
     engine = Engine()
+    counts_lock = threading.Lock()
 
     @engine.input
     def mode() -> int:
@@ -63,7 +64,10 @@ def test_dependency_churn_rewrites_dynamic_edges() -> None:
 
     @engine.query
     def dynamic_value(index: int) -> int:
-        counts["dynamic"] += 1
+        # Free-threaded builds can execute query bodies truly concurrently, so
+        # shared test counters need synchronization to avoid lost updates.
+        with counts_lock:
+            counts["dynamic"] += 1
         pivot = index if mode() == 0 else index + 1_000
         return source(pivot) * 2
 

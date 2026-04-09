@@ -32,6 +32,20 @@ class ScenarioResult:
     details: dict[str, Any]
 
 
+def _effective_cpu_count() -> int:
+    count = max(1, os.cpu_count() or 1)
+    if hasattr(os, "sched_getaffinity"):
+        count = min(count, max(1, len(os.sched_getaffinity(0))))
+    cpu_max = Path("/sys/fs/cgroup/cpu.max")
+    if cpu_max.exists():
+        raw = cpu_max.read_text(encoding="utf-8").strip().split()
+        if len(raw) >= 2 and raw[0] != "max":
+            quota = int(raw[0])
+            period = max(int(raw[1]), 1)
+            count = min(count, max(1, quota // period))
+    return count
+
+
 def _median(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -239,23 +253,28 @@ def _run_compute_many_once(workers: int, calls_count: int, iterations: int) -> f
 def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     calls_count = 32
     iterations = 250_000
-    available_cpus = max(1, len(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else max(1, os.cpu_count() or 1)
+    available_cpus = _effective_cpu_count()
     workers = min(8, max(2, available_cpus))
-    serial_samples = [
-        _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations) for _ in range(4)
-    ]
-    parallel_samples = [
-        _run_compute_many_once(workers=workers, calls_count=calls_count, iterations=iterations) for _ in range(4)
-    ]
+    rounds = 4
+    serial_samples: list[float] = []
+    parallel_samples: list[float] = []
+    pair_speedups: list[float] = []
+    # Interleaving serial and parallel rounds dampens host-load drift noise.
+    for _ in range(rounds):
+        serial_ms = _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations)
+        parallel_ms = _run_compute_many_once(workers=workers, calls_count=calls_count, iterations=iterations)
+        serial_samples.append(serial_ms)
+        parallel_samples.append(parallel_ms)
+        pair_speedups.append(serial_ms / max(parallel_ms, 1e-9))
     serial_ms = _median(serial_samples)
     parallel_ms = _median(parallel_samples)
-    speedup = serial_ms / max(parallel_ms, 1e-9)
+    speedup = _median(pair_speedups)
     threshold = 1.15
     passed = speedup >= threshold
     return ScenarioResult(
         name="compute-many-parallel-speedup",
         concern="Work-stealing scheduling should provide meaningful overlap on CPU-bound tasks under free-threaded Python.",
-        metric_name="workers8_vs_workers1_speedup",
+        metric_name=f"workers{workers}_vs_workers1_speedup",
         metric_value=speedup,
         unit="x",
         threshold=threshold,
@@ -264,6 +283,7 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
         details={
             "calls": calls_count,
             "iterations_per_task": iterations,
+            "rounds": rounds,
             "workers": workers,
             "available_cpus": available_cpus,
             "serial_ms": serial_ms,
