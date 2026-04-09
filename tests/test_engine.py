@@ -989,6 +989,47 @@ def test_compute_many_deduplicates_identical_calls_within_batch() -> None:
     assert any(event.event == "dedup_wait" for event in engine.traces())
 
 
+def test_compute_many_shared_dependency_recomputes_once_per_invalidation_wave() -> None:
+    engine = Engine()
+    width = 36
+    lock = threading.Lock()
+    runs = {"shared": 0, "parent": 0}
+
+    @engine.input
+    def base() -> int:
+        return 0
+
+    @engine.query
+    def shared_root() -> int:
+        with lock:
+            runs["shared"] += 1
+        # Keep the shared compute in flight long enough for many parent calls
+        # to contend on the same memo key.
+        time.sleep(0.02)
+        return base() * 100
+
+    @engine.query
+    def parent(index: int) -> int:
+        with lock:
+            runs["parent"] += 1
+        return shared_root() + index
+
+    calls = [(parent, (index,)) for index in range(width)]
+
+    base.set(1)
+    first = engine.compute_many(calls, workers=12)
+    assert first == [100 + index for index in range(width)]
+    assert runs["parent"] == width
+    assert runs["shared"] == 1
+
+    base.set(2)
+    second = engine.compute_many(calls, workers=12)
+    assert second == [200 + index for index in range(width)]
+    assert runs["parent"] == width * 2
+    assert runs["shared"] == 2
+    assert any(event.event == "dedup_wait" for event in engine.traces())
+
+
 def test_load_missing_state_table_raises_operational_error(tmp_path: Path) -> None:
     db_path = tmp_path / "missing-table.db"
     conn = sqlite3.connect(db_path)
