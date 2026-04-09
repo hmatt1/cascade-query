@@ -178,7 +178,7 @@ done
 
 Examples print step-by-step narration while they run so you can follow each behavior they demonstrate.
 
-### Compare `python3.14` vs `python3.14t` performance
+### Compare `python3.14` vs free-threaded performance
 
 Install both interpreters so you can run the same benchmark twice:
 
@@ -200,7 +200,15 @@ python3.14 -m pip install -e .
 python3.14t -m pip install -e .
 ```
 
-Run the CPU-bound benchmark example with matching arguments:
+Quick run (same free-threaded interpreter, toggle runtime GIL mode):
+
+```bash
+python3.14t -c "import sys, sysconfig; print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
+PYTHON_GIL=1 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
+PYTHON_GIL=0 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
+```
+
+Alternative (compare separate interpreter builds directly):
 
 ```bash
 python3.14 examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
@@ -212,7 +220,18 @@ Compare these lines from each run:
 - `median parallel seconds`
 - `threaded speedup in this runtime`
 
-On multi-core hardware, `python3.14t` with `PYTHON_GIL=0` should usually show substantially better threaded speedup for this CPU-bound workload.
+Interpretation:
+
+- lower `median parallel seconds` is better
+- higher `threaded speedup in this runtime` is better
+
+Benchmark hygiene tips:
+
+- keep arguments identical between runs
+- run with minimal background CPU load
+- use `--repeats` (for example `5`) to reduce noise
+
+On multi-core hardware, free-threaded CPython with `PYTHON_GIL=0` should usually show substantially better threaded speedup for this CPU-bound workload.
 
 ## Persistence and inspection
 
