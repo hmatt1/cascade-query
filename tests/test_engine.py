@@ -359,3 +359,315 @@ def test_input_set_with_keyword_value_and_no_positional_value() -> None:
 
     assert setting() == 7
     assert threshold("prod") == 11
+
+def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection() -> None:
+    engine = Engine()
+
+    @engine.input
+    def base(i: int) -> int:
+        return 0
+
+    @engine.query
+    def plus(i: int) -> int:
+        return base(i) + 1
+
+    for i in range(6):
+        base.set(i, i)
+
+    # workers=0 uses the default worker-count branch.
+    result = engine.compute_many([(plus, (i,)) for i in range(6)], workers=0)
+    assert result == [i + 1 for i in range(6)]
+
+
+def test_compute_many_deduplicates_identical_calls_within_batch() -> None:
+    engine = Engine()
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    runs = 0
+
+    @engine.input
+    def base() -> int:
+        return 0
+
+    @engine.query
+    def expensive() -> int:
+        nonlocal runs
+        with lock:
+            runs += 1
+        started.set()
+        release.wait(timeout=2.0)
+        time.sleep(0.01)
+        return base() + 1
+
+    base.set(41)
+    result_box: list[list[int]] = []
+    error_box: list[BaseException] = []
+
+    def run_batch() -> None:
+        try:
+            result_box.append(engine.compute_many([(expensive, ()) for _ in range(40)], workers=12))
+        except BaseException as exc:  # pragma: no cover - defensive
+            error_box.append(exc)
+
+    runner = threading.Thread(target=run_batch, daemon=True)
+    runner.start()
+
+    assert started.wait(timeout=1.0)
+    time.sleep(0.03)
+    release.set()
+
+    runner.join(timeout=3.0)
+    assert not runner.is_alive()
+    assert not error_box
+    assert result_box == [[42] * 40]
+    assert runs == 1
+    assert any(event.event == "dedup_wait" for event in engine.traces())
+
+
+def test_compute_many_shared_dependency_recomputes_once_per_invalidation_wave() -> None:
+    engine = Engine()
+    width = 36
+    lock = threading.Lock()
+    runs = {"shared": 0, "parent": 0}
+
+    @engine.input
+    def base() -> int:
+        return 0
+
+    @engine.query
+    def shared_root() -> int:
+        with lock:
+            runs["shared"] += 1
+        # Keep the shared compute in flight long enough for many parent calls
+        # to contend on the same memo key.
+        time.sleep(0.02)
+        return base() * 100
+
+    @engine.query
+    def parent(index: int) -> int:
+        with lock:
+            runs["parent"] += 1
+        return shared_root() + index
+
+    calls = [(parent, (index,)) for index in range(width)]
+
+    base.set(1)
+    first = engine.compute_many(calls, workers=12)
+    assert first == [100 + index for index in range(width)]
+    assert runs["parent"] == width
+    assert runs["shared"] == 1
+
+    base.set(2)
+    second = engine.compute_many(calls, workers=12)
+    assert second == [200 + index for index in range(width)]
+    assert runs["parent"] == width * 2
+    assert runs["shared"] == 2
+    assert any(event.event == "dedup_wait" for event in engine.traces())
+
+
+def test_load_missing_state_table_raises_operational_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-table.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        # Intentionally leave out cascade_state table.
+        conn.execute("create table if not exists unrelated (id integer primary key)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    engine = Engine()
+    with pytest.raises(sqlite3.OperationalError, match="no such table: cascade_state"):
+        engine.load(str(db_path))
+
+
+def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "corrupt.db"
+
+    engine = Engine()
+
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def value() -> int:
+        return source() + 1
+
+    source.set(10)
+    assert value() == 11
+    revision_before = engine.revision
+    snapshot_before = engine.snapshot()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
+        conn.execute("delete from cascade_state")
+        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-a-pickle",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(Exception):
+        engine.load(str(db_path))
+
+    # Failed load must not clobber in-memory state.
+    assert engine.revision == revision_before
+    assert value(snapshot=snapshot_before) == 11
+    assert value() == 11
+
+
+def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:
+    engine = Engine()
+
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def compute() -> int:
+        return source() + 2
+
+    source.set(5)
+    assert compute() == 7
+    assert compute() == 7
+
+    events = [event.event for event in engine.traces()]
+    # Deterministic happy-path trace ordering for one recompute then cache hit.
+    assert events == ["input_set", "recompute_start", "input_read", "recompute_done", "cache_hit"]
+
+
+def test_inspect_graph_full_summary_oracle_across_varied_graphs() -> None:
+    def key(kind: str, function_id: str, args: tuple[object, ...]) -> str:
+        return f"{kind}:{function_id}{args}"
+
+    def assert_graph_matches(
+        graph: dict[str, object],
+        *,
+        expected_nodes: set[str],
+        expected_edges: set[tuple[str, str]],
+        expected_memo_count: int,
+        expected_input_count: int,
+    ) -> None:
+        nodes = set(graph["nodes"])  # type: ignore[arg-type]
+        edges = set(tuple(edge) for edge in graph["edges"])  # type: ignore[arg-type]
+        assert graph["memo_count"] == expected_memo_count
+        assert graph["input_count"] == expected_input_count
+        assert nodes == expected_nodes
+        assert edges == expected_edges
+
+    # Scenario 1: linear chain.
+    linear = Engine()
+
+    @linear.input
+    def source(name: str) -> str:
+        return ""
+
+    @linear.query
+    def parse(name: str) -> tuple[str, ...]:
+        return tuple(row.strip() for row in source(name).splitlines() if row.strip())
+
+    @linear.query
+    def symbol_count(name: str) -> int:
+        return len(parse(name))
+
+    source.set("main", "a\nb")
+    assert symbol_count("main") == 2
+    assert_graph_matches(
+        linear.inspect_graph(),
+        expected_nodes={
+            key("query", parse.id, ("main",)),
+            key("query", symbol_count.id, ("main",)),
+        },
+        expected_edges={
+            (key("query", parse.id, ("main",)), key("input", source.id, ("main",))),
+            (key("query", symbol_count.id, ("main",)), key("query", parse.id, ("main",))),
+        },
+        expected_memo_count=2,
+        expected_input_count=1,
+    )
+
+    # Scenario 2: shared fan-out.
+    fanout = Engine()
+
+    @fanout.input
+    def leaf(index: int) -> int:
+        return 0
+
+    @fanout.query
+    def inc(index: int) -> int:
+        return leaf(index) + 1
+
+    @fanout.query
+    def total() -> int:
+        return inc(0) + inc(1) + inc(2)
+
+    for idx in range(3):
+        leaf.set(idx, idx * 10)
+    assert total() == 33
+    assert_graph_matches(
+        fanout.inspect_graph(),
+        expected_nodes={
+            key("query", inc.id, (0,)),
+            key("query", inc.id, (1,)),
+            key("query", inc.id, (2,)),
+            key("query", total.id, ()),
+        },
+        expected_edges={
+            (key("query", inc.id, (0,)), key("input", leaf.id, (0,))),
+            (key("query", inc.id, (1,)), key("input", leaf.id, (1,))),
+            (key("query", inc.id, (2,)), key("input", leaf.id, (2,))),
+            (key("query", total.id, ()), key("query", inc.id, (0,))),
+            (key("query", total.id, ()), key("query", inc.id, (1,))),
+            (key("query", total.id, ()), key("query", inc.id, (2,))),
+        },
+        expected_memo_count=4,
+        expected_input_count=3,
+    )
+
+    # Scenario 3: dynamic branch rewrite removes stale dependency edges.
+    dynamic = Engine()
+
+    @dynamic.input
+    def mode() -> int:
+        return 0
+
+    @dynamic.input
+    def left() -> int:
+        return 0
+
+    @dynamic.input
+    def right() -> int:
+        return 0
+
+    @dynamic.query
+    def choose() -> int:
+        return left() if mode() == 0 else right()
+
+    mode.set(0)
+    left.set(10)
+    right.set(20)
+    assert choose() == 10
+    assert_graph_matches(
+        dynamic.inspect_graph(),
+        expected_nodes={key("query", choose.id, ())},
+        expected_edges={
+            (key("query", choose.id, ()), key("input", mode.id, ())),
+            (key("query", choose.id, ()), key("input", left.id, ())),
+        },
+        expected_memo_count=1,
+        expected_input_count=3,
+    )
+
+    mode.set(1)
+    assert choose() == 20
+    assert_graph_matches(
+        dynamic.inspect_graph(),
+        expected_nodes={key("query", choose.id, ())},
+        expected_edges={
+            (key("query", choose.id, ()), key("input", mode.id, ())),
+            (key("query", choose.id, ()), key("input", right.id, ())),
+        },
+        expected_memo_count=1,
+        expected_input_count=3,
+    )
