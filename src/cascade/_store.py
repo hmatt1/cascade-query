@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import bisect
 import concurrent.futures
-import hashlib
-import pickle
 import threading
 import time
 from collections import defaultdict, deque
 from typing import Any, Callable
 
+from ._serde import stable_value_digest
 from ._state import Dependency, InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 
 
@@ -65,8 +64,7 @@ class GraphStore:
         return f"{kind}:{fid}{args}"
 
     def stable_hash(self, value: Any) -> str:
-        digest = hashlib.blake2b(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), digest_size=20)
-        return digest.hexdigest()
+        return stable_value_digest(value)
 
     def touch_memo_locked(self, key: QueryKey) -> None:
         memo = self.memos[key]
@@ -178,7 +176,10 @@ class GraphStore:
             self.cancel_epoch = payload["cancel_epoch"]
             self.inputs = payload["inputs"]
             self.memos = payload["memos"]
-            self.dependents = payload["dependents"]
+            deps_in = payload["dependents"]
+            self.dependents = defaultdict(set)
+            for k, v in deps_in.items():
+                self.dependents[k] = set(v)
             self.trace = deque(payload["trace"], maxlen=self.trace_limit)
             self.next_access_id = payload["access_id"]
             # In-flight dedup futures are process-local/transient and should never

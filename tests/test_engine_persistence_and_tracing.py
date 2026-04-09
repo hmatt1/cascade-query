@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import concurrent.futures
-import pickle
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 import cascade._persistence as persistence_mod
+import cascade._serde as serde_mod
 from cascade import Engine
 from cascade._state import Dependency, MemoEntry
 from cascade._store import GraphStore
@@ -206,7 +206,7 @@ def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) ->
     try:
         conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
         conn.execute("delete from cascade_state")
-        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-a-pickle",))
+        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",))
         conn.commit()
     finally:
         conn.close()
@@ -384,9 +384,9 @@ def test_prune_terminates_for_non_empty_root_set() -> None:
     run_prune_with_timeout(engine, [root], timeout=0.5)
 
 
-def test_save_payload_uses_highest_protocol_and_stable_sql_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_save_payload_writes_utf8_json_blob(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"revision": 7, "data": {"k": [1, 2, 3]}}
-    expected_blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    expected_blob = serde_mod.dumps_payload(payload)
     db_path = "tests:fake-path.db"
     executed: list[tuple[str, tuple[object, ...]]] = []
     commits = 0
@@ -421,14 +421,18 @@ def test_save_payload_uses_highest_protocol_and_stable_sql_sequence(monkeypatch:
     ]
 
 
-def test_save_payload_passes_explicit_highest_protocol_to_pickle(monkeypatch: pytest.MonkeyPatch) -> None:
-    payload = {"important": ("state", 1)}
+def test_save_payload_uses_canonical_json_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"revision": 0, "cancel_epoch": 0, "inputs": {}, "memos": {}, "dependents": {}, "trace": [], "access_id": 0}
     sentinel_blob = b"blob-by-contract"
 
-    def fake_dumps(obj: object, *, protocol: int | None = None) -> bytes:
-        assert obj is payload
-        assert protocol == pickle.HIGHEST_PROTOCOL
-        return sentinel_blob
+    def fake_dumps_wrapped(obj: object, **kwargs: object) -> str:
+        assert kwargs.get("sort_keys") is True
+        assert kwargs.get("separators") == (",", ":")
+        assert kwargs.get("ensure_ascii") is False
+        assert isinstance(obj, dict)
+        assert obj.get("format") == serde_mod.PERSISTENCE_FORMAT
+        assert "payload" in obj
+        return "blob-by-contract"
 
     executed: list[tuple[str, tuple[object, ...]]] = []
 
@@ -443,10 +447,10 @@ def test_save_payload_passes_explicit_highest_protocol_to_pickle(monkeypatch: py
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(persistence_mod.pickle, "dumps", fake_dumps)
+    monkeypatch.setattr(serde_mod.json, "dumps", fake_dumps_wrapped)
     monkeypatch.setattr(persistence_mod.sqlite3, "connect", lambda _: FakeConn())
 
-    persistence_mod.save_payload("tests:fake-protocol.db", payload)
+    persistence_mod.save_payload("tests:fake-json.db", payload)
 
     assert executed[-1] == ("insert into cascade_state(id, payload) values (1, ?)", (sentinel_blob,))
 

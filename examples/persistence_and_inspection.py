@@ -6,7 +6,9 @@ from tempfile import TemporaryDirectory
 from cascade import Engine
 
 
-def build_line_counter() -> tuple[Engine, object, object]:
+def build_line_counter(
+    recompute_counter: dict[str, int] | None = None,
+) -> tuple[Engine, object, object]:
     engine = Engine()
 
     @engine.input
@@ -15,6 +17,8 @@ def build_line_counter() -> tuple[Engine, object, object]:
 
     @engine.query
     def non_empty_lines(name: str) -> int:
+        if recompute_counter is not None:
+            recompute_counter["line_count_runs"] = recompute_counter.get("line_count_runs", 0) + 1
         return len([line for line in source(name).splitlines() if line.strip()])
 
     return engine, source, non_empty_lines
@@ -41,23 +45,13 @@ def run_persistence_demo() -> None:
         engine_a.save(str(db_path))
         print("Step 2: Saved state to:", db_path)
 
-        counters = {"line_count_runs": 0}
-        engine_b = Engine()
-
-        @engine_b.input
-        def source(name: str) -> str:
-            return ""
-
-        @engine_b.query
-        def non_empty_lines(name: str) -> int:
-            counters["line_count_runs"] += 1
-            return len([line for line in source(name).splitlines() if line.strip()])
-
+        counters: dict[str, int] = {}
+        engine_b, _source_b, non_empty_lines_b = build_line_counter(recompute_counter=counters)
         print("Step 3: Load state into engine B and query values.")
         engine_b.load(str(db_path))
-        print("main line count:", non_empty_lines("main"))
-        print("lib line count:", non_empty_lines("lib"))
-        print("Query recomputations after load:", counters["line_count_runs"])
+        print("main line count:", non_empty_lines_b("main"))
+        print("lib line count:", non_empty_lines_b("lib"))
+        print("Query recomputations after load:", counters.get("line_count_runs", 0))
 
         graph_after = engine_b.inspect_graph()
         print(

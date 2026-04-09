@@ -581,7 +581,7 @@ def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) ->
     try:
         conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
         conn.execute("delete from cascade_state")
-        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-a-pickle",))
+        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",))
         conn.commit()
     finally:
         conn.close()
