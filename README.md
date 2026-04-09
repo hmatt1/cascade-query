@@ -158,7 +158,7 @@ assert lint_count() == 2
 Install package + test dependencies once:
 
 ```bash
-python3.14t -m pip install -e . pytest
+python3.14t -m pip install -e ".[dev]"
 ```
 
 Run a single example:
@@ -254,10 +254,25 @@ This project now assumes a free-threaded CPython baseline and aligns with state-
 ## Running tests
 
 ```bash
-python -m pip install -e . pytest
+python3.14t -m pip install -e ".[dev]"
 python -c "import sys, sysconfig; print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
 pytest -q
 ```
+
+Run the stateful invariant fuzz test directly:
+
+```bash
+PYTHON_GIL=0 python3.14t -m pytest -q tests/test_stateful_engine_invariants.py
+```
+
+Run mutation testing (test-strength check):
+
+```bash
+PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut run
+PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut results
+```
+
+Use the `mutmut` CLI entrypoint (`mutmut run`) instead of `python -m mutmut run`.
 
 ## Performance checks and report
 

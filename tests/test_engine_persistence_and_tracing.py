@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import sqlite3
 from pathlib import Path
 
@@ -253,3 +254,22 @@ def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:
     events = [event.event for event in engine.traces()]
     # Deterministic happy-path trace ordering for one recompute then cache hit.
     assert events == ["input_set", "recompute_start", "input_read", "recompute_done", "cache_hit"]
+
+
+def test_load_clears_transient_in_flight_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    persisted = Engine()
+    persisted.save(str(db_path))
+
+    engine = Engine()
+    stale_future: concurrent.futures.Future[object] = concurrent.futures.Future()
+    stale_future.set_result("stale")
+    stale_key = ("query", "tests:stale", ())
+    engine._in_flight[(stale_key, 123)] = stale_future  # noqa: SLF001
+    assert len(engine._in_flight) == 1  # noqa: SLF001
+
+    engine.load(str(db_path))
+
+    # in_flight contains process-local synchronization primitives and must not
+    # leak across load boundaries.
+    assert engine._in_flight == {}  # noqa: SLF001

@@ -40,7 +40,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest pytest-cov ruff
+          python -m pip install -e . pytest pytest-cov ruff hypothesis
 
       - name: Run extended nightly performance loop
         run: |

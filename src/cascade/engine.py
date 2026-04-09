@@ -11,6 +11,8 @@ from ._scheduler import WorkStealingExecutor
 from ._state import InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 from ._store import GraphStore
 
+_UNSET = object()
+
 __all__ = [
     "Accumulator",
     "CancellationError",
@@ -31,8 +33,8 @@ class _InputHandle:
     def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
         return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
-    def set(self, *args: Any, value: Any = None) -> int:
-        if value is None:
+    def set(self, *args: Any, value: Any = _UNSET) -> int:
+        if value is _UNSET:
             if not args:
                 raise TypeError("set() requires input value")
             *input_args, resolved_value = args

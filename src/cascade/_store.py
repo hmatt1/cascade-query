@@ -181,6 +181,9 @@ class GraphStore:
             self.dependents = payload["dependents"]
             self.trace = deque(payload["trace"], maxlen=self.trace_limit)
             self.next_access_id = payload["access_id"]
+            # In-flight dedup futures are process-local/transient and should never
+            # survive a load boundary.
+            self.in_flight.clear()
 
     def make_persistence_payload(self) -> dict[str, Any]:
         with self.lock:

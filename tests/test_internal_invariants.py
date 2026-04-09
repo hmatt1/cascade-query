@@ -55,3 +55,11 @@ def test_internal_dependency_helpers_and_indexes_are_consistent() -> None:
     assert engine._input_version_at((source.id, ("main",)), revision=0) is None  # noqa: SLF001
     assert engine._dependency_changed_at(dep_key, snap) == snap.revision  # noqa: SLF001
     assert_internal_dependents_consistent(engine)
+
+
+def test_private_set_input_default_still_bumps_cancel_epoch() -> None:
+    engine = Engine()
+
+    before = engine._cancel_epoch  # noqa: SLF001
+    engine._set_input("tests:manual_input", (), 1)  # noqa: SLF001
+    assert engine._cancel_epoch == before + 1  # noqa: SLF001
