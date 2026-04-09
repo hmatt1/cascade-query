@@ -114,6 +114,64 @@ To keep API surface minimal, this version does not include:
 
 Those can be layered on top without changing the core query model.
 
+## Use-case fit checklist
+
+Use this checklist to decide if a problem is a strong fit for `query-cascade`.
+The best candidates are graph-shaped, mostly pure computations that run often on
+mostly stable state.
+
+Mark each item Yes/No:
+
+1. **Graph-shaped derivation:** Can the logic be represented as inputs feeding
+   derived queries (`A -> B -> C`)?
+2. **Mostly pure compute:** Are derived results mostly pure functions of
+   tracked inputs (with minimal out-of-band side effects)?
+3. **High read repetition:** Are the same queries asked repeatedly?
+4. **Small incremental writes:** Do inputs usually change in small increments
+   instead of full replacement each run?
+5. **Expensive recompute cost:** Is full recomputation meaningfully expensive?
+6. **Need precise invalidation:** Do you need to recompute only affected
+   downstream nodes?
+7. **Concurrency overlap:** Do concurrent callers often request identical keys?
+8. **Snapshot consistency need:** Do some callers need a stable point-in-time
+   view while writes continue?
+9. **Stale background work risk:** Do background computations become obsolete
+   when new writes arrive?
+10. **Debug/explainability need:** Is it useful to inspect why recomputation,
+    cache hits, or invalidation happened?
+
+Interpretation:
+
+- **9-10 Yes:** excellent fit
+- **7-8 Yes:** strong fit
+- **5-6 Yes:** possible fit; validate with a small prototype
+- **0-4 Yes:** likely not the right abstraction
+
+### Specific problems that pass this checklist
+
+The following concrete problems are typically excellent fits (9-10 Yes):
+
+1. **Incremental IDE analysis pipeline**
+   - Parse, symbol index, type diagnostics, code actions per edited file.
+2. **Monorepo impacted-test planner**
+   - Compute the minimal set of tests/checks affected by a PR diff.
+3. **Incremental static analyzer/security scanner**
+   - Recompute findings only for changed code and affected dependents.
+4. **Compiler or DSL transpiler with live diagnostics**
+   - Reuse parse/lowering/type stages and replay warnings on cache hits.
+5. **Policy-as-code evaluator for IaC changes**
+   - Re-evaluate only impacted resources/rules after config edits.
+6. **Feature-flag or entitlement resolution engine**
+   - Compute effective access from plans, flags, and org/user overrides.
+7. **Schema compatibility and migration impact checker**
+   - Track which downstream contracts break when one schema evolves.
+8. **Derived analytics metric compiler**
+   - Incrementally compile metric definitions and dependency expansions.
+9. **Asset/build graph incremental planner**
+   - Rebuild only outputs impacted by source, config, or toolchain changes.
+10. **Large rules engine with concurrent duplicate requests**
+    - Deduplicate in-flight computation for identical rule evaluations.
+
 ## Quickstart
 
 ```python
