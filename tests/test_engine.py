@@ -78,6 +78,40 @@ def test_snapshot_isolation_mvcc() -> None:
     assert parse("main") == ("x", "y")
 
 
+def test_snapshot_default_input_read_does_not_create_redundant_versions() -> None:
+    engine = Engine()
+
+    @engine.input
+    def missing(name: str) -> str:
+        return f"default:{name}"
+
+    @engine.query
+    def q1(name: str) -> str:
+        return missing(name) + ":q1"
+
+    @engine.query
+    def q2(name: str) -> str:
+        return missing(name) + ":q2"
+
+    snap = engine.snapshot()
+    assert engine.revision == 0
+
+    # First snapshot read materializes the missing input exactly once.
+    assert q1("x", snapshot=snap) == "default:x:q1"
+    assert engine.revision == 1
+
+    # A second query at the same snapshot should not force another input version
+    # for the same default value.
+    assert q2("x", snapshot=snap) == "default:x:q2"
+    assert engine.revision == 1
+
+    versions = engine._inputs[(missing.id, ("x",))]  # noqa: SLF001
+    assert len(versions) == 1
+    assert versions[0].revision == 1
+    assert versions[0].changed_at == 1
+    assert versions[0].value == "default:x"
+
+
 def test_query_dedup_concurrent_requests() -> None:
     engine = Engine()
     compute_counter = 0
