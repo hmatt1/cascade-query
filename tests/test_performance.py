@@ -4,7 +4,9 @@ from pathlib import Path
 
 from benchmarks.performance_suite import (
     PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS,
+    assert_parallel_speedup_scenario_threshold,
     assert_report_thresholds,
+    run_performance_scenario,
     run_performance_suite,
     write_performance_report,
 )
@@ -19,6 +21,11 @@ def test_default_perf_gate_excludes_parallel_speedup_scenario() -> None:
     # Keep the regular perf gate stable by excluding the most VM-sensitive
     # scenario, which is asserted in a dedicated test and CI step.
     assert "compute-many-parallel-speedup" in PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS
+
+
+def test_compute_many_parallel_speedup_scenario() -> None:
+    result = run_performance_scenario("compute-many-parallel-speedup")
+    assert_parallel_speedup_scenario_threshold(result)
 
 
 def test_performance_report_is_published(tmp_path: Path) -> None:
