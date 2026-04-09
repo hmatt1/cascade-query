@@ -19,5 +19,6 @@ class RuntimeState:
     snapshot: Snapshot
     stack: list[RuntimeFrame]
     root_effects: dict[str, list[Any]] | None
+    staged_root_effects: dict[str, list[Any]]
     cancel_epoch: int | None
     snapshot_pinned: bool
