@@ -187,6 +187,42 @@ def test_submit_replays_effects_on_cache_hit() -> None:
     assert effects_2["warnings"] == ["has warn"]
 
 
+def test_submit_honors_explicit_snapshot_for_background_work() -> None:
+    engine = Engine()
+
+    @engine.input
+    def source() -> int:
+        return 0
+
+    @engine.query
+    def read_source() -> int:
+        return source()
+
+    source.set(1)
+    stale_snapshot = engine.snapshot()
+    source.set(2)
+
+    # submit() must execute against the caller-provided snapshot, not the live head.
+    assert engine.submit(read_source, snapshot=stale_snapshot).result(timeout=2.0) == 1
+    assert engine.submit(read_source).result(timeout=2.0) == 2
+
+
+def test_submit_uses_query_identity_for_memoization_keys() -> None:
+    engine = Engine()
+
+    @engine.query
+    def first() -> str:
+        return "first"
+
+    @engine.query
+    def second() -> str:
+        return "second"
+
+    # Distinct query IDs with identical args must never alias in memo storage.
+    assert engine.submit(first).result(timeout=2.0) == "first"
+    assert engine.submit(second).result(timeout=2.0) == "second"
+
+
 def test_work_stealing_compute_many() -> None:
     engine = Engine()
     thread_ids: set[int] = set()

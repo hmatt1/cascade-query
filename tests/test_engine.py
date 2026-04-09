@@ -366,8 +366,9 @@ def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         number.set()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as exc:
         warnings.push("outside query")
+    assert str(exc.value) == "accumulator.push() must be called inside a query"
 
     # Empty dispatch is explicitly supported.
     assert engine.compute_many([]) == []
@@ -429,6 +430,30 @@ def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection()
     # workers=0 uses the default worker-count branch.
     result = engine.compute_many([(plus, (i,)) for i in range(6)], workers=0)
     assert result == [i + 1 for i in range(6)]
+
+
+def test_compute_many_with_single_worker_stays_single_threaded() -> None:
+    engine = Engine()
+    thread_ids: set[int] = set()
+    lock = threading.Lock()
+
+    @engine.input
+    def base(i: int) -> int:
+        return 0
+
+    @engine.query
+    def plus(i: int) -> int:
+        with lock:
+            thread_ids.add(threading.get_ident())
+        time.sleep(0.002)
+        return base(i) + 1
+
+    for i in range(10):
+        base.set(i, i)
+
+    result = engine.compute_many([(plus, (i,)) for i in range(10)], workers=1)
+    assert result == [i + 1 for i in range(10)]
+    assert len(thread_ids) == 1
 
 
 def test_compute_many_deduplicates_identical_calls_within_batch() -> None:

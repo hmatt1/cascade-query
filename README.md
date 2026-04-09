@@ -274,6 +274,36 @@ PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut results
 
 Use the `mutmut` CLI entrypoint (`mutmut run`) instead of `python -m mutmut run`.
 
+Run a practical local mutation loop with bounded workers:
+
+```bash
+PYTHON_GIL=0 MUTMUT_MAX_CHILDREN=2 ./scripts/mutation_fast.sh
+```
+
+Run a focused mutation loop for selected high-value mutants:
+
+```bash
+PYTHON_GIL=0 MUTMUT_MAX_CHILDREN=2 ./scripts/mutation_fast.sh "<mutant-name>" "<mutant-name>"
+```
+
+See `docs/mutation_triage.md` for current survivor triage and follow-ups.
+
+## Lightweight formal model checks
+
+A compact TLA+ model for core invariants lives in `docs/formal/`:
+
+- `docs/formal/cascade_core.tla`
+- `docs/formal/cascade_core.cfg`
+
+Run TLC:
+
+```bash
+java -cp tla2tools.jar tlc2.TLC docs/formal/cascade_core.tla -config docs/formal/cascade_core.cfg
+```
+
+The checked invariants cover snapshot consistency, active-dependency validity
+(red-green alignment), and cancellation epoch monotonicity.
+
 ## Performance checks and report
 
 Performance-sensitive behavior in this project is concentrated around:

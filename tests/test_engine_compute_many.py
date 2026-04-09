@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+import threading
 
 import pytest
 
 from cascade import Engine
+from cascade._scheduler import WorkStealingExecutor
 
 
 def test_compute_many_snapshot_freezes_input_reads() -> None:
@@ -80,3 +82,13 @@ def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection()
     # workers=0 uses the default worker-count branch.
     result = engine.compute_many([(plus, (i,)) for i in range(6)], workers=0)
     assert result == [i + 1 for i in range(6)]
+
+
+def test_scheduler_bootstrap_invariants_for_compute_many_path() -> None:
+    # Keep scheduler defaults explicit: starts open (not shutdown) and with a real lock.
+    scheduler = WorkStealingExecutor(workers=1)
+    assert scheduler._workers == 1  # noqa: SLF001
+    assert scheduler._shutdown is False  # noqa: SLF001
+    assert scheduler._lock is not None  # noqa: SLF001
+    assert hasattr(scheduler._lock, "acquire")  # noqa: SLF001
+    assert hasattr(scheduler._lock, "release")  # noqa: SLF001
