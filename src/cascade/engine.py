@@ -1,83 +1,24 @@
 from __future__ import annotations
 
-import bisect
 import concurrent.futures
-import contextvars
-import hashlib
-import pickle
-import sqlite3
-import threading
-import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from ._errors import CancellationError, CycleError, QueryCancelled
+from ._evaluator import Evaluator
+from ._persistence import load_payload, save_payload
+from ._scheduler import WorkStealingExecutor
+from ._state import InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
+from ._store import GraphStore
 
-class CycleError(RuntimeError):
-    """Raised when a query cycle is detected."""
-
-
-class CancellationError(RuntimeError):
-    """Base cancellation exception for obsolete computations."""
-
-
-class QueryCancelled(CancellationError):
-    """Raised when a running query becomes obsolete."""
-
-
-@dataclass(frozen=True)
-class TraceEvent:
-    event: str
-    key: str
-    revision: int
-    detail: str
-    timestamp: float
-
-
-@dataclass(frozen=True)
-class Dependency:
-    key: tuple[str, str, tuple[Any, ...]]
-    observed_changed_at: int
-
-
-@dataclass
-class MemoEntry:
-    value: Any
-    value_hash: str
-    changed_at: int
-    verified_at: int
-    deps: tuple[Dependency, ...]
-    effects: dict[str, tuple[Any, ...]]
-    last_access: int
-
-
-@dataclass(frozen=True)
-class InputVersion:
-    revision: int
-    changed_at: int
-    value_hash: str
-    value: Any
-
-
-@dataclass(frozen=True)
-class Snapshot:
-    revision: int
-
-
-@dataclass
-class _RuntimeFrame:
-    key: tuple[str, str, tuple[Any, ...]]
-    deps: dict[tuple[str, str, tuple[Any, ...]], int] = field(default_factory=dict)
-    effects: dict[str, list[Any]] = field(default_factory=lambda: defaultdict(list))
-
-
-@dataclass
-class _RuntimeState:
-    snapshot: Snapshot
-    stack: list[_RuntimeFrame]
-    root_effects: dict[str, list[Any]] | None
-    cancel_epoch: int | None
-    snapshot_pinned: bool
+__all__ = [
+    "Accumulator",
+    "CancellationError",
+    "CycleError",
+    "Engine",
+    "QueryCancelled",
+    "Snapshot",
+    "TraceEvent",
+]
 
 
 class _InputHandle:
@@ -144,109 +85,64 @@ class Accumulator:
         return f"<Accumulator {self.name}>"
 
 
-class _WorkStealingExecutor:
-    def __init__(self, workers: int) -> None:
-        self._workers = max(1, workers)
-        self._deques = [deque() for _ in range(self._workers)]
-        self._lock = threading.RLock()
-        self._pending = 0
-        self._shutdown = False
-        self._wake = threading.Condition(self._lock)
-
-    def submit_indexed(self, index: int, fn: Callable[[], Any]) -> None:
-        worker_idx = index % self._workers
-        with self._wake:
-            self._deques[worker_idx].append((index, fn))
-            self._pending += 1
-            self._wake.notify_all()
-
-    def run(self, size: int) -> list[Any]:
-        results: list[Any] = [None] * size
-        errors: list[BaseException | None] = [None] * size
-        threads: list[threading.Thread] = []
-
-        def worker_loop(worker_idx: int) -> None:
-            while True:
-                task = self._take_task(worker_idx)
-                if task is None:
-                    return
-                idx, fn = task
-                try:
-                    results[idx] = fn()
-                except BaseException as exc:  # pragma: no cover - defensive branch
-                    errors[idx] = exc
-                finally:
-                    with self._wake:
-                        self._pending -= 1
-                        self._wake.notify_all()
-
-        for idx in range(self._workers):
-            thread = threading.Thread(target=worker_loop, args=(idx,), daemon=True)
-            threads.append(thread)
-            thread.start()
-
-        for thread in threads:
-            thread.join()
-
-        for error in errors:
-            if error is not None:
-                raise error
-        return results
-
-    def _take_task(self, worker_idx: int) -> tuple[int, Callable[[], Any]] | None:
-        with self._wake:
-            while True:
-                local = self._deques[worker_idx]
-                if local:
-                    return local.pop()
-                for idx, bucket in enumerate(self._deques):
-                    if idx == worker_idx:
-                        continue
-                    if bucket:
-                        return bucket.popleft()
-                if self._pending == 0 or self._shutdown:
-                    return None
-                self._wake.wait(timeout=0.01)
-
-
 class Engine:
     def __init__(self, *, max_entries: int = 10_000, trace_limit: int = 50_000) -> None:
-        self._lock = threading.RLock()
-        self._revision = 0
-        self._cancel_epoch = 0
-        self._next_access_id = 0
-        self._max_entries = max_entries
         self._trace_limit = trace_limit
+        self._store = GraphStore(max_entries=max_entries, trace_limit=trace_limit)
+        self._evaluator = Evaluator(self._store)
 
-        self._runtime_var: contextvars.ContextVar[_RuntimeState | None] = contextvars.ContextVar(
-            "cascade_runtime", default=None
-        )
+        # Backward-compatible private handles for tests/introspection.
+        self._lock = self._store.lock
 
-        self._inputs: dict[tuple[str, tuple[Any, ...]], list[InputVersion]] = {}
-        self._queries: dict[str, Callable[..., Any]] = {}
-        self._memos: dict[tuple[str, str, tuple[Any, ...]], MemoEntry] = {}
-        self._dependents: dict[tuple[str, str, tuple[Any, ...]], set[tuple[str, str, tuple[Any, ...]]]] = defaultdict(set)
-        # Dedup only within the same logical read-view. Sharing in-flight work
-        # across snapshot revisions can return stale values.
-        self._in_flight: dict[
-            tuple[str, str, tuple[Any, ...]],
-            dict[int, concurrent.futures.Future[MemoEntry]],
-        ] = {}
-        self._trace: deque[TraceEvent] = deque(maxlen=trace_limit)
+    @property
+    def _revision(self) -> int:  # pragma: no cover - compatibility shim
+        return self._store.revision
+
+    @property
+    def _cancel_epoch(self) -> int:  # pragma: no cover - compatibility shim
+        return self._store.cancel_epoch
+
+    @property
+    def _next_access_id(self) -> int:  # pragma: no cover - compatibility shim
+        return self._store.next_access_id
+
+    @property
+    def _max_entries(self) -> int:  # pragma: no cover - compatibility shim
+        return self._store.max_entries
+
+    @property
+    def _inputs(self) -> dict[tuple[str, tuple[Any, ...]], list[InputVersion]]:
+        return self._store.inputs
+
+    @property
+    def _queries(self) -> dict[str, Callable[..., Any]]:
+        return self._store.queries
+
+    @property
+    def _memos(self) -> dict[QueryKey, MemoEntry]:
+        return self._store.memos
+
+    @property
+    def _dependents(self) -> dict[QueryKey, set[QueryKey]]:
+        return self._store.dependents
+
+    @property
+    def _in_flight(self) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
+        return self._store.in_flight
 
     @property
     def revision(self) -> int:
-        return self._revision
+        return self._store.revision
 
     def snapshot(self) -> Snapshot:
-        return Snapshot(revision=self._revision)
+        return self._store.snapshot()
 
     def input(self, fn: Callable[..., Any]) -> _InputHandle:
         return _InputHandle(self, fn)
 
     def query(self, fn: Callable[..., Any]) -> _QueryHandle:
         handle = _QueryHandle(self, fn)
-        self._queries[handle.id] = fn
+        self._store.queries[handle.id] = fn
         return handle
 
     def accumulator(self, name: str) -> Accumulator:
@@ -261,11 +157,18 @@ class Engine:
         executor: concurrent.futures.Executor | None = None,
     ) -> concurrent.futures.Future[Any]:
         run_snapshot = snapshot or self.snapshot()
-        with self._lock:
-            cancel_epoch = self._cancel_epoch
+        with self._store.lock:
+            cancel_epoch = self._store.cancel_epoch
 
         def run() -> Any:
-            return self._query_call(query.id, query.raw, tuple(args), snapshot=run_snapshot, effects=effects, cancel_epoch=cancel_epoch)
+            return self._query_call(
+                query.id,
+                query.raw,
+                tuple(args),
+                snapshot=run_snapshot,
+                effects=effects,
+                cancel_epoch=cancel_epoch,
+            )
 
         if executor is None:
             owned = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -290,7 +193,7 @@ class Engine:
             return []
         run_snapshot = snapshot or self.snapshot()
         worker_count = workers or min(32, max(1, len(calls)))
-        scheduler = _WorkStealingExecutor(worker_count)
+        scheduler = WorkStealingExecutor(worker_count)
         for idx, (query, args) in enumerate(calls):
             scheduler.submit_indexed(
                 idx,
@@ -299,144 +202,44 @@ class Engine:
         return scheduler.run(len(calls))
 
     def traces(self) -> list[TraceEvent]:
-        return list(self._trace)
+        return list(self._store.trace)
 
     def clear_traces(self) -> None:
-        self._trace.clear()
+        self._store.trace.clear()
 
     def inspect_graph(self) -> dict[str, Any]:
-        with self._lock:
-            nodes = [self._key_to_str(k) for k in self._memos.keys()]
-            edges = []
-            for parent, memo in self._memos.items():
-                parent_s = self._key_to_str(parent)
-                for dep in memo.deps:
-                    edges.append((parent_s, self._key_to_str(dep.key)))
-            return {
-                "revision": self._revision,
-                "memo_count": len(self._memos),
-                "input_count": len(self._inputs),
-                "nodes": nodes,
-                "edges": edges,
-            }
+        return self._store.inspect_graph()
 
     def prune(self, roots: Iterable[tuple[str, str, tuple[Any, ...]]]) -> None:
-        wanted: set[tuple[str, str, tuple[Any, ...]]] = set(roots)
-        queue = deque(roots)
-        while queue:
-            node = queue.popleft()
-            memo = self._memos.get(node)
-            if memo is None:
-                continue
-            for dep in memo.deps:
-                if dep.key[0] == "query" and dep.key not in wanted:
-                    wanted.add(dep.key)
-                    queue.append(dep.key)
-        with self._lock:
-            remove = [k for k in self._memos.keys() if k not in wanted]
-            for key in remove:
-                self._drop_memo_locked(key)
+        self._store.prune(list(roots))
 
     def save(self, path: str) -> None:
-        payload = {
-            "revision": self._revision,
-            "cancel_epoch": self._cancel_epoch,
-            "inputs": self._inputs,
-            "memos": self._memos,
-            "dependents": self._dependents,
-            "trace": list(self._trace),
-            "access_id": self._next_access_id,
-        }
-        blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-        conn = sqlite3.connect(path)
-        try:
-            conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
-            conn.execute("delete from cascade_state")
-            conn.execute("insert into cascade_state(id, payload) values (1, ?)", (blob,))
-            conn.commit()
-        finally:
-            conn.close()
+        save_payload(path, self._store.make_persistence_payload())
 
     def load(self, path: str) -> None:
-        conn = sqlite3.connect(path)
-        try:
-            row = conn.execute("select payload from cascade_state where id = 1").fetchone()
-            if row is None:
-                return
-            payload = pickle.loads(row[0])
-        finally:
-            conn.close()
-
-        with self._lock:
-            self._revision = payload["revision"]
-            self._cancel_epoch = payload["cancel_epoch"]
-            self._inputs = payload["inputs"]
-            self._memos = payload["memos"]
-            self._dependents = payload["dependents"]
-            self._trace = deque(payload["trace"], maxlen=self._trace_limit)
-            self._next_access_id = payload["access_id"]
+        payload = load_payload(path)
+        if payload is None:
+            return
+        self._store.assign_loaded_state(payload)
 
     # --- internals ---
     def _function_id(self, fn: Callable[..., Any]) -> str:
         return f"{fn.__module__}:{fn.__qualname__}"
 
-    def _trace_event(self, event: str, key: tuple[str, str, tuple[Any, ...]], detail: str = "") -> None:
-        self._trace.append(
-            TraceEvent(
-                event=event,
-                key=self._key_to_str(key),
-                revision=self._revision,
-                detail=detail,
-                timestamp=time.time(),
-            )
-        )
+    def _trace_event(self, event: str, key: QueryKey, detail: str = "") -> None:
+        self._store.trace_event(event, key, detail=detail)
 
-    def _key_to_str(self, key: tuple[str, str, tuple[Any, ...]]) -> str:
-        kind, fid, args = key
-        return f"{kind}:{fid}{args}"
+    def _key_to_str(self, key: QueryKey) -> str:
+        return self._store.key_to_str(key)
 
     def _stable_hash(self, value: Any) -> str:
-        digest = hashlib.blake2b(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), digest_size=20)
-        return digest.hexdigest()
-
-    def _touch_memo_locked(self, key: tuple[str, str, tuple[Any, ...]]) -> None:
-        memo = self._memos[key]
-        self._next_access_id += 1
-        memo.last_access = self._next_access_id
-
-    def _drop_memo_locked(self, key: tuple[str, str, tuple[Any, ...]]) -> None:
-        memo = self._memos.pop(key, None)
-        if memo is None:
-            return
-        for dep in memo.deps:
-            dependents = self._dependents.get(dep.key)
-            if dependents is None:
-                continue
-            dependents.discard(key)
-            if not dependents:
-                self._dependents.pop(dep.key, None)
-
-    def _evict_if_needed_locked(self) -> None:
-        while len(self._memos) > self._max_entries:
-            oldest_key = min(self._memos.items(), key=lambda it: it[1].last_access)[0]
-            self._trace_event("evict", oldest_key, "lru")
-            self._drop_memo_locked(oldest_key)
+        return self._store.stable_hash(value)
 
     def _latest_input_version(self, input_key: tuple[str, tuple[Any, ...]]) -> InputVersion | None:
-        versions = self._inputs.get(input_key)
-        if not versions:
-            return None
-        return versions[-1]
+        return self._store.latest_input_version(input_key)
 
     def _input_version_at(self, input_key: tuple[str, tuple[Any, ...]], revision: int) -> InputVersion | None:
-        versions = self._inputs.get(input_key)
-        if not versions:
-            return None
-        revs = [v.revision for v in versions]
-        idx = bisect.bisect_right(revs, revision) - 1
-        if idx < 0:
-            return None
-        return versions[idx]
+        return self._store.input_version_at(input_key, revision)
 
     def _set_input(
         self,
@@ -446,29 +249,7 @@ class Engine:
         *,
         bump_cancel_epoch: bool = True,
     ) -> int:
-        with self._lock:
-            self._revision += 1
-            if bump_cancel_epoch:
-                self._cancel_epoch += 1
-            key = (input_id, args)
-            versions = self._inputs.setdefault(key, [])
-            current = versions[-1] if versions else None
-            value_hash = self._stable_hash(value)
-            if current is not None and current.value_hash == value_hash:
-                changed_at = current.changed_at
-            else:
-                changed_at = self._revision
-            versions.append(
-                InputVersion(
-                    revision=self._revision,
-                    changed_at=changed_at,
-                    value_hash=value_hash,
-                    value=value,
-                )
-            )
-            trace_key = ("input", input_id, args)
-            self._trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
-            return self._revision
+        return self._store.set_input(input_id, args, value, bump_cancel_epoch=bump_cancel_epoch)
 
     def _read_input(
         self,
@@ -478,43 +259,10 @@ class Engine:
         *,
         snapshot: Snapshot | None,
     ) -> Any:
-        runtime = self._runtime_var.get()
-        use_snapshot = snapshot or (runtime.snapshot if runtime is not None else self.snapshot())
-        snapshot_pinned = snapshot is not None or (runtime.snapshot_pinned if runtime is not None else False)
-        if runtime is not None:
-            self._check_cancelled(runtime.cancel_epoch)
-        key = ("input", input_id, args)
-        version = self._input_version_at((input_id, args), use_snapshot.revision)
-        if version is None:
-            default = fn(*args)
-            should_materialize = False
-            if not snapshot_pinned:
-                with self._lock:
-                    latest = self._latest_input_version((input_id, args))
-                    should_materialize = latest is None and use_snapshot.revision == self._revision
-            if should_materialize:
-                self._set_input(input_id, args, default, bump_cancel_epoch=False)
-                version = self._latest_input_version((input_id, args))
-                if version is None:  # pragma: no cover - safety belt
-                    raise RuntimeError("input version missing after initialization")
-            else:
-                version = InputVersion(
-                    revision=use_snapshot.revision,
-                    changed_at=-1,
-                    value_hash=self._stable_hash(default),
-                    value=default,
-                )
-        self._record_dependency(key, version.changed_at)
-        self._trace_event("input_read", key)
-        return version.value
+        return self._evaluator.read_input(input_id, fn, args, snapshot=snapshot)
 
     def _check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
-        if runtime_cancel_epoch is None:
-            return
-        with self._lock:
-            current = self._cancel_epoch
-        if current != runtime_cancel_epoch:
-            raise QueryCancelled("query cancelled because inputs changed")
+        self._evaluator.check_cancelled(runtime_cancel_epoch)
 
     def _query_call(
         self,
@@ -526,217 +274,38 @@ class Engine:
         effects: dict[str, list[Any]] | None = None,
         cancel_epoch: int | None = None,
     ) -> Any:
-        runtime = self._runtime_var.get()
-        if runtime is None:
-            token = self._runtime_var.set(
-                _RuntimeState(
-                    snapshot=snapshot or self.snapshot(),
-                    stack=[],
-                    root_effects=effects,
-                    cancel_epoch=cancel_epoch,
-                    snapshot_pinned=snapshot is not None,
-                )
-            )
-            try:
-                return self._query_call(query_id, fn, args, snapshot=snapshot, effects=effects, cancel_epoch=cancel_epoch)
-            finally:
-                self._runtime_var.reset(token)
-
-        key = ("query", query_id, args)
-        if any(frame.key == key for frame in runtime.stack):
-            cycle_start = [frame.key for frame in runtime.stack] + [key]
-            cycle = " -> ".join(self._key_to_str(k) for k in cycle_start)
-            raise CycleError(f"cycle detected: {cycle}")
-        self._check_cancelled(runtime.cancel_epoch)
-        entry, replay_needed = self._compute_or_get_memo(key, fn, runtime)
-        self._record_dependency(key, entry.changed_at)
-        if replay_needed:
-            self._replay_effects(entry.effects)
-        return entry.value
+        return self._evaluator.query_call(
+            query_id,
+            fn,
+            args,
+            snapshot=snapshot,
+            effects=effects,
+            cancel_epoch=cancel_epoch,
+        )
 
     def _compute_or_get_memo(
         self,
-        key: tuple[str, str, tuple[Any, ...]],
+        key: QueryKey,
         fn: Callable[..., Any],
-        runtime: _RuntimeState,
+        runtime: Any,
     ) -> tuple[MemoEntry, bool]:
-        with self._lock:
-            existing = self._memos.get(key)
-            if existing is not None:
-                self._touch_memo_locked(key)
-                if existing.verified_at == runtime.snapshot.revision:
-                    self._trace_event("cache_hit", key)
-                    return existing, True
+        return self._evaluator.compute_or_get_memo(key, fn, runtime)
 
-                if self._try_mark_green(key, existing, runtime.snapshot):
-                    existing.verified_at = runtime.snapshot.revision
-                    self._touch_memo_locked(key)
-                    self._trace_event("cache_green", key)
-                    return existing, True
+    def _try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
+        return self._evaluator.try_mark_green(key, entry, snapshot)
 
-            in_flight_for_key = self._in_flight.get(key)
-            owner_future = None if in_flight_for_key is None else in_flight_for_key.get(runtime.snapshot.revision)
-            if owner_future is None:
-                owner_future = concurrent.futures.Future()
-                if in_flight_for_key is None:
-                    in_flight_for_key = {}
-                    self._in_flight[key] = in_flight_for_key
-                in_flight_for_key[runtime.snapshot.revision] = owner_future
-                is_owner = True
-            else:
-                is_owner = False
+    def _dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
+        return self._evaluator.dependency_changed_at(key, snapshot)
 
-        if not is_owner:
-            self._trace_event("dedup_wait", key)
-            result = owner_future.result()
-            return result, True
+    def _recompute(self, key: QueryKey, fn: Callable[..., Any], runtime: Any) -> MemoEntry:
+        return self._evaluator.recompute(key, fn, runtime)
 
-        try:
-            result = self._recompute(key, fn, runtime)
-            owner_future.set_result(result)
-            return result, False
-        except BaseException as exc:
-            owner_future.set_exception(exc)
-            raise
-        finally:
-            with self._lock:
-                in_flight_for_key = self._in_flight.get(key)
-                if in_flight_for_key is not None:
-                    in_flight_for_key.pop(runtime.snapshot.revision, None)
-                    if not in_flight_for_key:
-                        self._in_flight.pop(key, None)
-
-    def _try_mark_green(
-        self,
-        key: tuple[str, str, tuple[Any, ...]],
-        entry: MemoEntry,
-        snapshot: Snapshot,
-    ) -> bool:
-        for dep in entry.deps:
-            dep_changed_at = self._dependency_changed_at(dep.key, snapshot)
-            if dep_changed_at != dep.observed_changed_at:
-                self._trace_event("cache_red", key, detail=self._key_to_str(dep.key))
-                return False
-        return True
-
-    def _dependency_changed_at(self, key: tuple[str, str, tuple[Any, ...]], snapshot: Snapshot) -> int:
-        kind, fid, args = key
-        if kind == "input":
-            version = self._input_version_at((fid, args), snapshot.revision)
-            return -1 if version is None else version.changed_at
-
-        with self._lock:
-            memo = self._memos.get(key)
-            fn = self._queries[fid]
-        if memo is not None and memo.verified_at == snapshot.revision:
-            return memo.changed_at
-
-        runtime = self._runtime_var.get()
-        if runtime is None:
-            token = self._runtime_var.set(
-                _RuntimeState(
-                    snapshot=snapshot,
-                    stack=[],
-                    root_effects=None,
-                    cancel_epoch=None,
-                    snapshot_pinned=True,
-                )
-            )
-            try:
-                _ = self._query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None)
-            finally:
-                self._runtime_var.reset(token)
-        else:
-            # Dependency verification should not add edges to currently executing frame.
-            shadow = _RuntimeState(
-                snapshot=snapshot,
-                stack=[],
-                root_effects=None,
-                cancel_epoch=runtime.cancel_epoch,
-                snapshot_pinned=True,
-            )
-            token = self._runtime_var.set(shadow)
-            try:
-                _ = self._query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch)
-            finally:
-                self._runtime_var.reset(token)
-
-        with self._lock:
-            refreshed = self._memos.get(key)
-            if refreshed is None:  # pragma: no cover - safety belt
-                raise RuntimeError(f"missing memo for {self._key_to_str(key)}")
-            return refreshed.changed_at
-
-    def _recompute(
-        self,
-        key: tuple[str, str, tuple[Any, ...]],
-        fn: Callable[..., Any],
-        runtime: _RuntimeState,
-    ) -> MemoEntry:
-        frame = _RuntimeFrame(key=key)
-        runtime.stack.append(frame)
-        start = time.perf_counter()
-        self._trace_event("recompute_start", key)
-        try:
-            self._check_cancelled(runtime.cancel_epoch)
-            result = fn(*key[2])
-            self._check_cancelled(runtime.cancel_epoch)
-        finally:
-            runtime.stack.pop()
-        duration_ms = (time.perf_counter() - start) * 1000.0
-
-        frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
-        value_hash = self._stable_hash(result)
-        with self._lock:
-            previous = self._memos.get(key)
-            if previous is not None and previous.value_hash == value_hash:
-                changed_at = previous.changed_at
-                self._trace_event("backdate", key)
-            else:
-                changed_at = runtime.snapshot.revision
-            memo = MemoEntry(
-                value=result,
-                value_hash=value_hash,
-                changed_at=changed_at,
-                verified_at=runtime.snapshot.revision,
-                deps=tuple(Dependency(dep_key, observed) for dep_key, observed in frame.deps.items()),
-                effects=frozen_effects,
-                last_access=self._next_access_id + 1,
-            )
-            self._next_access_id += 1
-            self._drop_memo_locked(key)
-            self._memos[key] = memo
-            for dep_key in frame.deps.keys():
-                self._dependents[dep_key].add(key)
-            self._evict_if_needed_locked()
-        self._trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
-        return memo
-
-    def _record_dependency(self, dep_key: tuple[str, str, tuple[Any, ...]], observed_changed_at: int) -> None:
-        runtime = self._runtime_var.get()
-        if runtime is None or not runtime.stack:
-            return
-        frame = runtime.stack[-1]
-        frame.deps[dep_key] = observed_changed_at
+    def _record_dependency(self, dep_key: QueryKey, observed_changed_at: int) -> None:
+        self._evaluator.record_dependency(dep_key, observed_changed_at)
 
     def _replay_effects(self, effects: Mapping[str, Sequence[Any]]) -> None:
-        runtime = self._runtime_var.get()
-        if runtime is None:
-            return
-        for name, values in effects.items():
-            if runtime.root_effects is not None:
-                runtime.root_effects.setdefault(name, []).extend(values)
-            # Mirror _push_effect semantics so ancestor memo entries retain
-            # transitive effects even when children are served from cache.
-            for frame in runtime.stack:
-                frame.effects[name].extend(values)
+        self._evaluator.replay_effects(effects)
 
     def _push_effect(self, name: str, item: Any) -> None:
-        runtime = self._runtime_var.get()
-        if runtime is None:
-            raise RuntimeError("accumulator.push() must be called inside a query")
-        if runtime.root_effects is not None:
-            runtime.root_effects.setdefault(name, []).append(item)
-        for frame in runtime.stack:
-            frame.effects[name].append(item)
+        self._evaluator.push_effect(name, item)
 
