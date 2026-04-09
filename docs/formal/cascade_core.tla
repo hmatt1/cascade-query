@@ -202,4 +202,14 @@ RedGreenValueAgreement ==
 CancelEpochMonotone ==
     cancelEpoch >= prevCancelEpoch
 
+ChangedAtBoundedByRevision ==
+    /\ chooseChangedAt <= rev
+    /\ modeChangedAt <= rev
+    /\ leftChangedAt <= rev
+    /\ rightChangedAt <= rev
+    /\ depObservedChangedAt <= rev
+
+ReadLiveReturnsChoose ==
+    snapRev # -1 \/ snapResult = chooseVal
+
 ====

@@ -28,18 +28,29 @@ PYTHON_GIL=0 ./scripts/mutation_fast.sh \
   "cascade._scheduler.xǁWorkStealingExecutorǁ__init____mutmut_13"
 ```
 
-## Newly killed high-value mutants
+## This iteration's focused targets and outcomes
 
-- `Engine.submit` snapshot/identity paths:
-  - `submit__mutmut_1`, `submit__mutmut_2`, `submit__mutmut_4`, `submit__mutmut_7`
-- Internal probe wiring:
-  - `_EngineInternals.input_version_at__mutmut_1`
-  - `Engine._input_version_at__mutmut_1`
-- Accumulator error contract:
-  - `Evaluator.push_effect__mutmut_4`
-- Scheduler bootstrap invariant:
-  - `WorkStealingExecutor.__init____mutmut_6`
-  - `WorkStealingExecutor.__init____mutmut_13`
+### Targets
+
+- `GraphStore.touch_memo_locked` arithmetic/LRU-aging mutants
+- `GraphStore.prune` reachability and traversal-safety mutants
+- `_persistence.save_payload` durability/integrity contract mutants
+
+### Newly killed high-value mutants this round
+
+- `GraphStore.touch_memo_locked`:
+  - `touch_memo_locked__mutmut_3` (`next_access_id += 1` -> `-= 1`)
+  - `touch_memo_locked__mutmut_4` (`next_access_id += 1` -> `+= 2`)
+- `GraphStore.prune`:
+  - `prune__mutmut_3`, `prune__mutmut_6`, `prune__mutmut_7`, `prune__mutmut_9`
+  - `prune__mutmut_11`, `prune__mutmut_12`, `prune__mutmut_13`, `prune__mutmut_14`
+  - `prune__mutmut_15`, `prune__mutmut_16`, `prune__mutmut_17`
+  - `prune__mutmut_10` (killed after adding internal query-only reachability oracle)
+- `_persistence.save_payload`:
+  - `x_save_payload__mutmut_3` (`protocol=HIGHEST_PROTOCOL` -> `None`)
+  - `x_save_payload__mutmut_5` (dropped explicit protocol argument)
+  - `x_save_payload__mutmut_10`, `x_save_payload__mutmut_13`, `x_save_payload__mutmut_19`
+    (SQL text/normalization variants)
 
 ## Survivors observed and triage
 
@@ -65,25 +76,25 @@ PYTHON_GIL=0 ./scripts/mutation_fast.sh \
   - **Action:** if message stability is desired, add exact-string assertion
     similar to the one introduced in this iteration.
 
-### Needs broader design or dedicated benchmark harness
+### Remaining survivors / timeouts from this focused pass
 
-- `GraphStore.touch_memo_locked__mutmut_3` / `touch_memo_locked__mutmut_4`
-  (`next_access_id += 1` changed to `-1` or `+2`)
-  - **Why survives:** many tests validate LRU outcomes qualitatively, not exact
-    monotonic step-size of access IDs.
-  - **Risk:** medium for eviction aging precision under sustained churn.
-  - **Action:** add tighter deterministic LRU-age tests with direct internal
-    assertions (partially started in this iteration via monotonicity invariant).
+- `GraphStore.prune__mutmut_5` (`node = queue.popleft()` -> `node = None`)
+  - **Status:** timeout (not survived) on focused runs.
+  - **Why:** this mutant can spin indefinitely in some memo-graph shapes because
+    queue elements are never consumed.
+  - **Risk:** medium for pathological non-termination if traversal logic regresses.
+  - **Action:** keep timeout-guarded prune tests and consider adding an explicit
+    production-side defensive iteration cap or watchdog for prune traversal.
 
-### Not-yet-focused in this iteration
+### Low-risk equivalent/contract-level survivors
 
-Several survivors in `_synthetic_graph`, `_persistence`, and `prune` remain
-outside this focused loop. They are valid follow-up candidates once
-correctness-critical submit/snapshot/cancellation and scheduler bootstrap paths
-are hardened.
+- None observed in the three prioritized target groups after this round's test
+  additions, aside from the `prune__mutmut_5` timeout class above.
 
 ## Next mutation-hardening candidates (recommended order)
 
-1. `GraphStore.touch_memo_locked` arithmetic mutants (LRU aging precision).
-2. `GraphStore.prune` survivors (graph reachability edge cases).
-3. `_persistence.save_payload` survivors (durability and artifact integrity).
+1. `GraphStore.prune__mutmut_5` timeout class: decide whether to encode a
+   fail-fast traversal guard in implementation.
+2. `_persistence.load_payload` mutants (deserialization/shape validation).
+3. Remaining broader `_synthetic_graph` survivors once prune timeout policy is
+   settled.

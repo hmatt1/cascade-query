@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import threading
 from typing import Any
 
 from cascade import Engine
@@ -44,3 +45,29 @@ def assert_internal_dependents_consistent(engine: Engine) -> None:
             assert dependent in internals.memos
             memo = internals.memos[dependent]
             assert any(dep.key == dep_key for dep in memo.deps)
+
+
+def run_prune_with_timeout(
+    engine: Engine,
+    roots: list[tuple[str, str, tuple[Any, ...]]],
+    *,
+    timeout: float = 0.5,
+) -> None:
+    """Run prune in a daemon thread and fail fast on non-termination."""
+
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            engine.prune(roots)
+        except BaseException as exc:  # pragma: no cover - defensive
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    assert finished.wait(timeout), "prune() did not terminate within timeout"
+    if errors:
+        raise errors[0]

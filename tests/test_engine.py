@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from cascade import CycleError, Engine
+from tests.scale_helpers import run_prune_with_timeout
 
 # Black-box behavior coverage for core query/input semantics.
 # Concurrency, compute_many behavior detail, and persistence/trace assertions
@@ -392,7 +393,7 @@ def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
     engine.load(str(empty_path))
 
     # prune() tolerates unreachable roots and keeps memo graph consistent.
-    engine.prune([("query", plus_one.id, (999,))])
+    run_prune_with_timeout(engine, [("query", plus_one.id, (999,))], timeout=0.5)
     assert isinstance(engine.inspect_graph(), dict)
 
 

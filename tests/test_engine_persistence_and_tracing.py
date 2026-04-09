@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import concurrent.futures
+import pickle
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+import cascade._persistence as persistence_mod
 from cascade import Engine
+from cascade._state import Dependency, MemoEntry
+from cascade._store import GraphStore
+from tests.scale_helpers import run_prune_with_timeout
 
 
 def test_persistence_save_and_load(tmp_path: Path) -> None:
@@ -102,7 +107,7 @@ def test_eviction_and_prune() -> None:
     assert graph["memo_count"] <= 2
 
     roots = [("query", inc.id, (3,))]
-    engine.prune(roots)
+    run_prune_with_timeout(engine, roots, timeout=0.5)
     graph_after = engine.inspect_graph()
     assert all(node.endswith("(3,)") for node in graph_after["nodes"])
 
@@ -273,3 +278,302 @@ def test_load_clears_transient_in_flight_state(tmp_path: Path) -> None:
     # in_flight contains process-local synchronization primitives and must not
     # leak across load boundaries.
     assert engine._in_flight == {}  # noqa: SLF001
+
+
+def test_prune_keeps_transitively_reachable_query_chain_only() -> None:
+    engine = Engine()
+
+    @engine.input
+    def source(index: int) -> int:
+        return 0
+
+    @engine.query
+    def leaf(index: int) -> int:
+        return source(index) + 1
+
+    @engine.query
+    def middle(index: int) -> int:
+        return leaf(index) + 10
+
+    @engine.query
+    def top(index: int) -> int:
+        return middle(index) + 100
+
+    @engine.query
+    def side(index: int) -> int:
+        return source(index) + 1_000
+
+    source.set(1, 5)
+    source.set(2, 8)
+    assert top(1) == 116
+    assert top(2) == 119
+    assert side(2) == 1_008
+
+    root = ("query", top.id, (1,))
+    run_prune_with_timeout(engine, [root], timeout=0.5)
+    graph = engine.inspect_graph()
+
+    top_node = f"query:{top.id}(1,)"
+    middle_node = f"query:{middle.id}(1,)"
+    leaf_node = f"query:{leaf.id}(1,)"
+    assert set(graph["nodes"]) == {top_node, middle_node, leaf_node}
+    assert graph["memo_count"] == 3
+
+    query_edges = {(parent, child) for parent, child in graph["edges"] if child.startswith("query:")}
+    assert query_edges == {(top_node, middle_node), (middle_node, leaf_node)}
+
+
+def test_prune_ignores_missing_root_without_skipping_valid_roots() -> None:
+    engine = Engine()
+
+    @engine.input
+    def source(index: int) -> int:
+        return 0
+
+    @engine.query
+    def leaf(index: int) -> int:
+        return source(index) + 1
+
+    @engine.query
+    def middle(index: int) -> int:
+        return leaf(index) + 10
+
+    @engine.query
+    def top(index: int) -> int:
+        return middle(index) + 100
+
+    source.set(0, 2)
+    source.set(1, 3)
+    assert top(0) == 113
+    assert top(1) == 114
+
+    missing_root = ("query", top.id, (999,))
+    valid_root = ("query", top.id, (1,))
+    run_prune_with_timeout(engine, [missing_root, valid_root], timeout=0.5)
+    graph = engine.inspect_graph()
+
+    expected_nodes = {
+        f"query:{top.id}(1,)",
+        f"query:{middle.id}(1,)",
+        f"query:{leaf.id}(1,)",
+    }
+    assert set(graph["nodes"]) == expected_nodes
+    assert graph["memo_count"] == 3
+
+
+def test_prune_terminates_for_non_empty_root_set() -> None:
+    engine = Engine()
+
+    @engine.input
+    def source(index: int) -> int:
+        return 0
+
+    @engine.query
+    def leaf(index: int) -> int:
+        return source(index) + 1
+
+    @engine.query
+    def top(index: int) -> int:
+        return leaf(index) + 10
+
+    source.set(0, 1)
+    assert top(0) == 12
+    root = ("query", top.id, (0,))
+
+    # prune() should not spin indefinitely on valid non-empty roots.
+    run_prune_with_timeout(engine, [root], timeout=0.5)
+
+
+def test_save_payload_uses_highest_protocol_and_stable_sql_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"revision": 7, "data": {"k": [1, 2, 3]}}
+    expected_blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    db_path = "tests:fake-path.db"
+    executed: list[tuple[str, tuple[object, ...]]] = []
+    commits = 0
+    closes = 0
+
+    class FakeConn:
+        def execute(self, sql: str, params: tuple[object, ...] = ()) -> "FakeConn":
+            executed.append((sql, params))
+            return self
+
+        def commit(self) -> None:
+            nonlocal commits
+            commits += 1
+
+        def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    def fake_connect(path: str) -> FakeConn:
+        assert path == db_path
+        return FakeConn()
+
+    monkeypatch.setattr(persistence_mod.sqlite3, "connect", fake_connect)
+    persistence_mod.save_payload(db_path, payload)
+
+    assert commits == 1
+    assert closes == 1
+    assert executed == [
+        ("create table if not exists cascade_state (id integer primary key, payload blob not null)", ()),
+        ("delete from cascade_state", ()),
+        ("insert into cascade_state(id, payload) values (1, ?)", (expected_blob,)),
+    ]
+
+
+def test_save_payload_passes_explicit_highest_protocol_to_pickle(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"important": ("state", 1)}
+    sentinel_blob = b"blob-by-contract"
+
+    def fake_dumps(obj: object, *, protocol: int | None = None) -> bytes:
+        assert obj is payload
+        assert protocol == pickle.HIGHEST_PROTOCOL
+        return sentinel_blob
+
+    executed: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeConn:
+        def execute(self, sql: str, params: tuple[object, ...] = ()) -> "FakeConn":
+            executed.append((sql, params))
+            return self
+
+        def commit(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(persistence_mod.pickle, "dumps", fake_dumps)
+    monkeypatch.setattr(persistence_mod.sqlite3, "connect", lambda _: FakeConn())
+
+    persistence_mod.save_payload("tests:fake-protocol.db", payload)
+
+    assert executed[-1] == ("insert into cascade_state(id, payload) values (1, ?)", (sentinel_blob,))
+
+
+def test_prune_uses_query_only_reachability_for_dependency_expansion() -> None:
+    store = GraphStore(max_entries=32, trace_limit=64)
+
+    q_root = ("query", "q_root", ())
+    q_child = ("query", "q_child", ())
+    i_leaf = ("input", "i_leaf", ())
+
+    store.memos[q_root] = MemoEntry(
+        value=1,
+        value_hash="root",
+        changed_at=1,
+        verified_at=1,
+        deps=(Dependency(key=q_child, observed_changed_at=1),),
+        effects={},
+        last_access=1,
+    )
+    store.memos[q_child] = MemoEntry(
+        value=2,
+        value_hash="child",
+        changed_at=1,
+        verified_at=1,
+        deps=(Dependency(key=i_leaf, observed_changed_at=1),),
+        effects={},
+        last_access=2,
+    )
+
+    store.prune([q_root])
+
+    assert set(store.memos) == {q_root, q_child}
+
+
+def test_prune_does_not_infinite_loop_with_query_cycle_when_root_reachable() -> None:
+    store = GraphStore(max_entries=32, trace_limit=64)
+    q_a = ("query", "q_a", ())
+    q_b = ("query", "q_b", ())
+
+    store.memos[q_a] = MemoEntry(
+        value="a",
+        value_hash="a",
+        changed_at=1,
+        verified_at=1,
+        deps=(Dependency(key=q_b, observed_changed_at=1),),
+        effects={},
+        last_access=1,
+    )
+    store.memos[q_b] = MemoEntry(
+        value="b",
+        value_hash="b",
+        changed_at=1,
+        verified_at=1,
+        deps=(Dependency(key=q_a, observed_changed_at=1),),
+        effects={},
+        last_access=2,
+    )
+
+    finished = concurrent.futures.Future[None]()
+
+    def run_prune() -> None:
+        try:
+            store.prune([q_a])
+            finished.set_result(None)
+        except BaseException as exc:  # pragma: no cover - defensive
+            finished.set_exception(exc)
+
+    worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        worker.submit(run_prune)
+        finished.result(timeout=0.5)
+    finally:
+        worker.shutdown(wait=False, cancel_futures=True)
+
+    assert set(store.memos) == {q_a, q_b}
+
+
+def test_prune_terminates_even_with_query_cycle_in_memo_graph() -> None:
+    store = GraphStore(max_entries=32, trace_limit=64)
+
+    q_a = ("query", "q_a", ())
+    q_b = ("query", "q_b", ())
+    q_c = ("query", "q_c", ())
+
+    store.memos[q_a] = MemoEntry(
+        value=1,
+        value_hash="a",
+        changed_at=1,
+        verified_at=1,
+        deps=(Dependency(key=q_b, observed_changed_at=1),),
+        effects={},
+        last_access=1,
+    )
+    store.memos[q_b] = MemoEntry(
+        value=2,
+        value_hash="b",
+        changed_at=1,
+        verified_at=1,
+        deps=(Dependency(key=q_a, observed_changed_at=1),),
+        effects={},
+        last_access=2,
+    )
+    store.memos[q_c] = MemoEntry(
+        value=3,
+        value_hash="c",
+        changed_at=1,
+        verified_at=1,
+        deps=(),
+        effects={},
+        last_access=3,
+    )
+
+    done = concurrent.futures.Future[None]()
+
+    def run_prune() -> None:
+        try:
+            store.prune([q_a])
+            done.set_result(None)
+        except BaseException as exc:  # pragma: no cover - defensive
+            done.set_exception(exc)
+
+    worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        worker.submit(run_prune)
+        done.result(timeout=0.5)
+    finally:
+        worker.shutdown(wait=False, cancel_futures=True)
+
+    assert set(store.memos) == {q_a, q_b}
