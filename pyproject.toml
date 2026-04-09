@@ -9,6 +9,15 @@ description = "Minimal demand-driven query framework for incremental computation
 requires-python = ">=3.14"
 readme = "README.md"
 
+[project.optional-dependencies]
+dev = [
+    "hypothesis",
+    "mutmut",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -27,3 +36,10 @@ source = ["cascade"]
 [tool.coverage.report]
 skip_covered = false
 show_missing = true
+
+[tool.mutmut]
+paths_to_mutate = ["src/cascade/"]
+tests_dir = ["tests/"]
+runner = "python3.14t -m pytest -q -m \"not slow\""
+mutate_only_covered_lines = true
+also_copy = ["pyproject.toml"]
