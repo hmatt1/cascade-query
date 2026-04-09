@@ -57,7 +57,6 @@ def _gil_state() -> str:
 def main(argv: list[str] | None = None) -> None:
     cpu_count = os.cpu_count() or 2
     default_workers = min(8, max(2, cpu_count))
-    default_tasks = default_workers * 12
 
     parser = argparse.ArgumentParser(
         description=(
