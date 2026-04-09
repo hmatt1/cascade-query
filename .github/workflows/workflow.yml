@@ -85,12 +85,29 @@ jobs:
         run: |
           python -m pytest -q tests/test_performance.py::test_compute_many_parallel_speedup_scenario
 
+      - name: Generate isolated compute-many speedup report (GIL disabled)
+        env:
+          PYTHON_GIL: "0"
+        run: |
+          python -m benchmarks.performance_suite \
+            --report-dir artifacts/performance/gil-disabled-isolated \
+            --assert-thresholds \
+            --include-scenarios compute-many-parallel-speedup
+
       - name: Generate performance report (GIL enabled)
         env:
           PYTHON_GIL: "1"
         run: |
           python -m benchmarks.performance_suite \
             --report-dir artifacts/performance/gil-enabled
+
+      - name: Generate isolated compute-many speedup report (GIL enabled)
+        env:
+          PYTHON_GIL: "1"
+        run: |
+          python -m benchmarks.performance_suite \
+            --report-dir artifacts/performance/gil-enabled-isolated \
+            --include-scenarios compute-many-parallel-speedup
 
       - name: Compare free-threaded vs GIL performance
         run: |
@@ -100,8 +117,8 @@ jobs:
           from pathlib import Path
 
           perf_root = Path("artifacts/performance")
-          free_report_path = perf_root / "gil-disabled" / "performance-report.json"
-          gil_report_path = perf_root / "gil-enabled" / "performance-report.json"
+          free_report_path = perf_root / "gil-disabled-isolated" / "performance-report.json"
+          gil_report_path = perf_root / "gil-enabled-isolated" / "performance-report.json"
 
           free_report = json.loads(free_report_path.read_text(encoding="utf-8"))
           gil_report = json.loads(gil_report_path.read_text(encoding="utf-8"))
