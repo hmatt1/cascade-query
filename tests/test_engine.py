@@ -943,6 +943,52 @@ def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection()
     assert result == [i + 1 for i in range(6)]
 
 
+def test_compute_many_deduplicates_identical_calls_within_batch() -> None:
+    engine = Engine()
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    runs = 0
+
+    @engine.input
+    def base() -> int:
+        return 0
+
+    @engine.query
+    def expensive() -> int:
+        nonlocal runs
+        with lock:
+            runs += 1
+        started.set()
+        release.wait(timeout=2.0)
+        time.sleep(0.01)
+        return base() + 1
+
+    base.set(41)
+    result_box: list[list[int]] = []
+    error_box: list[BaseException] = []
+
+    def run_batch() -> None:
+        try:
+            result_box.append(engine.compute_many([(expensive, ()) for _ in range(40)], workers=12))
+        except BaseException as exc:  # pragma: no cover - defensive
+            error_box.append(exc)
+
+    runner = threading.Thread(target=run_batch, daemon=True)
+    runner.start()
+
+    assert started.wait(timeout=1.0)
+    time.sleep(0.03)
+    release.set()
+
+    runner.join(timeout=3.0)
+    assert not runner.is_alive()
+    assert not error_box
+    assert result_box == [[42] * 40]
+    assert runs == 1
+    assert any(event.event == "dedup_wait" for event in engine.traces())
+
+
 def test_load_missing_state_table_raises_operational_error(tmp_path: Path) -> None:
     db_path = tmp_path / "missing-table.db"
     conn = sqlite3.connect(db_path)
