@@ -17,11 +17,11 @@ jobs:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     env:
-      PYTHON_GIL: "0"
+      PYTHON_GIL: ${{ matrix.python-version == '3.14t' && '0' || '1' }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.14t"]
+        python-version: ["3.12", "3.14t"]
 
     steps:
       - name: Check out repository
@@ -42,6 +42,7 @@ jobs:
         run: python -m ruff check .
 
       - name: Verify free-threaded runtime
+        if: matrix.python-version == '3.14t'
         run: |
           python - <<'PY'
           import sys
@@ -65,12 +66,14 @@ jobs:
             --cov-fail-under=95
 
       - name: Run performance test suite separately
+        if: matrix.python-version == '3.14t'
         env:
           PYTHON_GIL: "0"
         run: |
           python -m pytest -q tests/test_performance.py::test_performance_regressions
 
       - name: Generate performance report (GIL disabled)
+        if: matrix.python-version == '3.14t'
         env:
           PYTHON_GIL: "0"
         run: |
@@ -80,12 +83,14 @@ jobs:
             --exclude-scenarios compute-many-parallel-speedup
 
       - name: Run isolated compute-many parallel speedup check
+        if: matrix.python-version == '3.14t'
         env:
           PYTHON_GIL: "0"
         run: |
           python -m pytest -q tests/test_performance.py::test_compute_many_parallel_speedup_scenario
 
       - name: Generate isolated compute-many speedup report (GIL disabled)
+        if: matrix.python-version == '3.14t'
         env:
           PYTHON_GIL: "0"
         run: |
@@ -95,6 +100,7 @@ jobs:
             --include-scenarios compute-many-parallel-speedup
 
       - name: Generate performance report (GIL enabled)
+        if: matrix.python-version == '3.14t'
         env:
           PYTHON_GIL: "1"
         run: |
@@ -102,6 +108,7 @@ jobs:
             --report-dir artifacts/performance/gil-enabled
 
       - name: Generate isolated compute-many speedup report (GIL enabled)
+        if: matrix.python-version == '3.14t'
         env:
           PYTHON_GIL: "1"
         run: |
@@ -110,6 +117,7 @@ jobs:
             --include-scenarios compute-many-parallel-speedup
 
       - name: Compare free-threaded vs GIL performance
+        if: matrix.python-version == '3.14t'
         run: |
           python - <<'PY'
           import json
@@ -201,7 +209,7 @@ jobs:
           PY
 
       - name: Upload performance report
-        if: always()
+        if: always() && matrix.python-version == '3.14t'
         uses: actions/upload-artifact@v4
         with:
           name: performance-report
@@ -235,7 +243,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.14t"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Build package artifacts
@@ -268,23 +276,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.14t"
+          python-version: "3.12"
           cache: "pip"
-
-      - name: Verify free-threaded runtime
-        env:
-          PYTHON_GIL: "0"
-        run: |
-          python - <<'PY'
-          import sys
-          import sysconfig
-          
-          if sysconfig.get_config_var("Py_GIL_DISABLED") != 1:
-              raise SystemExit("Interpreter is not a free-threaded build.")
-          if sys._is_gil_enabled():
-              raise SystemExit("GIL is enabled. Expected free-threaded execution (PYTHON_GIL=0).")
-          print("Verified free-threaded runtime with GIL disabled.")
-          PY
 
       - name: Compute next semantic version
         id: semver

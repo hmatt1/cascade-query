@@ -84,9 +84,25 @@ assert calls == {"lines": 2, "mentions": 3}
 
 ---
 
-## Install (free-threaded Python)
+## Install
 
-The library targets **free-threaded CPython 3.14** so CPU-bound parallel work can scale without fighting the GIL. The package itself is **pure Python**; what matters is the interpreter you run with.
+The package metadata allows **CPython 3.12 and newer** (`requires-python >= 3.12`). The library is **pure Python**, so `pip` installs the same wheel everywhere. For **correctness and ordinary use**, any supported interpreter is fine.
+
+**Parallel CPU work:** best results still come from **free-threaded CPython 3.14** with the GIL disabled at runtime (see below). On 3.12/3.13 with the standard GIL, threaded speedups for CPU-heavy graphs may be limited even though the API behaves the same.
+
+### Standard Python (3.12+)
+
+```bash
+python -m pip install -U query-cascade
+```
+
+Use the same command with your `python`/`py` launcher for 3.12 or any newer version you rely on.
+
+---
+
+## Install (free-threaded Python 3.14, recommended for parallel CPU work)
+
+The library is **optimized for** **free-threaded CPython 3.14** so CPU-bound parallel work can scale without fighting the GIL. What matters for throughput is the interpreter you run with, not how the wheel was built.
 
 ### Windows
 

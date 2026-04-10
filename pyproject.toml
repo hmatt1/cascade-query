@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "query-cascade"
 version = "0.1.0"
 description = "Minimal demand-driven query framework for incremental computation."
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 readme = "README.md"
 
 [project.optional-dependencies]
@@ -40,6 +40,6 @@ show_missing = true
 [tool.mutmut]
 paths_to_mutate = ["src/cascade/"]
 tests_dir = ["tests/"]
-runner = "python3.14t -m pytest -q -m \"not slow\" --ignore=tests/test_performance.py"
+runner = "python -m pytest -q -m \"not slow\" --ignore=tests/test_performance.py"
 mutate_only_covered_lines = true
 also_copy = ["pyproject.toml", "benchmarks"]
