@@ -11,7 +11,6 @@ class WorkStealingExecutor:
         self._deques = [deque() for _ in range(self._workers)]
         self._lock = threading.RLock()
         self._pending = 0
-        self._shutdown = False
         self._wake = threading.Condition(self._lock)
 
     def submit_indexed(self, index: int, fn: Callable[[], Any]) -> None:
@@ -34,7 +33,7 @@ class WorkStealingExecutor:
                 idx, fn = task
                 try:
                     results[idx] = fn()
-                except BaseException as exc:  # pragma: no cover - defensive branch
+                except BaseException as exc:
                     errors[idx] = exc
                 finally:
                     with self._wake:
@@ -65,6 +64,6 @@ class WorkStealingExecutor:
                         continue
                     if bucket:
                         return bucket.popleft()
-                if self._pending == 0 or self._shutdown:
+                if self._pending == 0:
                     return None
                 self._wake.wait(timeout=0.01)

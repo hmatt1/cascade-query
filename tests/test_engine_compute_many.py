@@ -83,11 +83,26 @@ def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection()
     assert result == [i + 1 for i in range(6)]
 
 
+def test_work_stealing_run_raises_first_recorded_task_error() -> None:
+    scheduler = WorkStealingExecutor(workers=2)
+
+    def failing() -> None:
+        raise ValueError("task failed")
+
+    def succeeding() -> int:
+        return 1
+
+    scheduler.submit_indexed(0, failing)
+    scheduler.submit_indexed(1, succeeding)
+    with pytest.raises(ValueError, match="task failed"):
+        scheduler.run(2)
+
+
 def test_scheduler_bootstrap_invariants_for_compute_many_path() -> None:
-    # Keep scheduler defaults explicit: starts open (not shutdown) and with a real lock.
+    # Keep scheduler defaults explicit: idle (no pending work) and with a real lock.
     scheduler = WorkStealingExecutor(workers=1)
     assert scheduler._workers == 1  # noqa: SLF001
-    assert scheduler._shutdown is False  # noqa: SLF001
+    assert scheduler._pending == 0  # noqa: SLF001
     assert scheduler._lock is not None  # noqa: SLF001
     assert hasattr(scheduler._lock, "acquire")  # noqa: SLF001
     assert hasattr(scheduler._lock, "release")  # noqa: SLF001

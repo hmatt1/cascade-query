@@ -4,7 +4,7 @@ from cascade import Engine
 
 
 def run_demo() -> None:
-    print("=== Schema compatibility + migration impact checker example ===")
+    print("=== Schema compatibility + evolution impact checker example ===")
     engine = Engine()
     calls: dict[str, int] = {"parse_schema": 0, "direct_breaks": 0, "consumer_breaks": 0}
 

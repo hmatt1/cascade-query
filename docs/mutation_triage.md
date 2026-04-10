@@ -22,7 +22,6 @@ PYTHON_GIL=0 ./scripts/mutation_fast.sh \
   "cascade.engine.xǁEngineǁsubmit__mutmut_4" \
   "cascade.engine.xǁEngineǁsubmit__mutmut_7" \
   "cascade.engine.xǁ_EngineInternalsǁinput_version_at__mutmut_1" \
-  "cascade.engine.xǁEngineǁ_input_version_at__mutmut_1" \
   "cascade._evaluator.xǁEvaluatorǁpush_effect__mutmut_4" \
   "cascade._scheduler.xǁWorkStealingExecutorǁ__init____mutmut_6" \
   "cascade._scheduler.xǁWorkStealingExecutorǁ__init____mutmut_13"

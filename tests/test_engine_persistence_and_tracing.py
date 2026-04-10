@@ -270,14 +270,14 @@ def test_load_clears_transient_in_flight_state(tmp_path: Path) -> None:
     stale_future: concurrent.futures.Future[object] = concurrent.futures.Future()
     stale_future.set_result("stale")
     stale_key = ("query", "tests:stale", ())
-    engine._in_flight[(stale_key, 123)] = stale_future  # noqa: SLF001
-    assert len(engine._in_flight) == 1  # noqa: SLF001
+    engine._internals.in_flight[(stale_key, 123)] = stale_future  # noqa: SLF001
+    assert len(engine._internals.in_flight) == 1  # noqa: SLF001
 
     engine.load(str(db_path))
 
     # in_flight contains process-local synchronization primitives and must not
     # leak across load boundaries.
-    assert engine._in_flight == {}  # noqa: SLF001
+    assert engine._internals.in_flight == {}  # noqa: SLF001
 
 
 def test_prune_keeps_transitively_reachable_query_chain_only() -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
+import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ._errors import CancellationError, CycleError, QueryCancelled
@@ -8,10 +10,15 @@ from ._evaluator import Evaluator
 from ._persistence import load_payload, save_payload
 from ._runtime import RuntimeState
 from ._scheduler import WorkStealingExecutor
-from ._state import InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
+from ._state import InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 from ._store import GraphStore
 
 _UNSET = object()
+
+
+def _default_submit_pool_workers() -> int:
+    return min(32, (os.cpu_count() or 1) + 4)
+
 
 __all__ = [
     "Accumulator",
@@ -116,30 +123,40 @@ class _EngineInternals:
     def dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
         return self._evaluator.dependency_changed_at(key, snapshot)
 
+    @property
+    def cancel_epoch(self) -> int:
+        return self._store.cancel_epoch
+
+    @property
+    def next_access_id(self) -> int:
+        return self._store.next_access_id
+
+    @property
+    def in_flight(self) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
+        return self._store.in_flight
+
+    @property
+    def inputs(self) -> dict[InputKey, list[InputVersion]]:
+        return self._store.inputs
+
+    @property
+    def queries(self) -> dict[str, Callable[..., Any]]:
+        return self._store.queries
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self._store.lock
+
+    @property
+    def max_entries(self) -> int:
+        return self._store.max_entries
+
 
 class Engine:
     # Explicit private-policy contract for tests/introspection.
     # Invariant-oriented access should flow through the _internals probe.
     _INTERNAL_TEST_API: tuple[str, ...] = (
         "_internals",
-    )
-    # Legacy shims kept for backward private compatibility only. These include
-    # older invariant helpers, which now delegate to _internals during
-    # migration. New tests and internals should not depend on these names.
-    _LEGACY_PRIVATE_SHIMS: tuple[str, ...] = (
-        "_latest_input_version",
-        "_input_version_at",
-        "_dependency_changed_at",
-        "_memos",
-        "_dependents",
-        "_revision",
-        "_cancel_epoch",
-        "_next_access_id",
-        "_max_entries",
-        "_inputs",
-        "_queries",
-        "_in_flight",
-        "_lock",
     )
 
     def __init__(self, *, max_entries: int = 10_000, trace_limit: int = 50_000) -> None:
@@ -148,49 +165,8 @@ class Engine:
         self._evaluator = Evaluator(self._store)
         # Single private probe for invariant-oriented internals.
         self._internals = _EngineInternals(self._store, self._evaluator)
-
-        # Backward-compatible private handles for tests/introspection.
-        self._lock = self._store.lock
-
-    # --- legacy private compatibility shims ---
-    @property
-    def _revision(self) -> int:  # pragma: no cover - compatibility shim
-        return self._store.revision
-
-    @property
-    def _cancel_epoch(self) -> int:  # pragma: no cover - compatibility shim
-        return self._store.cancel_epoch
-
-    @property
-    def _next_access_id(self) -> int:  # pragma: no cover - compatibility shim
-        return self._store.next_access_id
-
-    @property
-    def _max_entries(self) -> int:  # pragma: no cover - compatibility shim
-        return self._store.max_entries
-
-    @property
-    def _inputs(self) -> dict[tuple[str, tuple[Any, ...]], list[InputVersion]]:
-        return self._store.inputs
-
-    @property
-    def _queries(self) -> dict[str, Callable[..., Any]]:
-        return self._store.queries
-
-    @property
-    def _in_flight(self) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
-        return self._store.in_flight
-
-    # --- supported internal test/introspection surface ---
-    # Keep this focused on invariant-centric introspection only.
-    # Prefer engine._internals.*; these names are legacy aliases.
-    @property
-    def _memos(self) -> dict[QueryKey, MemoEntry]:
-        return self._internals.memos
-
-    @property
-    def _dependents(self) -> dict[QueryKey, set[QueryKey]]:
-        return self._internals.dependents
+        self._submit_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._submit_executor_lock = threading.Lock()
 
     @property
     def revision(self) -> int:
@@ -210,6 +186,27 @@ class Engine:
     def accumulator(self, name: str) -> Accumulator:
         return Accumulator(self, name=name)
 
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        """Shut down the lazily created default :meth:`submit` thread pool, if any.
+
+        When ``executor`` is not passed to :meth:`submit`, work runs on a shared
+        per-engine pool; call this when discarding the engine if you need prompt
+        thread teardown (for example in tests).
+        """
+        with self._submit_executor_lock:
+            pool = self._submit_executor
+            self._submit_executor = None
+        if pool is not None:
+            pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def _ensure_submit_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        with self._submit_executor_lock:
+            if self._submit_executor is None:
+                self._submit_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_default_submit_pool_workers()
+                )
+            return self._submit_executor
+
     def submit(
         self,
         query: _QueryHandle,
@@ -218,6 +215,15 @@ class Engine:
         effects: dict[str, list[Any]] | None = None,
         executor: concurrent.futures.Executor | None = None,
     ) -> concurrent.futures.Future[Any]:
+        """Run ``query`` asynchronously.
+
+        If ``executor`` is ``None`` (default), the engine uses a lazily created
+        shared :class:`~concurrent.futures.ThreadPoolExecutor` so repeated
+        submits do not spawn a new pool each time. Pass a long-lived executor
+        when you need isolation, custom limits, or coordinated shutdown with
+        other tasks. Call :meth:`shutdown` when dropping the engine if you
+        require the default pool to release threads promptly.
+        """
         run_snapshot = snapshot or self.snapshot()
         with self._store.lock:
             cancel_epoch = self._store.cancel_epoch
@@ -233,15 +239,7 @@ class Engine:
             )
 
         if executor is None:
-            owned = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-            def wrapped() -> Any:
-                try:
-                    return run()
-                finally:
-                    owned.shutdown(wait=False, cancel_futures=False)
-
-            return owned.submit(wrapped)
+            return self._ensure_submit_executor().submit(run)
         return executor.submit(run)
 
     def compute_many(
@@ -297,12 +295,6 @@ class Engine:
     def _stable_hash(self, value: Any) -> str:
         return self._store.stable_hash(value)
 
-    def _latest_input_version(self, input_key: tuple[str, tuple[Any, ...]]) -> InputVersion | None:
-        return self._internals.latest_input_version(input_key)
-
-    def _input_version_at(self, input_key: tuple[str, tuple[Any, ...]], revision: int) -> InputVersion | None:
-        return self._internals.input_version_at(input_key, revision)
-
     def _set_input(
         self,
         input_id: str,
@@ -355,9 +347,6 @@ class Engine:
 
     def _try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
         return self._evaluator.try_mark_green(key, entry, snapshot)
-
-    def _dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
-        return self._internals.dependency_changed_at(key, snapshot)
 
     def _recompute(self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState) -> MemoEntry:
         return self._evaluator.recompute(key, fn, runtime)

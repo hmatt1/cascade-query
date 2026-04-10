@@ -289,6 +289,7 @@ class Evaluator:
             )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = memo
+            self._store.push_memo_lru_locked(key)
             for dep_key in frame.deps.keys():
                 self._store.dependents[dep_key].add(key)
             self._store.evict_if_needed_locked()

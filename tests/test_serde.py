@@ -188,11 +188,11 @@ def test_input_version_round_trip() -> None:
 
 
 def test_to_jsonable_rejects_arbitrary_object() -> None:
-    class O:
+    class PlainClass:
         pass
 
     with pytest.raises(TypeError, match="unsupported type"):
-        to_j(O())
+        to_j(PlainClass())
 
 
 def test_decode_float_nan_and_negative_infinity() -> None:

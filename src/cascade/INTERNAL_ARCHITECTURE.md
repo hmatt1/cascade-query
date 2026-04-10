@@ -9,7 +9,8 @@ handles/types.
 - `engine.py` (facade/composition)
   - Public API surface (`Engine`, input/query/accumulator handles).
   - Delegates state and evaluation logic to internal modules.
-  - Keeps a minimal private compatibility layer for legacy introspection.
+  - Exposes a single invariant-oriented probe (`_internals`) for tests; no other
+    private `Engine` attributes are part of the supported coupling surface.
 
 - `_state.py` (data model)
   - Core immutable/mutable record types:
@@ -60,28 +61,25 @@ handles/types.
 
 ## Private internal API hygiene policy
 
-`Engine` keeps two explicit internal lists and one canonical probe object:
+`Engine` declares `_INTERNAL_TEST_API` (currently `("_internals",)`) so tests
+that need graph or epoch state do so through one explicit probe object.
 
-- `_INTERNAL_TEST_API`: narrow, invariant-focused internals intentionally used by
-  tests (`_internals`).
-- `_LEGACY_PRIVATE_SHIMS`: backward-compatible private aliases retained for
-  compatibility only (`_latest_input_version`, `_input_version_at`,
-  `_dependency_changed_at`, `_memos`, `_dependents`, `_revision`,
-  `_cancel_epoch`, `_next_access_id`, `_max_entries`, `_inputs`, `_queries`,
-  `_in_flight`, `_lock`).
-
-`engine._internals` is the ownership boundary for invariant-oriented probing
-(`latest_input_version`, `input_version_at`, `dependency_changed_at`, `memos`,
-`dependents`). Legacy names delegate to it during migration.
+`engine._internals` is the ownership boundary for invariant-oriented probing:
+`latest_input_version`, `input_version_at`, `dependency_changed_at`, `memos`,
+`dependents`, `cancel_epoch`, `next_access_id`, `in_flight`, `inputs`, `queries`,
+`lock`, `max_entries`.
 
 Policy:
 
-1. New tests should default to public API behavior.
-2. If a test needs internals, prefer `engine._internals` and the existing
-   invariant helper path.
-3. Avoid introducing new dependencies on `_LEGACY_PRIVATE_SHIMS`.
-4. Removing a legacy shim requires first removing all call-sites, then updating
-   the explicit policy lists and internal invariant tests in one change.
+1. New tests should default to public API behavior. Prefer public diagnostics
+   (`revision`, `inspect_graph()`, `traces()`) over widening the internal
+   surface.
+2. If a test needs internals, use `engine._internals` (or the centralized
+   invariant helper in `tests/scale_helpers.py`) rather than new `Engine`
+   attributes.
+3. Keep `_INTERNAL_TEST_API` minimal (today: only `_internals`). Add entries
+   only when a long-lived invariant truly cannot be asserted through the public
+   API or `_internals`.
 
 ## Testing strategy split
 

@@ -101,6 +101,7 @@ def symbols(file_id: str) -> tuple[str, ...]:
 - **Free-threaded runtime requirement**: this project targets free-threaded CPython (`3.14t`) with runtime GIL disabled. If a non-free-threaded interpreter is used, or if imported extensions force GIL re-enable, CPU-bound parallel scaling will degrade.
   - **Publish/build environment vs runtime compatibility**: publishing wheels/sdists from a non-free-threaded interpreter does not, by itself, prevent installation or execution on free-threaded CPython. Compatibility is determined at install/runtime by the interpreter and dependency stack. This package is pure Python, so there is no extension ABI lock to a specific GIL mode.
 - **Process-level durability model**: persistence is an explicit point-in-time snapshot (`save`/`load`), not a transactional WAL-backed MVCC store shared by multiple live processes.
+- **Persistence trust boundary**: snapshots are canonical JSON with a versioned envelope (`format` in `src/cascade/_serde.py`). Decoding resolves recorded Python types via `importlib` (same trust model as loading structured data that names types). Only `load` files from trusted sources; treat them like code or pickle from an untrusted writer. The format version can be bumped when breaking changes require rejecting older files; there is no cryptographic signing layer in the library.
 - **Boundary of side-effect replay guarantees**: replay is guaranteed only for effects emitted through `Accumulator`; out-of-band side effects in query bodies (printing, network calls, filesystem writes) are intentionally not replayed.
 - **Cycle handling scope**: direct and long-chain dynamic query cycles are detected and raised as `CycleError`; this engine does not implement fixed-point solvers for cyclic dataflow.
 
@@ -163,7 +164,7 @@ The following concrete problems are typically excellent fits (9-10 Yes):
    - Re-evaluate only impacted resources/rules after config edits.
 6. **Feature-flag or entitlement resolution engine**
    - Compute effective access from plans, flags, and org/user overrides.
-7. **Schema compatibility and migration impact checker**
+7. **Schema compatibility / evolution impact checker**
    - Track which downstream contracts break when one schema evolves.
 8. **Derived analytics metric compiler**
    - Incrementally compile metric definitions and dependency expansions.
@@ -311,10 +312,30 @@ This project now assumes a free-threaded CPython baseline and aligns with state-
 
 ## Running tests
 
+CI runs the main suite with performance tests excluded (they are executed in separate steps). Match that locally:
+
 ```bash
+export PYTHON_GIL=0   # Windows: set PYTHON_GIL=0
 python3.14t -m pip install -e ".[dev]"
-python -c "import sys, sysconfig; print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
-pytest -q
+python3.14t -c "import sys, sysconfig; print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
+python3.14t -m pytest -q \
+  --ignore=tests/test_performance.py \
+  --cov=src/cascade \
+  --cov-branch \
+  --cov-report=term-missing \
+  --cov-fail-under=95
+```
+
+Then enforce branch coverage (CI runs an equivalent check on `coverage.json`):
+
+```bash
+python3.14t - <<'PY'
+import json
+with open("coverage.json", encoding="utf-8") as fh:
+    b = json.load(fh)["totals"]["percent_branches_covered"]
+print(f"branch coverage: {b:.2f}%")
+assert b >= 90.0
+PY
 ```
 
 Run the stateful invariant fuzz test directly:
@@ -386,6 +407,11 @@ This writes:
 
 CI executes the same suite on each build and uploads the report as an artifact named `performance-report`.
 
+The **`compute-many-parallel-speedup`** scenario (and `tests/test_performance.py::test_compute_many_parallel_speedup_scenario`) is the most CPU-scheduler-sensitive check. CI runs it in an isolated step after the main test job. On underpowered laptops or busy VMs the threshold can fail without indicating a regression. Mitigations for local runs:
+
+- Re-run the single test a few times, or set **`CASCADE_QUERY_PARALLEL_PERF_RETRIES`** to a small integer (for example `3`); each attempt re-runs the scenario before failing.
+- To skip this scenario entirely while iterating on other work, set **`CASCADE_QUERY_SKIP_PARALLEL_PERF=1`** (CI does not set this).
+
 ### Nightly long-running performance workflow
 
 A separate GitHub Actions workflow (`.github/workflows/nightly-performance.yml`) runs a longer perf sweep on a nightly schedule (and on demand via `workflow_dispatch`):
@@ -409,14 +435,13 @@ Some of the heaviest graph and concurrency scenarios are marked `@pytest.mark.sl
 Internal-invariant checks are intentionally centralized in
 `tests/test_internal_invariants.py`. This keeps private-engine coupling minimal
 while preserving a focused safety net for internal consistency.
-Invariant-oriented internal probes now flow through a single private object
-(`engine._internals`), while older private attributes remain compatibility
-aliases during migration.
+Invariant-oriented internal probes flow through a single private object
+(`engine._internals`).
 
-Run default CI-equivalent tests:
+Run default CI-equivalent tests (skips `@pytest.mark.slow` via `pyproject.toml`, and ignores `tests/test_performance.py` like the main CI pytest step):
 
 ```bash
-pytest -q
+PYTHON_GIL=0 python3.14t -m pytest -q --ignore=tests/test_performance.py
 ```
 
 Run only slow scale/stress tests locally:

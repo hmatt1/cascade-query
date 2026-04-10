@@ -76,7 +76,7 @@ class EngineStateMachine(RuleBasedStateMachine):
     def _sync_from_engine(self) -> None:
         self._revision = self.engine.revision
         rebuilt: dict[tuple[str, tuple[int, ...]], list[tuple[int, int | None]]] = {}
-        for (input_id, args), versions in self.engine._inputs.items():  # noqa: SLF001
+        for (input_id, args), versions in self.engine._internals.inputs.items():  # noqa: SLF001
             name = self._id_to_name.get(input_id)
             if name is None:
                 continue
@@ -192,7 +192,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         self.engine.load(str(self._state_db))
         self._sync_from_engine()
         assert self.engine.revision == self._revision
-        assert self.engine._in_flight == {}  # noqa: SLF001
+        assert self.engine._internals.in_flight == {}  # noqa: SLF001
         for index in sorted(self._observed_indexes)[:3]:
             assert self.choose(index) == self._expected_choose(index, self._revision)
 
@@ -207,7 +207,7 @@ class EngineStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def in_flight_map_is_empty_after_operations(self) -> None:
-        assert self.engine._in_flight == {}  # noqa: SLF001
+        assert self.engine._internals.in_flight == {}  # noqa: SLF001
 
 
 TestEngineStateMachine = EngineStateMachine.TestCase

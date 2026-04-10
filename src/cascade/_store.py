@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import concurrent.futures
+import heapq
 import threading
 import time
 from collections import defaultdict, deque
@@ -27,6 +28,8 @@ class GraphStore:
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
         self.in_flight: dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]] = {}
+        # Lazy min-heap (last_access, key); stale entries removed on pop (touches push new tuples).
+        self._lru_heap: list[tuple[int, QueryKey]] = []
 
     def register_query(self, query_id: str, fn: Callable[..., Any]) -> None:
         with self.lock:
@@ -49,15 +52,18 @@ class GraphStore:
             self.trace.clear()
 
     def trace_event(self, event: str, key: QueryKey, detail: str = "") -> None:
-        self.trace.append(
-            TraceEvent(
-                event=event,
-                key=self.key_to_str(key),
-                revision=self.revision,
-                detail=detail,
-                timestamp=time.time(),
+        # Must synchronize with readers/writers of `trace` and with `revision`
+        # (recorded on each event). Evaluator paths invoke this from many threads.
+        with self.lock:
+            self.trace.append(
+                TraceEvent(
+                    event=event,
+                    key=self.key_to_str(key),
+                    revision=self.revision,
+                    detail=detail,
+                    timestamp=time.time(),
+                )
             )
-        )
 
     def key_to_str(self, key: QueryKey) -> str:
         kind, fid, args = key
@@ -70,6 +76,13 @@ class GraphStore:
         memo = self.memos[key]
         self.next_access_id += 1
         memo.last_access = self.next_access_id
+        heapq.heappush(self._lru_heap, (memo.last_access, key))
+
+    def push_memo_lru_locked(self, key: QueryKey) -> None:
+        memo = self.memos.get(key)
+        if memo is None:
+            return
+        heapq.heappush(self._lru_heap, (memo.last_access, key))
 
     def drop_memo_locked(self, key: QueryKey) -> None:
         memo = self.memos.pop(key, None)
@@ -83,11 +96,29 @@ class GraphStore:
             if not dependents:
                 self.dependents.pop(dep.key, None)
 
+    def _rebuild_lru_heap_locked(self) -> None:
+        self._lru_heap = [(memo.last_access, k) for k, memo in self.memos.items()]
+        heapq.heapify(self._lru_heap)
+
+    def _pop_lru_victim_key_locked(self) -> QueryKey | None:
+        while self._lru_heap:
+            last_acc, key = heapq.heappop(self._lru_heap)
+            memo = self.memos.get(key)
+            if memo is None or memo.last_access != last_acc:
+                continue
+            return key
+        return None
+
     def evict_if_needed_locked(self) -> None:
         while len(self.memos) > self.max_entries:
-            oldest_key = min(self.memos.items(), key=lambda it: it[1].last_access)[0]
-            self.trace_event("evict", oldest_key, "lru")
-            self.drop_memo_locked(oldest_key)
+            victim = self._pop_lru_victim_key_locked()
+            if victim is None:
+                self._rebuild_lru_heap_locked()
+                victim = self._pop_lru_victim_key_locked()
+            if victim is None:
+                victim = min(self.memos.items(), key=lambda it: it[1].last_access)[0]
+            self.trace_event("evict", victim, "lru")
+            self.drop_memo_locked(victim)
 
     def latest_input_version(self, input_key: InputKey) -> InputVersion | None:
         versions = self.inputs.get(input_key)
@@ -185,6 +216,7 @@ class GraphStore:
             # In-flight dedup futures are process-local/transient and should never
             # survive a load boundary.
             self.in_flight.clear()
+            self._rebuild_lru_heap_locked()
 
     def make_persistence_payload(self) -> dict[str, Any]:
         with self.lock:

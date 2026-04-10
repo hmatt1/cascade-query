@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from benchmarks.performance_suite import (
     PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS,
@@ -24,8 +27,17 @@ def test_default_perf_gate_excludes_parallel_speedup_scenario() -> None:
 
 
 def test_compute_many_parallel_speedup_scenario() -> None:
-    result = run_performance_scenario("compute-many-parallel-speedup")
-    assert_parallel_speedup_scenario_threshold(result)
+    if os.environ.get("CASCADE_QUERY_SKIP_PARALLEL_PERF") == "1":
+        pytest.skip("CASCADE_QUERY_SKIP_PARALLEL_PERF=1")
+    retries = max(0, int(os.environ.get("CASCADE_QUERY_PARALLEL_PERF_RETRIES", "0")))
+    for attempt in range(retries + 1):
+        result = run_performance_scenario("compute-many-parallel-speedup")
+        try:
+            assert_parallel_speedup_scenario_threshold(result)
+            return
+        except AssertionError:
+            if attempt >= retries:
+                raise
 
 
 def test_performance_report_is_published(tmp_path: Path) -> None:

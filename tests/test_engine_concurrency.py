@@ -154,11 +154,11 @@ def test_input_set_bumps_cancel_epoch_by_default() -> None:
         return 0
 
     # Default input writes are the cancellation boundary for in-flight work.
-    before = engine._cancel_epoch  # noqa: SLF001
+    before = engine._internals.cancel_epoch  # noqa: SLF001
     source.set(1)
-    assert engine._cancel_epoch == before + 1  # noqa: SLF001
+    assert engine._internals.cancel_epoch == before + 1  # noqa: SLF001
     source.set(2)
-    assert engine._cancel_epoch == before + 2  # noqa: SLF001
+    assert engine._internals.cancel_epoch == before + 2  # noqa: SLF001
 
 
 def test_submit_replays_effects_on_cache_hit() -> None:

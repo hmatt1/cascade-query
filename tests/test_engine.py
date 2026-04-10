@@ -374,8 +374,9 @@ def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
     # Empty dispatch is explicitly supported.
     assert engine.compute_many([]) == []
 
-    # submit() without an external executor takes the owned-executor path.
+    # submit() without an external executor uses a lazily created shared pool.
     assert engine.submit(plus_one, 3).result(timeout=2.0) == 7
+    engine.shutdown()
 
     # clear_traces() resets the event buffer.
     assert engine.traces()
@@ -395,6 +396,29 @@ def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
     # prune() tolerates unreachable roots and keeps memo graph consistent.
     run_prune_with_timeout(engine, [("query", plus_one.id, (999,))], timeout=0.5)
     assert isinstance(engine.inspect_graph(), dict)
+
+
+def test_submit_without_executor_reuses_shared_thread_pool() -> None:
+    engine = Engine()
+
+    @engine.input
+    def n() -> int:
+        return 0
+
+    @engine.query
+    def q() -> int:
+        return n() + 1
+
+    n.set(1)
+    first = engine.submit(q)
+    first.result(timeout=2.0)
+    pool = engine._submit_executor  # noqa: SLF001
+    assert pool is not None
+    second = engine.submit(q)
+    second.result(timeout=2.0)
+    assert engine._submit_executor is pool  # noqa: SLF001
+    engine.shutdown()
+    assert engine._submit_executor is None  # noqa: SLF001
 
 
 def test_input_set_with_keyword_value_and_no_positional_value() -> None:
