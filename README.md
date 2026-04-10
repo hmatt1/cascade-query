@@ -6,45 +6,88 @@
   <a href="https://pypi.org/project/query-cascade/"><img alt="Distribution format" src="https://img.shields.io/pypi/wheel/query-cascade?color=4CAF50"></a>
 </p>
 
-**Releases:** https://pypi.org/project/query-cascade/
+**PyPI:** [query-cascade](https://pypi.org/project/query-cascade/)
 
-`cascade-query` is a minimal, demand-driven incremental computation framework for Python.
+**Cascade Query** is a small Python library for incremental, on-demand computation. You write normal functions; the engine figures out what depends on what, caches results, and recomputes only what changed.
 
-## Windows setup (free-threaded Python + PyPI install)
+It fits the same mental space as a build system or an IDE’s analysis pipeline: lots of derived values, inputs that change in small steps, and a graph of steps you do not want to rerun from scratch every time.
 
-`query-cascade` targets **free-threaded CPython**. On Windows, install the free-threaded build first, then install from PyPI.
+---
 
-1. Install free-threaded Python 3.14 from https://www.python.org/downloads/windows/
-   - Use the installer entry that includes **free-threaded** (`python3.14t` / launcher target `-3.14t`).
-   - If using the standard installer, ensure the free-threaded binaries option is enabled.
-2. Install the latest `query-cascade` globally:
+## What you get
+
+| Capability | What it means in practice |
+|------------|---------------------------|
+| **Lazy evaluation** | Nothing runs until something asks for a result. |
+| **Dependency tracking** | The engine records which queries read which inputs and other queries. |
+| **Targeted invalidation** | After a change, only downstream work that is still needed gets redone. |
+| **Deduplication** | Identical in-flight requests share one computation. |
+| **Snapshots** | Readers can pin a consistent view while inputs keep moving. |
+| **Background work** | Submit work in the background; stale work can be cancelled safely. |
+| **Replayable side effects** | Effects recorded through **accumulators** replay on cache hits so diagnostics stay consistent. |
+| **Save / load** | Persist graph and cache state (SQLite-backed API below). |
+| **Inspection** | Inspect the graph and trace events for debugging. |
+
+---
+
+## Quickstart
+
+```python
+from cascade import Engine
+
+engine = Engine()
+
+@engine.input
+def text() -> str:
+    return ""
+
+@engine.query
+def lint_count() -> int:
+    return text().count("TODO")
+
+text.set("TODO: one\nTODO: two")
+assert lint_count() == 2
+
+# Same value → no need to recompute downstream work.
+text.set("TODO: one\nTODO: two")
+assert lint_count() == 2
+```
+
+---
+
+## Install (free-threaded Python)
+
+The library targets **free-threaded CPython 3.14** so CPU-bound parallel work can scale without fighting the GIL. The package itself is **pure Python**; what matters is the interpreter you run with.
+
+### Windows
+
+1. Install **free-threaded** Python 3.14 from [python.org/downloads/windows](https://www.python.org/downloads/windows/)  
+   - Look for the build that includes **free-threaded** (`python3.14t` / `py -3.14t`).  
+   - In the full installer, enable the free-threaded binaries option if needed.
+
+2. Install from PyPI:
 
 ```powershell
 py -3.14t -m pip install -U query-cascade
 ```
 
-3. Verify the setup (import works + free-threaded runtime with GIL disabled):
+3. Confirm import and GIL-off mode (example):
 
 ```powershell
 py -3.14t -X gil=0 -c "import cascade, sys, sysconfig; print('cascade import ok from', cascade.__file__); print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
 ```
 
-Expected verification output includes:
-- `Py_GIL_DISABLED= 1`
-- `GIL enabled? False`
+You want to see `Py_GIL_DISABLED= 1` and `GIL enabled? False` when exercising the free-threaded + no-GIL path.
 
-It is designed for compiler-like workloads where you want:
+### Editable install (from this repo)
 
-- lazy pull-based evaluation
-- precise dependency tracking
-- red-green early bailout (backdating)
-- query dedup across concurrent callers
-- snapshot isolation for concurrent reads
-- safe cancellation of obsolete background work
-- side-effect replay on cache hits
-- persistence + graph inspection
+```bash
+python3.14t -m pip install -e ".[dev]"
+```
 
-## Minimal API
+---
+
+## Minimal API example
 
 ```python
 from cascade import Engine
@@ -65,168 +108,100 @@ def symbols(file_id: str) -> tuple[str, ...]:
     return tuple(row.split("=")[0].strip() for row in parse(file_id))
 ```
 
-### Primitives
+### API surface (cheat sheet)
 
-- `engine.input(fn)`  
-  Wraps mutable roots. Use `.set(...)` to create new revisions.
-- `engine.query(fn)`  
-  Wraps pure demand-driven queries with memoization and dependency capture.
-- `engine.accumulator(name)`  
-  Creates thread-safe side-effect channels replayed on cache hits.
-- `engine.snapshot()`  
-  Captures an immutable read view (`Snapshot`) for MVCC-like isolation.
-- `engine.submit(query, *args, snapshot=...)`  
-  Runs a query in the background with cancellation if inputs mutate.
-- `engine.compute_many([(query, args), ...], workers=N)`  
-  Multi-threaded execution with a work-stealing scheduler.
-- `engine.inspect_graph()` / `engine.traces()`  
-  Introspection hooks for diagnostics.
-- `engine.save(path)` / `engine.load(path)`  
-  Persist or recover graph/cached state from SQLite.
-- `engine.prune(roots)`  
-  Garbage-collect memoized subgraphs not reachable from roots.
+- **`engine.input(fn)`** — Mutable roots; call **`.set(...)`** to publish new revisions.
+- **`engine.query(fn)`** — On-demand queries with memoization; dependencies are captured automatically.
+- **`engine.accumulator(name)`** — Thread-safe channel for side effects that the engine **replays on cache hits**.
+- **`engine.snapshot()`** — Immutable read view (`Snapshot`) for snapshot-style isolation.
+- **`engine.submit(query, *args, snapshot=...)`** — Background execution; work can be **cancelled** if inputs move on (`QueryCancelled`).
+- **`engine.compute_many([(query, args), ...], workers=N)`** — Parallel run with a work-stealing scheduler.
+- **`engine.inspect_graph()` / `engine.traces()`** — Graph and trace introspection.
+- **`engine.save(path)` / `engine.load(path)`** — Persist or restore state (SQLite).
+- **`engine.prune(roots)`** — Drop memoized nodes not reachable from the given roots.
 
-## Design Notes
+---
 
-### What this framework guarantees
+## Guarantees (the short version)
 
-- **Smart recalculation**: only stale demand paths recompute.
-- **Selective updates**: unchanged parents remain green after child backdating.
-- **Query deduplication**: one in-flight compute serves all identical concurrent requests.
-- **Cycle detection**: recursive query cycles raise `CycleError`.
-- **Cancellation**: stale background queries raise `QueryCancelled`.
+- **Incremental updates:** Stale paths recompute; work that is still valid is reused.
+- **Selective invalidation:** When a child signals “unchanged,” parents can stay valid without redoing everything above (the engine’s red/green style early bailout).
+- **One compute, many waiters:** Concurrent identical requests share a single in-flight run.
+- **Cycles:** Recursive query cycles raise **`CycleError`** (there is no fixed-point solver in core).
+- **Stale background work:** Obsolete background queries raise **`QueryCancelled`**.
 
-### Limitations and enforceability boundaries
+---
 
-- **Free-threaded runtime requirement**: this project targets free-threaded CPython (`3.14t`) with runtime GIL disabled. If a non-free-threaded interpreter is used, or if imported extensions force GIL re-enable, CPU-bound parallel scaling will degrade.
-  - **Publish/build environment vs runtime compatibility**: publishing wheels/sdists from a non-free-threaded interpreter does not, by itself, prevent installation or execution on free-threaded CPython. Compatibility is determined at install/runtime by the interpreter and dependency stack. This package is pure Python, so there is no extension ABI lock to a specific GIL mode.
-- **Process-level durability model**: persistence is an explicit point-in-time snapshot (`save`/`load`), not a transactional WAL-backed MVCC store shared by multiple live processes.
-- **Persistence trust boundary**: snapshots are canonical JSON with a versioned envelope (`format` in `src/cascade/_serde.py`). Decoding resolves recorded Python types via `importlib` (same trust model as loading structured data that names types). Only `load` files from trusted sources; treat them like code or pickle from an untrusted writer. The format version can be bumped when breaking changes require rejecting older files; there is no cryptographic signing layer in the library.
-- **Boundary of side-effect replay guarantees**: replay is guaranteed only for effects emitted through `Accumulator`; out-of-band side effects in query bodies (printing, network calls, filesystem writes) are intentionally not replayed.
-- **Cycle handling scope**: direct and long-chain dynamic query cycles are detected and raised as `CycleError`; this engine does not implement fixed-point solvers for cyclic dataflow.
+## Limitations (read before you bet the farm)
 
-### What this framework intentionally does not include
+- **Interpreter:** Best results for parallel CPU work come from **free-threaded 3.14** with the GIL disabled at runtime. Other interpreters work for correctness, but threaded speedups may disappoint. Building or publishing the package from a non-free-threaded Python does not block users on free-threaded Python—there is no native extension ABI tied to GIL mode.
+- **Persistence:** `save` / `load` are **point-in-time snapshots**, not a multi-process transactional store with WAL semantics.
+- **Trust `load` like code:** Snapshots use versioned JSON; types are resolved via **`importlib`**. Only load files from sources you trust (similar caution to pickle or “data that names types”).
+- **Side effects:** Only effects sent through **`Accumulator`** are replayed. Prints, network I/O, or writes inside query bodies are **not** magically replayed.
+- **Cycles:** Dynamic cycles are detected and rejected; cyclic dataflow is **not** solved to a fixed point inside this library.
 
-To keep API surface minimal, this version does not include:
+### Deliberately out of scope (for a small core)
 
-- nominal interning APIs (`@interned`) and tracked structs (`@tracked`)
-- fixed-point cycle solvers
-- distributed/shared cache protocols
+- Nominal interning (`@interned`), tracked structs (`@tracked`)
+- Fixed-point solvers for cyclic graphs
+- Distributed or shared cache protocols
 
-Those can be layered on top without changing the core query model.
+You can add these on top of the same query model if you need them.
 
-## Use-case fit checklist
+---
 
-Use this checklist to decide if a problem is a strong fit for `query-cascade`.
-The best candidates are graph-shaped, mostly pure computations that run often on
-mostly stable state.
+## Is this a good fit? (checklist)
 
-Mark each item Yes/No:
+Strong fits look like **graphs of mostly pure steps** over **inputs that change a little at a time**, with **expensive recomputation** if you always recompute everything.
 
-1. **Graph-shaped derivation:** Can the logic be represented as inputs feeding
-   derived queries (`A -> B -> C`)?
-2. **Mostly pure compute:** Are derived results mostly pure functions of
-   tracked inputs (with minimal out-of-band side effects)?
-3. **High read repetition:** Are the same queries asked repeatedly?
-4. **Small incremental writes:** Do inputs usually change in small increments
-   instead of full replacement each run?
-5. **Expensive recompute cost:** Is full recomputation meaningfully expensive?
-6. **Need precise invalidation:** Do you need to recompute only affected
-   downstream nodes?
-7. **Concurrency overlap:** Do concurrent callers often request identical keys?
-8. **Snapshot consistency need:** Do some callers need a stable point-in-time
-   view while writes continue?
-9. **Stale background work risk:** Do background computations become obsolete
-   when new writes arrive?
-10. **Debug/explainability need:** Is it useful to inspect why recomputation,
-    cache hits, or invalidation happened?
+Answer Yes/No:
 
-Interpretation:
+1. Can you express the logic as **inputs → derived queries** (`A → B → C`)?
+2. Are derived values **mostly pure** functions of tracked inputs (side effects routed through accumulators)?
+3. Do you **ask the same queries repeatedly**?
+4. Do inputs usually change in **small increments** rather than full replacement every time?
+5. Is a **full recompute** noticeably expensive?
+6. Do you need **precise invalidation** (only affected downstream nodes)?
+7. Do concurrent callers often request the **same keys**?
+8. Do some readers need a **stable snapshot** while writes continue?
+9. Can **background** work become **waste** when new writes land?
+10. Would **graph/tracing** help you debug cache hits and invalidation?
 
-- **9-10 Yes:** excellent fit
-- **7-8 Yes:** strong fit
-- **5-6 Yes:** possible fit; validate with a small prototype
-- **0-4 Yes:** likely not the right abstraction
+**Rough read:** 9–10 Yes → excellent · 7–8 → strong · 5–6 → try a spike · 0–4 → probably not this abstraction.
 
-### Specific problems that pass this checklist
+### Problems that usually score high
 
-The following concrete problems are typically excellent fits (9-10 Yes):
+- Incremental IDE analysis (parse, index, diagnostics, code actions)
+- Monorepo “what tests ran” / impact planners
+- Incremental static analysis or security scanning
+- Compilers / DSL pipelines with live diagnostics and warning replay
+- Policy-as-code over IaC (re-eval only what changed)
+- Feature flags / entitlements from layered config
+- Schema evolution impact
+- Derived metrics / analytics compilers
+- Build or asset graphs
+- Rules engines with heavy duplicate concurrent requests
 
-1. **Incremental IDE analysis pipeline**
-   - Parse, symbol index, type diagnostics, code actions per edited file.
-2. **Monorepo impacted-test planner**
-   - Compute the minimal set of tests/checks affected by a PR diff.
-3. **Incremental static analyzer/security scanner**
-   - Recompute findings only for changed code and affected dependents.
-4. **Compiler or DSL transpiler with live diagnostics**
-   - Reuse parse/lowering/type stages and replay warnings on cache hits.
-5. **Policy-as-code evaluator for IaC changes**
-   - Re-evaluate only impacted resources/rules after config edits.
-6. **Feature-flag or entitlement resolution engine**
-   - Compute effective access from plans, flags, and org/user overrides.
-7. **Schema compatibility / evolution impact checker**
-   - Track which downstream contracts break when one schema evolves.
-8. **Derived analytics metric compiler**
-   - Incrementally compile metric definitions and dependency expansions.
-9. **Asset/build graph incremental planner**
-   - Rebuild only outputs impacted by source, config, or toolchain changes.
-10. **Large rules engine with concurrent duplicate requests**
-    - Deduplicate in-flight computation for identical rule evaluations.
+---
 
-## Quickstart
+## Examples (in `examples/`)
 
-```python
-from cascade import Engine
+| Script | What it shows |
+|--------|----------------|
+| `compiler_pipeline.py` | `source → parse → symbols → typecheck`, warnings accumulator, cache-hit narration |
+| `dynamic_macro_expansion.py` | Query that **changes downstream dependencies** at runtime |
+| `snapshot_isolation.py` | Snapshot reads while live inputs change |
+| `concurrent_background_work.py` | Dedup under concurrency + cancellation after input changes |
+| `persistence_and_inspection.py` | Save/load and graph summaries |
+| `gil_parallel_speedup.py` | Threaded CPU benchmark: GIL vs free-threaded |
 
-engine = Engine()
-
-@engine.input
-def text() -> str:
-    return ""
-
-@engine.query
-def lint_count() -> int:
-    value = text()
-    return value.count("TODO")
-
-text.set("TODO: one\nTODO: two")
-assert lint_count() == 2
-
-# No recompute needed if input did not semantically change.
-text.set("TODO: one\nTODO: two")
-assert lint_count() == 2
-```
-
-## Examples
-
-- `examples/compiler_pipeline.py`  
-  Tiny compiler pipeline (`source -> parse -> symbol_names -> typecheck`) with warnings accumulator and cache-hit narration.
-- `examples/dynamic_macro_expansion.py`  
-  Runtime macro-expansion query that dynamically changes downstream graph dependencies.
-- `examples/snapshot_isolation.py`  
-  Demonstrates immutable snapshot reads while live inputs continue to change.
-- `examples/concurrent_background_work.py`  
-  Shows concurrent deduplicated query execution plus stale background cancellation after input mutation.
-- `examples/persistence_and_inspection.py`  
-  Saves engine state, loads it into a new engine, and inspects memo/input graph summaries.
-- `examples/gil_parallel_speedup.py`  
-  Benchmarks CPU-bound threaded work so you can compare `python3.14` (GIL) vs `python3.14t` (free-threaded).
-
-### Running examples
-
-Install package + test dependencies once:
-
-```bash
-python3.14t -m pip install -e ".[dev]"
-```
-
-Run a single example:
+Run one:
 
 ```bash
 python3.14t examples/compiler_pipeline.py
 ```
 
-Run all examples:
+Run all (Unix-style shell):
 
 ```bash
 for example in examples/*.py; do
@@ -235,62 +210,38 @@ for example in examples/*.py; do
 done
 ```
 
-Examples print step-by-step narration while they run so you can follow each behavior they demonstrate.
+Examples print narration as they run so you can follow each behavior.
 
-### Compare `python3.14` vs free-threaded performance
+### Compare GIL vs free-threaded (same machine)
 
-Install both interpreters so you can run the same benchmark twice:
-
-- **CPython 3.14 (with GIL):** `python3.14`
-- **Free-threaded CPython 3.14:** `python3.14t`
-
-Example install on Ubuntu (deadsnakes):
+Install both **3.14** and **3.14t** if you want apples-to-apples. On Ubuntu (deadsnakes):
 
 ```bash
 sudo add-apt-repository ppa:deadsnakes/ppa
 sudo apt update
 sudo apt install -y python3.14 python3.14-venv python3.14t python3.14t-venv
-```
-
-Install this project for both interpreters:
-
-```bash
 python3.14 -m pip install -e .
 python3.14t -m pip install -e .
 ```
 
-Quick run (same free-threaded interpreter, toggle runtime GIL mode):
+Quick check on free-threaded build:
 
 ```bash
 python3.14t -c "import sys, sysconfig; print('Py_GIL_DISABLED=', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled?', sys._is_gil_enabled())"
+```
+
+Same interpreter, toggle GIL at runtime:
+
+```bash
 PYTHON_GIL=1 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
 PYTHON_GIL=0 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
 ```
 
-Alternative (compare separate interpreter builds directly):
+Or compare `python3.14` vs `PYTHON_GIL=0 python3.14t` on the same script.
 
-```bash
-python3.14 examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
-PYTHON_GIL=0 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96 --rounds 300000 --repeats 5
-```
+Compare **`median parallel seconds`** (lower is better) and **`threaded speedup in this runtime`** (higher is better). Keep args identical, reduce background load, and use `--repeats` (e.g. `5`) to smooth noise. On multi-core machines, **free-threaded + GIL off** usually wins clearly for this CPU-bound demo.
 
-Compare these lines from each run:
-
-- `median parallel seconds`
-- `threaded speedup in this runtime`
-
-Interpretation:
-
-- lower `median parallel seconds` is better
-- higher `threaded speedup in this runtime` is better
-
-Benchmark hygiene tips:
-
-- keep arguments identical between runs
-- run with minimal background CPU load
-- use `--repeats` (for example `5`) to reduce noise
-
-On multi-core hardware, free-threaded CPython with `PYTHON_GIL=0` should usually show substantially better threaded speedup for this CPU-bound workload.
+---
 
 ## Persistence and inspection
 
@@ -302,17 +253,17 @@ for event in engine.traces():
     print(event.event, event.key, event.detail)
 ```
 
-## Analysis review of the uploaded notes
+---
 
-This project now assumes a free-threaded CPython baseline and aligns with state-of-the-art incremental systems:
+## Design stance
 
-- Correct: pull-based demand, red-green early bailout, dependency graph capture, dedup, MVCC snapshots, cancellation, side-effect replay, tracing, and persistence.
-- CPU-bound parallelism is expected on multi-core hardware when running with free-threaded CPython and GIL disabled.
-- Overreach for this minimal implementation: unsafe-pointer lifetime tricks, red/green syntax tree internals, and fixed-point cycle solving are advanced optimizations that are not required for a practical minimal API.
+The core is intentionally minimal: **pull-based** evaluation, dependency capture, red/green style bailout, dedup, snapshots, cancellation, accumulator replay, tracing, and persistence. That set is enough for many real pipelines without baking in advanced internals (e.g. fixed-point cycle solving or custom AST red/green structures). CPU-bound parallelism is expected to matter when you use **free-threaded CPython with the GIL disabled**.
 
-## Running tests
+---
 
-CI runs the main suite with performance tests excluded (they are executed in separate steps). Match that locally:
+## Development
+
+### Tests (match main CI)
 
 ```bash
 export PYTHON_GIL=0   # Windows: set PYTHON_GIL=0
@@ -326,7 +277,7 @@ python3.14t -m pytest -q \
   --cov-fail-under=95
 ```
 
-Then enforce branch coverage (CI runs an equivalent check on `coverage.json`):
+Branch coverage check (CI uses an equivalent step on `coverage.json`):
 
 ```bash
 python3.14t - <<'PY'
@@ -338,127 +289,96 @@ assert b >= 90.0
 PY
 ```
 
-Run the stateful invariant fuzz test directly:
+Stateful fuzz:
 
 ```bash
 PYTHON_GIL=0 python3.14t -m pytest -q tests/test_stateful_engine_invariants.py
 ```
 
-Run mutation testing (test-strength check):
+Mutation testing:
 
 ```bash
 PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut run
 PATH="$HOME/.local/bin:$PATH" PYTHON_GIL=0 mutmut results
 ```
 
-Use the `mutmut` CLI entrypoint (`mutmut run`) instead of `python -m mutmut run`.
-
-Run a practical local mutation loop with bounded workers:
+Use the `mutmut` CLI (`mutmut run`), not `python -m mutmut run`. Bounded local loop:
 
 ```bash
 PYTHON_GIL=0 MUTMUT_MAX_CHILDREN=2 ./scripts/mutation_fast.sh
 ```
 
-Run a focused mutation loop for selected high-value mutants:
+Focused mutants:
 
 ```bash
 PYTHON_GIL=0 MUTMUT_MAX_CHILDREN=2 ./scripts/mutation_fast.sh "<mutant-name>" "<mutant-name>"
 ```
 
-See `docs/mutation_triage.md` for current survivor triage and follow-ups.
+See `docs/mutation_triage.md` for survivor triage.
 
-## Lightweight formal model checks
+### Formal model (TLA+)
 
-A compact TLA+ model for core invariants lives in `docs/formal/`:
+Specs live under `docs/formal/`:
 
 - `docs/formal/cascade_core.tla`
 - `docs/formal/cascade_core.cfg`
 
-Run TLC:
+Run TLC (example):
 
 ```bash
 java -cp tla2tools.jar tlc2.TLC docs/formal/cascade_core.tla -config docs/formal/cascade_core.cfg
 ```
 
-The checked invariants cover snapshot consistency, active-dependency validity
-(red-green alignment), and cancellation epoch monotonicity.
+Checked properties include snapshot consistency, active-dependency validity (red/green alignment), and cancellation epoch monotonicity.
 
-## Performance checks and report
+### Performance suite
 
-Performance-sensitive behavior in this project is concentrated around:
-
-- cache-hit verification (green-path checks) versus full recomputation cost
-- concurrent query deduplication under contention
-- scheduler throughput for `compute_many` on free-threaded CPU workloads
-- giant-graph targeted mutation latency versus full rebuild latency
-- mark-green verification overhead as dependency depth grows
-- prune runtime scaling from small to large graphs
-
-Run the performance suite locally:
+Heavy behavior clusters around cache hits vs full recompute, concurrent dedup, `compute_many` throughput on free-threaded workloads, large-graph mutation vs rebuild, mark-green cost vs depth, and prune scaling.
 
 ```bash
 python -m benchmarks.performance_suite --report-dir artifacts/performance --assert-thresholds
 ```
 
-This writes:
+Outputs:
 
 - `artifacts/performance/performance-report.json`
 - `artifacts/performance/performance-report.md`
 
-CI executes the same suite on each build and uploads the report as an artifact named `performance-report`.
+CI runs the same suite and uploads **`performance-report`**.
 
-The **`compute-many-parallel-speedup`** scenario (and `tests/test_performance.py::test_compute_many_parallel_speedup_scenario`) is the most CPU-scheduler-sensitive check. CI runs it in an isolated step after the main test job. On underpowered laptops or busy VMs the threshold can fail without indicating a regression. Mitigations for local runs:
+The **`compute-many-parallel-speedup`** scenario (and `tests/test_performance.py::test_compute_many_parallel_speedup_scenario`) is sensitive to CPU scheduling. On a busy laptop or small VM, thresholds may flap without a real regression. Mitigations:
 
-- Re-run the single test a few times, or set **`CASCADE_QUERY_PARALLEL_PERF_RETRIES`** to a small integer (for example `3`); each attempt re-runs the scenario before failing.
-- To skip this scenario entirely while iterating on other work, set **`CASCADE_QUERY_SKIP_PARALLEL_PERF=1`** (CI does not set this).
+- Re-run the test, or set **`CASCADE_QUERY_PARALLEL_PERF_RETRIES`** (e.g. `3`).
+- To skip while iterating: **`CASCADE_QUERY_SKIP_PARALLEL_PERF=1`** (CI does not set this).
 
-### Nightly long-running performance workflow
+**Nightly:** `.github/workflows/nightly-performance.yml` runs a longer sweep (e.g. 8 runs) and publishes **`nightly-performance-report`**.
 
-A separate GitHub Actions workflow (`.github/workflows/nightly-performance.yml`) runs a longer perf sweep on a nightly schedule (and on demand via `workflow_dispatch`):
+### Scale and stress tests
 
-- executes the performance suite repeatedly (currently 8 runs) to improve signal quality
-- emits an aggregated summary and artifact bundle (`nightly-performance-report`)
+`tests/test_scale_behavior.py` covers large-graph invalidation, dynamic dependency churn, prune stress, persistence at scale, eviction under churn, and mixed concurrency (`submit` + `compute_many` + writes). The heaviest cases are marked **`@pytest.mark.slow`**; default `pytest` skips them via `pyproject.toml`.
 
-## Scale and stress test categories
+Internal invariants are concentrated in `tests/test_internal_invariants.py` (via `engine._internals`) to limit coupling while keeping safety checks.
 
-The test suite now includes scale-focused correctness tests in `tests/test_scale_behavior.py`:
-
-- giant graph selective invalidation with recompute-count assertions
-- dynamic dependency churn (stale edge cleanup and consistency checks)
-- prune stress (large memo graphs with narrow retention roots)
-- persistence round-trip at scale (post-load cache-hit behavior)
-- eviction policy behavior under heavy churn
-- mixed concurrency stress (`submit` + `compute_many` + frequent writes)
-
-Some of the heaviest graph and concurrency scenarios are marked `@pytest.mark.slow` to keep default CI deterministic and fast while still running a representative giant-graph test by default.
-
-Internal-invariant checks are intentionally centralized in
-`tests/test_internal_invariants.py`. This keeps private-engine coupling minimal
-while preserving a focused safety net for internal consistency.
-Invariant-oriented internal probes flow through a single private object
-(`engine._internals`).
-
-Run default CI-equivalent tests (skips `@pytest.mark.slow` via `pyproject.toml`, and ignores `tests/test_performance.py` like the main CI pytest step):
+Default CI-like run (no perf file, no slow):
 
 ```bash
 PYTHON_GIL=0 python3.14t -m pytest -q --ignore=tests/test_performance.py
 ```
 
-Run only slow scale/stress tests locally:
+Slow only:
 
 ```bash
 pytest -q -m slow
 ```
 
-Run all tests including slow:
+Everything including slow:
 
 ```bash
 pytest -q -m "slow or not slow"
 ```
 
-## CI best practices included
+### CI overview
 
-- GitHub Actions workflow at `.github/workflows/ci.yml`.
-- Runs on both pushes and pull requests.
-- Linting with `ruff` before tests.
-- Separate package-build job (`python -m build`) to catch packaging regressions early.
+- Workflow: `.github/workflows/ci.yml` (pushes and PRs).
+- **Ruff** before tests.
+- Separate **package build** (`python -m build`) to catch packaging issues early.
