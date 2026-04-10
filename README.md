@@ -36,21 +36,50 @@ It fits the same mental space as a build system or an IDE’s analysis pipeline:
 from cascade import Engine
 
 engine = Engine()
+calls = {"lines": 0, "mentions": 0}
 
 @engine.input
-def text() -> str:
+def doc() -> str:
     return ""
 
+@engine.input
+def needle() -> str:
+    return "TODO"
+
 @engine.query
-def lint_count() -> int:
-    return text().count("TODO")
+def lines() -> tuple[str, ...]:
+    calls["lines"] += 1
+    return tuple(line.rstrip() for line in doc().splitlines() if line.strip())
 
-text.set("TODO: one\nTODO: two")
-assert lint_count() == 2
+@engine.query
+def mentions() -> int:
+    calls["mentions"] += 1
+    n = needle().upper()
+    return sum(1 for line in lines() if n in line.upper())
 
-# Same value → no need to recompute downstream work.
-text.set("TODO: one\nTODO: two")
-assert lint_count() == 2
+@engine.query
+def report() -> str:
+    return f"{len(lines())} lines, {mentions()} matching {needle()}"
+
+needle.set("TODO")
+doc.set("# Notes\n\nShip the feature.\n\nTODO: add tests")
+assert report() == "3 lines, 1 matching TODO"
+assert calls == {"lines": 1, "mentions": 1}
+
+# Only `needle` changed — `lines()` stays cached; `mentions()` reruns.
+needle.set("SHIP")
+assert report() == "3 lines, 1 matching SHIP"
+assert calls == {"lines": 1, "mentions": 2}
+
+# `doc` changed — `lines()` runs again, then downstream queries refresh.
+doc.set("# Notes\n\nShip the feature.\n\nNothing to find")
+assert report() == "3 lines, 1 matching SHIP"
+assert calls == {"lines": 2, "mentions": 3}
+
+# Same revision as before — nothing is recomputed.
+doc.set("# Notes\n\nShip the feature.\n\nNothing to find")
+assert report() == "3 lines, 1 matching SHIP"
+assert calls == {"lines": 2, "mentions": 3}
 ```
 
 ---
@@ -87,7 +116,33 @@ python3.14t -m pip install -e ".[dev]"
 
 ---
 
-## Minimal API example
+## API reference
+
+Public symbols (all importable from `cascade`):
+
+| Name | Role |
+|------|------|
+| **`Engine`** | Graph engine: registration, evaluation, persistence, tracing. |
+| **`Accumulator`** | Named channel for side effects recorded during queries and **replayed on cache hits**. |
+| **`Snapshot`** | Immutable handle pinning a **global revision** for consistent reads. |
+| **`TraceEvent`** | One record from the in-memory trace log. |
+| **`CycleError`** | Raised when a **query cycle** is detected during evaluation. |
+| **`QueryCancelled`** | Raised when **background** work is invalidated by newer input revisions (subclass of **`CancellationError`**). |
+| **`CancellationError`** | Base class for cancellation-style failures. |
+
+```python
+from cascade import (
+    Accumulator,
+    CancellationError,
+    CycleError,
+    Engine,
+    QueryCancelled,
+    Snapshot,
+    TraceEvent,
+)
+```
+
+### Example
 
 ```python
 from cascade import Engine
@@ -108,17 +163,77 @@ def symbols(file_id: str) -> tuple[str, ...]:
     return tuple(row.split("=")[0].strip() for row in parse(file_id))
 ```
 
-### API surface (cheat sheet)
+### `Engine`
 
-- **`engine.input(fn)`** — Mutable roots; call **`.set(...)`** to publish new revisions.
-- **`engine.query(fn)`** — On-demand queries with memoization; dependencies are captured automatically.
-- **`engine.accumulator(name)`** — Thread-safe channel for side effects that the engine **replays on cache hits**.
-- **`engine.snapshot()`** — Immutable read view (`Snapshot`) for snapshot-style isolation.
-- **`engine.submit(query, *args, snapshot=...)`** — Background execution; work can be **cancelled** if inputs move on (`QueryCancelled`).
-- **`engine.compute_many([(query, args), ...], workers=N)`** — Parallel run with a work-stealing scheduler.
-- **`engine.inspect_graph()` / `engine.traces()`** — Graph and trace introspection.
-- **`engine.save(path)` / `engine.load(path)`** — Persist or restore state (SQLite).
-- **`engine.prune(roots)`** — Drop memoized nodes not reachable from the given roots.
+Constructor:
+
+- **`Engine(*, max_entries: int = 10_000, trace_limit: int = 50_000)`** — `max_entries` bounds memoized query nodes (LRU-style eviction when over capacity). `trace_limit` caps the number of **`TraceEvent`** records retained.
+
+Properties and methods:
+
+- **`revision`** *(read-only `int`)* — Monotonic counter bumped on each successful input publish; also carried on **`Snapshot`**.
+- **`input(fn) → InputHandle`** — Register **`fn`** as a **mutable root**. The decorated callable’s parameters are the key (see **Input handles**); its return value is only used as the initial value before the first **`.set`**. Dependencies from queries are tracked automatically when the body calls the handle.
+- **`query(fn) → QueryHandle`** — Register **`fn`** as a memoized query. The engine records which inputs and other queries run during each evaluation. Re-entrancy that forms a cycle raises **`CycleError`**.
+- **`accumulator(name: str) → Accumulator`** — Return a named **`Accumulator`** (see below). Names are keys in the optional **`effects`** map passed to synchronous **`QueryHandle`** calls and **`submit`**.
+- **`snapshot() → Snapshot`** — Capture **`Snapshot(revision=engine.revision)`** for use as **`snapshot=`** on reads. Reads through that snapshot see input and memo state as of that revision; live **`set`** calls do not disturb snapshot reads.
+- **`submit(query, *args, *, snapshot=None, effects=None, executor=None) → concurrent.futures.Future`** — Run **`query(*args)`** on **`executor`**, or on a **lazily created** per-engine **`ThreadPoolExecutor`** when **`executor` is `None`**. The engine captures **`cancel_epoch`** at schedule time; if inputs move on before the task runs, the future may complete with **`QueryCancelled`**. **`snapshot`** defaults to a fresh **`snapshot()`** at submit time when omitted.
+- **`compute_many(calls, *, workers=None, snapshot=None) → list[Any]`** — Run many queries in parallel with a work-stealing scheduler. **`calls`** is a sequence of **`(query_handle, args_tuple)`**. Result order matches **`calls`**. **`workers`** defaults to a sensible value from **`len(calls)`** (capped); **`workers=0`** falls back to that same default. **`snapshot`** defaults to **`snapshot()`** when omitted. There is no **`effects`** parameter on this path—use **`QueryHandle.__call__`** or **`submit`** if you need to collect accumulator output in a dict.
+- **`shutdown(*, wait: bool = True, cancel_futures: bool = False)`** — Shut down the **default** thread pool created by **`submit`**, if any. Call when discarding the engine if you need threads torn down promptly (for example in tests).
+- **`traces() → list[TraceEvent]`** — Copy of recent trace events (subject to **`trace_limit`**).
+- **`clear_traces()`** — Drop all buffered trace events.
+- **`inspect_graph() → dict[str, Any]`** — Under the store lock, summarize memoized queries: **`revision`**, **`memo_count`**, **`input_count`**, **`nodes`** (string keys for memo entries), **`edges`** as **`(parent_key, dep_key)`** pairs for recorded dependencies.
+- **`prune(roots)`** — Remove memoized **query** nodes not reachable from **`roots`**, following dependency edges backward. Each root is a **`QueryKey`**: **`("query", query_handle.id, args_tuple)`** (the same shape the engine uses internally). Unknown roots are ignored safely.
+- **`save(path: str)`** — Persist graph state (inputs, memos, dependents, trace buffer metadata, revision counters) into a **SQLite** file via a versioned JSON payload.
+- **`load(path: str)`** — Restore from **`path`**. If the table is empty or missing payload data, returns without error. Clears in-flight futures. **Only load snapshots from trusted sources** (payloads name types for **`importlib`** resolution—see **Limitations**).
+
+### Input handles
+
+Returned by **`engine.input`**. Treat as the callable you defined:
+
+- **`handle(*args, *, snapshot=None) → Any`** — Read the current value for that input key (optionally pinned to **`snapshot`**).
+- **`handle.set(*args, value)`** — Publish a new value for key **`args`**. Variants: **`handle.set(value=x)`** when the input has no key parameters, or **`handle.set(key_arg, …, value=y)`** using the keyword. The last positional argument may also be the value when **`value`** is omitted (see tests for the exact **`set`** shapes). Returns the new **`engine.revision`** after the write.
+- **`handle.id`** *(property, `str`)* — Stable string id (**`module:qualname`**) used in persistence and **`prune`** keys.
+
+### Query handles
+
+Returned by **`engine.query`**:
+
+- **`handle(*args, *, snapshot=None, effects=None) → Any`** — Run or reuse the memoized query. When **`effects`** is a **`dict`**, accumulator **`push`** calls append to **`effects[accumulator_name]`** for this evaluation (including **replayed** effects on cache hits).
+- **`handle.id`** *(property, `str`)* — Use in **`prune([("query", handle.id, args_tuple), …])`**.
+- **`handle.raw`** *(property)* — The original decorated callable (for advanced use).
+
+### `Accumulator`
+
+- **`name`** *(attribute, `str`)* — Channel name used as the key in **`effects`** dicts.
+- **`push(item)`** — Record **`item`** for the current query evaluation. **Must be called from inside a running query**; otherwise raises **`RuntimeError`**. On a memo **hit**, stored effects are **replayed** so diagnostics stay stable without re-executing the query body.
+
+### `Snapshot`
+
+Frozen dataclass:
+
+- **`revision: int`** — Global revision pinned for reads using **`snapshot=`** on inputs and queries.
+
+### `TraceEvent`
+
+Frozen dataclass (see **`traces()`**):
+
+- **`event: str`**, **`key: str`**, **`revision: int`**, **`detail: str`**, **`timestamp: float`**.
+
+### Exceptions
+
+- **`CycleError`** — Dynamic dependency graph formed a cycle; no fixed-point solver is applied.
+- **`QueryCancelled`** — Scheduled or running work was superseded; typical when reading **`Future.result()`** from **`submit`** after inputs changed.
+- **`CancellationError`** — Base type for **`QueryCancelled`**; you can catch it if you treat all cancellation the same.
+
+### Persistence and inspection (quick usage)
+
+```python
+engine.save("state.db")
+engine.load("state.db")
+print(engine.inspect_graph())
+for event in engine.traces():
+    print(event.event, event.key, event.detail)
+```
 
 ---
 
@@ -240,18 +355,6 @@ PYTHON_GIL=0 python3.14t examples/gil_parallel_speedup.py --workers 8 --tasks 96
 Or compare `python3.14` vs `PYTHON_GIL=0 python3.14t` on the same script.
 
 Compare **`median parallel seconds`** (lower is better) and **`threaded speedup in this runtime`** (higher is better). Keep args identical, reduce background load, and use `--repeats` (e.g. `5`) to smooth noise. On multi-core machines, **free-threaded + GIL off** usually wins clearly for this CPU-bound demo.
-
----
-
-## Persistence and inspection
-
-```python
-engine.save("state.db")
-engine.load("state.db")
-print(engine.inspect_graph())
-for event in engine.traces():
-    print(event.event, event.key, event.detail)
-```
 
 ---
 
