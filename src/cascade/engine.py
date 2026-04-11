@@ -3,7 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import threading
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from ._errors import CancellationError, CycleError, QueryCancelled
 from ._evaluator import Evaluator
@@ -159,9 +159,23 @@ class Engine:
         "_internals",
     )
 
-    def __init__(self, *, max_entries: int = 10_000, trace_limit: int = 50_000) -> None:
+    def __init__(
+        self,
+        *,
+        max_entries: int = 10_000,
+        trace_limit: int = 50_000,
+        stats: bool = False,
+        stats_eviction_recent_cap: int = 32,
+        stats_clock: Callable[[], float] | None = None,
+    ) -> None:
         self._trace_limit = trace_limit
-        self._store = GraphStore(max_entries=max_entries, trace_limit=trace_limit)
+        self._store = GraphStore(
+            max_entries=max_entries,
+            trace_limit=trace_limit,
+            stats=stats,
+            stats_eviction_recent_cap=stats_eviction_recent_cap,
+            monotonic_seconds=stats_clock,
+        )
         self._evaluator = Evaluator(self._store)
         # Single private probe for invariant-oriented internals.
         self._internals = _EngineInternals(self._store, self._evaluator)
@@ -269,6 +283,35 @@ class Engine:
 
     def inspect_graph(self) -> dict[str, Any]:
         return self._store.inspect_graph()
+
+    def subgraph(
+        self,
+        roots: Sequence[QueryKey | str],
+        *,
+        direction: Literal["deps", "dependents"] = "deps",
+    ) -> dict[str, Any]:
+        """Memoized nodes/edges reachable from ``roots`` (default: transitive dependencies).
+
+        Edges follow :meth:`inspect_graph` semantics: ``(parent_key, dep_key)`` means
+        *parent depends on dep*. The default ``direction="deps"`` walks from each root
+        toward its dependencies (backward along the computation graph). Use
+        ``direction="dependents"`` for transitive dependents (forward).
+
+        String roots must match entries in :meth:`inspect_graph` ``nodes``; unknown
+        roots are ignored (same policy as :meth:`prune`). ``QueryKey`` roots not
+        present in the memo table are ignored. Empty ``roots`` yields empty
+        ``nodes`` and ``edges`` (no exception). Thread-safe under the store lock.
+        """
+        return self._store.subgraph(roots, direction=direction)
+
+    def enable_stats(self, enabled: bool = True) -> None:
+        self._store.set_stats_enabled(enabled)
+
+    def stats_summary(self) -> dict[str, Any]:
+        return self._store.stats_summary()
+
+    def reset_stats(self) -> None:
+        self._store.reset_stats()
 
     def prune(self, roots: Iterable[tuple[str, str, tuple[Any, ...]]]) -> None:
         self._store.prune(list(roots))

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "query-cascade"
-version = "0.1.0"
+version = "0.2.0"
 description = "Minimal demand-driven query framework for incremental computation."
 requires-python = ">=3.12"
 readme = "README.md"

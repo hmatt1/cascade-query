@@ -6,6 +6,7 @@ import heapq
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from ._serde import stable_value_digest
@@ -13,7 +14,15 @@ from ._state import Dependency, InputKey, InputVersion, MemoEntry, QueryKey, Sna
 
 
 class GraphStore:
-    def __init__(self, *, max_entries: int, trace_limit: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_entries: int,
+        trace_limit: int,
+        stats: bool = False,
+        stats_eviction_recent_cap: int = 32,
+        monotonic_seconds: Callable[[], float] | None = None,
+    ) -> None:
         self.lock = threading.RLock()
         self.revision = 0
         self.cancel_epoch = 0
@@ -21,6 +30,15 @@ class GraphStore:
         self.max_entries = max_entries
         self.trace_limit = trace_limit
         self.trace: deque[TraceEvent] = deque(maxlen=trace_limit)
+
+        self._monotonic_seconds: Callable[[], float] = monotonic_seconds or time.perf_counter
+        self._stats_enabled = stats
+        self._stats_eviction_recent_cap = max(0, stats_eviction_recent_cap)
+        self._stats_by_key: dict[str, float] = {}
+        self._stats_evictions_total = 0
+        self._stats_evictions_recent: deque[str] = deque(
+            maxlen=self._stats_eviction_recent_cap if self._stats_eviction_recent_cap > 0 else None
+        )
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
@@ -30,6 +48,52 @@ class GraphStore:
         self.in_flight: dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]] = {}
         # Lazy min-heap (last_access, key); stale entries removed on pop (touches push new tuples).
         self._lru_heap: list[tuple[int, QueryKey]] = []
+
+    def monotonic_seconds(self) -> float:
+        return self._monotonic_seconds()
+
+    def is_stats_enabled(self) -> bool:
+        return self._stats_enabled
+
+    def set_stats_enabled(self, enabled: bool) -> None:
+        with self.lock:
+            self._stats_enabled = enabled
+
+    def set_stats_eviction_recent_cap(self, cap: int) -> None:
+        with self.lock:
+            self._stats_eviction_recent_cap = max(0, cap)
+            new_max = self._stats_eviction_recent_cap if self._stats_eviction_recent_cap > 0 else None
+            recent = list(self._stats_evictions_recent)
+            if self._stats_eviction_recent_cap > 0:
+                recent = recent[-self._stats_eviction_recent_cap :]
+            else:
+                recent = []
+            self._stats_evictions_recent = deque(recent, maxlen=new_max)
+
+    def reset_stats(self) -> None:
+        with self.lock:
+            self._stats_by_key.clear()
+            self._stats_evictions_total = 0
+            self._stats_evictions_recent.clear()
+
+    def stats_summary(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "by_key": dict(sorted(self._stats_by_key.items())),
+                "evictions_total": self._stats_evictions_total,
+                "evictions_recent": list(self._stats_evictions_recent),
+                "memo_count": len(self.memos),
+                "max_entries": self.max_entries,
+            }
+
+    def record_query_body_time(self, key: QueryKey, seconds: float) -> None:
+        if seconds < 0:
+            seconds = 0.0
+        with self.lock:
+            if not self._stats_enabled:
+                return
+            sk = self.key_to_str(key)
+            self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
     def register_query(self, query_id: str, fn: Callable[..., Any]) -> None:
         with self.lock:
@@ -118,6 +182,10 @@ class GraphStore:
             if victim is None:
                 victim = min(self.memos.items(), key=lambda it: it[1].last_access)[0]
             self.trace_event("evict", victim, "lru")
+            if self._stats_enabled:
+                self._stats_evictions_total += 1
+                if self._stats_eviction_recent_cap > 0:
+                    self._stats_evictions_recent.append(self.key_to_str(victim))
             self.drop_memo_locked(victim)
 
     def latest_input_version(self, input_key: InputKey) -> InputVersion | None:
@@ -182,6 +250,76 @@ class GraphStore:
                 "input_count": len(self.inputs),
                 "nodes": nodes,
                 "edges": edges,
+            }
+
+    def subgraph(self, roots: Sequence[QueryKey | str], *, direction: str) -> dict[str, Any]:
+        if direction not in ("deps", "dependents"):
+            raise ValueError("direction must be 'deps' or 'dependents'")
+        with self.lock:
+            key_str = {self.key_to_str(k): k for k in self.memos}
+            nodes_full = list(key_str.keys())
+            edges_full: list[tuple[str, str]] = []
+            for parent, memo in self.memos.items():
+                parent_s = self.key_to_str(parent)
+                for dep in memo.deps:
+                    edges_full.append((parent_s, self.key_to_str(dep.key)))
+
+            seeds: list[str] = []
+            for r in roots:
+                if isinstance(r, str):
+                    if r in key_str:
+                        seeds.append(r)
+                else:
+                    s = self.key_to_str(r)
+                    if r in self.memos:
+                        seeds.append(s)
+
+            if not seeds:
+                return {
+                    "revision": self.revision,
+                    "memo_count": 0,
+                    "input_count": len(self.inputs),
+                    "nodes": [],
+                    "edges": [],
+                }
+
+            if direction == "deps":
+                adj: dict[str, list[str]] = defaultdict(list)
+                for parent_s, dep_s in edges_full:
+                    adj[parent_s].append(dep_s)
+                reachable: set[str] = set()
+                queue: deque[str] = deque(seeds)
+                while queue:
+                    u = queue.popleft()
+                    if u in reachable:
+                        continue
+                    reachable.add(u)
+                    for v in adj.get(u, ()):
+                        if v not in reachable:
+                            queue.append(v)
+            else:
+                radj: dict[str, list[str]] = defaultdict(list)
+                for parent_s, dep_s in edges_full:
+                    radj[dep_s].append(parent_s)
+                reachable = set()
+                queue = deque(seeds)
+                while queue:
+                    u = queue.popleft()
+                    if u in reachable:
+                        continue
+                    reachable.add(u)
+                    for v in radj.get(u, ()):
+                        if v not in reachable:
+                            queue.append(v)
+
+            nodes_out = [n for n in nodes_full if n in reachable]
+            edges_out = [(p, d) for p, d in edges_full if p in reachable and d in reachable]
+            return {
+                "revision": self.revision,
+                "memo_count": len(nodes_out),
+                "input_count": len(self.inputs),
+                "nodes": nodes_out,
+                "edges": edges_out,
             }
 
     def prune(self, roots: list[QueryKey]) -> None:

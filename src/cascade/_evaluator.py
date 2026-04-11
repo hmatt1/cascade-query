@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
-import time
 from typing import Any, Callable, Mapping, Sequence
 
 from ._errors import CycleError, QueryCancelled
@@ -258,7 +257,7 @@ class Evaluator:
     ) -> MemoEntry:
         frame = RuntimeFrame(key=key)
         runtime.stack.append(frame)
-        start = time.perf_counter()
+        start = self._store.monotonic_seconds()
         self._store.trace_event("recompute_start", key)
         try:
             self.check_cancelled(runtime.cancel_epoch)
@@ -266,7 +265,8 @@ class Evaluator:
             self.check_cancelled(runtime.cancel_epoch)
         finally:
             runtime.stack.pop()
-        duration_ms = (time.perf_counter() - start) * 1000.0
+        elapsed = self._store.monotonic_seconds() - start
+        duration_ms = elapsed * 1000.0
 
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
         value_hash = self._store.stable_hash(result)
@@ -294,4 +294,6 @@ class Evaluator:
                 self._store.dependents[dep_key].add(key)
             self._store.evict_if_needed_locked()
         self._store.trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
+        if self._store.is_stats_enabled():
+            self._store.record_query_body_time(key, elapsed)
         return memo

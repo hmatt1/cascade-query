@@ -27,6 +27,7 @@ It fits the same mental space as a build system or an IDE’s analysis pipeline:
 | **Replayable side effects** | Effects recorded through **accumulators** replay on cache hits so diagnostics stay consistent. |
 | **Save / load** | Persist graph and cache state (SQLite-backed API below). |
 | **Inspection** | Inspect the graph and trace events for debugging. |
+| **Graph utilities** | **Subgraph** reachability on memoized nodes, optional **stats** (body time + LRU evictions), and **DOT / Mermaid** export for visualization. |
 
 ---
 
@@ -142,6 +143,8 @@ Public symbols (all importable from `cascade`):
 | **`Accumulator`** | Named channel for side effects recorded during queries and **replayed on cache hits**. |
 | **`Snapshot`** | Immutable handle pinning a **global revision** for consistent reads. |
 | **`TraceEvent`** | One record from the in-memory trace log. |
+| **`QueryKey`** | **Type alias** for memo/input keys: **`tuple[str, str, tuple[Any, ...]]`** (`kind`, function id, args). Use in type hints with **`prune`**, **`subgraph`**, etc. |
+| **`export_dot`** / **`export_mermaid`** | Pure renderers from an **`inspect_graph()`**-shaped dict to **Graphviz DOT** or **Mermaid** `flowchart` text. |
 | **`CycleError`** | Raised when a **query cycle** is detected during evaluation. |
 | **`QueryCancelled`** | Raised when **background** work is invalidated by newer input revisions (subclass of **`CancellationError`**). |
 | **`CancellationError`** | Base class for cancellation-style failures. |
@@ -153,8 +156,11 @@ from cascade import (
     CycleError,
     Engine,
     QueryCancelled,
+    QueryKey,
     Snapshot,
     TraceEvent,
+    export_dot,
+    export_mermaid,
 )
 ```
 
@@ -183,7 +189,7 @@ def symbols(file_id: str) -> tuple[str, ...]:
 
 Constructor:
 
-- **`Engine(*, max_entries: int = 10_000, trace_limit: int = 50_000)`** — `max_entries` bounds memoized query nodes (LRU-style eviction when over capacity). `trace_limit` caps the number of **`TraceEvent`** records retained.
+- **`Engine(*, max_entries: int = 10_000, trace_limit: int = 50_000, stats: bool = False, stats_eviction_recent_cap: int = 32, stats_clock: Callable[[], float] | None = None)`** — `max_entries` bounds memoized query nodes (LRU-style eviction when over capacity). `trace_limit` caps the number of **`TraceEvent`** records retained. With **`stats=True`**, the engine records **wall time** spent in successful query bodies (same monotonic clock as recompute tracing; overridable via **`stats_clock`** for tests) and LRU **eviction** counters (see **`stats_summary()`**). When **`stats=False`**, behavior matches prior releases aside from one indirect call to **`time.perf_counter`** per recompute (negligible vs. query work).
 
 Properties and methods:
 
@@ -197,7 +203,9 @@ Properties and methods:
 - **`shutdown(*, wait: bool = True, cancel_futures: bool = False)`** — Shut down the **default** thread pool created by **`submit`**, if any. Call when discarding the engine if you need threads torn down promptly (for example in tests).
 - **`traces() → list[TraceEvent]`** — Copy of recent trace events (subject to **`trace_limit`**).
 - **`clear_traces()`** — Drop all buffered trace events.
-- **`inspect_graph() → dict[str, Any]`** — Under the store lock, summarize memoized queries: **`revision`**, **`memo_count`**, **`input_count`**, **`nodes`** (string keys for memo entries), **`edges`** as **`(parent_key, dep_key)`** pairs for recorded dependencies.
+- **`inspect_graph() → dict[str, Any]`** — Under the store lock, summarize memoized queries: **`revision`**, **`memo_count`**, **`input_count`**, **`nodes`** (string keys for memo entries), **`edges`** as **`(parent_key, dep_key)`** pairs for recorded dependencies (parent depends on dep). Key string format is unchanged since this helper was introduced.
+- **`subgraph(roots, *, direction="deps") → dict[str, Any]`** — Same shape as **`inspect_graph()`**, filtered to memoized nodes and edges in the transitive closure of **`roots`**. Default **`direction="deps"`** walks toward dependencies (same edge direction as inspection). Use **`direction="dependents"`** for transitive dependents. Each root may be a **`QueryKey`** or a string equal to a **`nodes`** entry; unknown roots are ignored. Empty **`roots`** yields empty **`nodes`** / **`edges`**.
+- **`enable_stats(enabled=True)`** / **`stats_summary() → dict[str, Any]`** / **`reset_stats()`** — Toggle aggregation, read **`by_key`** body times (seconds), LRU **`evictions_total`**, **`evictions_recent`** ring (size from **`stats_eviction_recent_cap`**), plus live **`memo_count`** / **`max_entries`**. Eviction counters count only LRU evictions, not **`prune`** or manual drops.
 - **`prune(roots)`** — Remove memoized **query** nodes not reachable from **`roots`**, following dependency edges backward. Each root is a **`QueryKey`**: **`("query", query_handle.id, args_tuple)`** (the same shape the engine uses internally). Unknown roots are ignored safely.
 - **`save(path: str)`** — Persist graph state (inputs, memos, dependents, trace buffer metadata, revision counters) into a **SQLite** file via a versioned JSON payload.
 - **`load(path: str)`** — Restore from **`path`**. If the table is empty or missing payload data, returns without error. Clears in-flight futures. **Only load snapshots from trusted sources** (payloads name types for **`importlib`** resolution—see **Limitations**).
@@ -235,6 +243,23 @@ Frozen dataclass (see **`traces()`**):
 
 - **`event: str`**, **`key: str`**, **`revision: int`**, **`detail: str`**, **`timestamp: float`**.
 
+### `QueryKey`
+
+Typing-only alias (same shape the engine uses internally): **`("query" \| "input", function_id, args_tuple)`**. Example:
+
+```python
+from cascade import Engine, QueryKey
+
+engine = Engine()
+
+@engine.query
+def work(x: int) -> int:
+    return x + 1
+
+def roots_for(x: int) -> list[QueryKey]:
+    return [("query", work.id, (x,))]
+```
+
 ### Exceptions
 
 - **`CycleError`** — Dynamic dependency graph formed a cycle; no fixed-point solver is applied.
@@ -250,6 +275,97 @@ print(engine.inspect_graph())
 for event in engine.traces():
     print(event.event, event.key, event.detail)
 ```
+
+### Subgraph (dependency closure)
+
+Default **`direction="deps"`** is **backward** along edges as reported by **`inspect_graph()`** (from a memoized query toward its recorded dependencies). **`direction="dependents"`** walks “upward” to transitive dependents.
+
+```python
+from cascade import Engine
+
+engine = Engine()
+
+@engine.input
+def src(x: int) -> int:
+    return 0
+
+@engine.query
+def mid(x: int) -> int:
+    return src(x) + 1
+
+@engine.query
+def top(x: int) -> int:
+    return mid(x) * 2
+
+src.set(0, 3)
+assert top(0) == 8
+full = engine.inspect_graph()
+leaf = next(n for n in full["nodes"] if n.startswith("query:") and "top" in n)
+deps_only = engine.subgraph([leaf], direction="deps")
+assert set(deps_only["nodes"]) <= set(full["nodes"])
+print(deps_only["memo_count"], deps_only["edges"])
+```
+
+### Query stats (timing and eviction)
+
+**`by_key`** totals **wall time** in seconds for **successful** recomputes only (cache hits are not timed). **`stats_clock`** is optional for deterministic tests. Counters are **in-memory only** (**`save`** / **`load`** do not persist them).
+
+```python
+from cascade import Engine
+
+engine = Engine(max_entries=2, stats=True)
+
+@engine.input
+def i() -> int:
+    return 0
+
+@engine.query
+def slow() -> int:
+    return i() + 1
+
+@engine.query
+def fast() -> int:
+    return i() + 2
+
+i.set(1)
+slow()
+fast()
+extra = Engine(max_entries=1, stats=True)
+
+@extra.input
+def j() -> int:
+    return 0
+
+@extra.query
+def a() -> int:
+    return j()
+
+@extra.query
+def b() -> int:
+    return j() + 1
+
+j.set(0)
+a()
+b()
+print(engine.stats_summary()["by_key"])
+print(extra.stats_summary()["evictions_total"], extra.stats_summary()["evictions_recent"])
+```
+
+### Graph export (DOT and Mermaid)
+
+Pure functions: pass any **`inspect_graph()`**-shaped dict (including **`subgraph(...)`**). Labels are escaped; large graphs are fine for **`dot`** layout (very large Mermaid diagrams may be slow in viewers).
+
+```python
+from cascade import Engine, export_dot, export_mermaid
+
+engine = Engine()
+# ... define inputs/queries, run something ...
+g = engine.inspect_graph()
+open("memo.dot", "w", encoding="utf-8").write(export_dot(g))
+open("memo.mmd", "w", encoding="utf-8").write(export_mermaid(g))
+```
+
+**Mermaid:** newline characters inside keys are replaced with spaces so node syntax stays valid.
 
 ---
 

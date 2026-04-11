@@ -1,3 +1,5 @@
+from ._graph_export import export_dot, export_mermaid
+from ._state import QueryKey
 from .engine import (
     Accumulator,
     CancellationError,
@@ -14,6 +16,9 @@ __all__ = [
     "CycleError",
     "Engine",
     "QueryCancelled",
+    "QueryKey",
     "Snapshot",
     "TraceEvent",
+    "export_dot",
+    "export_mermaid",
 ]
