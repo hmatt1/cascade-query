@@ -308,7 +308,7 @@ print(deps_only["memo_count"], deps_only["edges"])
 
 ### Query stats (timing and eviction)
 
-**`by_key`** totals **wall time** in seconds for **successful** recomputes only (cache hits are not timed). **`stats_clock`** is optional for deterministic tests. Counters are **in-memory only** (**`save`** / **`load`** do not persist them).
+**`by_key`** totals **wall time** in seconds for **successful** recomputes only (cache hits are not timed). Each value is **inclusive** for that callable: if the body calls other queries, their execution time is included in the parent’s row as well as their own (do not sum **`by_key`** across the graph to get “total work”). **`stats_clock`** is optional for deterministic tests. Counters are **in-memory only** (**`save`** / **`load`** do not persist them).
 
 ```python
 from cascade import Engine
