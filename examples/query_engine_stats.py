@@ -183,11 +183,15 @@ def run_runtime_toggle() -> None:
 
 
 def main() -> None:
+    print("Step 1: Flat queries — by_key tracks real sleep in each body.")
     run_flat_queries_real_time()
+    print("Step 2: Nested queries — parent by_key includes child time.")
     run_nested_queries_real_time()
+    print("Step 3: LRU eviction counters with a tiny memo table.")
     run_lru_evictions()
+    print("Step 4: Enable stats after cold runs, then bump input and time one recompute.")
     run_runtime_toggle()
-    print("Done.")
+    print("Example complete.")
 
 
 if __name__ == "__main__":
