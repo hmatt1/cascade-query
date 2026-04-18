@@ -162,7 +162,13 @@ class Evaluator:
                     self._store.trace_event("cache_hit", key)
                     return existing, True
 
-                if self.try_mark_green(key, existing, runtime.snapshot):
+                self._store.pin_memo_verification_locked(key)
+                try:
+                    green = self.try_mark_green(key, existing, runtime.snapshot)
+                finally:
+                    self._store.unpin_memo_verification_locked(key)
+
+                if green:
                     existing.verified_at = runtime.snapshot.revision
                     self._store.touch_memo_locked(key)
                     self._store.trace_event("cache_green", key)
