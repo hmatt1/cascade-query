@@ -199,7 +199,7 @@ Properties and methods:
 - **`accumulator(name: str) → Accumulator`** — Return a named **`Accumulator`** (see below). Names are keys in the optional **`effects`** map passed to synchronous **`QueryHandle`** calls and **`submit`**.
 - **`snapshot() → Snapshot`** — Capture **`Snapshot(revision=engine.revision)`** for use as **`snapshot=`** on reads. Reads through that snapshot see input and memo state as of that revision; live **`set`** calls do not disturb snapshot reads.
 - **`submit(query, *args, *, snapshot=None, effects=None, executor=None) → concurrent.futures.Future`** — Run **`query(*args)`** on **`executor`**, or on a **lazily created** per-engine **`ThreadPoolExecutor`** when **`executor` is `None`**. The engine captures **`cancel_epoch`** at schedule time; if inputs move on before the task runs, the future may complete with **`QueryCancelled`**. **`snapshot`** defaults to a fresh **`snapshot()`** at submit time when omitted.
-- **`compute_many(calls, *, workers=None, snapshot=None) → list[Any]`** — Run many queries in parallel with a work-stealing scheduler. **`calls`** is a sequence of **`(query_handle, args_tuple)`**. Result order matches **`calls`**. **`workers`** defaults to a sensible value from **`len(calls)`** (capped); **`workers=0`** falls back to that same default. **`snapshot`** defaults to **`snapshot()`** when omitted. There is no **`effects`** parameter on this path—use **`QueryHandle.__call__`** or **`submit`** if you need to collect accumulator output in a dict.
+- **`compute_many(calls, *, workers=None, snapshot=None, effects=None) → list[Any]`** — Run many queries in parallel with a work-stealing scheduler. **`calls`** is a sequence of **`(query_handle, args_tuple)`**. Result order matches **`calls`**. **`workers`** defaults to a sensible value from **`len(calls)`** (capped); **`workers=0`** falls back to that same default. **`snapshot`** defaults to **`snapshot()`** when omitted. When **`effects`** is a dict, accumulator output is collected and appended into **`effects[name]`** deterministically in **call order** (not completion order).
 - **`shutdown(*, wait: bool = True, cancel_futures: bool = False)`** — Shut down the **default** thread pool created by **`submit`**, if any. Call when discarding the engine if you need threads torn down promptly (for example in tests).
 - **`traces() → list[TraceEvent]`** — Copy of recent trace events (subject to **`trace_limit`**).
 - **`clear_traces()`** — Drop all buffered trace events.
@@ -439,6 +439,7 @@ Answer Yes/No:
 | `dynamic_macro_expansion.py` | Query that **changes downstream dependencies** at runtime |
 | `snapshot_isolation.py` | Snapshot reads while live inputs change |
 | `concurrent_background_work.py` | Dedup under concurrency + cancellation after input changes |
+| `compute_many_with_accumulators.py` | `compute_many(..., effects=...)` accumulator collection |
 | `persistence_and_inspection.py` | Save/load and graph summaries |
 | `gil_parallel_speedup.py` | Threaded CPU benchmark: GIL vs free-threaded |
 

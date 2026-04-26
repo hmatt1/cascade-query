@@ -3,7 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import threading
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from ._errors import CancellationError, CycleError, QueryCancelled
 from ._evaluator import Evaluator
@@ -262,18 +262,95 @@ class Engine:
         *,
         workers: int | None = None,
         snapshot: Snapshot | None = None,
+        effects: dict[str, list[Any]] | None = None,
     ) -> list[Any]:
         if not calls:
             return []
         run_snapshot = snapshot or self.snapshot()
         worker_count = workers or min(32, max(1, len(calls)))
         scheduler = WorkStealingExecutor(worker_count)
+        per_call_effects: list[dict[str, list[Any]] | None]
+        if effects is None:
+            per_call_effects = [None] * len(calls)
+        else:
+            per_call_effects = [{} for _ in range(len(calls))]
         for idx, (query, args) in enumerate(calls):
             scheduler.submit_indexed(
                 idx,
-                lambda q=query, a=args: self._query_call(q.id, q.raw, a, snapshot=run_snapshot),
+                lambda q=query, a=args, e=per_call_effects[idx]: self._query_call(
+                    q.id,
+                    q.raw,
+                    a,
+                    snapshot=run_snapshot,
+                    effects=e,
+                ),
             )
-        return scheduler.run(len(calls))
+        results = scheduler.run(len(calls))
+        if effects is not None:
+            for call_effects in per_call_effects:
+                if not call_effects:
+                    continue
+                for name, items in call_effects.items():
+                    if not items:
+                        continue
+                    effects.setdefault(name, []).extend(items)
+        return results
+
+    def compute_many_stream(
+        self,
+        calls: Sequence[tuple[_QueryHandle, tuple[Any, ...]]],
+        *,
+        workers: int | None = None,
+        snapshot: Snapshot | None = None,
+        effects: dict[str, list[Any]] | None = None,
+    ) -> Iterator[tuple[int, Any, dict[str, list[Any]]]]:
+        """Yield completed results as each call finishes.
+
+        Yields ``(index, value, call_effects)`` where ``index`` matches the position in
+        ``calls`` and ``call_effects`` contains accumulator output for that call when
+        ``effects`` was provided (otherwise an empty dict).
+
+        Unlike :meth:`compute_many`, this API yields items in *completion order*.
+        If ``effects`` is provided, it is populated after all calls complete, merged
+        deterministically in call order (matching :meth:`compute_many`).
+        """
+        if not calls:
+            return
+
+        run_snapshot = snapshot or self.snapshot()
+        worker_count = workers or min(32, max(1, len(calls)))
+
+        per_call_effects: list[dict[str, list[Any]]]
+        per_call_effects = [{} for _ in range(len(calls))]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+            future_to_index: dict[concurrent.futures.Future[Any], int] = {}
+            for idx, (query, args) in enumerate(calls):
+                fut = pool.submit(
+                    self._query_call,
+                    query.id,
+                    query.raw,
+                    args,
+                    snapshot=run_snapshot,
+                    effects=per_call_effects[idx] if effects is not None else None,
+                )
+                future_to_index[fut] = idx
+
+            for fut in concurrent.futures.as_completed(future_to_index):
+                idx = future_to_index[fut]
+                value = fut.result()
+                call_effects = per_call_effects[idx] if effects is not None else {}
+                item = (idx, value, call_effects)
+                yield item
+
+        if effects is not None:
+            for call_effects in per_call_effects:
+                if not call_effects:
+                    continue
+                for name, items in call_effects.items():
+                    if not items:
+                        continue
+                    effects.setdefault(name, []).extend(items)
 
     def traces(self) -> list[TraceEvent]:
         return self._store.traces()

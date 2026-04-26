@@ -83,6 +83,79 @@ def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection()
     assert result == [i + 1 for i in range(6)]
 
 
+def test_compute_many_can_collect_accumulator_effects() -> None:
+    engine = Engine()
+    progress = engine.accumulator("progress")
+
+    @engine.query
+    def job(name: str) -> str:
+        progress.push(("start", name))
+        progress.push(("done", name))
+        return name.upper()
+
+    effects: dict[str, list[object]] = {}
+    result = engine.compute_many([(job, ("a",)), (job, ("b",)), (job, ("c",))], workers=3, effects=effects)
+    assert result == ["A", "B", "C"]
+    assert effects == {
+        "progress": [
+            ("start", "a"),
+            ("done", "a"),
+            ("start", "b"),
+            ("done", "b"),
+            ("start", "c"),
+            ("done", "c"),
+        ]
+    }
+
+
+def test_compute_many_stream_yields_in_completion_order() -> None:
+    engine = Engine()
+
+    @engine.query
+    def delayed(i: int) -> int:
+        time.sleep(0.004 * (4 - i))
+        return i
+
+    calls = [(delayed, (i,)) for i in range(4)]
+    items = list(engine.compute_many_stream(calls, workers=4))
+    # i=3 sleeps least, so it should complete first.
+    assert [idx for idx, _value, _effects in items] == [3, 2, 1, 0]
+    assert sorted(value for _idx, value, _effects in items) == [0, 1, 2, 3]
+
+
+def test_compute_many_stream_can_yield_and_collect_accumulator_effects() -> None:
+    engine = Engine()
+    progress = engine.accumulator("progress")
+
+    @engine.query
+    def job(name: str, seconds: float) -> str:
+        progress.push(("start", name))
+        time.sleep(seconds)
+        progress.push(("done", name))
+        return name.upper()
+
+    calls = [(job, ("a", 0.03)), (job, ("b", 0.01)), (job, ("c", 0.02))]
+    effects: dict[str, list[object]] = {}
+    items = list(engine.compute_many_stream(calls, workers=3, effects=effects))
+
+    # Stream yields in completion order (b, c, a).
+    assert [value for _idx, value, _call_effects in items] == ["B", "C", "A"]
+    # Each yielded item includes just that call's effects.
+    by_value = {value: call_effects["progress"] for _idx, value, call_effects in items}
+    assert by_value["A"] == [("start", "a"), ("done", "a")]
+    assert by_value["B"] == [("start", "b"), ("done", "b")]
+    assert by_value["C"] == [("start", "c"), ("done", "c")]
+    # Aggregate effects dict is merged in call order, matching compute_many.
+    assert effects["progress"] == [
+        ("start", "a"),
+        ("done", "a"),
+        ("start", "b"),
+        ("done", "b"),
+        ("start", "c"),
+        ("done", "c"),
+    ]
+
+
 def test_work_stealing_run_raises_first_recorded_task_error() -> None:
     scheduler = WorkStealingExecutor(workers=2)
 
