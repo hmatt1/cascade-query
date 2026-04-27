@@ -41,23 +41,22 @@ def main() -> None:
     engine, calls = _make_engine_and_calls(durations)
 
     effects_batch: dict[str, list[object]] = {}
-    print("Step 1: Run 3 independent jobs via compute_many(workers=3). (Barrier API)")
+    print("Step 1: Run 3 independent jobs in parallel.")
     t0 = time.perf_counter()
     results = engine.compute_many(calls, workers=3, effects=effects_batch)
     dt = time.perf_counter() - t0
 
-    print("Step 2: Print results and collected accumulator events.")
+    print("Step 2: Print results and collected side-effects.")
     print(f"compute_many returned {len(results)} results in {dt:.3f}s")
-    print("results (call order):", results)
+    print("results:", results)
     print()
-    print("accumulator output collected via effects['progress'] (call order):")
+    print("Accumulator output (call order):")
     for item in effects_batch.get("progress", []):
         print(" ", item)
 
     print()
-    print("Step 3: Run the same jobs via compute_many_stream(...). (Streaming completion API)")
-    # Important: use a fresh engine/graph so the sleeps are not memo-cached from
-    # the compute_many run above.
+    print("Step 3: Run the same jobs via streaming results.")
+    # Important: use a fresh engine/graph so the sleeps are not retrieved from cache.
     engine_stream, calls_stream = _make_engine_and_calls(durations)
     effects_stream: dict[str, list[object]] = {}
     t0 = time.perf_counter()
@@ -73,7 +72,7 @@ def main() -> None:
         for item in call_effects.get("progress", []):
             print("  effect:", item)
 
-    print("\nStep 4: Show the aggregated effects dict for the streaming run (call order).")
+    print("\nStep 4: Aggregated side-effects for the streaming run (call order).")
     for item in effects_stream.get("progress", []):
         print(" ", item)
 

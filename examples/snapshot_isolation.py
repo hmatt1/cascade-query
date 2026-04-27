@@ -5,7 +5,7 @@ from cascade import Engine
 
 def run_snapshot_demo() -> None:
     print("=== Snapshot isolation example ===")
-    print("Goal: prove snapshot reads stay stable while live state changes.")
+    print("Ensure snapshot reads remain stable while live state changes.")
     engine = Engine()
 
     @engine.input
@@ -16,18 +16,18 @@ def run_snapshot_demo() -> None:
     def parse(file_id: str) -> tuple[str, ...]:
         return tuple(line.strip() for line in source(file_id).splitlines() if line.strip())
 
-    print("Step 1: Set initial source and take a snapshot.")
+    print("Step 1: Set initial source and capture a snapshot.")
     source.set("main", "alpha\nbeta")
     frozen = engine.snapshot()
     print("Snapshot revision:", frozen.revision)
-    print("Live parse before mutation:", parse("main"))
+    print("Live parse before update:", parse("main"))
 
-    print("Step 2: Mutate live source after snapshot.")
+    print("Step 2: Update live source after snapshot.")
     source.set("main", "alpha\ngamma\ndelta")
-    print("Live parse after mutation:", parse("main"))
+    print("Live parse after update:", parse("main"))
 
-    print("Step 3: Read through the old snapshot.")
-    print("Snapshot parse (frozen view):", parse("main", snapshot=frozen))
+    print("Step 3: Read from the snapshot.")
+    print("Snapshot parse (pinned view):", parse("main", snapshot=frozen))
     print("Example complete.")
 
 

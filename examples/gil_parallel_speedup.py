@@ -61,8 +61,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark CPU-bound threaded compute_many work. "
-            "Run this script once with python3.14 (GIL on) and once with "
-            "python3.14t + PYTHON_GIL=0 to compare."
+            "Compare python3.14 (GIL enabled) vs python3.14t (GIL disabled)."
         )
     )
     parser.add_argument("--tasks", type=int, default=max(8, default_workers * 4), help="Number of independent query keys to run.")

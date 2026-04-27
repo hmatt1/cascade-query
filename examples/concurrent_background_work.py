@@ -22,20 +22,20 @@ def run_concurrency_demo() -> None:
         time.sleep(0.08)
         return base() + 1
 
-    print("Step 1: Warm the cache with base=41.")
+    print("Step 1: Initial result with base=41.")
     base.set(41)
-    print("Warm result:", expensive())
+    print("Result:", expensive())
     print("Counters:", counters)
 
-    print("Step 2: Fire many concurrent calls for the same query key.")
+    print("Step 2: Multiple concurrent calls for the same query key.")
     base.set(42)
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futures = [pool.submit(expensive) for _ in range(6)]
         values = [future.result() for future in futures]
     print("Concurrent values:", values)
-    print("Counters (one recompute shared across callers):", counters)
+    print("Counters (single computation shared by all callers):", counters)
 
-    print("Step 3: Submit background query, then mutate input to cancel stale work.")
+    print("Step 3: Background query cancellation.")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         base.set(10)
         stale = engine.submit(expensive, executor=pool)
@@ -43,9 +43,9 @@ def run_concurrency_demo() -> None:
         base.set(20)
         try:
             stale.result(timeout=2.0)
-            print("Unexpected: stale computation did not cancel.")
+            print("Error: stale computation did not cancel.")
         except QueryCancelled:
-            print("Expected: stale computation cancelled after input changed.")
+            print("Success: stale computation cancelled after input changed.")
         print("Fresh value after mutation:", expensive())
 
     dedup_waits = sum(1 for event in engine.traces() if event.event == "dedup_wait")

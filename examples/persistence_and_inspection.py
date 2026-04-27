@@ -26,12 +26,12 @@ def build_line_counter(
 
 def run_persistence_demo() -> None:
     print("=== Persistence and graph inspection example ===")
-    print("This example demonstrates save/load and inspecting graph structure.")
+    print("Save/load state and inspect graph structure.")
 
     engine_a, source_a, non_empty_lines_a = build_line_counter()
     source_a.set("main", "alpha\n\nbeta\n")
     source_a.set("lib", "gamma\n")
-    print("Step 1: Compute values in engine A.")
+    print("Step 1: Compute initial values in engine A.")
     print("main line count:", non_empty_lines_a("main"))
     print("lib line count:", non_empty_lines_a("lib"))
     graph_before = engine_a.inspect_graph()
@@ -45,13 +45,25 @@ def run_persistence_demo() -> None:
         engine_a.save(str(db_path))
         print("Step 2: Saved state to:", db_path)
 
+        # Demonstrate subgraph inspection
+        main_key = ("query", non_empty_lines_a.id, ("main",))
+        deps = engine_a.subgraph([main_key], direction="deps")
+        print(f"Step 3: Dependencies for 'main': {len(deps['nodes'])} nodes found.")
+
+        # Demonstrate pruning
+        print("Step 4: Pruning everything except 'lib' dependencies.")
+        lib_key = ("query", non_empty_lines_a.id, ("lib",))
+        engine_a.prune([lib_key])
+        graph_pruned = engine_a.inspect_graph()
+        print(f"Nodes after pruning: {graph_pruned['memo_count']}")
+
         counters: dict[str, int] = {}
         engine_b, _source_b, non_empty_lines_b = build_line_counter(recompute_counter=counters)
-        print("Step 3: Load state into engine B and query values.")
+        print("Step 5: Load state and query values from engine B.")
         engine_b.load(str(db_path))
         print("main line count:", non_empty_lines_b("main"))
         print("lib line count:", non_empty_lines_b("lib"))
-        print("Query recomputations after load:", counters.get("line_count_runs", 0))
+        print("Query recomputations (results retrieved from cache):", counters.get("line_count_runs", 0))
 
         graph_after = engine_b.inspect_graph()
         print(

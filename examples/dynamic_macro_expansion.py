@@ -5,7 +5,7 @@ from cascade import Engine
 
 def run_dynamic_demo() -> None:
     print("=== Dynamic macro expansion example ===")
-    print("This example shows runtime-generated dependencies and selective recomputation.")
+    print("Runtime-generated dependencies and selective recomputation.")
     engine = Engine()
     counters = {"expand": 0, "lowered": 0}
 
@@ -29,19 +29,19 @@ def run_dynamic_demo() -> None:
     @engine.query
     def lowered(module: str) -> tuple[str, ...]:
         counters["lowered"] += 1
-        # Dynamic graph expansion: lowered depends on runtime-generated output.
+        # lowered depends on results generated at runtime by expand.
         return tuple(line.lower() for line in expand(module))
 
-    print("Step 1: Set macro source and run lowering.")
+    print("Step 1: Set source and run expansion.")
     source.set("core", "macro make_fn Add\nmacro make_fn Sub")
     print("Lowered output:", lowered("core"))
     print("Counters:", counters)
 
-    print("Step 2: Re-run without changes (should reuse cached values).")
+    print("Step 2: Re-run with unchanged inputs (results retrieved from cache).")
     print("Lowered output:", lowered("core"))
     print("Counters:", counters)
 
-    print("Step 3: Change one macro target and rerun.")
+    print("Step 3: Update input and re-run.")
     source.set("core", "macro make_fn Add\nmacro make_fn Mul")
     print("Lowered output:", lowered("core"))
     print("Counters:", counters)
