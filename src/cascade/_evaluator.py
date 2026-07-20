@@ -573,3 +573,44 @@ class Evaluator:
             return self._store.stable_hash(fn(*dep_args))
         except TypeError:
             return None
+
+    def prune_disk_cache(self, roots: list[QueryKey]) -> None:
+        disk = self._disk
+        if disk is None:
+            return
+
+        import collections
+        wanted_entries = set()
+        wanted_blobs = set()
+        queue = collections.deque()
+
+        for key in roots:
+            kind, fid, args = key
+            try:
+                args_blob = _canonical.encode(args)
+            except TypeError:
+                continue
+            ekey = _disk_cache.entry_key(kind, fid, args_blob)
+            queue.append(ekey)
+            wanted_entries.add(ekey)
+
+        while queue:
+            ekey = queue.popleft()
+            record = disk.load_entry(ekey)
+            if record is None:
+                continue
+
+            value_hash = record.get("value_hash")
+            if value_hash:
+                wanted_blobs.add(value_hash)
+
+            for dep in record.get("deps", []):
+                dep_kind, dep_fid, dep_args_blob, _ = dep
+                if dep_kind != "query":
+                    continue
+                dep_ekey = _disk_cache.entry_key(dep_kind, dep_fid, dep_args_blob)
+                if dep_ekey not in wanted_entries:
+                    wanted_entries.add(dep_ekey)
+                    queue.append(dep_ekey)
+
+        disk.retain(wanted_entries, wanted_blobs)

@@ -545,3 +545,132 @@ def test_pinned_snapshot_isolation_holds_with_disk_cache(tmp_path: Path) -> None
     assert doubled_b(snapshot=pinned) == 0
     assert doubled_b() == 10
     engine_b.shutdown()
+
+
+def test_disk_cache_prune_vacuum(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+
+    def build() -> tuple[Engine, Any, Any, Any]:
+        engine = Engine(cache_dir=cache)
+
+        @engine.input
+        def val_a() -> int:
+            return 1
+
+        @engine.input
+        def val_b() -> int:
+            return 2
+
+        @engine.query
+        def query_a() -> int:
+            return val_a() + 10
+
+        @engine.query
+        def query_b() -> int:
+            return val_b() + 20
+
+        return engine, val_a, query_a, query_b
+
+    engine, val_a, query_a, query_b = build()
+    assert query_a() == 11
+    assert query_b() == 22
+
+    # Verify both are in the disk cache
+    disk = engine._disk
+    assert disk is not None
+
+    def count_meta_entries() -> int:
+        with disk._env.begin() as txn:
+            with txn.cursor(db=disk._meta) as curs:
+                return len(list(curs.iternext(keys=True, values=False)))
+
+    def count_blob_entries() -> int:
+        with disk._env.begin() as txn:
+            with txn.cursor(db=disk._blobs) as curs:
+                return len(list(curs.iternext(keys=True, values=False)))
+
+    meta_count = count_meta_entries()
+    blob_count = count_blob_entries()
+    assert meta_count == 2
+    assert blob_count == 2
+
+    # Prune keeping only query_a
+    # This should drop query_b from memory and disk cache
+    engine.prune([("query", query_a.id, ())], vacuum_disk=True)
+
+    meta_count_after = count_meta_entries()
+    blob_count_after = count_blob_entries()
+
+    assert meta_count_after == 1
+    assert blob_count_after == 1
+
+    engine.shutdown()
+
+    # Verify we can still hydrate query_a
+    engine_2, val_a_2, query_a_2, query_b_2 = build()
+    assert query_a_2() == 11
+    engine_2.shutdown()
+
+
+def test_disk_cache_prune_vacuum_empty(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    engine = Engine(cache_dir=cache)
+    
+    # Prune empty cache
+    engine.prune([], vacuum_disk=True)
+    engine.shutdown()
+
+
+def test_disk_cache_prune_vacuum_no_disk() -> None:
+    engine = Engine()
+    
+    # Should safely return
+    engine.prune([], vacuum_disk=True)
+    engine.shutdown()
+
+
+def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    engine = Engine(cache_dir=cache)
+    disk = engine._disk
+    assert disk is not None
+
+    @engine.query
+    def uncacheable_args(arg: Any) -> int:
+        return 1
+        
+    @engine.query
+    def normal_query() -> int:
+        return 2
+
+    # We manually populate the disk cache with a corrupted/fake record 
+    # to cover the `if record is None:` and missing value_hash branches.
+    import cascade._canonical as canonical
+    from cascade._disk_cache import entry_key
+    
+    fake_fid = "fake:query"
+    args_blob = canonical.encode(())
+    ekey = entry_key("query", fake_fid, args_blob)
+    
+    # Store a bad record using raw lmdb put
+    with disk._env.begin(write=True) as txn:
+        # A record with no value_hash and a non-query dep
+        bad_record = canonical.encode({
+            "kind": "query",
+            "id": fake_fid,
+            # no value_hash
+            "deps": [
+                ["input", "some_input", args_blob, "fingerprint"],
+            ],
+            "effects": {}
+        })
+        txn.put(ekey, bad_record, db=disk._meta)
+
+    # Now attempt to prune with the fake query as root
+    # It will read the bad record, skip value_hash, and skip the input dep
+    engine.prune([("query", fake_fid, ()), ("query", uncacheable_args.id, (lambda: None,))], vacuum_disk=True)
+    
+    # Also verify that a completely missing key handled gracefully
+    engine.prune([("query", "missing:fid", ())], vacuum_disk=True)
+    
+    engine.shutdown()

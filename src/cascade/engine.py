@@ -418,8 +418,11 @@ class Engine:
     def reset_stats(self) -> None:
         self._store.reset_stats()
 
-    def prune(self, roots: Iterable[tuple[str, str, tuple[Any, ...]]]) -> None:
-        self._store.prune(list(roots))
+    def prune(self, roots: Iterable[tuple[str, str, tuple[Any, ...]]], *, vacuum_disk: bool = False) -> None:
+        root_list = list(roots)
+        self._store.prune(root_list)
+        if vacuum_disk and self._disk is not None:
+            self._evaluator.prune_disk_cache(root_list)
 
     def save(self, path: str) -> None:
         save_payload(path, self._store.make_persistence_payload())

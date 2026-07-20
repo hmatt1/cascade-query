@@ -73,7 +73,7 @@ print(get_result())
 ### Graph Utilities
 *   **`engine.inspect_graph()`**: Returns a dictionary of all nodes and edges in the dependency graph.
 *   **`engine.subgraph(roots, direction="deps")`**: Filters the graph to the dependency chain of the specified root nodes.
-*   **`engine.prune(roots)`**: Removes cached query results that are not reachable from the specified roots.
+*   **`engine.prune(roots, vacuum_disk=False)`**: Removes cached query results from the in-memory LRU cache that are not reachable from the specified roots. Set `vacuum_disk=True` to also do a deep vacuum of the persistent LMDB disk cache, deleting all orphaned blobs and metadata.
 
 ---
 

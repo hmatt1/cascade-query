@@ -159,6 +159,27 @@ class DiskCache:
             txn.drop(self._meta, delete=False)
             txn.drop(self._blobs, delete=False)
 
+    def retain(self, wanted_entries: set[bytes], wanted_blobs: set[str]) -> None:
+        """Drop all meta entries and blobs not in the provided sets."""
+        with self._env.begin(write=True) as txn:
+            drop_meta = []
+            with txn.cursor(db=self._meta) as curs:
+                if curs.first():
+                    for key in curs.iternext(keys=True, values=False):
+                        if key not in wanted_entries:
+                            drop_meta.append(key)
+            for k in drop_meta:
+                txn.delete(k, db=self._meta)
+
+            drop_blobs = []
+            with txn.cursor(db=self._blobs) as curs:
+                if curs.first():
+                    for key in curs.iternext(keys=True, values=False):
+                        if key.decode("ascii") not in wanted_blobs:
+                            drop_blobs.append(key)
+            for k in drop_blobs:
+                txn.delete(k, db=self._blobs)
+
     def close(self) -> None:
         if not self._closed:
             self._closed = True
