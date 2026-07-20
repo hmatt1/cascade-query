@@ -5,7 +5,9 @@ import os
 import threading
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
-from ._errors import CancellationError, CycleError, QueryCancelled
+from . import _canonical
+from ._disk_cache import DiskCache
+from ._errors import CancellationError, CycleError, PersistentCacheError, QueryCancelled
 from ._evaluator import Evaluator
 from ._persistence import load_payload, save_payload
 from ._runtime import RuntimeState
@@ -25,6 +27,7 @@ __all__ = [
     "CancellationError",
     "CycleError",
     "Engine",
+    "PersistentCacheError",
     "QueryCancelled",
     "Snapshot",
     "TraceEvent",
@@ -167,16 +170,27 @@ class Engine:
         stats: bool = False,
         stats_eviction_recent_cap: int = 32,
         stats_clock: Callable[[], float] | None = None,
+        cache_dir: str | os.PathLike[str] | None = None,
+        cache_map_size: int = 1 << 30,
     ) -> None:
         self._trace_limit = trace_limit
+        # Passing cache_dir switches on zero-config persistence: LMDB store,
+        # deterministic msgpack serialization, and content fingerprints as the
+        # cross-session revision markers. Missing lmdb/msgpack raises here.
+        self._disk: DiskCache | None = None
+        value_digest: Callable[[Any], str] | None = None
+        if cache_dir is not None:
+            self._disk = DiskCache(cache_dir, map_size=cache_map_size)
+            value_digest = _canonical.value_digest
         self._store = GraphStore(
             max_entries=max_entries,
             trace_limit=trace_limit,
             stats=stats,
             stats_eviction_recent_cap=stats_eviction_recent_cap,
             monotonic_seconds=stats_clock,
+            value_digest=value_digest,
         )
-        self._evaluator = Evaluator(self._store)
+        self._evaluator = Evaluator(self._store, disk=self._disk)
         # Single private probe for invariant-oriented internals.
         self._internals = _EngineInternals(self._store, self._evaluator)
         self._submit_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -189,8 +203,20 @@ class Engine:
     def snapshot(self) -> Snapshot:
         return self._store.snapshot()
 
+    @property
+    def cache_dir(self) -> str | None:
+        return None if self._disk is None else self._disk.path
+
+    def clear_disk_cache(self) -> None:
+        """Delete all entries in the persistent cache; the next run recomputes."""
+        if self._disk is None:
+            raise PersistentCacheError("engine has no persistent cache; pass cache_dir= to Engine")
+        self._disk.clear()
+
     def input(self, fn: Callable[..., Any]) -> _InputHandle:
-        return _InputHandle(self, fn)
+        handle = _InputHandle(self, fn)
+        self._store.register_input(handle.id, fn)
+        return handle
 
     def query(self, fn: Callable[..., Any]) -> _QueryHandle:
         handle = _QueryHandle(self, fn)
@@ -212,6 +238,8 @@ class Engine:
             self._submit_executor = None
         if pool is not None:
             pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+        if self._disk is not None:
+            self._disk.close()
 
     def _ensure_submit_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         with self._submit_executor_lock:

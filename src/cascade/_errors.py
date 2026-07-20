@@ -11,3 +11,7 @@ class CancellationError(RuntimeError):
 
 class QueryCancelled(CancellationError):
     """Raised when a running query becomes obsolete."""
+
+
+class PersistentCacheError(RuntimeError):
+    """Raised when the persistent disk cache cannot be provisioned or used."""

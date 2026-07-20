@@ -10,8 +10,14 @@ requires-python = ">=3.12"
 readme = "README.md"
 
 [project.optional-dependencies]
+disk = [
+    "lmdb",
+    "msgpack",
+]
 dev = [
     "hypothesis",
+    "lmdb",
+    "msgpack",
     "mutmut",
     "pytest",
     "pytest-cov",

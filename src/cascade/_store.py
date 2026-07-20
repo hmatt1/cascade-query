@@ -22,8 +22,10 @@ class GraphStore:
         stats: bool = False,
         stats_eviction_recent_cap: int = 32,
         monotonic_seconds: Callable[[], float] | None = None,
+        value_digest: Callable[[Any], str] | None = None,
     ) -> None:
         self.lock = threading.RLock()
+        self._value_digest: Callable[[Any], str] = value_digest or stable_value_digest
         self.revision = 0
         self.cancel_epoch = 0
         self.next_access_id = 0
@@ -42,6 +44,7 @@ class GraphStore:
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
+        self.input_fns: dict[str, Callable[..., Any]] = {}
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
@@ -106,6 +109,14 @@ class GraphStore:
         with self.lock:
             return self.queries[query_id]
 
+    def register_input(self, input_id: str, fn: Callable[..., Any]) -> None:
+        with self.lock:
+            self.input_fns[input_id] = fn
+
+    def lookup_input(self, input_id: str) -> Callable[..., Any] | None:
+        with self.lock:
+            return self.input_fns.get(input_id)
+
     def snapshot(self) -> Snapshot:
         with self.lock:
             return Snapshot(revision=self.revision)
@@ -137,7 +148,7 @@ class GraphStore:
         return f"{kind}:{fid}{args}"
 
     def stable_hash(self, value: Any) -> str:
-        return stable_value_digest(value)
+        return self._value_digest(value)
 
     def touch_memo_locked(self, key: QueryKey) -> None:
         memo = self.memos[key]

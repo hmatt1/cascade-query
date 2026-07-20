@@ -56,13 +56,14 @@ print(get_result())
 ## Engine API
 
 ### Core Methods
-*   **`Engine(max_entries=10000, stats=False)`**: Initializes the engine. `max_entries` sets the limit for the Least Recently Used (LRU) cache.
+*   **`Engine(max_entries=10000, stats=False, cache_dir=None, cache_map_size=2**30)`**: Initializes the engine. `max_entries` sets the limit for the Least Recently Used (LRU) cache. Passing `cache_dir` enables persistent disk caching (see below).
 *   **`@engine.input`**: Decorator for mutable data roots.
     *   `input.set(value)`: Updates the value and increments the global revision.
     *   `input.set(*args, value=value)`: Updates a keyed input.
 *   **`@engine.query`**: Decorator for cached computations.
 *   **`engine.snapshot()`**: Returns a `Snapshot` object pinning the current global revision. Use `query(snapshot=s)` to read data as it existed at that revision.
 *   **`engine.save(path)` / `engine.load(path)`**: Persists all inputs and cached results to a SQLite database.
+*   **`engine.clear_disk_cache()`**: Deletes every entry in the persistent disk cache. Raises if the engine was created without `cache_dir`.
 
 ### Parallel & Background Execution
 *   **`engine.compute_many(calls, workers=None)`**: Executes a list of queries in parallel using a thread pool.
@@ -73,6 +74,45 @@ print(get_result())
 *   **`engine.inspect_graph()`**: Returns a dictionary of all nodes and edges in the dependency graph.
 *   **`engine.subgraph(roots, direction="deps")`**: Filters the graph to the dependency chain of the specified root nodes.
 *   **`engine.prune(roots)`**: Removes cached query results that are not reachable from the specified roots.
+
+---
+
+## Persistent Disk Caching
+
+Passing `cache_dir` to the `Engine` turns on zero-config persistence. Cascade provisions an embedded LMDB store in that directory, serializes query results with a deterministic msgpack encoding, and fingerprints every input value by hashing its serialized bytes with blake2b. Nothing else changes: queries and inputs are written exactly as before.
+
+```python
+from cascade import Engine
+
+engine = Engine(max_entries=10_000, cache_dir=".cascade_cache")
+
+@engine.input
+def package_source_text(pkg: str) -> str:
+    with open(pkg, "r") as f:
+        return f.read()
+
+@engine.query
+def parsed_package_ast(pkg: str):
+    return parse(package_source_text(pkg))
+```
+
+The first run executes normally and writes each result to disk. A later run in a new process starts with an empty in-memory cache, finds the entry on disk, and verifies it top-down: leaf inputs are re-executed and re-hashed (for the input above, that means re-reading the file), and the current hashes are compared against the fingerprints saved with the entry. If everything matches, the stored value is deserialized and returned without running any query body. If a file changed, its hash mismatches, and exactly the queries downstream of that file recompute. Early bail-out works across sessions too, since dependency fingerprints are content hashes: a whitespace-only edit that leaves an intermediate result unchanged will not recompute anything past it.
+
+Accumulator effects are stored with each entry and replayed on disk hits, so a warning emitted in run 1 still appears in run 2 even when the query is served from disk.
+
+`lmdb` and `msgpack` are required once `cache_dir` is set; there is no fallback, and the engine raises `PersistentCacheError` with install instructions if either is missing:
+
+```bash
+pip install query-cascade[disk]
+```
+
+A few things to know:
+
+*   Values and arguments must be serializable: primitives, bytes, `list`/`tuple`/`set`/`frozenset`/`dict`, `@dataclass` instances, and `typing.NamedTuple` instances. A query that returns anything else raises at compute time when persistence is on. A query called with an unserializable argument still computes and memoizes in memory, it just skips the disk.
+*   Cache addresses are derived from the function id (`module:qualname`) and the hashed arguments, so renaming or moving a function starts it from a cold cache. Editing a function body does not invalidate its entries; bump the cache with `engine.clear_disk_cache()` or delete the directory when query logic changes.
+*   The store supports concurrent access from multiple processes through LMDB's own locking. Within one process, engines sharing a `cache_dir` share one LMDB environment; the first opener's `cache_map_size` wins.
+*   The default `cache_map_size` is 1 GiB. LMDB allocates this lazily, so the file only grows as entries are written. If the cache fills up, `PersistentCacheError` explains the options.
+*   The on-disk data is a cache: clearing it is always safe and only costs recomputation. Cascade wipes it automatically when its own storage format version changes.
 
 ---
 
@@ -123,7 +163,7 @@ mermaid_text = export_mermaid(graph)
 
 1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`.
 2. **Thread Safety:** While Cascade supports parallel query execution, the `Engine` object itself should be modified (`.set()`, `@engine.query`) from a single thread or with external synchronization.
-3. **Persistence Security:** `engine.load()` uses JSON to resolve types via `importlib`. Only load databases from trusted sources.
+3. **Persistence Security:** `engine.load()` and the persistent disk cache resolve `@dataclass` and `NamedTuple` types via `importlib`. Only load databases or open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.
 
 ---
