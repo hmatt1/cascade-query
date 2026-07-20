@@ -23,11 +23,12 @@ VARIABLES
     leftHist,
     rightHist,
     snapRev,
-    snapResult
+    snapResult,
+    diskCache
 
 vars ==
     <<rev, cancelEpoch, prevCancelEpoch, mode, leftVal, rightVal, modeChangedAt, leftChangedAt, rightChangedAt,
-      activeDep, depObservedChangedAt, chooseVal, chooseChangedAt, modeHist, leftHist, rightHist, snapRev, snapResult>>
+      activeDep, depObservedChangedAt, chooseVal, chooseChangedAt, modeHist, leftHist, rightHist, snapRev, snapResult, diskCache>>
 
 UpdateAt(hist, idx, value) ==
     [hist EXCEPT ![idx] = value]
@@ -54,6 +55,7 @@ Init ==
     /\ rightHist = [i \in 0..MaxRev |-> 0]
     /\ snapRev = -1
     /\ snapResult = NullResult
+    /\ diskCache = {}
 
 WriteLeft(v) ==
     /\ rev < MaxRev
@@ -82,6 +84,7 @@ WriteLeft(v) ==
            /\ rightHist' = UpdateAt(rightHist, newRev, rightVal)
            /\ snapRev' = snapRev
            /\ snapResult' = snapResult
+           /\ diskCache' = diskCache
 
 WriteRight(v) ==
     /\ rev < MaxRev
@@ -110,6 +113,7 @@ WriteRight(v) ==
            /\ rightHist' = UpdateAt(rightHist, newRev, v)
            /\ snapRev' = snapRev
            /\ snapResult' = snapResult
+           /\ diskCache' = diskCache
 
 WriteMode(newMode) ==
     /\ rev < MaxRev
@@ -138,25 +142,63 @@ WriteMode(newMode) ==
            /\ rightHist' = UpdateAt(rightHist, newRev, rightVal)
            /\ snapRev' = snapRev
            /\ snapResult' = snapResult
+           /\ diskCache' = diskCache
 
 TakeSnapshot ==
     /\ snapRev' = rev
     /\ UNCHANGED <<cancelEpoch, prevCancelEpoch, rev, mode, leftVal, rightVal, modeChangedAt, leftChangedAt,
                    rightChangedAt, activeDep, depObservedChangedAt, chooseVal, chooseChangedAt,
-                   modeHist, leftHist, rightHist, snapResult>>
+                   modeHist, leftHist, rightHist, snapResult, diskCache>>
 
 ReadSnapshot ==
     /\ snapRev # -1
     /\ snapResult' = ChooseAt(snapRev)
     /\ UNCHANGED <<cancelEpoch, prevCancelEpoch, rev, mode, leftVal, rightVal, modeChangedAt, leftChangedAt,
                    rightChangedAt, activeDep, depObservedChangedAt, chooseVal, chooseChangedAt,
-                   modeHist, leftHist, rightHist, snapRev>>
+                   modeHist, leftHist, rightHist, snapRev, diskCache>>
 
 ReadLive ==
     /\ snapResult' = chooseVal
     /\ UNCHANGED <<cancelEpoch, prevCancelEpoch, rev, mode, leftVal, rightVal, modeChangedAt, leftChangedAt,
                    rightChangedAt, activeDep, depObservedChangedAt, chooseVal, chooseChangedAt,
-                   modeHist, leftHist, rightHist, snapRev>>
+                   modeHist, leftHist, rightHist, snapRev, diskCache>>
+
+SaveToDiskCache ==
+    /\ diskCache' = diskCache \cup {[
+           mode |-> mode,
+           chooseVal |-> chooseVal,
+           depVal |-> IF mode = "left" THEN leftVal ELSE rightVal
+       ]}
+    /\ UNCHANGED <<rev, cancelEpoch, prevCancelEpoch, mode, leftVal, rightVal, modeChangedAt, leftChangedAt, rightChangedAt, activeDep, depObservedChangedAt, chooseVal, chooseChangedAt, modeHist, leftHist, rightHist, snapRev, snapResult>>
+
+HydrateFromDiskCache ==
+    /\ rev < MaxRev
+    /\ \E c \in diskCache:
+        /\ c.mode = mode
+        /\ c.depVal = (IF mode = "left" THEN leftVal ELSE rightVal)
+        /\ LET newRev == rev + 1
+               newObservedDepChangedAt == IF mode = "left" THEN leftChangedAt ELSE rightChangedAt
+               newChooseChangedAt == newRev
+           IN
+               /\ rev' = newRev
+               /\ cancelEpoch' = cancelEpoch + 1
+               /\ prevCancelEpoch' = cancelEpoch
+               /\ mode' = mode
+               /\ leftVal' = leftVal
+               /\ rightVal' = rightVal
+               /\ modeChangedAt' = modeChangedAt
+               /\ leftChangedAt' = leftChangedAt
+               /\ rightChangedAt' = rightChangedAt
+               /\ activeDep' = c.mode
+               /\ depObservedChangedAt' = newObservedDepChangedAt
+               /\ chooseVal' = c.chooseVal
+               /\ chooseChangedAt' = newChooseChangedAt
+               /\ modeHist' = UpdateAt(modeHist, newRev, mode)
+               /\ leftHist' = UpdateAt(leftHist, newRev, leftVal)
+               /\ rightHist' = UpdateAt(rightHist, newRev, rightVal)
+               /\ snapRev' = snapRev
+               /\ snapResult' = snapResult
+               /\ diskCache' = diskCache
 
 Next ==
     \/ \E v \in ValueSet: WriteLeft(v)
@@ -165,6 +207,8 @@ Next ==
     \/ TakeSnapshot
     \/ ReadSnapshot
     \/ ReadLive
+    \/ SaveToDiskCache
+    \/ HydrateFromDiskCache
 
 Spec ==
     Init /\ [][Next]_vars
@@ -188,6 +232,7 @@ TypeOK ==
     /\ rightHist \in [0..MaxRev -> ValueSet]
     /\ snapRev \in -1..MaxRev
     /\ snapResult \in ValueSet \cup {NullResult}
+    /\ diskCache \in SUBSET [mode: Modes, chooseVal: ValueSet, depVal: ValueSet]
 
 SnapshotConsistency ==
     snapRev = -1 \/ snapResult = NullResult \/ snapResult = ChooseAt(snapRev)
