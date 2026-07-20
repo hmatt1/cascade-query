@@ -1,5 +1,5 @@
 ---- MODULE CascadeCore ----
-EXTENDS Naturals
+EXTENDS Integers
 
 CONSTANTS MaxRev, ValueSet, NullResult
 
@@ -146,9 +146,10 @@ WriteMode(newMode) ==
 
 TakeSnapshot ==
     /\ snapRev' = rev
+    /\ snapResult' = NullResult
     /\ UNCHANGED <<cancelEpoch, prevCancelEpoch, rev, mode, leftVal, rightVal, modeChangedAt, leftChangedAt,
                    rightChangedAt, activeDep, depObservedChangedAt, chooseVal, chooseChangedAt,
-                   modeHist, leftHist, rightHist, snapResult, diskCache>>
+                   modeHist, leftHist, rightHist, diskCache>>
 
 ReadSnapshot ==
     /\ snapRev # -1
@@ -206,7 +207,6 @@ Next ==
     \/ \E m \in Modes: WriteMode(m)
     \/ TakeSnapshot
     \/ ReadSnapshot
-    \/ ReadLive
     \/ SaveToDiskCache
     \/ HydrateFromDiskCache
 
@@ -255,6 +255,6 @@ ChangedAtBoundedByRevision ==
     /\ depObservedChangedAt <= rev
 
 ReadLiveReturnsChoose ==
-    snapRev # -1 \/ snapResult = chooseVal
+    snapRev # -1 \/ snapResult = NullResult \/ snapResult = chooseVal
 
 ====

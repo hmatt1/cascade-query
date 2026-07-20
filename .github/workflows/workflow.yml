@@ -248,7 +248,7 @@ jobs:
         run: wget -qN https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 
       - name: Run TLC Model Checker
-        run: java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock docs/formal/cascade_core.tla -config docs/formal/cascade_core.cfg
+        run: java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock docs/formal/CascadeCore.tla -config docs/formal/CascadeCore.cfg
 
   package:
     name: Package build
