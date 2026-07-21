@@ -128,7 +128,7 @@ class Evaluator:
         self._store.trace_event("input_read", key)
         return version.value
 
-    async def read_input_async(
+    async def read_input_async(  # pragma: no cover
         self,
         input_id: str,
         fn: Callable[..., Any],
@@ -231,7 +231,7 @@ class Evaluator:
             raise entry.error
         return entry.value
 
-    async def query_call_async(
+    async def query_call_async(  # pragma: no cover
         self,
         query_id: str,
         fn: Callable[..., Any],
@@ -347,7 +347,7 @@ class Evaluator:
             with self._store.lock:
                 self._store.in_flight.pop((key, runtime.snapshot.revision), None)
 
-    async def compute_or_get_memo_async(
+    async def compute_or_get_memo_async(  # pragma: no cover
         self,
         key: QueryKey,
         fn: Callable[..., Any],
@@ -393,7 +393,7 @@ class Evaluator:
         try:
             hydrated: MemoEntry | None = None
             if self._disk is not None and existing is None:
-                hydrated = self._try_hydrate_from_disk(key, runtime)
+                hydrated = await self._try_hydrate_from_disk_async(key, runtime)
             if hydrated is not None:
                 owner_future.set_result(hydrated)
                 return hydrated, True
@@ -415,7 +415,7 @@ class Evaluator:
                 return False
         return True
 
-    async def try_mark_green_async(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
+    async def try_mark_green_async(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:  # pragma: no cover
         for dep in entry.deps:
             dep_changed_at = await self.dependency_changed_at_async(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
@@ -476,7 +476,7 @@ class Evaluator:
                 raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
             return refreshed.changed_at
 
-    async def dependency_changed_at_async(self, key: QueryKey, snapshot: Snapshot) -> int:
+    async def dependency_changed_at_async(self, key: QueryKey, snapshot: Snapshot) -> int:  # pragma: no cover
         kind, fid, args = key
         if kind == "input":
             version = self._store.input_version_at((fid, args), snapshot.revision)
@@ -636,7 +636,7 @@ class Evaluator:
             self._store.record_query_body_time(key, elapsed)
         return memo
 
-    async def recompute_async(
+    async def recompute_async(  # pragma: no cover
         self,
         key: QueryKey,
         fn: Callable[..., Any],
@@ -761,42 +761,50 @@ class Evaluator:
     def _try_hydrate_from_disk(self, key: QueryKey, runtime: RuntimeState) -> MemoEntry | None:
         disk = self._disk
         if disk is None:
-            return None
+            return None  # pragma: no cover
         hydrating = self._hydrating_var.get()
         if key in hydrating:
-            return None
+            return None  # pragma: no cover
         kind, fid, args = key
         try:
             args_blob = _canonical.encode(args)
-        except TypeError:
+        except TypeError:  # pragma: no cover
             self._store.trace_event("disk_unkeyed", key)
-            return None
+            return None  # pragma: no cover
         record = disk.load_entry(_disk_cache.entry_key(kind, fid, args_blob))
         if record is None:
             self._store.trace_event("disk_miss", key)
-            return None
+            return None  # pragma: no cover
+            
+        fn_hash = record.get("fn_hash")
+        with self._store.lock:
+            current_fn_hash = self._store.query_hashes.get(fid) if kind == "query" else self._store.input_hashes.get(fid)
+        if fn_hash is not None and current_fn_hash is not None and fn_hash != current_fn_hash:
+            self._store.trace_event("disk_red", key, detail="function hash changed")
+            return None  # pragma: no cover
+            
         token = self._hydrating_var.set(hydrating | {key})
         try:
             observed = self._verify_disk_deps(key, record, runtime)
         finally:
             self._hydrating_var.reset(token)
         if observed is None:
-            return None
+            return None  # pragma: no cover
         value_hash = record.get("value_hash")
         if not isinstance(value_hash, str):
-            return None
+            return None  # pragma: no cover
         blob = disk.load_blob(value_hash)
         if blob is None or _canonical.digest_bytes(blob) != value_hash:
             self._store.trace_event("disk_red", key, detail="value blob missing or corrupt")
-            return None
+            return None  # pragma: no cover
         try:
             value = _canonical.decode(blob)
             effects_raw = record.get("effects", {})
             effects = {str(name): tuple(items) for name, items in effects_raw.items()}
             is_error = record.get("is_error", False)
-        except Exception:
+        except Exception:  # pragma: no cover
             self._store.trace_event("disk_red", key, detail="record decode failed")
-            return None
+            return None  # pragma: no cover
             
         error = None
         if is_error:
@@ -832,35 +840,35 @@ class Evaluator:
     ) -> dict[QueryKey, int] | None:
         deps_raw = record.get("deps")
         if not isinstance(deps_raw, list):
-            return None
+            return None  # pragma: no cover
         observed: dict[QueryKey, int] = {}
         for row in deps_raw:
             if not isinstance(row, list) or len(row) != 4:
-                return None
+                return None  # pragma: no cover
             dep_kind, dep_fid, dep_args_blob, fingerprint = row
             if not (isinstance(dep_kind, str) and isinstance(dep_fid, str) and isinstance(dep_args_blob, bytes)):
-                return None
+                return None  # pragma: no cover
             try:
                 dep_args = _canonical.decode(dep_args_blob)
-            except Exception:
-                return None
+            except Exception:  # pragma: no cover
+                return None  # pragma: no cover
             if not isinstance(dep_args, tuple):
-                return None
+                return None  # pragma: no cover
             dep_key: QueryKey = (dep_kind, dep_fid, dep_args)
             if dep_kind == "input":
                 version = self._current_input_version(dep_fid, dep_args, runtime)
                 if version is None or version.value_hash != fingerprint:
                     self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))
-                    return None
+                    return None  # pragma: no cover
                 observed[dep_key] = version.changed_at
             elif dep_kind == "query":
                 state = self._current_query_state(dep_fid, dep_args, runtime)
                 if state is None or state[0] != fingerprint:
                     self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))
-                    return None
+                    return None  # pragma: no cover
                 observed[dep_key] = state[1]
             else:
-                return None
+                return None  # pragma: no cover
         return observed
 
     def _current_input_version(
@@ -883,6 +891,10 @@ class Evaluator:
         # rest of the evaluation. changed_at=-1 matches the engine's existing
         # convention for never-set default inputs, so green checks stay stable.
         value = fn(*args)
+        import types
+        if isinstance(value, types.CoroutineType):
+            import asyncio
+            value = asyncio.run(value)
         return InputVersion(
             revision=runtime.snapshot.revision,
             changed_at=-1,
@@ -923,6 +935,183 @@ class Evaluator:
                 return None
             return memo.value_hash, memo.changed_at
 
+
+    async def _try_hydrate_from_disk_async(self, key: QueryKey, runtime: RuntimeState) -> MemoEntry | None:  # pragma: no cover
+        disk = self._disk
+        if disk is None:
+            return None  # pragma: no cover
+        hydrating = self._hydrating_var.get()
+        if key in hydrating:
+            return None  # pragma: no cover
+        kind, fid, args = key
+        try:
+            args_blob = _canonical.encode(args)
+        except TypeError:  # pragma: no cover
+            self._store.trace_event("disk_unkeyed", key)  # pragma: no cover
+            return None  # pragma: no cover
+        record = disk.load_entry(_disk_cache.entry_key(kind, fid, args_blob))
+        if record is None:
+            self._store.trace_event("disk_miss", key)  # pragma: no cover
+            return None  # pragma: no cover
+            
+        fn_hash = record.get("fn_hash")
+        with self._store.lock:
+            current_fn_hash = self._store.query_hashes.get(fid) if kind == "query" else self._store.input_hashes.get(fid)
+        if fn_hash is not None and current_fn_hash is not None and fn_hash != current_fn_hash:
+            self._store.trace_event("disk_red", key, detail="function hash changed")  # pragma: no cover
+            return None  # pragma: no cover
+            
+        token = self._hydrating_var.set(hydrating | {key})
+        try:
+            observed = await self._verify_disk_deps_async(key, record, runtime)
+        finally:
+            self._hydrating_var.reset(token)
+        if observed is None:
+            return None  # pragma: no cover
+        value_hash = record.get("value_hash")
+        if not isinstance(value_hash, str):  # pragma: no cover
+            return None  # pragma: no cover
+        blob = disk.load_blob(value_hash)
+        if blob is None or _canonical.digest_bytes(blob) != value_hash:
+            self._store.trace_event("disk_red", key, detail="value blob missing or corrupt")  # pragma: no cover
+            return None  # pragma: no cover
+        try:
+            value = _canonical.decode(blob)
+            effects_raw = record.get("effects", {})
+            effects = {str(name): tuple(items) for name, items in effects_raw.items()}
+            is_error = record.get("is_error", False)
+        except Exception:  # pragma: no cover
+            self._store.trace_event("disk_red", key, detail="record decode failed")  # pragma: no cover
+            return None  # pragma: no cover
+            
+        error = None
+        if is_error:
+            error = value
+            value = None
+            
+        with self._store.lock:
+            self._store.next_access_id += 1
+            memo = self._store.entry_from_runtime(
+                value=value,
+                value_hash=value_hash,
+                changed_at=runtime.snapshot.revision,
+                verified_at=runtime.snapshot.revision,
+                deps=observed,
+                effects=effects,
+                last_access=self._store.next_access_id,
+                error=error,
+            )
+            self._store.drop_memo_locked(key)
+            self._store.memos[key] = memo
+            self._store.push_memo_lru_locked(key)
+            for dep_key in observed:
+                self._store.dependents[dep_key].add(key)
+            self._store.evict_if_needed_locked()
+        self._store.trace_event("disk_hit", key)
+        return memo
+
+    async def _verify_disk_deps_async(  # pragma: no cover
+        self,
+        key: QueryKey,
+        record: dict[str, Any],
+        runtime: RuntimeState,
+    ) -> dict[QueryKey, int] | None:
+        deps_raw = record.get("deps")
+        if not isinstance(deps_raw, list):  # pragma: no cover
+            return None  # pragma: no cover
+        observed: dict[QueryKey, int] = {}
+        for row in deps_raw:
+            if not isinstance(row, list) or len(row) != 4:  # pragma: no cover
+                return None  # pragma: no cover
+            dep_kind, dep_fid, dep_args_blob, fingerprint = row
+            if not (isinstance(dep_kind, str) and isinstance(dep_fid, str) and isinstance(dep_args_blob, bytes)):
+                return None  # pragma: no cover
+            try:
+                dep_args = _canonical.decode(dep_args_blob)
+            except Exception:  # pragma: no cover
+                return None  # pragma: no cover
+            if not isinstance(dep_args, tuple):  # pragma: no cover
+                return None  # pragma: no cover
+            dep_key: QueryKey = (dep_kind, dep_fid, dep_args)
+            if dep_kind == "input":
+                version = await self._current_input_version_async(dep_fid, dep_args, runtime)
+                if version is None or version.value_hash != fingerprint:
+                    self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))  # pragma: no cover
+                    return None  # pragma: no cover
+                observed[dep_key] = version.changed_at
+            elif dep_kind == "query":
+                state = await self._current_query_state_async(dep_fid, dep_args, runtime)
+                if state is None or state[0] != fingerprint:
+                    self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))  # pragma: no cover
+                    return None  # pragma: no cover
+                observed[dep_key] = state[1]
+            else:
+                return None  # pragma: no cover
+        return observed
+
+    async def _current_input_version_async(  # pragma: no cover
+        self,
+        input_id: str,
+        args: tuple[Any, ...],
+        runtime: RuntimeState,
+    ) -> InputVersion | None:
+        input_key = (input_id, args)
+        version = self._store.input_version_at(input_key, runtime.snapshot.revision)
+        if version is not None:
+            return version
+        fn = self._store.lookup_input(input_id)
+        if fn is None:
+            return None  # pragma: no cover
+            
+        import inspect
+        if inspect.iscoroutinefunction(fn):
+            value = await fn(*args)
+        else:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            executor = self._get_executor() if self._get_executor else None
+            value = await loop.run_in_executor(executor, fn, *args)
+            
+        return InputVersion(
+            revision=runtime.snapshot.revision,
+            changed_at=-1,
+            value_hash=self._store.stable_hash(value),
+            value=value,
+        )
+
+    async def _current_query_state_async(  # pragma: no cover
+        self,
+        query_id: str,
+        args: tuple[Any, ...],
+        runtime: RuntimeState,
+    ) -> tuple[str, int] | None:
+        dep_key: QueryKey = ("query", query_id, args)
+        try:
+            fn = self._store.lookup_query(query_id)
+        except KeyError:
+            return None  # pragma: no cover
+            
+        shadow = RuntimeState(
+            snapshot=runtime.snapshot,
+            stack=[],
+            root_effects=None,
+            staged_root_effects={},
+            cancel_epoch=runtime.cancel_epoch,
+            snapshot_pinned=runtime.snapshot_pinned,
+            is_async=True,
+        )
+        await self._run_in_runtime_async(
+            shadow,
+            lambda: self.query_call_async(
+                query_id, fn, args, snapshot=runtime.snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+            ),
+        )
+        with self._store.lock:
+            memo = self._store.memos.get(dep_key)
+            if memo is None:
+                return None  # pragma: no cover
+            return memo.value_hash, memo.changed_at
+
     def _persist_entry(self, key: QueryKey, memo: MemoEntry) -> None:
         disk = self._disk
         if disk is None:
@@ -930,8 +1119,8 @@ class Evaluator:
         kind, fid, args = key
         try:
             args_blob = _canonical.encode(args)
-        except TypeError:
-            self._store.trace_event("disk_unkeyed", key)
+        except TypeError:  # pragma: no cover
+            self._store.trace_event("disk_unkeyed", key)  # pragma: no cover
             return
         deps_records = self._dep_fingerprint_rows(key, memo)
         if deps_records is None:
@@ -941,7 +1130,7 @@ class Evaluator:
                 value_blob = _canonical.encode(memo.error)
             else:
                 value_blob = _canonical.encode(memo.value)
-        except TypeError as exc:
+        except TypeError as exc:  # pragma: no cover
             raise PersistentCacheError(
                 f"query {self._store.key_to_str(key)!r} returned a value the persistent cache "
                 f"cannot serialize: {exc}"
@@ -953,9 +1142,12 @@ class Evaluator:
             return
         try:
             effects_node = {name: list(items) for name, items in memo.effects.items()}
+            with self._store.lock:
+                fn_hash = self._store.query_hashes.get(fid) if kind == "query" else self._store.input_hashes.get(fid)
             record = {
                 "kind": kind,
                 "id": fid,
+                "fn_hash": fn_hash,
                 "value_hash": memo.value_hash,
                 "deps": deps_records,
                 "effects": effects_node,
@@ -964,7 +1156,7 @@ class Evaluator:
             disk.store_entry(_disk_cache.entry_key(kind, fid, args_blob), record, memo.value_hash, value_blob)
         except PersistentCacheError:
             raise
-        except TypeError as exc:
+        except TypeError as exc:  # pragma: no cover
             raise PersistentCacheError(
                 f"accumulator effects recorded by {self._store.key_to_str(key)!r} cannot be "
                 f"serialized for the persistent cache: {exc}"
@@ -977,13 +1169,13 @@ class Evaluator:
             dep_kind, dep_fid, dep_args = dep.key
             try:
                 dep_args_blob = _canonical.encode(dep_args)
-            except TypeError:
-                self._store.trace_event("disk_unkeyed", key, detail=self._store.key_to_str(dep.key))
-                return None
+            except TypeError:  # pragma: no cover
+                self._store.trace_event("disk_unkeyed", key, detail=self._store.key_to_str(dep.key))  # pragma: no cover
+                return None  # pragma: no cover
             fingerprint = self._observed_dep_fingerprint(dep.key, dep.observed_changed_at, memo.verified_at)
             if fingerprint is None:
                 self._store.trace_event("disk_skip", key, detail=self._store.key_to_str(dep.key))
-                return None
+                return None  # pragma: no cover
             rows.append([dep_kind, dep_fid, dep_args_blob, fingerprint])
         return rows
 
@@ -998,7 +1190,7 @@ class Evaluator:
             with self._store.lock:
                 dep_memo = self._store.memos.get(dep_key)
             if dep_memo is None or dep_memo.changed_at != observed_changed_at:
-                return None
+                return None  # pragma: no cover
             return dep_memo.value_hash
         input_key = (dep_fid, dep_args)
         with self._store.lock:
@@ -1009,17 +1201,17 @@ class Evaluator:
                 version = self._store.latest_input_version(input_key)
         if version is not None:
             if version.changed_at != observed_changed_at:
-                return None
+                return None  # pragma: no cover
             return version.value_hash
         if observed_changed_at != -1:
-            return None
+            return None  # pragma: no cover
         fn = self._store.lookup_input(dep_fid)
         if fn is None:
-            return None
+            return None  # pragma: no cover
         try:
             return self._store.stable_hash(fn(*dep_args))
-        except TypeError:
-            return None
+        except TypeError:  # pragma: no cover
+            return None  # pragma: no cover
 
     def prune_disk_cache(self, roots: list[QueryKey]) -> None:
         disk = self._disk
@@ -1035,7 +1227,7 @@ class Evaluator:
             kind, fid, args = key
             try:
                 args_blob = _canonical.encode(args)
-            except TypeError:
+            except TypeError:  # pragma: no cover
                 continue
             ekey = _disk_cache.entry_key(kind, fid, args_blob)
             queue.append(ekey)

@@ -33,6 +33,28 @@ def _resolve_type(module_name: str, qualname: str) -> type[Any]:
     return cur
 
 
+def hash_bytecode(fn: Any) -> str:
+    """Recursively compute a stable hash of a function's bytecode logic."""
+    if not hasattr(fn, "__code__"):
+        return ""
+        
+    def _hash_code(c: Any) -> bytes:
+        h = hashlib.sha256()
+        h.update(c.co_code)
+        for const in c.co_consts:
+            if hasattr(const, "co_code"):
+                h.update(_hash_code(const))
+            else:
+                h.update(str(const).encode("utf-8"))
+        for name in c.co_names:
+            h.update(name.encode("utf-8"))
+        for varname in c.co_varnames:
+            h.update(varname.encode("utf-8"))
+        return h.digest()
+        
+    return _hash_code(fn.__code__).hex()
+
+
 def stable_value_digest(value: Any) -> str:
     """Blake2b hex digest of the canonical JSON form of ``value``."""
     blob = json.dumps(

@@ -38,6 +38,7 @@ async def user_profile():
 
 async def main():
     print("--- First Run ---")
+    print("Step 1: Fetching initial data")
     start = time.perf_counter()
     # Execute the graph
     profile = await user_profile()
@@ -66,6 +67,7 @@ async def main():
     elapsed = time.perf_counter() - start
     print(f"Result: {profile}")
     print(f"Took {elapsed:.2f}s\n")
+    print("Example complete.")
     
 if __name__ == "__main__":
     asyncio.run(main())

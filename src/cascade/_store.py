@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from collections.abc import Sequence
 from typing import Any, Callable
 
-from ._serde import stable_value_digest
+from ._serde import hash_bytecode, stable_value_digest
 from ._state import Dependency, InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 
 
@@ -43,7 +43,9 @@ class GraphStore:
         )
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
+        self.input_hashes: dict[str, str] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
+        self.query_hashes: dict[str, str] = {}
         self.query_fixed_points: dict[str, Any] = {}
         self.query_cache_exceptions: dict[str, bool | tuple[type[BaseException], ...]] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
@@ -104,8 +106,14 @@ class GraphStore:
             self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
     def register_query(self, query_id: str, fn: Callable[..., Any], *, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False) -> None:
+        fn_hash = hash_bytecode(fn)
         with self.lock:
+            if query_id in self.query_hashes and self.query_hashes[query_id] != fn_hash:
+                drop_keys = [k for k in self.memos if k[0] == "query" and k[1] == query_id]
+                for k in drop_keys:
+                    self.drop_memo_locked(k)
             self.queries[query_id] = fn
+            self.query_hashes[query_id] = fn_hash
             self.query_cache_exceptions[query_id] = cache_exceptions
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
@@ -126,8 +134,14 @@ class GraphStore:
             return False, None
 
     def register_input(self, input_id: str, fn: Callable[..., Any]) -> None:
+        fn_hash = hash_bytecode(fn)
         with self.lock:
+            if input_id in self.input_hashes and self.input_hashes[input_id] != fn_hash:
+                drop_keys = [k for k in self.inputs if k[0] == input_id]
+                for k in drop_keys:
+                    self.inputs.pop(k, None)
             self.input_fns[input_id] = fn
+            self.input_hashes[input_id] = fn_hash
 
     def lookup_input(self, input_id: str) -> Callable[..., Any] | None:
         with self.lock:

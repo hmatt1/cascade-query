@@ -178,6 +178,9 @@ def parse(source: str):
 ```
 If a query throws an exception, it gets cached just like a regular return value. Subsequent calls instantly re-raise the exception, preserving incremental evaluation speed during error states. Cached exceptions can also be hydrated from the persistent disk cache.
 
+### Code-Aware Caching (Automatic Invalidation)
+Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic. If the logic has changed, Cascade immediately invalidates that function's memory and persistent disk caches, avoiding stale results without requiring manual cache wipes. Code formatting and comments do not affect the bytecode hash.
+
 ### Performance Metrics
 Set `stats=True` in the `Engine` constructor to track execution timing.
 *   **`engine.stats_summary()`**: Returns wall-clock time spent in function bodies and cache eviction counts.
@@ -223,6 +226,7 @@ pip install query-cascade
 | `async_execution.py` | Asynchronous query evaluation and asyncio event loop integration for IO-bound work |
 | `error_caching.py` | Basic exception caching to prevent repeated re-evaluation on failure |
 | `error_caching_persistence.py` | Disk cache hydration of exceptions across process runs |
+| `code_versioning.py` | Automatic cache invalidation when a function's bytecode logic changes |
 | `dynamic_macro_expansion.py` | Query that **changes downstream dependencies** at runtime |
 | `snapshot_isolation.py` | Snapshot reads while live inputs change |
 | `concurrent_background_work.py` | Dedup under concurrency + cancellation after input changes |
