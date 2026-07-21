@@ -39,7 +39,7 @@ def parse_ast(path: str) -> dict:
 @engine.query
 def analyze_imports(path: str) -> list[str]:
     # This will propagate the SyntaxError if parse_ast fails
-    ast = parse_ast(path)
+    _ = parse_ast(path)
     return ["sys", "os"]
 
 

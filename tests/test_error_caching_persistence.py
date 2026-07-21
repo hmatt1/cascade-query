@@ -1,8 +1,6 @@
 import pytest
-import os
 import tempfile
 from cascade.engine import Engine
-from cascade._disk_cache import DiskCache
 
 def test_persistent_error_caching():
     with tempfile.TemporaryDirectory() as tmpdir:
