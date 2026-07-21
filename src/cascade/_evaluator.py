@@ -180,6 +180,7 @@ class Evaluator:
         snapshot: Snapshot | None,
         effects: dict[str, list[Any]] | None = None,
         cancel_epoch: int | None = None,
+        need_value: bool = True,
     ) -> Any:
         runtime = self._runtime_var.get()
         if runtime is None:
@@ -200,6 +201,7 @@ class Evaluator:
                     snapshot=snapshot,
                     effects=effects,
                     cancel_epoch=cancel_epoch,
+                    need_value=need_value,
                 ),
             )
 
@@ -223,7 +225,7 @@ class Evaluator:
                     runtime.stack[-1].deps[key] = runtime.snapshot.revision
                 return frame.cycle_guess
         self.check_cancelled(runtime.cancel_epoch)
-        entry, replay_needed = self.compute_or_get_memo(key, fn, runtime)
+        entry, replay_needed = self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
         self.record_dependency(key, entry.changed_at)
         if replay_needed:
             self.replay_effects(entry.effects)
@@ -240,6 +242,7 @@ class Evaluator:
         snapshot: Snapshot | None,
         effects: dict[str, list[Any]] | None = None,
         cancel_epoch: int | None = None,
+        need_value: bool = True,
     ) -> Any:
         runtime = self._runtime_var.get()
         if runtime is None:
@@ -250,6 +253,7 @@ class Evaluator:
                 staged_root_effects={},
                 cancel_epoch=cancel_epoch,
                 snapshot_pinned=snapshot is not None,
+                is_async=True,
             )
             return await self._run_in_runtime_async(
                 root_runtime,
@@ -260,6 +264,7 @@ class Evaluator:
                     snapshot=snapshot,
                     effects=effects,
                     cancel_epoch=cancel_epoch,
+                    need_value=need_value,
                 ),
             )
 
@@ -282,7 +287,7 @@ class Evaluator:
                     runtime.stack[-1].deps[key] = runtime.snapshot.revision
                 return frame.cycle_guess
         self.check_cancelled(runtime.cancel_epoch)
-        entry, replay_needed = await self.compute_or_get_memo_async(key, fn, runtime)
+        entry, replay_needed = await self.compute_or_get_memo_async(key, fn, runtime, need_value=need_value)
         self.record_dependency(key, entry.changed_at)
         if replay_needed:
             self.replay_effects(entry.effects)
@@ -295,14 +300,18 @@ class Evaluator:
         key: QueryKey,
         fn: Callable[..., Any],
         runtime: RuntimeState,
+        *,
+        need_value: bool = True,
     ) -> tuple[MemoEntry, bool]:
         with self._store.lock:
             existing = self._store.memos.get(key)
+            is_memoized = self._store.lookup_query_memoize(key[1])
             if existing is not None:
                 self._store.touch_memo_locked(key)
                 if existing.verified_at == runtime.snapshot.revision:
                     self._store.trace_event("cache_hit", key)
-                    return existing, True
+                    if is_memoized or not need_value:
+                        return existing, True
 
                 self._store.pin_memo_verification_locked(key)
                 try:
@@ -314,7 +323,8 @@ class Evaluator:
                     existing.verified_at = runtime.snapshot.revision
                     self._store.touch_memo_locked(key)
                     self._store.trace_event("cache_green", key)
-                    return existing, True
+                    if is_memoized or not need_value:
+                        return existing, True
 
             in_flight_key = (key, runtime.snapshot.revision)
             owner_future = self._store.in_flight.get(in_flight_key)
@@ -332,7 +342,7 @@ class Evaluator:
 
         try:
             hydrated: MemoEntry | None = None
-            if self._disk is not None and existing is None:
+            if self._disk is not None and existing is None and is_memoized:
                 hydrated = self._try_hydrate_from_disk(key, runtime)
             if hydrated is not None:
                 owner_future.set_result(hydrated)
@@ -352,14 +362,18 @@ class Evaluator:
         key: QueryKey,
         fn: Callable[..., Any],
         runtime: RuntimeState,
+        *,
+        need_value: bool = True,
     ) -> tuple[MemoEntry, bool]:
         with self._store.lock:
             existing = self._store.memos.get(key)
+            is_memoized = self._store.lookup_query_memoize(key[1])
             if existing is not None:
                 self._store.touch_memo_locked(key)
                 if existing.verified_at == runtime.snapshot.revision:
                     self._store.trace_event("cache_hit", key)
-                    return existing, True
+                    if is_memoized or not need_value:
+                        return existing, True
                 self._store.pin_memo_verification_locked(key)
 
         if existing is not None:
@@ -373,7 +387,8 @@ class Evaluator:
                     existing.verified_at = runtime.snapshot.revision
                     self._store.touch_memo_locked(key)
                 self._store.trace_event("cache_green", key)
-                return existing, True
+                if is_memoized or not need_value:
+                    return existing, True
 
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
@@ -392,7 +407,7 @@ class Evaluator:
 
         try:
             hydrated: MemoEntry | None = None
-            if self._disk is not None and existing is None:
+            if self._disk is not None and existing is None and is_memoized:
                 hydrated = await self._try_hydrate_from_disk_async(key, runtime)
             if hydrated is not None:
                 owner_future.set_result(hydrated)
@@ -451,7 +466,7 @@ class Evaluator:
                     cancel_epoch=None,
                     snapshot_pinned=True,
                 ),
-                lambda: self.query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None),
+                lambda: self.query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None, need_value=False),
             )
         else:
             # Dependency verification should not add edges to currently executing frame.
@@ -466,7 +481,7 @@ class Evaluator:
             self._run_in_runtime(
                 shadow,
                 lambda: self.query_call(
-                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch, need_value=False
                 ),
             )
 
@@ -505,7 +520,7 @@ class Evaluator:
                     snapshot_pinned=True,
                     is_async=True,
                 ),
-                lambda: self.query_call_async(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None),
+                lambda: self.query_call_async(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None, need_value=False),
             )
         else:
             shadow = RuntimeState(
@@ -520,7 +535,7 @@ class Evaluator:
             await self._run_in_runtime_async(
                 shadow,
                 lambda: self.query_call_async(
-                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch, need_value=False
                 ),
             )
 
@@ -604,6 +619,7 @@ class Evaluator:
             for k in frame.cycle_nodes:
                 frame.deps.pop(k, None)
             
+        is_memoized = self._store.lookup_query_memoize(key[1])
         with self._store.lock:
             previous = self._store.memos.get(key)
             if previous is not None and previous.value_hash == value_hash:
@@ -612,7 +628,7 @@ class Evaluator:
             else:
                 changed_at = runtime.snapshot.revision
             self._store.next_access_id += 1
-            memo = self._store.entry_from_runtime(
+            full_memo = self._store.entry_from_runtime(
                 value=result,
                 value_hash=value_hash,
                 changed_at=changed_at,
@@ -623,18 +639,32 @@ class Evaluator:
                 cycle_nodes=tuple(frame.cycle_nodes),
                 error=error,
             )
+            if is_memoized:
+                stored_memo = full_memo
+            else:
+                stored_memo = self._store.entry_from_runtime(
+                    value=None,
+                    value_hash=value_hash,
+                    changed_at=changed_at,
+                    verified_at=runtime.snapshot.revision,
+                    deps=frame.deps,
+                    effects=frozen_effects,
+                    last_access=self._store.next_access_id,
+                    cycle_nodes=tuple(frame.cycle_nodes),
+                    error=error,
+                )
             self._store.drop_memo_locked(key)
-            self._store.memos[key] = memo
+            self._store.memos[key] = stored_memo
             self._store.push_memo_lru_locked(key)
             for dep_key in frame.deps.keys():
                 self._store.dependents[dep_key].add(key)
             self._store.evict_if_needed_locked()
-        if self._disk is not None:
-            self._persist_entry(key, memo)
+        if self._disk is not None and is_memoized:
+            self._persist_entry(key, full_memo)
         self._store.trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
         if self._store.is_stats_enabled():
             self._store.record_query_body_time(key, elapsed)
-        return memo
+        return full_memo
 
     async def recompute_async(  # pragma: no cover
         self,
@@ -721,6 +751,7 @@ class Evaluator:
                 for k in frame.cycle_nodes:
                     frame.deps.pop(k, None)
                 
+            is_memoized = self._store.lookup_query_memoize(key[1])
             with self._store.lock:
                 previous = self._store.memos.get(key)
                 if previous is not None and previous.value_hash == value_hash:
@@ -729,7 +760,7 @@ class Evaluator:
                 else:
                     changed_at = new_runtime.snapshot.revision
                 self._store.next_access_id += 1
-                memo = self._store.entry_from_runtime(
+                full_memo = self._store.entry_from_runtime(
                     value=result,
                     value_hash=value_hash,
                     changed_at=changed_at,
@@ -740,18 +771,32 @@ class Evaluator:
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
                 )
+                if is_memoized:
+                    stored_memo = full_memo
+                else:
+                    stored_memo = self._store.entry_from_runtime(
+                        value=None,
+                        value_hash=value_hash,
+                        changed_at=changed_at,
+                        verified_at=new_runtime.snapshot.revision,
+                        deps=frame.deps,
+                        effects=frozen_effects,
+                        last_access=self._store.next_access_id,
+                        cycle_nodes=tuple(frame.cycle_nodes),
+                        error=error,
+                    )
                 self._store.drop_memo_locked(key)
-                self._store.memos[key] = memo
+                self._store.memos[key] = stored_memo
                 self._store.push_memo_lru_locked(key)
                 for dep_key in frame.deps.keys():
                     self._store.dependents[dep_key].add(key)
                 self._store.evict_if_needed_locked()
-            if self._disk is not None:
-                self._persist_entry(key, memo)
+            if self._disk is not None and is_memoized:
+                self._persist_entry(key, full_memo)
             self._store.trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
             if self._store.is_stats_enabled():
                 self._store.record_query_body_time(key, elapsed)
-            return memo
+            return full_memo
         finally:
             runtime.snapshot = new_runtime.snapshot
             self._runtime_var.reset(token)

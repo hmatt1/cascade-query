@@ -7,7 +7,6 @@ import os
 import threading
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
-_get_loop = getattr(asyncio, "_get_running_loop", None)
 
 from . import _canonical
 from ._disk_cache import DiskCache
@@ -18,6 +17,7 @@ from ._runtime import RuntimeState
 from ._scheduler import WorkStealingExecutor
 from ._state import InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 from ._store import GraphStore
+_get_loop = getattr(asyncio, "_get_running_loop", None)
 
 _UNSET = object()
 
@@ -250,11 +250,11 @@ class Engine:
         self._store.register_input(handle.id, fn)
         return handle
 
-    def query(self, fn: Callable[..., Any] | None = None, *, fixed_point: Any = _UNSET, cache_exceptions: bool | tuple[type[BaseException], ...] = True) -> Any:
+    def query(self, fn: Callable[..., Any] | None = None, *, memoize: bool = True, fixed_point: Any = _UNSET, cache_exceptions: bool | tuple[type[BaseException], ...] = True) -> Any:
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
             handle = _QueryHandle(self, f)
             has_fixed_point = fixed_point is not _UNSET
-            self._store.register_query(handle.id, f, fixed_point=fixed_point, has_fixed_point=has_fixed_point, cache_exceptions=cache_exceptions)
+            self._store.register_query(handle.id, f, memoize=memoize, fixed_point=fixed_point, has_fixed_point=has_fixed_point, cache_exceptions=cache_exceptions)
             return handle
         if fn is not None:
             return decorator(fn)

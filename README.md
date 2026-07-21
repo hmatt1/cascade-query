@@ -147,6 +147,16 @@ asyncio.run(main())
 ```
 Synchronous queries can also be called directly from inside asynchronous nodes (and vice versa). Cascade maintains type stability and performance segregation, ensuring pure-Python CPU-bound tasks suffer no context-switching overhead while I/O-bound tasks evaluate concurrently.
 
+### Pass-Through Queries (`memoize=False`)
+For intermediate queries that generate large outputs, you can set `memoize=False` to prevent their results from being stored in the LRU cache. This saves significant memory while still allowing the query to fully participate in the dependency graph. Downstream nodes will still accurately detect when the query's inputs change, and the unmemoized query will simply recompute its output on-demand when an active caller needs it.
+
+```python
+@engine.query(memoize=False)
+def mapped_data() -> list[int]:
+    data = raw_data()
+    return [x * 2 for x in data]
+```
+
 ### Side-Effect Accumulators
 Queries must be pure functions. Use `Accumulator` to record side-effects (like logs or warnings) that must be replayed when a result is served from the cache.
 
@@ -227,6 +237,7 @@ pip install query-cascade
 | `error_caching.py` | Basic exception caching to prevent repeated re-evaluation on failure |
 | `error_caching_persistence.py` | Disk cache hydration of exceptions across process runs |
 | `code_versioning.py` | Automatic cache invalidation when a function's bytecode logic changes |
+| `pass_through_queries.py` | `memoize=False` tracking inputs without keeping large outputs in the LRU cache |
 | `dynamic_macro_expansion.py` | Query that **changes downstream dependencies** at runtime |
 | `snapshot_isolation.py` | Snapshot reads while live inputs change |
 | `concurrent_background_work.py` | Dedup under concurrency + cancellation after input changes |

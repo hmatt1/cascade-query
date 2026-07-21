@@ -46,6 +46,7 @@ class GraphStore:
         self.input_hashes: dict[str, str] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
         self.query_hashes: dict[str, str] = {}
+        self.query_memoize: dict[str, bool] = {}
         self.query_fixed_points: dict[str, Any] = {}
         self.query_cache_exceptions: dict[str, bool | tuple[type[BaseException], ...]] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
@@ -105,7 +106,7 @@ class GraphStore:
             sk = self.key_to_str(key)
             self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
-    def register_query(self, query_id: str, fn: Callable[..., Any], *, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False) -> None:
+    def register_query(self, query_id: str, fn: Callable[..., Any], *, memoize: bool = True, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False) -> None:
         fn_hash = hash_bytecode(fn)
         with self.lock:
             if query_id in self.query_hashes and self.query_hashes[query_id] != fn_hash:
@@ -114,9 +115,14 @@ class GraphStore:
                     self.drop_memo_locked(k)
             self.queries[query_id] = fn
             self.query_hashes[query_id] = fn_hash
+            self.query_memoize[query_id] = memoize
             self.query_cache_exceptions[query_id] = cache_exceptions
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
+
+    def lookup_query_memoize(self, query_id: str) -> bool:
+        with self.lock:
+            return self.query_memoize.get(query_id, True)
 
     def lookup_query(self, query_id: str) -> Callable[..., Any]:
         with self.lock:

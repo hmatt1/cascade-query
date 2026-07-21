@@ -1,6 +1,3 @@
-import pytest
-import os
-import cascade
 from cascade.engine import Engine
 
 def test_memory_cache_invalidation_on_code_change():

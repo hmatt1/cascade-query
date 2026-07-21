@@ -31,7 +31,7 @@ async def test_async_input_and_disk_cache(tmp_path):
     engine2 = Engine(cache_dir=str(tmp_path), stats=True)
     
     @engine2.input
-    async def async_input(x: int) -> int:
+    async def async_input2(x: int) -> int:
         await asyncio.sleep(0.01)
         return x + 10
         
