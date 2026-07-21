@@ -36,6 +36,8 @@ def run_example():
     # Since mapped_data() is memoize=False, it executes to generate its output
     # but doesn't store the output in the LRU cache.
     print("Result:", aggregated_result())
+    
+    print("\nExample complete.")
 
 if __name__ == "__main__":
     run_example()
