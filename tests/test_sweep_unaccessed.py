@@ -1,4 +1,3 @@
-import pytest
 from cascade import Engine
 
 def test_sweep_unaccessed() -> None:
