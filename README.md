@@ -120,6 +120,33 @@ A few things to know:
 
 ## Advanced Features
 
+### Asynchronous Execution
+Cascade natively supports asynchronous queries via `async def`. This is extremely useful for I/O-bound workflows (such as making database or network calls). When an asynchronous query evaluates, it runs cooperatively on the active `asyncio` event loop.
+
+```python
+import asyncio
+from cascade import Engine
+
+engine = Engine()
+
+@engine.query
+async def fetch_user(uid: str):
+    await asyncio.sleep(0.5) # Network I/O
+    return {"id": uid, "name": "Alice"}
+    
+@engine.query
+async def process_user(uid: str):
+    # Await downstream async queries seamlessly
+    user = await fetch_user(uid)
+    return user["name"].upper()
+
+async def main():
+    print(await process_user("123"))
+
+asyncio.run(main())
+```
+Synchronous queries can also be called directly from inside asynchronous nodes (and vice versa). Cascade maintains type stability and performance segregation, ensuring pure-Python CPU-bound tasks suffer no context-switching overhead while I/O-bound tasks evaluate concurrently.
+
 ### Side-Effect Accumulators
 Queries must be pure functions. Use `Accumulator` to record side-effects (like logs or warnings) that must be replayed when a result is served from the cache.
 
@@ -193,6 +220,7 @@ pip install query-cascade
 | Script | What it shows |
 |--------|----------------|
 | `compiler_pipeline.py` | `source → parse → symbols → typecheck`, warnings accumulator, cache-hit narration |
+| `async_execution.py` | Asynchronous query evaluation and asyncio event loop integration for IO-bound work |
 | `error_caching.py` | Basic exception caching to prevent repeated re-evaluation on failure |
 | `error_caching_persistence.py` | Disk cache hydration of exceptions across process runs |
 | `dynamic_macro_expansion.py` | Query that **changes downstream dependencies** at runtime |

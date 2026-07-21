@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import contextvars
+import inspect
+import types
 from typing import Any, Callable, Mapping, Sequence
 
 from . import _canonical, _disk_cache
@@ -13,9 +16,10 @@ from ._store import GraphStore
 
 
 class Evaluator:
-    def __init__(self, store: GraphStore, *, disk: DiskCache | None = None) -> None:
+    def __init__(self, store: GraphStore, *, disk: DiskCache | None = None, get_executor: Callable[[], concurrent.futures.Executor] | None = None) -> None:
         self._store = store
         self._disk = disk
+        self._get_executor = get_executor
         self._runtime_var: contextvars.ContextVar[RuntimeState | None] = contextvars.ContextVar(
             "cascade_runtime", default=None
         )
@@ -30,8 +34,17 @@ class Evaluator:
         token = self._runtime_var.set(runtime)
         try:
             result = fn()
-            # Root effects become externally visible only after successful query
-            # completion, preventing failed executions from leaking partial output.
+            if runtime.root_effects is not None:
+                for name, values in runtime.staged_root_effects.items():
+                    runtime.root_effects.setdefault(name, []).extend(values)
+            return result
+        finally:
+            self._runtime_var.reset(token)
+
+    async def _run_in_runtime_async(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
+        token = self._runtime_var.set(runtime)
+        try:
+            result = await fn()
             if runtime.root_effects is not None:
                 for name, values in runtime.staged_root_effects.items():
                     runtime.root_effects.setdefault(name, []).extend(values)
@@ -92,6 +105,8 @@ class Evaluator:
         version = self._store.input_version_at((input_id, args), use_snapshot.revision)
         if version is None:
             default = fn(*args)
+            if isinstance(default, types.CoroutineType):
+                default = asyncio.run(default)
             should_materialize = False
             if not snapshot_pinned:
                 with self._store.lock:
@@ -101,6 +116,49 @@ class Evaluator:
                 self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
                 version = self._store.latest_input_version((input_id, args))
                 if version is None:  # pragma: no cover - safety belt
+                    raise RuntimeError("input version missing after initialization")
+            else:
+                version = InputVersion(
+                    revision=use_snapshot.revision,
+                    changed_at=-1,
+                    value_hash=self._store.stable_hash(default),
+                    value=default,
+                )
+        self.record_dependency(key, version.changed_at)
+        self._store.trace_event("input_read", key)
+        return version.value
+
+    async def read_input_async(
+        self,
+        input_id: str,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        *,
+        snapshot: Snapshot | None,
+    ) -> Any:
+        runtime = self._runtime_var.get()
+        use_snapshot = snapshot or (runtime.snapshot if runtime is not None else self._store.snapshot())
+        snapshot_pinned = snapshot is not None or (runtime.snapshot_pinned if runtime is not None else False)
+        if runtime is not None:
+            self.check_cancelled(runtime.cancel_epoch)
+        key = ("input", input_id, args)
+        version = self._store.input_version_at((input_id, args), use_snapshot.revision)
+        if version is None:
+            if inspect.iscoroutinefunction(fn):
+                default = await fn(*args)
+            else:
+                loop = asyncio.get_running_loop()
+                executor = self._get_executor() if self._get_executor else None
+                default = await loop.run_in_executor(executor, fn, *args)
+            should_materialize = False
+            if not snapshot_pinned:
+                with self._store.lock:
+                    latest = self._store.latest_input_version((input_id, args))
+                    should_materialize = latest is None and use_snapshot.revision == self._store.revision
+            if should_materialize:
+                self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
+                version = self._store.latest_input_version((input_id, args))
+                if version is None:  # pragma: no cover
                     raise RuntimeError("input version missing after initialization")
             else:
                 version = InputVersion(
@@ -173,6 +231,65 @@ class Evaluator:
             raise entry.error
         return entry.value
 
+    async def query_call_async(
+        self,
+        query_id: str,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        *,
+        snapshot: Snapshot | None,
+        effects: dict[str, list[Any]] | None = None,
+        cancel_epoch: int | None = None,
+    ) -> Any:
+        runtime = self._runtime_var.get()
+        if runtime is None:
+            root_runtime = RuntimeState(
+                snapshot=snapshot or self._store.snapshot(),
+                stack=[],
+                root_effects=effects,
+                staged_root_effects={},
+                cancel_epoch=cancel_epoch,
+                snapshot_pinned=snapshot is not None,
+            )
+            return await self._run_in_runtime_async(
+                root_runtime,
+                lambda: self.query_call_async(
+                    query_id,
+                    fn,
+                    args,
+                    snapshot=snapshot,
+                    effects=effects,
+                    cancel_epoch=cancel_epoch,
+                ),
+            )
+
+        key: QueryKey = ("query", query_id, args)
+        for i, frame in enumerate(runtime.stack):
+            if frame.key == key:
+                if frame.cycle_guess is UNSET:
+                    has_fp, fp_val = self._store.lookup_query_fixed_point(query_id)
+                    if not has_fp:
+                        cycle_start = [f.key for f in runtime.stack[i:]] + [key]
+                        cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
+                        raise CycleError(f"cycle detected: {cycle}")
+                    frame.cycle_guess = fp_val
+                    
+                frame.is_cycle_root = True
+                for f in runtime.stack[i:]:
+                    frame.cycle_nodes.add(f.key)
+                
+                if len(runtime.stack) > 0:
+                    runtime.stack[-1].deps[key] = runtime.snapshot.revision
+                return frame.cycle_guess
+        self.check_cancelled(runtime.cancel_epoch)
+        entry, replay_needed = await self.compute_or_get_memo_async(key, fn, runtime)
+        self.record_dependency(key, entry.changed_at)
+        if replay_needed:
+            self.replay_effects(entry.effects)
+        if entry.error is not None:
+            raise entry.error
+        return entry.value
+
     def compute_or_get_memo(
         self,
         key: QueryKey,
@@ -230,9 +347,77 @@ class Evaluator:
             with self._store.lock:
                 self._store.in_flight.pop((key, runtime.snapshot.revision), None)
 
+    async def compute_or_get_memo_async(
+        self,
+        key: QueryKey,
+        fn: Callable[..., Any],
+        runtime: RuntimeState,
+    ) -> tuple[MemoEntry, bool]:
+        with self._store.lock:
+            existing = self._store.memos.get(key)
+            if existing is not None:
+                self._store.touch_memo_locked(key)
+                if existing.verified_at == runtime.snapshot.revision:
+                    self._store.trace_event("cache_hit", key)
+                    return existing, True
+                self._store.pin_memo_verification_locked(key)
+
+        if existing is not None:
+            try:
+                green = await self.try_mark_green_async(key, existing, runtime.snapshot)
+            finally:
+                with self._store.lock:
+                    self._store.unpin_memo_verification_locked(key)
+            if green:
+                with self._store.lock:
+                    existing.verified_at = runtime.snapshot.revision
+                    self._store.touch_memo_locked(key)
+                self._store.trace_event("cache_green", key)
+                return existing, True
+
+        with self._store.lock:
+            in_flight_key = (key, runtime.snapshot.revision)
+            owner_future = self._store.in_flight.get(in_flight_key)
+            if owner_future is None:
+                owner_future = concurrent.futures.Future()
+                self._store.in_flight[in_flight_key] = owner_future
+                is_owner = True
+            else:
+                is_owner = False
+
+        if not is_owner:
+            self._store.trace_event("dedup_wait", key)
+            result = await asyncio.wrap_future(owner_future)
+            return result, True
+
+        try:
+            hydrated: MemoEntry | None = None
+            if self._disk is not None and existing is None:
+                hydrated = self._try_hydrate_from_disk(key, runtime)
+            if hydrated is not None:
+                owner_future.set_result(hydrated)
+                return hydrated, True
+            result = await self.recompute_async(key, fn, runtime)
+            owner_future.set_result(result)
+            return result, False
+        except BaseException as exc:
+            owner_future.set_exception(exc)
+            raise
+        finally:
+            with self._store.lock:
+                self._store.in_flight.pop((key, runtime.snapshot.revision), None)
+
     def try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
         for dep in entry.deps:
             dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
+            if dep_changed_at != dep.observed_changed_at:
+                self._store.trace_event("cache_red", key, detail=self._store.key_to_str(dep.key))
+                return False
+        return True
+
+    async def try_mark_green_async(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
+        for dep in entry.deps:
+            dep_changed_at = await self.dependency_changed_at_async(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
                 self._store.trace_event("cache_red", key, detail=self._store.key_to_str(dep.key))
                 return False
@@ -291,6 +476,60 @@ class Evaluator:
                 raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
             return refreshed.changed_at
 
+    async def dependency_changed_at_async(self, key: QueryKey, snapshot: Snapshot) -> int:
+        kind, fid, args = key
+        if kind == "input":
+            version = self._store.input_version_at((fid, args), snapshot.revision)
+            return -1 if version is None else version.changed_at
+
+        with self._store.lock:
+            memo = self._store.memos.get(key)
+        fn = self._store.lookup_query(fid)
+        if memo is not None and memo.verified_at == snapshot.revision:
+            return memo.changed_at
+
+        runtime = self._runtime_var.get()
+        if runtime is not None:
+            for frame in runtime.stack:
+                if frame.key == key:
+                    return snapshot.revision
+
+        if runtime is None:
+            await self._run_in_runtime_async(
+                RuntimeState(
+                    snapshot=snapshot,
+                    stack=[],
+                    root_effects=None,
+                    staged_root_effects={},
+                    cancel_epoch=None,
+                    snapshot_pinned=True,
+                    is_async=True,
+                ),
+                lambda: self.query_call_async(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None),
+            )
+        else:
+            shadow = RuntimeState(
+                snapshot=snapshot,
+                stack=[],
+                root_effects=None,
+                staged_root_effects={},
+                cancel_epoch=runtime.cancel_epoch,
+                snapshot_pinned=True,
+                is_async=True,
+            )
+            await self._run_in_runtime_async(
+                shadow,
+                lambda: self.query_call_async(
+                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+                ),
+            )
+
+        with self._store.lock:
+            refreshed = self._store.memos.get(key)
+            if refreshed is None:  # pragma: no cover - safety belt
+                raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
+            return refreshed.changed_at
+
     def recompute(
         self,
         key: QueryKey,
@@ -314,6 +553,8 @@ class Evaluator:
             try:
                 self.check_cancelled(runtime.cancel_epoch)
                 result = fn(*key[2])
+                if isinstance(result, types.CoroutineType):
+                    result = asyncio.run(result)
                 self.check_cancelled(runtime.cancel_epoch)
                 error = None
             except BaseException as exc:
@@ -394,6 +635,126 @@ class Evaluator:
         if self._store.is_stats_enabled():
             self._store.record_query_body_time(key, elapsed)
         return memo
+
+    async def recompute_async(
+        self,
+        key: QueryKey,
+        fn: Callable[..., Any],
+        runtime: RuntimeState,
+    ) -> MemoEntry:
+        frame = RuntimeFrame(key=key)
+        new_runtime = RuntimeState(
+            snapshot=runtime.snapshot,
+            stack=runtime.stack + [frame],
+            root_effects=runtime.root_effects,
+            staged_root_effects=runtime.staged_root_effects,
+            cancel_epoch=runtime.cancel_epoch,
+            snapshot_pinned=runtime.snapshot_pinned,
+            is_async=True,
+        )
+        token = self._runtime_var.set(new_runtime)
+        try:
+            start = self._store.monotonic_seconds()
+            self._store.trace_event("recompute_start", key)
+            
+            with self._store.lock:
+                old_memo = self._store.memos.get(key)
+                if old_memo is not None and old_memo.cycle_nodes:
+                    for k in old_memo.cycle_nodes:
+                        if k != key:
+                            self._store.drop_memo_locked(k)
+                            
+            error: BaseException | None = None
+            while True:
+                try:
+                    self.check_cancelled(new_runtime.cancel_epoch)
+                    if inspect.iscoroutinefunction(fn):
+                        result = await fn(*key[2])
+                    else:
+                        loop = asyncio.get_running_loop()
+                        executor = self._get_executor() if self._get_executor else None
+                        result = await loop.run_in_executor(executor, fn, *key[2])
+                    self.check_cancelled(new_runtime.cancel_epoch)
+                    error = None
+                except BaseException as exc:
+                    cache_ex = self._store.lookup_query_cache_exceptions(key[1])
+                    should_cache = False
+                    if isinstance(exc, (QueryCancelled, CycleError, PersistentCacheError)):
+                        pass
+                    elif cache_ex is True:
+                        should_cache = isinstance(exc, Exception)
+                    elif isinstance(cache_ex, tuple):
+                        should_cache = isinstance(exc, cache_ex)
+                        
+                    if should_cache:
+                        error = exc
+                        result = None
+                    else:
+                        raise
+                    
+                if frame.is_cycle_root:
+                    if error is None and self._store.stable_hash(result) != self._store.stable_hash(frame.cycle_guess):
+                        frame.cycle_guess = result
+                        frame.is_cycle_root = False
+                        with self._store.lock:
+                            self._store.revision += 1
+                            new_runtime.snapshot = Snapshot(revision=self._store.revision)
+                            for k in frame.cycle_nodes:
+                                if k != key:
+                                    self._store.drop_memo_locked(k)
+                        frame.deps.clear()
+                        frame.effects.clear()
+                        continue
+                        
+                break
+                
+            elapsed = self._store.monotonic_seconds() - start
+            duration_ms = elapsed * 1000.0
+
+            frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
+            if error is not None:
+                value_hash = self._store.stable_hash(error)
+            else:
+                value_hash = self._store.stable_hash(result)
+            
+            if frame.cycle_nodes:
+                for k in frame.cycle_nodes:
+                    frame.deps.pop(k, None)
+                
+            with self._store.lock:
+                previous = self._store.memos.get(key)
+                if previous is not None and previous.value_hash == value_hash:
+                    changed_at = previous.changed_at
+                    self._store.trace_event("backdate", key)
+                else:
+                    changed_at = new_runtime.snapshot.revision
+                self._store.next_access_id += 1
+                memo = self._store.entry_from_runtime(
+                    value=result,
+                    value_hash=value_hash,
+                    changed_at=changed_at,
+                    verified_at=new_runtime.snapshot.revision,
+                    deps=frame.deps,
+                    effects=frozen_effects,
+                    last_access=self._store.next_access_id,
+                    cycle_nodes=tuple(frame.cycle_nodes),
+                    error=error,
+                )
+                self._store.drop_memo_locked(key)
+                self._store.memos[key] = memo
+                self._store.push_memo_lru_locked(key)
+                for dep_key in frame.deps.keys():
+                    self._store.dependents[dep_key].add(key)
+                self._store.evict_if_needed_locked()
+            if self._disk is not None:
+                self._persist_entry(key, memo)
+            self._store.trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
+            if self._store.is_stats_enabled():
+                self._store.record_query_body_time(key, elapsed)
+            return memo
+        finally:
+            runtime.snapshot = new_runtime.snapshot
+            self._runtime_var.reset(token)
 
     # --- persistent disk cache ---
 

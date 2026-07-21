@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import concurrent.futures
 import os
 import threading
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
+
+_get_loop = getattr(asyncio, "_get_running_loop", None)
 
 from . import _canonical
 from ._disk_cache import DiskCache
@@ -39,8 +43,22 @@ class _InputHandle:
         self._engine = engine
         self._fn = fn
         self._id = engine._function_id(fn)
+        self._is_async_fn = inspect.iscoroutinefunction(fn)
 
     def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
+        if not self._is_async_fn:
+            return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
+            
+        if _get_loop is not None and _get_loop() is not None:
+            return self._engine._read_input_async(self._id, self._fn, args, snapshot=snapshot)
+            
+        if _get_loop is None:
+            try:
+                asyncio.get_running_loop()
+                return self._engine._read_input_async(self._id, self._fn, args, snapshot=snapshot)
+            except RuntimeError:
+                pass
+                
         return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
     def set(self, *args: Any, value: Any = _UNSET) -> int:
@@ -65,6 +83,7 @@ class _QueryHandle:
         self._engine = engine
         self._fn = fn
         self._id = engine._function_id(fn)
+        self._is_async_fn = inspect.iscoroutinefunction(fn)
 
     def __call__(
         self,
@@ -72,6 +91,19 @@ class _QueryHandle:
         snapshot: Snapshot | None = None,
         effects: dict[str, list[Any]] | None = None,
     ) -> Any:
+        if not self._is_async_fn:
+            return self._engine._query_call(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
+            
+        if _get_loop is not None and _get_loop() is not None:
+            return self._engine._query_call_async(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
+            
+        if _get_loop is None:
+            try:
+                asyncio.get_running_loop()
+                return self._engine._query_call_async(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
+            except RuntimeError:
+                pass
+                
         return self._engine._query_call(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
 
     @property
@@ -190,7 +222,7 @@ class Engine:
             monotonic_seconds=stats_clock,
             value_digest=value_digest,
         )
-        self._evaluator = Evaluator(self._store, disk=self._disk)
+        self._evaluator = Evaluator(self._store, disk=self._disk, get_executor=self._ensure_submit_executor)
         # Single private probe for invariant-oriented internals.
         self._internals = _EngineInternals(self._store, self._evaluator)
         self._submit_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -480,6 +512,16 @@ class Engine:
     ) -> Any:
         return self._evaluator.read_input(input_id, fn, args, snapshot=snapshot)
 
+    async def _read_input_async(
+        self,
+        input_id: str,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        *,
+        snapshot: Snapshot | None,
+    ) -> Any:
+        return await self._evaluator.read_input_async(input_id, fn, args, snapshot=snapshot)
+
     def _check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         self._evaluator.check_cancelled(runtime_cancel_epoch)
 
@@ -494,6 +536,25 @@ class Engine:
         cancel_epoch: int | None = None,
     ) -> Any:
         return self._evaluator.query_call(
+            query_id,
+            fn,
+            args,
+            snapshot=snapshot,
+            effects=effects,
+            cancel_epoch=cancel_epoch,
+        )
+
+    async def _query_call_async(
+        self,
+        query_id: str,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        *,
+        snapshot: Snapshot | None,
+        effects: dict[str, list[Any]] | None = None,
+        cancel_epoch: int | None = None,
+    ) -> Any:
+        return await self._evaluator.query_call_async(
             query_id,
             fn,
             args,

@@ -27,3 +27,4 @@ class RuntimeState:
     staged_root_effects: dict[str, list[Any]]
     cancel_epoch: int | None
     snapshot_pinned: bool
+    is_async: bool = False
