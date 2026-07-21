@@ -7,11 +7,16 @@ from typing import Any
 from ._state import QueryKey, Snapshot
 
 
+UNSET = object()
+
 @dataclass
 class RuntimeFrame:
     key: QueryKey
     deps: dict[QueryKey, int] = field(default_factory=dict)
     effects: dict[str, list[Any]] = field(default_factory=lambda: defaultdict(list))
+    cycle_guess: Any = UNSET
+    is_cycle_root: bool = False
+    cycle_nodes: set[QueryKey] = field(default_factory=set)
 
 
 @dataclass

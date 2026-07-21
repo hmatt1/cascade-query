@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import _canonical, _disk_cache
 from ._disk_cache import DiskCache
 from ._errors import CycleError, PersistentCacheError, QueryCancelled
-from ._runtime import RuntimeFrame, RuntimeState
+from ._runtime import UNSET, RuntimeFrame, RuntimeState
 from ._state import InputVersion, MemoEntry, QueryKey, Snapshot
 from ._store import GraphStore
 
@@ -146,10 +146,24 @@ class Evaluator:
             )
 
         key: QueryKey = ("query", query_id, args)
-        if any(frame.key == key for frame in runtime.stack):
-            cycle_start = [frame.key for frame in runtime.stack] + [key]
-            cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
-            raise CycleError(f"cycle detected: {cycle}")
+        for i, frame in enumerate(runtime.stack):
+            if frame.key == key:
+                if frame.cycle_guess is UNSET:
+                    has_fp, fp_val = self._store.lookup_query_fixed_point(query_id)
+                    if not has_fp:
+                        cycle_start = [f.key for f in runtime.stack[i:]] + [key]
+                        cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
+                        raise CycleError(f"cycle detected: {cycle}")
+                    frame.cycle_guess = fp_val
+                    
+                frame.is_cycle_root = True
+                for f in runtime.stack[i:]:
+                    frame.cycle_nodes.add(f.key)
+                
+                # Record the back-edge dependency so the calling node is properly invalidated later
+                if len(runtime.stack) > 0:
+                    runtime.stack[-1].deps[key] = runtime.snapshot.revision
+                return frame.cycle_guess
         self.check_cancelled(runtime.cancel_epoch)
         entry, replay_needed = self.compute_or_get_memo(key, fn, runtime)
         self.record_dependency(key, entry.changed_at)
@@ -235,6 +249,11 @@ class Evaluator:
             return memo.changed_at
 
         runtime = self._runtime_var.get()
+        if runtime is not None:
+            for frame in runtime.stack:
+                if frame.key == key:
+                    return snapshot.revision
+
         if runtime is None:
             self._run_in_runtime(
                 RuntimeState(
@@ -280,17 +299,50 @@ class Evaluator:
         runtime.stack.append(frame)
         start = self._store.monotonic_seconds()
         self._store.trace_event("recompute_start", key)
-        try:
-            self.check_cancelled(runtime.cancel_epoch)
-            result = fn(*key[2])
-            self.check_cancelled(runtime.cancel_epoch)
-        finally:
+        
+        with self._store.lock:
+            old_memo = self._store.memos.get(key)
+            if old_memo is not None and old_memo.cycle_nodes:
+                for k in old_memo.cycle_nodes:
+                    if k != key:
+                        self._store.drop_memo_locked(k)
+                        
+        while True:
+            try:
+                self.check_cancelled(runtime.cancel_epoch)
+                result = fn(*key[2])
+                self.check_cancelled(runtime.cancel_epoch)
+            except BaseException:
+                runtime.stack.pop()
+                raise
+                
+            if frame.is_cycle_root:
+                if self._store.stable_hash(result) != self._store.stable_hash(frame.cycle_guess):
+                    frame.cycle_guess = result
+                    frame.is_cycle_root = False
+                    with self._store.lock:
+                        self._store.revision += 1
+                        runtime.snapshot = Snapshot(revision=self._store.revision)
+                        for k in frame.cycle_nodes:
+                            if k != key:
+                                self._store.drop_memo_locked(k)
+                    frame.deps.clear()
+                    frame.effects.clear()
+                    continue
+                    
             runtime.stack.pop()
+            break
+            
         elapsed = self._store.monotonic_seconds() - start
         duration_ms = elapsed * 1000.0
 
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
         value_hash = self._store.stable_hash(result)
+        
+        if frame.cycle_nodes:
+            for k in frame.cycle_nodes:
+                frame.deps.pop(k, None)
+            
         with self._store.lock:
             previous = self._store.memos.get(key)
             if previous is not None and previous.value_hash == value_hash:
@@ -307,6 +359,7 @@ class Evaluator:
                 deps=frame.deps,
                 effects=frozen_effects,
                 last_access=self._store.next_access_id,
+                cycle_nodes=tuple(frame.cycle_nodes),
             )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = memo

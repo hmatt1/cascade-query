@@ -44,6 +44,7 @@ class GraphStore:
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
+        self.query_fixed_points: dict[str, Any] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
@@ -101,13 +102,22 @@ class GraphStore:
             sk = self.key_to_str(key)
             self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
-    def register_query(self, query_id: str, fn: Callable[..., Any]) -> None:
+    def register_query(self, query_id: str, fn: Callable[..., Any], *, fixed_point: Any = None, has_fixed_point: bool = False) -> None:
         with self.lock:
             self.queries[query_id] = fn
+            if has_fixed_point:
+                self.query_fixed_points[query_id] = fixed_point
 
     def lookup_query(self, query_id: str) -> Callable[..., Any]:
         with self.lock:
             return self.queries[query_id]
+
+    def lookup_query_fixed_point(self, query_id: str) -> tuple[bool, Any]:
+        """Returns (has_fixed_point, fixed_point_value)."""
+        with self.lock:
+            if query_id in self.query_fixed_points:
+                return True, self.query_fixed_points[query_id]
+            return False, None
 
     def register_input(self, input_id: str, fn: Callable[..., Any]) -> None:
         with self.lock:
@@ -419,6 +429,7 @@ class GraphStore:
         deps: dict[QueryKey, int],
         effects: dict[str, tuple[Any, ...]],
         last_access: int,
+        cycle_nodes: tuple[QueryKey, ...] = (),
     ) -> MemoEntry:
         return MemoEntry(
             value=value,
@@ -428,4 +439,5 @@ class GraphStore:
             deps=tuple(Dependency(dep_key, observed) for dep_key, observed in deps.items()),
             effects=effects,
             last_access=last_access,
+            cycle_nodes=cycle_nodes,
         )

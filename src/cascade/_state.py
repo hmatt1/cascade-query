@@ -31,6 +31,7 @@ class MemoEntry:
     deps: tuple[Dependency, ...]
     effects: dict[str, tuple[Any, ...]]
     last_access: int
+    cycle_nodes: tuple[QueryKey, ...] = ()
 
 
 @dataclass(frozen=True)
