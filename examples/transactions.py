@@ -1,3 +1,4 @@
+import time
 from cascade.engine import Engine
 
 engine = Engine()
@@ -32,8 +33,34 @@ if __name__ == "__main__":
         config.set("theme", "blue")
         config.set("layout", "sidebar")
     
-    # The UI only re-evaluates once observing both changes
-    print("Result:", render_ui())
+    @engine.query
+    def read_all() -> int:
+        # A query that depends on 100 inputs
+        return sum(len(config(f"key_{i}")) for i in range(100))
+
+    # Evaluate once to prime the cache
+    read_all()
+
+    print("\n=== Efficiency: Without Transactions (Reactive System) ===")
+    start_time = time.time()
+    for i in range(100):
+        config.set(f"key_{i}", "value")
+        # In a reactive system, each update might trigger a re-eval
+        read_all()
+    no_tx_time = time.time() - start_time
+    print(f"100 separate sets + 100 reads took {no_tx_time:.4f} seconds.")
+
+    print("\n=== Efficiency: With Transactions (Reactive System) ===")
+    start_time = time.time()
+    with engine.transaction():
+        for i in range(100):
+            config.set(f"key_{i}", "value_new")
+    # Only re-evaluate once after the transaction commits
+    read_all()
+    tx_time = time.time() - start_time
+    print(f"100 batched sets + 1 read took {tx_time:.4f} seconds.")
+    if tx_time > 0:
+        print(f"Transactions were {no_tx_time/tx_time:.1f}x faster in this scenario.")
     
     print("\nStep 1")
     print("Example complete.")
