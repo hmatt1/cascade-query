@@ -674,3 +674,172 @@ def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path) -> None:
     engine.prune([("query", "missing:fid", ())], vacuum_disk=True)
     
     engine.shutdown()
+
+
+def test_dynamic_graph_topology_cross_session(tmp_path: Path) -> None:
+    data = tmp_path / "cond.txt"
+    data.write_text("A")
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+
+    def build() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=cache)
+
+        @engine.input
+        def condition() -> str:
+            return data.read_text().strip()
+
+        @engine.query
+        def branch_a() -> str:
+            runs["branch_a"] = runs.get("branch_a", 0) + 1
+            return "A_out"
+
+        @engine.query
+        def branch_b() -> str:
+            runs["branch_b"] = runs.get("branch_b", 0) + 1
+            return "B_out"
+
+        @engine.query
+        def root() -> str:
+            runs["root"] = runs.get("root", 0) + 1
+            if condition() == "A":
+                return branch_a()
+            else:
+                return branch_b()
+
+        return engine, root
+
+    # Session 1: cond is A
+    engine_1, root_1 = build()
+    assert root_1() == "A_out"
+    assert runs == {"root": 1, "branch_a": 1}
+    engine_1.shutdown()
+
+    # Session 2: cond is still A, should hit
+    runs.clear()
+    engine_2, root_2 = build()
+    assert root_2() == "A_out"
+    assert runs == {}
+    engine_2.shutdown()
+
+    # Session 3: cond is B, must recompute root and branch_b
+    data.write_text("B")
+    runs.clear()
+    engine_3, root_3 = build()
+    assert root_3() == "B_out"
+    assert runs == {"root": 1, "branch_b": 1}
+    engine_3.shutdown()
+
+    # Session 4: cond is B, should hit
+    runs.clear()
+    engine_4, root_4 = build()
+    assert root_4() == "B_out"
+    assert runs == {}
+    engine_4.shutdown()
+
+    # Session 5: cond is A again. root's fingerprint was overwritten by Session 3 (which depended on B),
+    # so root must recompute. But branch_a will hit the cache from Session 1!
+    data.write_text("A")
+    runs.clear()
+    engine_5, root_5 = build()
+    assert root_5() == "A_out"
+    assert runs == {"root": 1}
+    engine_5.shutdown()
+
+
+def test_errors_are_not_cached_across_sessions(tmp_path: Path) -> None:
+    data = tmp_path / "state.txt"
+    data.write_text("fail")
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+
+    def build() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=cache)
+
+        @engine.input
+        def state() -> str:
+            return data.read_text().strip()
+
+        @engine.query
+        def process() -> str:
+            runs["process"] = runs.get("process", 0) + 1
+            val = state()
+            if val == "fail":
+                raise ValueError("Oops")
+            return "Success"
+
+        return engine, process
+
+    # Session 1: fails
+    engine_1, process_1 = build()
+    with pytest.raises(ValueError, match="Oops"):
+        process_1()
+    assert runs == {"process": 1}
+    engine_1.shutdown()
+
+    # Session 2: still failing, must re-run because errors aren't cached
+    runs.clear()
+    engine_2, process_2 = build()
+    with pytest.raises(ValueError, match="Oops"):
+        process_2()
+    assert runs == {"process": 1}
+    engine_2.shutdown()
+
+    # Session 3: state fixed, runs and caches
+    data.write_text("ok")
+    runs.clear()
+    engine_3, process_3 = build()
+    assert process_3() == "Success"
+    assert runs == {"process": 1}
+    engine_3.shutdown()
+
+    # Session 4: state still ok, hits cache
+    runs.clear()
+    engine_4, process_4 = build()
+    assert process_4() == "Success"
+    assert runs == {}
+    engine_4.shutdown()
+
+
+def test_deep_dependency_chain_cross_session(tmp_path: Path) -> None:
+    data = tmp_path / "val.txt"
+    data.write_text("0")
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+
+    def build() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=cache)
+
+        @engine.input
+        def base() -> int:
+            return int(data.read_text().strip())
+
+        @engine.query
+        def chain(idx: int) -> int:
+            runs[f"q_{idx}"] = runs.get(f"q_{idx}", 0) + 1
+            if idx == 0:
+                return base() + 1
+            return chain(idx - 1) + 1
+
+        return engine, chain
+
+    # Session 1: compute the chain
+    engine_1, chain_1 = build()
+    assert chain_1(49) == 50
+    assert len(runs) == 50
+    engine_1.shutdown()
+
+    # Session 2: hit the chain
+    runs.clear()
+    engine_2, chain_2 = build()
+    assert chain_2(49) == 50
+    assert len(runs) == 0
+    engine_2.shutdown()
+
+    # Session 3: update base, recomputes all
+    data.write_text("10")
+    runs.clear()
+    engine_3, chain_3 = build()
+    assert chain_3(49) == 60
+    assert len(runs) == 50
+    engine_3.shutdown()
