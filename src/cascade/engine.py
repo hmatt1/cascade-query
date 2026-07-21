@@ -423,6 +423,15 @@ class Engine:
     def reset_stats(self) -> None:
         self._store.reset_stats()
 
+    @property
+    def access_id(self) -> int:
+        """The monotonically increasing sequence number for memo accesses."""
+        return self._store.next_access_id
+
+    def sweep_unaccessed(self, since_access_id: int) -> None:
+        """Evict all memos that haven't been accessed since the given access ID."""
+        self._store.sweep_unaccessed(since_access_id)
+
     def prune(self, roots: Iterable[tuple[str, str, tuple[Any, ...]]], *, vacuum_disk: bool = False) -> None:
         root_list = list(roots)
         self._store.prune(root_list)

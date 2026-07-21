@@ -238,6 +238,13 @@ class GraphStore:
                     self._stats_evictions_recent.append(self.key_to_str(victim))
             self.drop_memo_locked(victim)
 
+    def sweep_unaccessed(self, since_access_id: int) -> None:
+        with self.lock:
+            remove = [k for k, memo in self.memos.items() if memo.last_access <= since_access_id]
+            for key in remove:
+                self.drop_memo_locked(key)
+            self._rebuild_lru_heap_locked()
+
     def latest_input_version(self, input_key: InputKey) -> InputVersion | None:
         versions = self.inputs.get(input_key)
         if not versions:

@@ -74,6 +74,8 @@ print(get_result())
 *   **`engine.inspect_graph()`**: Returns a dictionary of all nodes and edges in the dependency graph.
 *   **`engine.subgraph(roots, direction="deps")`**: Filters the graph to the dependency chain of the specified root nodes.
 *   **`engine.prune(roots, vacuum_disk=False)`**: Removes cached query results from the in-memory LRU cache that are not reachable from the specified roots. Set `vacuum_disk=True` to also do a deep vacuum of the persistent LMDB disk cache, deleting all orphaned blobs and metadata.
+*   **`engine.access_id`**: Property returning a monotonically increasing sequence number for memo accesses.
+*   **`engine.sweep_unaccessed(since_access_id)`**: Evicts all memos that haven't been accessed since `since_access_id`. Useful for generational garbage collection (e.g. at the end of a compilation pass).
 
 ---
 
