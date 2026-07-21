@@ -1,0 +1,69 @@
+
+
+  10. Query Tags & Bulk Invalidation: Allow tagging queries (e.g., @engine.query(tags=["db", "user-service"])). Then provide APIs to aggressively flush or
+  invalidate queries by tag without needing to know the exact inputs.
+
+  13. Strict Purity Checker: An optional mode (perhaps using AST analysis or sys.settrace) that enforces that @engine.query functions do not mutate global
+  state, throwing an error if a query attempts to perform an un-tracked side effect.
+
+  7. Native Map/Reduce API: A specialized API for incrementally mapping over large lists and reducing the results, where changing one item in the list only
+  re-maps that single item and updates the final reduction in O(1) or O(log n) time.  First-class higher-order functions built into the engine (engine.map, engine.filter). The engine would deeply
+  understand these operations and automatically apply optimizations, like pushing filters up the graph to prevent unnecessary computations early.
+
+  8. Input Debouncing & Transactions: Allow developers to queue multiple input.set() operations and commit them all at once in a transaction, preventing
+  intermediate "flapping" evaluations.
+
+
+  2. Multi-Output Queries: Support queries that return multiple independent values (e.g., a tuple). Downstream queries could depend on just one of those
+  outputs, meaning they won't recompute if only the unused outputs change.
+
+
+
+2.  Native hooks - on_start, on_success, on_failure, on_complete, etc
+Input Validation Hooks: Allow attaching pre-flight validators directly to inputs (@engine.input(validate=pydantic_model)). This ensures bad data is
+  rejected before it taints the dependency graph and forces a recompute.
+
+5. Time-To-Live Cache Invalidation
+
+Introduce a ⁠ttl⁠ flag for cached outputs to expire stale data automatically.
+
+7. Priority-Based Execution Scheduling
+
+Add a ⁠priority⁠ integer flag to the task decorator.
+
+A priority queue dictates the execution order when multiple nodes are ready for evaluation simultaneously. The engine processes high-priority nodes first to accelerate the final output generation.
+
+
+  4.b Graph Optimization Passes (Query Fusion): An optimizer that analyzes the dependency graph before execution and automatically "fuses" adjacent, simple
+  mapping queries into a single execution step to reduce Python function call overhead. It's kind of like "inlining" pass-through quyeries?
+
+
+  14. Incremental Collections: Provide specialized CascadeList, CascadeDict, and CascadeSet structures. Instead of recomputing an entire list when one
+  element changes, downstream queries would only receive the diff (additions/removals) for ultra-fast granular updates.
+
+
+  15.  Pluggable Storage Backends: Abstract the persistent disk cache to allow swapping LMDB for SQLite, RocksDB, or even ephemeral in-memory stores like Redis.
+
+
+  4. Memory Compression: Automatically compress large objects (like large ASTs or string blobs) in the in-memory LRU cache using LZ4 or Zstandard to
+  drastically reduce RAM usage while keeping retrieval fast.
+
+  11. Context/Environment Injection: Allow passing implicit "Context" objects (like Authentication tokens, locale settings, or feature flags) down the
+  graph without having to pass them as explicit arguments to every single query function. Like have a global context that can set and read values?
+
+
+  17. Distributed Task Queue Integration: Native adapters for Celery, RQ, or Temporal so that a cascade graph can be constructed where nodes are actually
+  distributed tasks in a queue.
+
+
+
+
+
+Complete all of the following:
+
+- Ensure test coverage is at least 95%. The build fails below this threshold, so add tests until coverage meets or exceeds 95%.
+- Add an example that showcases the new feature.
+- Update the README so it accurately reflects the current behavior, including the new feature.
+- Run the linter and resolve any issues so it passes cleanly.
+- Commit and push
+

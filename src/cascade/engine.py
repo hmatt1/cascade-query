@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import concurrent.futures
 import os
@@ -38,6 +39,30 @@ __all__ = [
 ]
 
 
+class EngineTransaction:
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+        self.updates: list[tuple[str, tuple[Any, ...], Any]] = []
+        self._token: contextvars.Token | None = None
+
+    def __enter__(self) -> EngineTransaction:
+        if _active_transaction.get() is not None:
+            raise RuntimeError("Nested transactions are not supported")
+        self._token = _active_transaction.set(self)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._token is not None:
+            _active_transaction.reset(self._token)
+        if exc_type is None and self.updates:
+            self.engine._set_inputs(self.updates)
+
+
+_active_transaction: contextvars.ContextVar[EngineTransaction | None] = contextvars.ContextVar(
+    "active_transaction", default=None
+)
+
+
 class _InputHandle:
     def __init__(self, engine: Engine, fn: Callable[..., Any]) -> None:
         self._engine = engine
@@ -61,13 +86,19 @@ class _InputHandle:
                 
         return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
-    def set(self, *args: Any, value: Any = _UNSET) -> int:
+    def set(self, *args: Any, value: Any = _UNSET) -> int | None:
         if value is _UNSET:
             if not args:
                 raise TypeError("set() requires input value")
             *input_args, resolved_value = args
             args = tuple(input_args)
             value = resolved_value
+            
+        tx = _active_transaction.get()
+        if tx is not None and tx.engine is self._engine:
+            tx.updates.append((self._id, tuple(args), value))
+            return None
+            
         return self._engine._set_input(self._id, tuple(args), value)
 
     @property
@@ -244,6 +275,9 @@ class Engine:
         if self._disk is None:
             raise PersistentCacheError("engine has no persistent cache; pass cache_dir= to Engine")
         self._disk.clear()
+
+    def transaction(self) -> EngineTransaction:
+        return EngineTransaction(self)
 
     def input(self, fn: Callable[..., Any]) -> _InputHandle:
         handle = _InputHandle(self, fn)
@@ -501,6 +535,14 @@ class Engine:
         bump_cancel_epoch: bool = True,
     ) -> int:
         return self._store.set_input(input_id, args, value, bump_cancel_epoch=bump_cancel_epoch)
+
+    def _set_inputs(
+        self,
+        updates: list[tuple[str, tuple[Any, ...], Any]],
+        *,
+        bump_cancel_epoch: bool = True,
+    ) -> int:
+        return self._store.set_inputs(updates, bump_cancel_epoch=bump_cancel_epoch)
 
     def _read_input(
         self,

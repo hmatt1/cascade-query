@@ -18,8 +18,9 @@ if __name__ == "__main__":
     graph_dict = engine.inspect_graph()
     mermaid_str = export_mermaid(graph_dict)
     
+    print("Step 1")
     print(mermaid_str)
-
+    print("Example complete.")
 """
 Example graph output:
     flowchart TD

@@ -188,6 +188,17 @@ def parse(source: str):
 ```
 If a query throws an exception, it gets cached just like a regular return value. Subsequent calls instantly re-raise the exception, preserving incremental evaluation speed during error states. Cached exceptions can also be hydrated from the persistent disk cache.
 
+### Input Debouncing & Transactions
+When updating multiple inputs, intermediate read states ("flapping") can cause inconsistent evaluations. Use `engine.transaction()` to batch updates so they are committed atomically.
+
+```python
+with engine.transaction():
+    theme.set("dark")
+    layout.set("grid")
+    
+# Queries will only re-evaluate once observing both changes simultaneously.
+```
+
 ### Code-Aware Caching (Automatic Invalidation)
 Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic. If the logic has changed, Cascade immediately invalidates that function's memory and persistent disk caches, avoiding stale results without requiring manual cache wipes. Code formatting and comments do not affect the bytecode hash.
 

@@ -58,3 +58,5 @@ if __name__ == "__main__":
     # Now we change the data in a way that affects 'foo'
     get_data.set("foo2,bar2")
     downstream_foo_user()
+    print("\nStep 1")
+    print("Example complete.")

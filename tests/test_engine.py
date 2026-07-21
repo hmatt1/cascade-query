@@ -773,3 +773,49 @@ def test_inspect_graph_full_summary_oracle_across_varied_graphs() -> None:
         expected_memo_count=1,
         expected_input_count=3,
     )
+
+
+def test_engine_transaction() -> None:
+    engine = Engine()
+
+    @engine.input
+    def input_a() -> int:
+        return 0
+
+    @engine.input
+    def input_b() -> int:
+        return 0
+
+    @engine.query
+    def q() -> tuple[int, int]:
+        return (input_a(), input_b())
+
+    assert q() == (0, 0)
+    rev_before = engine.revision
+
+    with engine.transaction():
+        input_a.set(1)
+        input_b.set(2)
+        # uncommitted changes should not be visible
+        assert q() == (0, 0)
+
+    assert q() == (1, 2)
+    assert engine.revision == rev_before + 1
+
+    # Exception in transaction should abort updates
+    try:
+        with engine.transaction():
+            input_a.set(10)
+            input_b.set(20)
+            raise ValueError("abort")
+    except ValueError:
+        pass
+
+    assert q() == (1, 2)
+    assert engine.revision == rev_before + 1
+
+    # Nested transactions raise error
+    with engine.transaction():
+        with pytest.raises(RuntimeError, match="Nested transactions"):
+            with engine.transaction():
+                pass

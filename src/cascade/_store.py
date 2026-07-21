@@ -319,6 +319,39 @@ class GraphStore:
             self.trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
             return self.revision
 
+    def set_inputs(
+        self,
+        updates: list[tuple[str, tuple[Any, ...], Any]],
+        *,
+        bump_cancel_epoch: bool = True,
+    ) -> int:
+        with self.lock:
+            if not updates:
+                return self.revision
+            self.revision += 1
+            if bump_cancel_epoch:
+                self.cancel_epoch += 1
+            for input_id, args, value in updates:
+                key = (input_id, args)
+                versions = self.inputs.setdefault(key, [])
+                current = versions[-1] if versions else None
+                value_hash = self.stable_hash(value)
+                if current is not None and current.value_hash == value_hash:
+                    changed_at = current.changed_at
+                else:
+                    changed_at = self.revision
+                versions.append(
+                    InputVersion(
+                        revision=self.revision,
+                        changed_at=changed_at,
+                        value_hash=value_hash,
+                        value=value,
+                    )
+                )
+                trace_key = ("input", input_id, args)
+                self.trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
+            return self.revision
+
     def inspect_graph(self) -> dict[str, Any]:
         with self.lock:
             nodes = [self.key_to_str(k) for k in self.memos.keys()]
