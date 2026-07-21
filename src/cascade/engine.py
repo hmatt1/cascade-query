@@ -218,11 +218,11 @@ class Engine:
         self._store.register_input(handle.id, fn)
         return handle
 
-    def query(self, fn: Callable[..., Any] | None = None, *, fixed_point: Any = _UNSET) -> Any:
+    def query(self, fn: Callable[..., Any] | None = None, *, fixed_point: Any = _UNSET, cache_exceptions: bool | tuple[type[BaseException], ...] = True) -> Any:
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
             handle = _QueryHandle(self, f)
             has_fixed_point = fixed_point is not _UNSET
-            self._store.register_query(handle.id, f, fixed_point=fixed_point, has_fixed_point=has_fixed_point)
+            self._store.register_query(handle.id, f, fixed_point=fixed_point, has_fixed_point=has_fixed_point, cache_exceptions=cache_exceptions)
             return handle
         if fn is not None:
             return decorator(fn)

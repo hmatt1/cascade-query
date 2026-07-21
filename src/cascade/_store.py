@@ -45,6 +45,7 @@ class GraphStore:
         self.inputs: dict[InputKey, list[InputVersion]] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
         self.query_fixed_points: dict[str, Any] = {}
+        self.query_cache_exceptions: dict[str, bool | tuple[type[BaseException], ...]] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
@@ -102,15 +103,20 @@ class GraphStore:
             sk = self.key_to_str(key)
             self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
-    def register_query(self, query_id: str, fn: Callable[..., Any], *, fixed_point: Any = None, has_fixed_point: bool = False) -> None:
+    def register_query(self, query_id: str, fn: Callable[..., Any], *, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False) -> None:
         with self.lock:
             self.queries[query_id] = fn
+            self.query_cache_exceptions[query_id] = cache_exceptions
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
 
     def lookup_query(self, query_id: str) -> Callable[..., Any]:
         with self.lock:
             return self.queries[query_id]
+
+    def lookup_query_cache_exceptions(self, query_id: str) -> bool | tuple[type[BaseException], ...]:
+        with self.lock:
+            return self.query_cache_exceptions.get(query_id, False)
 
     def lookup_query_fixed_point(self, query_id: str) -> tuple[bool, Any]:
         """Returns (has_fixed_point, fixed_point_value)."""
@@ -437,6 +443,7 @@ class GraphStore:
         effects: dict[str, tuple[Any, ...]],
         last_access: int,
         cycle_nodes: tuple[QueryKey, ...] = (),
+        error: BaseException | None = None,
     ) -> MemoEntry:
         return MemoEntry(
             value=value,
@@ -447,4 +454,5 @@ class GraphStore:
             effects=effects,
             last_access=last_access,
             cycle_nodes=cycle_nodes,
+            error=error,
         )

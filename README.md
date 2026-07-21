@@ -139,6 +139,18 @@ validate_data(effects=effects)
 print(effects["warnings"])
 ```
 
+### Error Caching
+By default, queries will intercept and cache exceptions (`Exception` subclasses, excluding control flow exceptions like `QueryCancelled`). This is critical for interactive systems like language servers where inputs are frequently invalid. 
+
+```python
+@engine.query(cache_exceptions=(ValueError, TypeError))
+def parse(source: str):
+    if not source:
+        raise ValueError("Empty source")
+    return {"ast": source}
+```
+If a query throws an exception, it gets cached just like a regular return value. Subsequent calls instantly re-raise the exception, preserving incremental evaluation speed during error states. Cached exceptions can also be hydrated from the persistent disk cache.
+
 ### Performance Metrics
 Set `stats=True` in the `Engine` constructor to track execution timing.
 *   **`engine.stats_summary()`**: Returns wall-clock time spent in function bodies and cache eviction counts.
@@ -181,6 +193,8 @@ pip install query-cascade
 | Script | What it shows |
 |--------|----------------|
 | `compiler_pipeline.py` | `source → parse → symbols → typecheck`, warnings accumulator, cache-hit narration |
+| `error_caching.py` | Basic exception caching to prevent repeated re-evaluation on failure |
+| `error_caching_persistence.py` | Disk cache hydration of exceptions across process runs |
 | `dynamic_macro_expansion.py` | Query that **changes downstream dependencies** at runtime |
 | `snapshot_isolation.py` | Snapshot reads while live inputs change |
 | `concurrent_background_work.py` | Dedup under concurrency + cancellation after input changes |

@@ -32,6 +32,7 @@ class MemoEntry:
     effects: dict[str, tuple[Any, ...]]
     last_access: int
     cycle_nodes: tuple[QueryKey, ...] = ()
+    error: BaseException | None = None
 
 
 @dataclass(frozen=True)

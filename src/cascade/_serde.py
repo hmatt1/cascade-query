@@ -183,10 +183,19 @@ def _to_jsonable(obj: Any) -> Any:
             pairs.append([_to_jsonable(k), _to_jsonable(obj[k])])
         return {"__map__": pairs}
 
+    if isinstance(obj, BaseException):
+        return {
+            "__exception__": {
+                "m": type(obj).__module__,
+                "q": type(obj).__qualname__,
+                "a": [_to_jsonable(x) for x in obj.args],
+            }
+        }
+
     raise TypeError(
         f"cascade serde: unsupported type {type(obj).__module__}.{type(obj).__qualname__!r}; "
-        "use primitives, bytes, collections, @dataclass / typing.NamedTuple instances, or "
-        "cascade state types (MemoEntry, InputVersion, …)."
+        "use primitives, bytes, collections, @dataclass / typing.NamedTuple instances, "
+        "cascade state types (MemoEntry, InputVersion, …), or BaseException."
     )
 
 
@@ -280,5 +289,16 @@ def _from_jsonable(obj: Any) -> Any:
             except Exception:
                 pass
             return tuple(vals)
+
+        if sole_key == "__exception__":
+            d = sole_val
+            vals = [_from_jsonable(x) for x in d["a"]]
+            try:
+                cls = _resolve_type(d["m"], d["q"])
+                if isinstance(cls, type) and issubclass(cls, BaseException):
+                    return cls(*vals)
+            except Exception:
+                pass
+            return Exception(f"Unresolved exception {d['m']}.{d['q']}: {vals}")
 
     raise TypeError(f"cascade serde: unrecognized object shape: {obj!r}")

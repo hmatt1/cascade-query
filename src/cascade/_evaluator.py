@@ -169,6 +169,8 @@ class Evaluator:
         self.record_dependency(key, entry.changed_at)
         if replay_needed:
             self.replay_effects(entry.effects)
+        if entry.error is not None:
+            raise entry.error
         return entry.value
 
     def compute_or_get_memo(
@@ -307,17 +309,32 @@ class Evaluator:
                     if k != key:
                         self._store.drop_memo_locked(k)
                         
+        error: BaseException | None = None
         while True:
             try:
                 self.check_cancelled(runtime.cancel_epoch)
                 result = fn(*key[2])
                 self.check_cancelled(runtime.cancel_epoch)
-            except BaseException:
-                runtime.stack.pop()
-                raise
+                error = None
+            except BaseException as exc:
+                cache_ex = self._store.lookup_query_cache_exceptions(key[1])
+                should_cache = False
+                if isinstance(exc, (QueryCancelled, CycleError, PersistentCacheError)):
+                    pass
+                elif cache_ex is True:
+                    should_cache = isinstance(exc, Exception)
+                elif isinstance(cache_ex, tuple):
+                    should_cache = isinstance(exc, cache_ex)
+                    
+                if should_cache:
+                    error = exc
+                    result = None
+                else:
+                    runtime.stack.pop()
+                    raise
                 
             if frame.is_cycle_root:
-                if self._store.stable_hash(result) != self._store.stable_hash(frame.cycle_guess):
+                if error is None and self._store.stable_hash(result) != self._store.stable_hash(frame.cycle_guess):
                     frame.cycle_guess = result
                     frame.is_cycle_root = False
                     with self._store.lock:
@@ -337,7 +354,10 @@ class Evaluator:
         duration_ms = elapsed * 1000.0
 
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
-        value_hash = self._store.stable_hash(result)
+        if error is not None:
+            value_hash = self._store.stable_hash(error)
+        else:
+            value_hash = self._store.stable_hash(result)
         
         if frame.cycle_nodes:
             for k in frame.cycle_nodes:
@@ -360,6 +380,7 @@ class Evaluator:
                 effects=frozen_effects,
                 last_access=self._store.next_access_id,
                 cycle_nodes=tuple(frame.cycle_nodes),
+                error=error,
             )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = memo
@@ -411,9 +432,16 @@ class Evaluator:
             value = _canonical.decode(blob)
             effects_raw = record.get("effects", {})
             effects = {str(name): tuple(items) for name, items in effects_raw.items()}
+            is_error = record.get("is_error", False)
         except Exception:
             self._store.trace_event("disk_red", key, detail="record decode failed")
             return None
+            
+        error = None
+        if is_error:
+            error = value
+            value = None
+            
         with self._store.lock:
             self._store.next_access_id += 1
             memo = self._store.entry_from_runtime(
@@ -424,6 +452,7 @@ class Evaluator:
                 deps=observed,
                 effects=effects,
                 last_access=self._store.next_access_id,
+                error=error,
             )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = memo
@@ -547,7 +576,10 @@ class Evaluator:
         if deps_records is None:
             return
         try:
-            value_blob = _canonical.encode(memo.value)
+            if memo.error is not None:
+                value_blob = _canonical.encode(memo.error)
+            else:
+                value_blob = _canonical.encode(memo.value)
         except TypeError as exc:
             raise PersistentCacheError(
                 f"query {self._store.key_to_str(key)!r} returned a value the persistent cache "
@@ -566,6 +598,7 @@ class Evaluator:
                 "value_hash": memo.value_hash,
                 "deps": deps_records,
                 "effects": effects_node,
+                "is_error": memo.error is not None,
             }
             disk.store_entry(_disk_cache.entry_key(kind, fid, args_blob), record, memo.value_hash, value_blob)
         except PersistentCacheError:

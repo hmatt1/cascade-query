@@ -747,7 +747,7 @@ def test_dynamic_graph_topology_cross_session(tmp_path: Path) -> None:
     engine_5.shutdown()
 
 
-def test_errors_are_not_cached_across_sessions(tmp_path: Path) -> None:
+def test_errors_are_cached_across_sessions(tmp_path: Path) -> None:
     data = tmp_path / "state.txt"
     data.write_text("fail")
     cache = tmp_path / "cache"
@@ -777,12 +777,12 @@ def test_errors_are_not_cached_across_sessions(tmp_path: Path) -> None:
     assert runs == {"process": 1}
     engine_1.shutdown()
 
-    # Session 2: still failing, must re-run because errors aren't cached
+    # Session 2: still failing, hydrated from disk
     runs.clear()
     engine_2, process_2 = build()
     with pytest.raises(ValueError, match="Oops"):
         process_2()
-    assert runs == {"process": 1}
+    assert runs == {}
     engine_2.shutdown()
 
     # Session 3: state fixed, runs and caches

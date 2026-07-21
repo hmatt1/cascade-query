@@ -114,10 +114,16 @@ def _encode_node(obj: Any) -> Any:
     if isinstance(obj, dict):
         return _encode_dict(obj)
 
+    if isinstance(obj, BaseException):
+        return _ext(
+            8,  # _EXT_EXCEPTION
+            [type(obj).__module__, type(obj).__qualname__, [_encode_node(x) for x in obj.args]]
+        )
+
     raise TypeError(
         f"cascade persistent cache: cannot serialize {type(obj).__module__}.{type(obj).__qualname__!r}; "
         "supported types are primitives, bytes, list/tuple/set/frozenset/dict, "
-        "@dataclass instances, and typing.NamedTuple instances."
+        "@dataclass instances, typing.NamedTuple instances, and BaseException."
     )
 
 
@@ -181,5 +187,12 @@ def _decode_ext(ext: Any) -> Any:
         cls = _resolve_type(module_name, qualname)
         if not (isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")):
             raise TypeError(f"{module_name}.{qualname!r} is not a NamedTuple")
+        return cls(*vals)
+    if ext.code == 8:  # _EXT_EXCEPTION
+        module_name, qualname, values = payload
+        vals = [_decode_node(x) for x in values]
+        cls = _resolve_type(module_name, qualname)
+        if not (isinstance(cls, type) and issubclass(cls, BaseException)):
+            raise TypeError(f"{module_name}.{qualname!r} is not an Exception")
         return cls(*vals)
     raise ValueError(f"cascade persistent cache: unknown extension code {ext.code}")
