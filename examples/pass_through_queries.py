@@ -22,15 +22,15 @@ def run_example():
         print("Computing aggregated result...")
         return sum(mapped_data())
 
-    print("--- First Run ---")
+    print("Step 1: First Run ---")
     print("Result:", aggregated_result())
 
-    print("\n--- Second Run (Cache Hit) ---")
+    print("\nStep 2: Second Run (Cache Hit) ---")
     # This will NOT recompute mapped_data() because aggregated_result() is cached
     # and its dependencies (raw_data) haven't changed.
     print("Result:", aggregated_result())
 
-    print("\n--- Third Run (Updating Input) ---")
+    print("\nStep 3: Third Run (Updating Input) ---")
     raw_data.set([1, 2, 3])
     # This WILL recompute mapped_data() because raw_data changed.
     # Since mapped_data() is memoize=False, it executes to generate its output
