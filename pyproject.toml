@@ -20,6 +20,7 @@ dev = [
     "msgpack",
     "mutmut",
     "pytest",
+    "pytest-asyncio",
     "pytest-cov",
     "ruff",
 ]
