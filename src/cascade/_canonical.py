@@ -108,7 +108,8 @@ def _encode_node(obj: Any) -> Any:
     if isinstance(obj, datetime.timedelta):
         return _ext(_EXT_TIMEDELTA, [obj.days, obj.seconds, obj.microseconds])
     if isinstance(obj, datetime.timezone):
-        return _ext(_EXT_TIMEZONE, [_encode_node(obj.utcoffset(None)), obj.tzname(None)])
+        td = obj.utcoffset(None)
+        return _ext(_EXT_TIMEZONE, [[td.days, td.seconds, td.microseconds], obj.tzname(None)])
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return _ext(
@@ -237,5 +238,7 @@ def _decode_ext(ext: Any) -> Any:
     if ext.code == _EXT_TIMEDELTA:
         return datetime.timedelta(days=payload[0], seconds=payload[1], microseconds=payload[2])
     if ext.code == _EXT_TIMEZONE:
-        return datetime.timezone(_decode_node(payload[0]), payload[1])
+        td_payload = payload[0]
+        td = datetime.timedelta(days=td_payload[0], seconds=td_payload[1], microseconds=td_payload[2])
+        return datetime.timezone(td, payload[1])
     raise ValueError(f"cascade persistent cache: unknown extension code {ext.code}")  # pragma: no cover
