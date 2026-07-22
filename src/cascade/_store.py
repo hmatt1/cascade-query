@@ -10,7 +10,15 @@ from collections.abc import Sequence
 from typing import Any, Callable
 
 from ._serde import hash_bytecode, stable_value_digest
-from ._state import Dependency, InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
+from ._state import (
+    Dependency,
+    InputKey,
+    InputVersion,
+    MemoEntry,
+    QueryKey,
+    Snapshot,
+    TraceEvent,
+)
 
 
 class GraphStore:
@@ -33,13 +41,17 @@ class GraphStore:
         self.trace_limit = trace_limit
         self.trace: deque[TraceEvent] = deque(maxlen=trace_limit)
 
-        self._monotonic_seconds: Callable[[], float] = monotonic_seconds or time.perf_counter
+        self._monotonic_seconds: Callable[[], float] = (
+            monotonic_seconds or time.perf_counter
+        )
         self._stats_enabled = stats
         self._stats_eviction_recent_cap = max(0, stats_eviction_recent_cap)
         self._stats_by_key: dict[str, float] = {}
         self._stats_evictions_total = 0
         self._stats_evictions_recent: deque[str] = deque(
-            maxlen=self._stats_eviction_recent_cap if self._stats_eviction_recent_cap > 0 else None
+            maxlen=self._stats_eviction_recent_cap
+            if self._stats_eviction_recent_cap > 0
+            else None
         )
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
@@ -48,13 +60,17 @@ class GraphStore:
         self.query_hashes: dict[str, str] = {}
         self.query_memoize: dict[str, bool] = {}
         self.query_fixed_points: dict[str, Any] = {}
-        self.query_cache_exceptions: dict[str, bool | tuple[type[BaseException], ...]] = {}
+        self.query_cache_exceptions: dict[
+            str, bool | tuple[type[BaseException], ...]
+        ] = {}
         self.query_ttl: dict[str, float | None] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
-        self.in_flight: dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]] = {}
+        self.in_flight: dict[
+            tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]
+        ] = {}
         # Lazy min-heap (last_access, key); stale entries removed on pop (touches push new tuples).
         self._lru_heap: list[tuple[int, QueryKey]] = []
         # Refcount: memo rows participating in an in-flight cache/verify sequence must not
@@ -74,7 +90,11 @@ class GraphStore:
     def set_stats_eviction_recent_cap(self, cap: int) -> None:
         with self.lock:
             self._stats_eviction_recent_cap = max(0, cap)
-            new_max = self._stats_eviction_recent_cap if self._stats_eviction_recent_cap > 0 else None
+            new_max = (
+                self._stats_eviction_recent_cap
+                if self._stats_eviction_recent_cap > 0
+                else None
+            )
             recent = list(self._stats_evictions_recent)
             if self._stats_eviction_recent_cap > 0:
                 recent = recent[-self._stats_eviction_recent_cap :]
@@ -107,11 +127,23 @@ class GraphStore:
             sk = self.key_to_str(key)
             self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
-    def register_query(self, query_id: str, fn: Callable[..., Any], *, memoize: bool = True, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False, ttl: float | None = None) -> None:
+    def register_query(
+        self,
+        query_id: str,
+        fn: Callable[..., Any],
+        *,
+        memoize: bool = True,
+        fixed_point: Any = None,
+        has_fixed_point: bool = False,
+        cache_exceptions: bool | tuple[type[BaseException], ...] = False,
+        ttl: float | None = None,
+    ) -> None:
         fn_hash = hash_bytecode(fn)
         with self.lock:
             if query_id in self.query_hashes and self.query_hashes[query_id] != fn_hash:
-                drop_keys = [k for k in self.memos if k[0] == "query" and k[1] == query_id]
+                drop_keys = [
+                    k for k in self.memos if k[0] == "query" and k[1] == query_id
+                ]
                 for k in drop_keys:
                     self.drop_memo_locked(k)
             self.queries[query_id] = fn
@@ -134,7 +166,9 @@ class GraphStore:
         with self.lock:
             return self.queries[query_id]
 
-    def lookup_query_cache_exceptions(self, query_id: str) -> bool | tuple[type[BaseException], ...]:
+    def lookup_query_cache_exceptions(
+        self, query_id: str
+    ) -> bool | tuple[type[BaseException], ...]:
         with self.lock:
             return self.query_cache_exceptions.get(query_id, False)
 
@@ -272,7 +306,11 @@ class GraphStore:
 
     def sweep_unaccessed(self, since_access_id: int) -> None:
         with self.lock:
-            remove = [k for k, memo in self.memos.items() if memo.last_access <= since_access_id]
+            remove = [
+                k
+                for k, memo in self.memos.items()
+                if memo.last_access <= since_access_id
+            ]
             for key in remove:
                 self.drop_memo_locked(key)
             self._rebuild_lru_heap_locked()
@@ -283,7 +321,9 @@ class GraphStore:
             return None
         return versions[-1]
 
-    def input_version_at(self, input_key: InputKey, revision: int) -> InputVersion | None:
+    def input_version_at(
+        self, input_key: InputKey, revision: int
+    ) -> InputVersion | None:
         versions = self.inputs.get(input_key)
         if not versions:
             return None
@@ -355,7 +395,9 @@ class GraphStore:
                     )
                 )
                 trace_key = ("input", input_id, args)
-                self.trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
+                self.trace_event(
+                    "input_set", trace_key, detail=f"changed_at={changed_at}"
+                )
             return self.revision
 
     def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
@@ -381,7 +423,9 @@ class GraphStore:
                 graph["edges"] = condensed["edges"]
             return graph
 
-    def subgraph(self, roots: Sequence[QueryKey | str], *, direction: str) -> dict[str, Any]:
+    def subgraph(
+        self, roots: Sequence[QueryKey | str], *, direction: str
+    ) -> dict[str, Any]:
         if direction not in ("deps", "dependents"):
             raise ValueError("direction must be 'deps' or 'dependents'")
         with self.lock:
@@ -442,7 +486,9 @@ class GraphStore:
                             queue.append(v)
 
             nodes_out = [n for n in nodes_full if n in reachable]
-            edges_out = [(p, d) for p, d in edges_full if p in reachable and d in reachable]
+            edges_out = [
+                (p, d) for p, d in edges_full if p in reachable and d in reachable
+            ]
             return {
                 "revision": self.revision,
                 "memo_count": len(nodes_out),
@@ -517,7 +563,9 @@ class GraphStore:
             value_hash=value_hash,
             changed_at=changed_at,
             verified_at=verified_at,
-            deps=tuple(Dependency(dep_key, observed) for dep_key, observed in deps.items()),
+            deps=tuple(
+                Dependency(dep_key, observed) for dep_key, observed in deps.items()
+            ),
             effects=effects,
             last_access=last_access,
             computed_at_time=computed_at_time,

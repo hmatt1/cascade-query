@@ -75,7 +75,10 @@ def _ext(code: int, payload_node: Any) -> Any:
 
 def _bigint_payload(value: int) -> list[Any]:
     magnitude = abs(value)
-    return [value < 0, magnitude.to_bytes((magnitude.bit_length() + 7) // 8 or 1, "big")]
+    return [
+        value < 0,
+        magnitude.to_bytes((magnitude.bit_length() + 7) // 8 or 1, "big"),
+    ]
 
 
 def _encode_node(obj: Any) -> Any:
@@ -94,13 +97,21 @@ def _encode_node(obj: Any) -> Any:
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return _ext(
             _EXT_NAMEDTUPLE,
-            [type(obj).__module__, type(obj).__qualname__, [_encode_node(getattr(obj, f)) for f in obj._fields]],
+            [
+                type(obj).__module__,
+                type(obj).__qualname__,
+                [_encode_node(getattr(obj, f)) for f in obj._fields],
+            ],
         )
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         names = sorted(obj.__dataclass_fields__.keys())
         return _ext(
             _EXT_DATACLASS,
-            [type(obj).__module__, type(obj).__qualname__, [[n, _encode_node(getattr(obj, n))] for n in names]],
+            [
+                type(obj).__module__,
+                type(obj).__qualname__,
+                [[n, _encode_node(getattr(obj, n))] for n in names],
+            ],
         )
 
     if isinstance(obj, tuple):
@@ -117,7 +128,11 @@ def _encode_node(obj: Any) -> Any:
     if isinstance(obj, BaseException):
         return _ext(
             8,  # _EXT_EXCEPTION
-            [type(obj).__module__, type(obj).__qualname__, [_encode_node(x) for x in obj.args]]
+            [
+                type(obj).__module__,
+                type(obj).__qualname__,
+                [_encode_node(x) for x in obj.args],
+            ],
         )
 
     raise TypeError(
@@ -185,7 +200,9 @@ def _decode_ext(ext: Any) -> Any:
         module_name, qualname, values = payload
         vals = [_decode_node(x) for x in values]
         cls = _resolve_type(module_name, qualname)
-        if not (isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")):
+        if not (
+            isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")
+        ):
             raise TypeError(f"{module_name}.{qualname!r} is not a NamedTuple")
         return cls(*vals)
     if ext.code == 8:  # _EXT_EXCEPTION

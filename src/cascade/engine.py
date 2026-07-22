@@ -10,14 +10,17 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 
 from . import _canonical
+from ._ast_rewrite import rewrite_query
 from ._disk_cache import DiskCache
 from ._errors import CancellationError, CycleError, PersistentCacheError, QueryCancelled
 from ._evaluator import Evaluator
+from ._incremental import IncrementalRuntime
 from ._persistence import load_payload, save_payload
 from ._runtime import RuntimeState
 from ._scheduler import WorkStealingExecutor
 from ._state import InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
 from ._store import GraphStore
+
 _get_loop = getattr(asyncio, "_get_running_loop", None)
 
 _UNSET = object()
@@ -58,8 +61,8 @@ class EngineTransaction:
             self.engine._set_inputs(self.updates)
 
 
-_active_transaction: contextvars.ContextVar[EngineTransaction | None] = contextvars.ContextVar(
-    "active_transaction", default=None
+_active_transaction: contextvars.ContextVar[EngineTransaction | None] = (
+    contextvars.ContextVar("active_transaction", default=None)
 )
 
 
@@ -73,17 +76,21 @@ class _InputHandle:
     def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
         if not self._is_async_fn:
             return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
-            
+
         if _get_loop is not None and _get_loop() is not None:
-            return self._engine._read_input_async(self._id, self._fn, args, snapshot=snapshot)
-            
+            return self._engine._read_input_async(
+                self._id, self._fn, args, snapshot=snapshot
+            )
+
         if _get_loop is None:
             try:
                 asyncio.get_running_loop()
-                return self._engine._read_input_async(self._id, self._fn, args, snapshot=snapshot)
+                return self._engine._read_input_async(
+                    self._id, self._fn, args, snapshot=snapshot
+                )
             except RuntimeError:
                 pass
-                
+
         return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
     def set(self, *args: Any, value: Any = _UNSET) -> int | None:
@@ -93,12 +100,12 @@ class _InputHandle:
             *input_args, resolved_value = args
             args = tuple(input_args)
             value = resolved_value
-            
+
         tx = _active_transaction.get()
         if tx is not None and tx.engine is self._engine:
             tx.updates.append((self._id, tuple(args), value))
             return None
-            
+
         return self._engine._set_input(self._id, tuple(args), value)
 
     @property
@@ -123,19 +130,27 @@ class _QueryHandle:
         effects: dict[str, list[Any]] | None = None,
     ) -> Any:
         if not self._is_async_fn:
-            return self._engine._query_call(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
-            
+            return self._engine._query_call(
+                self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+            )
+
         if _get_loop is not None and _get_loop() is not None:
-            return self._engine._query_call_async(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
-            
+            return self._engine._query_call_async(
+                self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+            )
+
         if _get_loop is None:
             try:
                 asyncio.get_running_loop()
-                return self._engine._query_call_async(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
+                return self._engine._query_call_async(
+                    self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+                )
             except RuntimeError:
                 pass
-                
-        return self._engine._query_call(self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects)
+
+        return self._engine._query_call(
+            self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+        )
 
     @property
     def id(self) -> str:
@@ -180,10 +195,14 @@ class _EngineInternals:
     def dependents(self) -> dict[QueryKey, set[QueryKey]]:
         return self._store.dependents
 
-    def latest_input_version(self, input_key: tuple[str, tuple[Any, ...]]) -> InputVersion | None:
+    def latest_input_version(
+        self, input_key: tuple[str, tuple[Any, ...]]
+    ) -> InputVersion | None:
         return self._store.latest_input_version(input_key)
 
-    def input_version_at(self, input_key: tuple[str, tuple[Any, ...]], revision: int) -> InputVersion | None:
+    def input_version_at(
+        self, input_key: tuple[str, tuple[Any, ...]], revision: int
+    ) -> InputVersion | None:
         return self._store.input_version_at(input_key, revision)
 
     def dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
@@ -198,7 +217,9 @@ class _EngineInternals:
         return self._store.next_access_id
 
     @property
-    def in_flight(self) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
+    def in_flight(
+        self,
+    ) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
         return self._store.in_flight
 
     @property
@@ -221,9 +242,7 @@ class _EngineInternals:
 class Engine:
     # Explicit private-policy contract for tests/introspection.
     # Invariant-oriented access should flow through the _internals probe.
-    _INTERNAL_TEST_API: tuple[str, ...] = (
-        "_internals",
-    )
+    _INTERNAL_TEST_API: tuple[str, ...] = ("_internals",)
 
     def __init__(
         self,
@@ -235,8 +254,12 @@ class Engine:
         stats_clock: Callable[[], float] | None = None,
         cache_dir: str | os.PathLike[str] | None = None,
         cache_map_size: int = 1 << 30,
+        incremental: bool = True,
     ) -> None:
         self._trace_limit = trace_limit
+        # Global opt-out for the map/reduce AST interception; per-query
+        # incremental= on @engine.query overrides it in either direction.
+        self._incremental_default = incremental
         # Passing cache_dir switches on zero-config persistence: LMDB store,
         # deterministic msgpack serialization, and content fingerprints as the
         # cross-session revision markers. Missing lmdb/msgpack raises here.
@@ -253,7 +276,10 @@ class Engine:
             monotonic_seconds=stats_clock,
             value_digest=value_digest,
         )
-        self._evaluator = Evaluator(self._store, disk=self._disk, get_executor=self._ensure_submit_executor)
+        self._evaluator = Evaluator(
+            self._store, disk=self._disk, get_executor=self._ensure_submit_executor
+        )
+        self._incremental_rt = IncrementalRuntime(self)
         # Single private probe for invariant-oriented internals.
         self._internals = _EngineInternals(self._store, self._evaluator)
         self._submit_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -273,7 +299,9 @@ class Engine:
     def clear_disk_cache(self) -> None:
         """Delete all entries in the persistent cache; the next run recomputes."""
         if self._disk is None:
-            raise PersistentCacheError("engine has no persistent cache; pass cache_dir= to Engine")
+            raise PersistentCacheError(
+                "engine has no persistent cache; pass cache_dir= to Engine"
+            )
         self._disk.clear()
 
     def transaction(self) -> EngineTransaction:
@@ -284,12 +312,36 @@ class Engine:
         self._store.register_input(handle.id, fn)
         return handle
 
-    def query(self, fn: Callable[..., Any] | None = None, *, memoize: bool = True, fixed_point: Any = _UNSET, cache_exceptions: bool | tuple[type[BaseException], ...] = True, ttl: float | None = None) -> Any:
+    def query(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        memoize: bool = True,
+        fixed_point: Any = _UNSET,
+        cache_exceptions: bool | tuple[type[BaseException], ...] = True,
+        ttl: float | None = None,
+        incremental: bool | None = None,
+    ) -> Any:
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
-            handle = _QueryHandle(self, f)
+            enabled = self._incremental_default if incremental is None else incremental
+            run_fn = f
+            if enabled:
+                rewritten = rewrite_query(f, self._incremental_rt)
+                if rewritten is not None:
+                    run_fn = rewritten
+            handle = _QueryHandle(self, run_fn)
             has_fixed_point = fixed_point is not _UNSET
-            self._store.register_query(handle.id, f, memoize=memoize, fixed_point=fixed_point, has_fixed_point=has_fixed_point, cache_exceptions=cache_exceptions, ttl=ttl)
+            self._store.register_query(
+                handle.id,
+                run_fn,
+                memoize=memoize,
+                fixed_point=fixed_point,
+                has_fixed_point=has_fixed_point,
+                cache_exceptions=cache_exceptions,
+                ttl=ttl,
+            )
             return handle
+
         if fn is not None:
             return decorator(fn)
         return decorator
@@ -458,7 +510,19 @@ class Engine:
         self._store.clear_traces()
 
     def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
-        return self._store.inspect_graph(condense=condense)
+        graph = self._store.inspect_graph(condense=condense)
+        extra_nodes, extra_edges = self._incremental_rt.graph_extras()
+        if extra_nodes:
+            known = set(graph["nodes"])
+            graph["nodes"] = list(graph["nodes"]) + [
+                n for n in extra_nodes if n not in known
+            ]
+            graph["edges"] = list(graph["edges"]) + extra_edges
+        return graph
+
+    def inspect_pipelines(self) -> list[dict[str, Any]]:
+        """Logical map/filter/reduce pipelines with fusion and checkpoint info."""
+        return self._incremental_rt.inspect_pipelines()
 
     def subgraph(
         self,
@@ -498,7 +562,12 @@ class Engine:
         """Evict all memos that haven't been accessed since the given access ID."""
         self._store.sweep_unaccessed(since_access_id)
 
-    def prune(self, roots: Iterable[tuple[str, str, tuple[Any, ...]]], *, vacuum_disk: bool = False) -> None:
+    def prune(
+        self,
+        roots: Iterable[tuple[str, str, tuple[Any, ...]]],
+        *,
+        vacuum_disk: bool = False,
+    ) -> None:
         root_list = list(roots)
         self._store.prune(root_list)
         if vacuum_disk and self._disk is not None:
@@ -534,7 +603,9 @@ class Engine:
         *,
         bump_cancel_epoch: bool = True,
     ) -> int:
-        return self._store.set_input(input_id, args, value, bump_cancel_epoch=bump_cancel_epoch)
+        return self._store.set_input(
+            input_id, args, value, bump_cancel_epoch=bump_cancel_epoch
+        )
 
     def _set_inputs(
         self,
@@ -562,7 +633,9 @@ class Engine:
         *,
         snapshot: Snapshot | None,
     ) -> Any:
-        return await self._evaluator.read_input_async(input_id, fn, args, snapshot=snapshot)
+        return await self._evaluator.read_input_async(
+            input_id, fn, args, snapshot=snapshot
+        )
 
     def _check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         self._evaluator.check_cancelled(runtime_cancel_epoch)
@@ -613,10 +686,14 @@ class Engine:
     ) -> tuple[MemoEntry, bool]:
         return self._evaluator.compute_or_get_memo(key, fn, runtime)
 
-    def _try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
+    def _try_mark_green(
+        self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
+    ) -> bool:
         return self._evaluator.try_mark_green(key, entry, snapshot)
 
-    def _recompute(self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState) -> MemoEntry:
+    def _recompute(
+        self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState
+    ) -> MemoEntry:
         return self._evaluator.recompute(key, fn, runtime)
 
     def _record_dependency(self, dep_key: QueryKey, observed_changed_at: int) -> None:
@@ -627,4 +704,3 @@ class Engine:
 
     def _push_effect(self, name: str, item: Any) -> None:
         self._evaluator.push_effect(name, item)
-

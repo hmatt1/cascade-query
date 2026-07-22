@@ -31,9 +31,15 @@ class _SampleNT(NamedTuple):
 
 
 def test_stable_digest_deterministic_for_collections_and_dataclass() -> None:
-    assert stable_value_digest({"z": 1, "a": 2}) == stable_value_digest({"a": 2, "z": 1})
-    assert stable_value_digest(_SampleDC(1, "x")) == stable_value_digest(_SampleDC(1, "x"))
-    assert stable_value_digest(frozenset((3, 1, 2))) == stable_value_digest(frozenset((1, 2, 3)))
+    assert stable_value_digest({"z": 1, "a": 2}) == stable_value_digest(
+        {"a": 2, "z": 1}
+    )
+    assert stable_value_digest(_SampleDC(1, "x")) == stable_value_digest(
+        _SampleDC(1, "x")
+    )
+    assert stable_value_digest(frozenset((3, 1, 2))) == stable_value_digest(
+        frozenset((1, 2, 3))
+    )
 
 
 def test_stable_digest_float_specials_and_bytearray() -> None:
@@ -94,9 +100,7 @@ def test_loads_payload_rejects_bad_envelope() -> None:
     with pytest.raises(ValueError, match="persistence envelope"):
         loads_payload(b"[]")
     with pytest.raises(ValueError, match="unsupported persistence format"):
-        loads_payload(
-            json_bytes({"format": 0, "payload": {"__map__": []}})
-        )
+        loads_payload(json_bytes({"format": 0, "payload": {"__map__": []}}))
     with pytest.raises(ValueError, match="missing payload field"):
         loads_payload(json_bytes({"format": PERSISTENCE_FORMAT}))
     with pytest.raises(ValueError, match="payload must decode to a dict"):

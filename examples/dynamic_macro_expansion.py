@@ -47,7 +47,10 @@ def run_dynamic_demo() -> None:
     print("Counters:", counters)
 
     graph = engine.inspect_graph()
-    print("Graph summary:", {"memo_count": graph["memo_count"], "input_count": graph["input_count"]})
+    print(
+        "Graph summary:",
+        {"memo_count": graph["memo_count"], "input_count": graph["input_count"]},
+    )
     print("Example complete.")
 
 

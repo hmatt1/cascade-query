@@ -7,9 +7,11 @@ engine = Engine()
 simulated_time = 0.0
 engine._store.monotonic_seconds = lambda: simulated_time
 
+
 @engine.input
 def db_url():
     return "postgres://localhost:5432"
+
 
 @engine.query(ttl=5.0)
 def fetch_users(url: str):
@@ -21,6 +23,7 @@ def fetch_users(url: str):
     print(f"  [Network] Fetching users from {url} at time {simulated_time}...")
     return ["alice", "bob", "charlie"]
 
+
 @engine.query
 def process_users():
     """
@@ -31,6 +34,7 @@ def process_users():
     users = fetch_users(db_url())
     print("  [CPU] Processing users...")
     return [u.upper() for u in users]
+
 
 print("Step 1: --- Initial Call (Time 0.0) ---")
 print(process_users())

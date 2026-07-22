@@ -3,36 +3,40 @@ from cascade._graph_export import export_mermaid
 
 engine = Engine()
 
+
 @engine.query
 def process_item_sync(item_id: int):
     return item_id * 2
+
 
 @engine.input
 def range_count():
     return 1
 
+
 @engine.query
 def aggregate_sync():
     return sum(process_item_sync(i) for i in range(range_count()))
 
+
 if __name__ == "__main__":
     result = aggregate_sync()
-    
+
     graph_dict = engine.inspect_graph()
     mermaid_str = export_mermaid(graph_dict)
-    
+
     print("Step 1: Count is 1")
     print(f"Result: {result}")
     print(mermaid_str)
-    
+
     print("Setting count to 5...")
     range_count.set(5)
-    
+
     result = aggregate_sync()
-    
+
     graph_dict = engine.inspect_graph(condense=True)
     mermaid_str = export_mermaid(graph_dict)
-    
+
     print("Step 2: Count is 5")
     print(f"Result: {result}")
     print(mermaid_str)

@@ -35,7 +35,10 @@ def test_internal_dependency_helpers_and_indexes_are_consistent() -> None:
     latest = internals.latest_input_version((source.id, ("main",)))
     assert latest is not None
     assert latest.value == "a\nb"
-    assert internals.input_version_at((source.id, ("main",)), revision=engine.revision) is latest
+    assert (
+        internals.input_version_at((source.id, ("main",)), revision=engine.revision)
+        is latest
+    )
     snap = engine.snapshot()
     assert symbol_count("main", snapshot=snap) == 2
 

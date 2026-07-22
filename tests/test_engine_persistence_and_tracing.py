@@ -115,7 +115,9 @@ def test_eviction_and_prune() -> None:
 def test_persistence_round_trip_robustness(tmp_path: Path) -> None:
     db_path = tmp_path / "roundtrip.db"
 
-    def build_pipeline(counter: dict[str, int] | None = None) -> tuple[Engine, object, object]:
+    def build_pipeline(
+        counter: dict[str, int] | None = None,
+    ) -> tuple[Engine, object, object]:
         engine = Engine()
 
         @engine.input
@@ -126,7 +128,9 @@ def test_persistence_round_trip_robustness(tmp_path: Path) -> None:
         def parse(name: str) -> tuple[str, ...]:
             if counter is not None:
                 counter["parse"] += 1
-            return tuple(line.strip() for line in source(name).splitlines() if line.strip())
+            return tuple(
+                line.strip() for line in source(name).splitlines() if line.strip()
+            )
 
         @engine.query
         def symbol_count(name: str) -> int:
@@ -204,9 +208,13 @@ def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) ->
 
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
+        conn.execute(
+            "create table if not exists cascade_state (id integer primary key, payload blob not null)"
+        )
         conn.execute("delete from cascade_state")
-        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",))
+        conn.execute(
+            "insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",)
+        )
         conn.commit()
     finally:
         conn.close()
@@ -258,7 +266,13 @@ def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:
 
     events = [event.event for event in engine.traces()]
     # Deterministic happy-path trace ordering for one recompute then cache hit.
-    assert events == ["input_set", "recompute_start", "input_read", "recompute_done", "cache_hit"]
+    assert events == [
+        "input_set",
+        "recompute_start",
+        "input_read",
+        "recompute_done",
+        "cache_hit",
+    ]
 
 
 def test_load_clears_transient_in_flight_state(tmp_path: Path) -> None:
@@ -319,7 +333,11 @@ def test_prune_keeps_transitively_reachable_query_chain_only() -> None:
     assert set(graph["nodes"]) == {top_node, middle_node, leaf_node}
     assert graph["memo_count"] == 3
 
-    query_edges = {(parent, child) for parent, child in graph["edges"] if child.startswith("query:")}
+    query_edges = {
+        (parent, child)
+        for parent, child in graph["edges"]
+        if child.startswith("query:")
+    }
     assert query_edges == {(top_node, middle_node), (middle_node, leaf_node)}
 
 
@@ -415,14 +433,27 @@ def test_save_payload_writes_utf8_json_blob(monkeypatch: pytest.MonkeyPatch) -> 
     assert commits == 1
     assert closes == 1
     assert executed == [
-        ("create table if not exists cascade_state (id integer primary key, payload blob not null)", ()),
+        (
+            "create table if not exists cascade_state (id integer primary key, payload blob not null)",
+            (),
+        ),
         ("delete from cascade_state", ()),
         ("insert into cascade_state(id, payload) values (1, ?)", (expected_blob,)),
     ]
 
 
-def test_save_payload_uses_canonical_json_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
-    payload = {"revision": 0, "cancel_epoch": 0, "inputs": {}, "memos": {}, "dependents": {}, "trace": [], "access_id": 0}
+def test_save_payload_uses_canonical_json_dumps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "revision": 0,
+        "cancel_epoch": 0,
+        "inputs": {},
+        "memos": {},
+        "dependents": {},
+        "trace": [],
+        "access_id": 0,
+    }
     sentinel_blob = b"blob-by-contract"
 
     def fake_dumps_wrapped(obj: object, **kwargs: object) -> str:
@@ -452,7 +483,10 @@ def test_save_payload_uses_canonical_json_dumps(monkeypatch: pytest.MonkeyPatch)
 
     persistence_mod.save_payload("tests:fake-json.db", payload)
 
-    assert executed[-1] == ("insert into cascade_state(id, payload) values (1, ?)", (sentinel_blob,))
+    assert executed[-1] == (
+        "insert into cascade_state(id, payload) values (1, ?)",
+        (sentinel_blob,),
+    )
 
 
 def test_prune_uses_query_only_reachability_for_dependency_expansion() -> None:

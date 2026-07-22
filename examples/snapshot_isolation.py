@@ -14,7 +14,9 @@ def run_snapshot_demo() -> None:
 
     @engine.query
     def parse(file_id: str) -> tuple[str, ...]:
-        return tuple(line.strip() for line in source(file_id).splitlines() if line.strip())
+        return tuple(
+            line.strip() for line in source(file_id).splitlines() if line.strip()
+        )
 
     print("Step 1: Set initial source and capture a snapshot.")
     source.set("main", "alpha\nbeta")

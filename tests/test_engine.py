@@ -387,7 +387,9 @@ def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
     empty_path = tmp_path / "empty.db"
     conn = sqlite3.connect(empty_path)
     try:
-        conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
+        conn.execute(
+            "create table if not exists cascade_state (id integer primary key, payload blob not null)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -438,7 +440,10 @@ def test_input_set_with_keyword_value_and_no_positional_value() -> None:
     assert setting() == 7
     assert threshold("prod") == 11
 
-def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection() -> None:
+
+def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection() -> (
+    None
+):
     engine = Engine()
 
     @engine.input
@@ -508,7 +513,9 @@ def test_compute_many_deduplicates_identical_calls_within_batch() -> None:
 
     def run_batch() -> None:
         try:
-            result_box.append(engine.compute_many([(expensive, ()) for _ in range(40)], workers=12))
+            result_box.append(
+                engine.compute_many([(expensive, ()) for _ in range(40)], workers=12)
+            )
         except BaseException as exc:  # pragma: no cover - defensive
             error_box.append(exc)
 
@@ -603,9 +610,13 @@ def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) ->
 
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
+        conn.execute(
+            "create table if not exists cascade_state (id integer primary key, payload blob not null)"
+        )
         conn.execute("delete from cascade_state")
-        conn.execute("insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",))
+        conn.execute(
+            "insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",)
+        )
         conn.commit()
     finally:
         conn.close()
@@ -636,7 +647,13 @@ def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:
 
     events = [event.event for event in engine.traces()]
     # Deterministic happy-path trace ordering for one recompute then cache hit.
-    assert events == ["input_set", "recompute_start", "input_read", "recompute_done", "cache_hit"]
+    assert events == [
+        "input_set",
+        "recompute_start",
+        "input_read",
+        "recompute_done",
+        "cache_hit",
+    ]
 
 
 def test_inspect_graph_full_summary_oracle_across_varied_graphs() -> None:
@@ -683,7 +700,10 @@ def test_inspect_graph_full_summary_oracle_across_varied_graphs() -> None:
         },
         expected_edges={
             (key("query", parse.id, ("main",)), key("input", source.id, ("main",))),
-            (key("query", symbol_count.id, ("main",)), key("query", parse.id, ("main",))),
+            (
+                key("query", symbol_count.id, ("main",)),
+                key("query", parse.id, ("main",)),
+            ),
         },
         expected_memo_count=2,
         expected_input_count=1,

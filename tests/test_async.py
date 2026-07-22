@@ -3,6 +3,7 @@ import time
 import pytest
 from cascade.engine import Engine
 
+
 def test_async_query_basic():
     engine = Engine()
 
@@ -19,6 +20,7 @@ def test_async_query_basic():
 
     result = compute(5)
     assert result == 10 + 12
+
 
 def test_mixed_graph_sync_async():
     engine = Engine()
@@ -37,13 +39,14 @@ def test_mixed_graph_sync_async():
         a = await async_node(x)
         b = await asyncio.get_running_loop().run_in_executor(None, sync_node, x)
         return a + b
-        
+
     @engine.query
     def root_sync(x):
         return sync_node(x)
 
     assert root_sync(5) == 15
     assert root_async(5) == 10 + 15
+
 
 @pytest.mark.asyncio
 async def test_engine_called_from_user_loop():
@@ -53,7 +56,7 @@ async def test_engine_called_from_user_loop():
     async def get_data(x):
         await asyncio.sleep(0.01)
         return x * 2
-        
+
     @engine.query
     def sync_data(x):
         time.sleep(0.01)
@@ -63,14 +66,15 @@ async def test_engine_called_from_user_loop():
     # for async nodes but blocks on sync nodes (which we could offload, but directly calling sync is blocking)
     res = await get_data(10)
     assert res == 20
-    
+
     # Sync query called from async loop executes synchronously.
     res2 = sync_data(10)
     assert res2 == 30
 
+
 def test_dedup_yields_loop():
     engine = Engine()
-    
+
     events = []
 
     @engine.query
@@ -86,7 +90,7 @@ def test_dedup_yields_loop():
         await asyncio.sleep(0.01)
         events.append("fast_end")
         return "fast"
-        
+
     @engine.query
     async def root():
         # Start both at the same time. They should run concurrently.
@@ -97,7 +101,6 @@ def test_dedup_yields_loop():
 
     res = root()
     assert res == ["slow", "slow", "fast"]
-    
+
     # fast_end should happen before slow_end
     assert events == ["slow_start", "fast_start", "fast_end", "slow_end"]
-

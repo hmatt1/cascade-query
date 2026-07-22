@@ -7,7 +7,11 @@ def run_demo() -> None:
     print("=== Monorepo impacted-test planner example ===")
     print("Goal: run only tests affected by a PR diff.")
     engine = Engine()
-    calls: dict[str, dict[str, int]] = {"module_deps": {}, "module_tests": {}, "impacted_tests": {}}
+    calls: dict[str, dict[str, int]] = {
+        "module_deps": {},
+        "module_tests": {},
+        "impacted_tests": {},
+    }
 
     def bump(stage: str, key: str) -> None:
         per_stage = calls[stage]
@@ -24,7 +28,11 @@ def run_demo() -> None:
         for row in module_manifest(module).splitlines():
             row = row.strip()
             if row.startswith("deps:"):
-                deps = [part.strip() for part in row.removeprefix("deps:").split(",") if part.strip()]
+                deps = [
+                    part.strip()
+                    for part in row.removeprefix("deps:").split(",")
+                    if part.strip()
+                ]
         return tuple(deps)
 
     @engine.query
@@ -34,7 +42,11 @@ def run_demo() -> None:
         for row in module_manifest(module).splitlines():
             row = row.strip()
             if row.startswith("tests:"):
-                tests = [part.strip() for part in row.removeprefix("tests:").split(",") if part.strip()]
+                tests = [
+                    part.strip()
+                    for part in row.removeprefix("tests:").split(",")
+                    if part.strip()
+                ]
         return tuple(tests)
 
     @engine.input
@@ -80,7 +92,9 @@ def run_demo() -> None:
     print("Counters:", calls)
 
     print("Step 2: Update only web module tests and recompute a web-only diff.")
-    module_manifest.set("web", "deps: api\ntests: tests/web/test_ui.py, tests/web/test_routing.py")
+    module_manifest.set(
+        "web", "deps: api\ntests: tests/web/test_ui.py, tests/web/test_routing.py"
+    )
     print("Changed modules: ('web',)")
     print("Impacted tests:", impacted_tests(("web",)))
     print("Counters after targeted update:", calls)

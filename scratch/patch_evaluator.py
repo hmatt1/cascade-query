@@ -1,4 +1,3 @@
-
 def patch():
     path = r"C:\Users\Matt\Projects\cascade-query\src\cascade\_evaluator.py"
     with open(path, "r", encoding="utf-8") as f:
@@ -188,15 +187,15 @@ def patch():
     if idx == -1:
         print("Could not find _persist_entry")
         return
-        
+
     content = content[:idx] + async_methods + content[idx:]
-    
+
     # Also fix compute_or_get_memo_async to call the async version
     content = content.replace(
         "hydrated = self._try_hydrate_from_disk(key, runtime)",
-        "hydrated = await self._try_hydrate_from_disk_async(key, runtime)"
+        "hydrated = await self._try_hydrate_from_disk_async(key, runtime)",
     )
-    
+
     # Also fix synchronous `_current_input_version` to handle coroutines properly using `asyncio.run`
     # Just in case it gets called synchronously.
     sync_input_fix = """        value = fn(*args)
@@ -205,11 +204,15 @@ def patch():
             import asyncio
             value = asyncio.run(value)
         return InputVersion("""
-    content = content.replace("""        value = fn(*args)
-        return InputVersion(""", sync_input_fix)
+    content = content.replace(
+        """        value = fn(*args)
+        return InputVersion(""",
+        sync_input_fix,
+    )
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-        
+
+
 if __name__ == "__main__":
     patch()

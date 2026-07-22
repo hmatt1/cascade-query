@@ -5,10 +5,14 @@ import threading
 from typing import Any
 
 from cascade import Engine
-from cascade._synthetic_graph import build_fanout_chain_pipeline as _build_fanout_chain_pipeline
+from cascade._synthetic_graph import (
+    build_fanout_chain_pipeline as _build_fanout_chain_pipeline,
+)
 
 
-def build_fanout_chain_pipeline(*args: Any, **kwargs: Any) -> tuple[Any, list[Any], Any]:
+def build_fanout_chain_pipeline(
+    *args: Any, **kwargs: Any
+) -> tuple[Any, list[Any], Any]:
     """Forward to the shared synthetic graph helper.
 
     Tests import this symbol from `tests.scale_helpers`; keep that call-site

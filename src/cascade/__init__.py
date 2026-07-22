@@ -1,3 +1,4 @@
+from ._collections import CascadeDict, CascadeList, CascadeSet
 from ._graph_export import export_dot, export_mermaid
 from ._state import QueryKey
 from .engine import (
@@ -14,6 +15,9 @@ from .engine import (
 __all__ = [
     "Accumulator",
     "CancellationError",
+    "CascadeDict",
+    "CascadeList",
+    "CascadeSet",
     "CycleError",
     "Engine",
     "PersistentCacheError",

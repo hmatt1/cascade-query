@@ -25,7 +25,9 @@ def test_compute_many_snapshot_freezes_input_reads() -> None:
     for index in range(6):
         cell.set(index, index + 100)
 
-    frozen = engine.compute_many([(read_cell, (index,)) for index in range(6)], snapshot=snapshot)
+    frozen = engine.compute_many(
+        [(read_cell, (index,)) for index in range(6)], snapshot=snapshot
+    )
     live = engine.compute_many([(read_cell, (index,)) for index in range(6)])
     assert frozen == [0, 1, 2, 3, 4, 5]
     assert live == [100, 101, 102, 103, 104, 105]
@@ -41,7 +43,9 @@ def test_compute_many_propagates_worker_exceptions() -> None:
         return i
 
     with pytest.raises(ValueError, match="boom"):
-        engine.compute_many([(boom, (0,)), (boom, (1,)), (boom, (2,)), (boom, (3,))], workers=3)
+        engine.compute_many(
+            [(boom, (0,)), (boom, (1,)), (boom, (2,)), (boom, (3,))], workers=3
+        )
 
 
 def test_compute_many_preserves_call_order_with_mixed_durations() -> None:
@@ -64,7 +68,9 @@ def test_compute_many_preserves_call_order_with_mixed_durations() -> None:
     assert result == [i * 10 for i in range(8)]
 
 
-def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection() -> None:
+def test_compute_many_with_zero_workers_falls_back_to_default_worker_selection() -> (
+    None
+):
     engine = Engine()
 
     @engine.input
@@ -94,7 +100,9 @@ def test_compute_many_can_collect_accumulator_effects() -> None:
         return name.upper()
 
     effects: dict[str, list[object]] = {}
-    result = engine.compute_many([(job, ("a",)), (job, ("b",)), (job, ("c",))], workers=3, effects=effects)
+    result = engine.compute_many(
+        [(job, ("a",)), (job, ("b",)), (job, ("c",))], workers=3, effects=effects
+    )
     assert result == ["A", "B", "C"]
     assert effects == {
         "progress": [

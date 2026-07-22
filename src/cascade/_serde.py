@@ -37,7 +37,7 @@ def hash_bytecode(fn: Any) -> str:
     """Recursively compute a stable hash of a function's bytecode logic."""
     if not hasattr(fn, "__code__"):
         return ""
-        
+
     def _hash_code(c: Any) -> bytes:
         h = hashlib.sha256()
         h.update(c.co_code)
@@ -51,7 +51,7 @@ def hash_bytecode(fn: Any) -> str:
         for varname in c.co_varnames:
             h.update(varname.encode("utf-8"))
         return h.digest()
-        
+
     return _hash_code(fn.__code__).hex()
 
 
@@ -148,7 +148,12 @@ def _to_jsonable(obj: Any) -> Any:
             }
         }
     if isinstance(obj, Dependency):
-        return {"__Dependency__": {"key": _to_jsonable(obj.key), "observed_changed_at": obj.observed_changed_at}}
+        return {
+            "__Dependency__": {
+                "key": _to_jsonable(obj.key),
+                "observed_changed_at": obj.observed_changed_at,
+            }
+        }
     if isinstance(obj, InputVersion):
         return {
             "__InputVersion__": {
@@ -233,7 +238,9 @@ def _from_jsonable(obj: Any) -> Any:
         return obj
 
     if not isinstance(obj, dict):
-        raise TypeError(f"cascade serde: expected dict, list, or scalar at this position, got {type(obj)!r}")
+        raise TypeError(
+            f"cascade serde: expected dict, list, or scalar at this position, got {type(obj)!r}"
+        )
 
     if "__float__" in obj:
         return _decode_float(obj)
@@ -269,7 +276,10 @@ def _from_jsonable(obj: Any) -> Any:
             )
         if sole_key == "__Dependency__":
             d = sole_val
-            return Dependency(key=_from_jsonable(d["key"]), observed_changed_at=d["observed_changed_at"])
+            return Dependency(
+                key=_from_jsonable(d["key"]),
+                observed_changed_at=d["observed_changed_at"],
+            )
         if sole_key == "__InputVersion__":
             d = sole_val
             return InputVersion(
@@ -308,7 +318,11 @@ def _from_jsonable(obj: Any) -> Any:
             vals = [_from_jsonable(x) for x in d["f"]]
             try:
                 cls = _resolve_type(d["m"], d["q"])
-                if isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make"):
+                if (
+                    isinstance(cls, type)
+                    and issubclass(cls, tuple)
+                    and hasattr(cls, "_make")
+                ):
                     return cls(*vals)
             except Exception:
                 pass

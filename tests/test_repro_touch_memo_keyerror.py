@@ -43,7 +43,9 @@ def test_same_graph_succeeds_with_smaller_cache() -> None:
     _run_nested_verify_under_pressure(max_entries=5)
 
 
-def test_many_fillers_after_revision_before_root_still_computes(max_entries: int = 12) -> None:
+def test_many_fillers_after_revision_before_root_still_computes(
+    max_entries: int = 12,
+) -> None:
     engine = Engine(max_entries=max_entries, trace_limit=10_000)
     inp = engine.input(lambda: 0)
 

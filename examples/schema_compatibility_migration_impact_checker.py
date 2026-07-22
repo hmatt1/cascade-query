@@ -6,7 +6,11 @@ from cascade import Engine
 def run_demo() -> None:
     print("=== Schema compatibility + evolution impact checker example ===")
     engine = Engine()
-    calls: dict[str, int] = {"parse_schema": 0, "direct_breaks": 0, "consumer_breaks": 0}
+    calls: dict[str, int] = {
+        "parse_schema": 0,
+        "direct_breaks": 0,
+        "consumer_breaks": 0,
+    }
 
     @engine.input
     def schema(module: str) -> str:
@@ -19,7 +23,11 @@ def run_demo() -> None:
     @engine.query
     def parse_schema(module: str) -> tuple[str, ...]:
         calls["parse_schema"] += 1
-        return tuple(sorted({field.strip() for field in schema(module).split(",") if field.strip()}))
+        return tuple(
+            sorted(
+                {field.strip() for field in schema(module).split(",") if field.strip()}
+            )
+        )
 
     @engine.query
     def direct_breaks(module: str) -> tuple[str, ...]:

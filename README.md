@@ -219,6 +219,95 @@ Set `stats=True` in the `Engine` constructor to track execution timing.
 
 ---
 
+## Incremental Collections & Native Map/Reduce
+
+`CascadeList`, `CascadeSet`, and `CascadeDict` behave like their builtin counterparts, but every mutation appends a diff to an event log and bumps a hidden engine input. Queries written with ordinary comprehensions and reducers are rewritten at registration time into incremental pipelines that consume only new diffs. Appending one element to a list of a million reruns your mapping function once.
+
+```python
+from cascade import Engine, CascadeList
+
+engine = Engine()
+docs = CascadeList(engine, ["alpha", "beta", "gamma"], name="docs")
+
+@engine.query
+def long_doc_count():
+    # Standard Python. Rewritten into filter -> len over the diff stream.
+    return len([d for d in docs if len(d) > 4])
+
+long_doc_count()      # walks all elements once
+docs.append("delta")  # one diff
+long_doc_count()      # processes only "delta"
+```
+
+### The collections
+
+*   **`CascadeList`** emits `{"action": "insert" | "update" | "remove", "uid": ..., "value": ..., "index": ...}`. Elements carry hidden monotonic uids, so a diff identifies its element stably while positions shift. `sort()` and `reverse()` reorder in place and keep uids attached to their values.
+*   **`CascadeSet`** emits `{"action": "add" | "remove", "value": ...}`. The value is its own identity; duplicate adds and absent discards emit nothing.
+*   **`CascadeDict`** emits `{"action": "upsert" | "remove", "key": ..., "value": ...}`. `keys()`, `values()`, and `items()` return intercepted views, so a pipeline over `d.keys()` treats a value-only upsert as a no-op.
+
+Every diff carries a monotonic `rev` tag. Each consuming pipeline keeps its own checkpoint, so two queries reading one collection advance independently and each requests only the diffs it has not seen.
+
+Plain reads (`for x in xs`, `len(xs)`, `xs[0]`, `x in xs`, `.copy()`, dict `.get()`) inside any query record a dependency on the collection, so ordinary loops still invalidate correctly even where nothing is rewritten.
+
+### What gets rewritten
+
+Rewriting covers comprehensions (`[...]`, `{...}`, `{k: v ...}`, and generator arguments), `map`, `filter`, `reversed`, and these reducers: `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`, `dict`, and string-literal `.join`. Adjacent map and filter stages are fused into a single per-item function before execution.
+
+| Reducer | Ingest per diff | Finalize |
+|---------|-----------------|----------|
+| `sum`, `len`, `any`, `all` | O(1) | O(1) |
+| `min`, `max` | O(log N) | O(1) |
+| `sorted` | O(log N) | O(output) |
+| `list`, `set`, `dict`, `.join` | O(1) | O(output) |
+| `reversed` | O(1) positional flip | inherited |
+
+Everything else runs exactly as written. The boundaries are strict and always fail toward standard execution:
+
+*   `enumerate()` and `zip()` sources are explicitly excluded. A prepend shifts every enumerate index and zip needs aligned streams, so neither can be made incremental safely; the code is left untouched and runs the normal O(N) way.
+*   Arbitrary `for` loops are never rewritten. They still invalidate through read tracking.
+*   Unsupported call shapes stay native: multi-generator comprehensions, `sum(..., start)`, `min`/`max` with `key` or multiple arguments, `dict(**kwargs)`, `.join` on anything except a string literal, `sorted` nested inside another pipeline, comprehensions inside `lambda` bodies.
+*   Functions whose source is unavailable (`exec`, REPL), `async` functions, lambdas, and functions that shadow a relevant builtin name are registered unmodified.
+*   If the source of a rewritten site turns out at runtime to be a plain list, set, dict, or iterator, the site falls back to plain Python semantics, including error behavior.
+
+Rewritten functions compile against the original filename and line numbers and reuse the original closure cells, so tracebacks point at your code and late-bound closures behave normally. `handle.raw.__cascade_rewritten__` tells you whether a query was rewritten.
+
+### Correctness guards
+
+The runtime fingerprints each stage function's bytecode, closure values, and defaults. If a closed-over value changes, the pipeline state rebuilds rather than mixing results from two function versions; if a captured value cannot be fingerprinted, the pipeline rebuilds on every run, which is slower but always correct. A stage function that reads tracked engine state (an input, another query, another collection) marks its pipeline impure, which also forces a rebuild per run, because its per-item results can change without the source collection emitting a diff.
+
+A few semantic edges are worth knowing. Incremental `sorted` breaks ties by insertion order into the structure, which can differ from CPython's positional stability after mid-list churn. Ordered outputs from a `CascadeSet` source follow insertion order. Incremental `sum` over strings raises `TypeError` with the generic operand message rather than `sum()`'s specific one. Incremental floating-point sums update by running addition and subtraction, so they can drift from a fresh recompute within normal float tolerance.
+
+### Opting out
+
+```python
+engine = Engine(incremental=False)      # global default off
+
+@engine.query(incremental=False)        # per-query off
+def q(): ...
+
+@engine.query(incremental=True)         # per-query on, overrides the global
+def r(): ...
+```
+
+Opted-out queries still invalidate through plain read tracking.
+
+### Persistence
+
+A **named** collection on an engine with `cache_dir` event-sources its log to disk. A later session with the same name restores contents, uid continuity, and revision head, and disk-cached query memos verify against that head, so a warm process serves results without recomputing anything.
+
+```python
+engine = Engine(cache_dir="./cache")
+items = CascadeList(engine, name="items", compact_every=1024)
+```
+
+The on-disk log compacts into a snapshot automatically every `compact_every` revisions, or on demand with `collection.compact()`. Restoring a name as a different kind raises `PersistentCacheError`, as does mutating a named, disk-backed collection with a value the canonical serializer cannot encode; the failed mutation is rolled back completely. Unnamed collections never persist. `engine.clear_disk_cache()` also wipes collection logs. Collections assume a single writer per name at a time.
+
+### Inspection
+
+`engine.inspect_pipelines()` lists every observed pipeline with its source, logical stages, fused stage count, checkpoint revision, and consuming queries. `engine.inspect_graph()` merges collection, map/filter, and reduce nodes into the dependency graph, so `export_mermaid` and `export_dot` render the full flow from collection to consuming query.
+
+---
+
 ## Visualization
 Cascade provides renderers for the dependency graph.
 
@@ -240,6 +329,7 @@ mermaid_text = export_mermaid(graph)
 2. **Thread Safety:** While Cascade supports parallel query execution, the `Engine` object itself should be modified (`.set()`, `@engine.query`) from a single thread or with external synchronization.
 3. **Persistence Security:** `engine.load()` and the persistent disk cache resolve `@dataclass` and `NamedTuple` types via `importlib`. Only load databases or open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.
+5. **Collections & `engine.save()`:** State snapshots via `engine.save()`/`engine.load()` do not carry collection event logs; use a named collection with `cache_dir` for durable collection state.
 
 ---
 
@@ -254,6 +344,7 @@ pip install query-cascade
 | Script | What it shows |
 |--------|----------------|
 | `compiler_pipeline.py` | `source → parse → symbols → typecheck`, warnings accumulator, cache-hit narration |
+| `incremental_collections.py` | CascadeList/Set/Dict diffs, comprehension rewriting, O(1) ingest, pipeline inspection |
 | `async_execution.py` | Asynchronous query evaluation and asyncio event loop integration for IO-bound work |
 | `ttl_invalidation.py` | Expiring stale query caches automatically based on wall-clock time |
 | `error_caching.py` | Basic exception caching to prevent repeated re-evaluation on failure |

@@ -28,8 +28,12 @@ class _Point(NamedTuple):
 def test_encode_is_deterministic_for_dict_and_set_ordering() -> None:
     assert canonical.encode({"z": 1, "a": 2}) == canonical.encode({"a": 2, "z": 1})
     assert canonical.encode({3, 1, 2}) == canonical.encode({2, 3, 1})
-    assert canonical.encode(frozenset(("b", "a"))) == canonical.encode(frozenset(("a", "b")))
-    assert canonical.value_digest({"k": [1, 2]}) == canonical.value_digest({"k": [1, 2]})
+    assert canonical.encode(frozenset(("b", "a"))) == canonical.encode(
+        frozenset(("a", "b"))
+    )
+    assert canonical.value_digest({"k": [1, 2]}) == canonical.value_digest(
+        {"k": [1, 2]}
+    )
     assert canonical.value_digest([1, 2]) != canonical.value_digest([2, 1])
 
 
@@ -100,13 +104,17 @@ def test_entry_key_is_deterministic_and_arg_sensitive() -> None:
 # --- missing dependency errors ---
 
 
-def test_missing_lmdb_raises_with_install_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_lmdb_raises_with_install_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(disk_cache_mod, "lmdb", None)
     with pytest.raises(PersistentCacheError, match="pip install lmdb"):
         Engine(cache_dir=tmp_path / "cache")
 
 
-def test_missing_msgpack_raises_with_install_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_msgpack_raises_with_install_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(canonical, "msgpack", None)
     with pytest.raises(PersistentCacheError, match="pip install msgpack"):
         Engine(cache_dir=tmp_path / "cache")
@@ -115,7 +123,9 @@ def test_missing_msgpack_raises_with_install_hint(tmp_path: Path, monkeypatch: p
 # --- helpers for cross-session scenarios ---
 
 
-def _build_file_pipeline(cache_dir: Path, runs: dict[str, int]) -> tuple[Engine, Any, Any, Any]:
+def _build_file_pipeline(
+    cache_dir: Path, runs: dict[str, int]
+) -> tuple[Engine, Any, Any, Any]:
     engine = Engine(cache_dir=cache_dir)
     warnings = engine.accumulator("warnings")
 
@@ -615,7 +625,7 @@ def test_disk_cache_prune_vacuum(tmp_path: Path) -> None:
 def test_disk_cache_prune_vacuum_empty(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     engine = Engine(cache_dir=cache)
-    
+
     # Prune empty cache
     engine.prune([], vacuum_disk=True)
     engine.shutdown()
@@ -623,7 +633,7 @@ def test_disk_cache_prune_vacuum_empty(tmp_path: Path) -> None:
 
 def test_disk_cache_prune_vacuum_no_disk() -> None:
     engine = Engine()
-    
+
     # Should safely return
     engine.prune([], vacuum_disk=True)
     engine.shutdown()
@@ -638,41 +648,46 @@ def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path) -> None:
     @engine.query
     def uncacheable_args(arg: Any) -> int:
         return 1
-        
+
     @engine.query
     def normal_query() -> int:
         return 2
 
-    # We manually populate the disk cache with a corrupted/fake record 
+    # We manually populate the disk cache with a corrupted/fake record
     # to cover the `if record is None:` and missing value_hash branches.
     import cascade._canonical as canonical
     from cascade._disk_cache import entry_key
-    
+
     fake_fid = "fake:query"
     args_blob = canonical.encode(())
     ekey = entry_key("query", fake_fid, args_blob)
-    
+
     # Store a bad record using raw lmdb put
     with disk._env.begin(write=True) as txn:
         # A record with no value_hash and a non-query dep
-        bad_record = canonical.encode({
-            "kind": "query",
-            "id": fake_fid,
-            # no value_hash
-            "deps": [
-                ["input", "some_input", args_blob, "fingerprint"],
-            ],
-            "effects": {}
-        })
+        bad_record = canonical.encode(
+            {
+                "kind": "query",
+                "id": fake_fid,
+                # no value_hash
+                "deps": [
+                    ["input", "some_input", args_blob, "fingerprint"],
+                ],
+                "effects": {},
+            }
+        )
         txn.put(ekey, bad_record, db=disk._meta)
 
     # Now attempt to prune with the fake query as root
     # It will read the bad record, skip value_hash, and skip the input dep
-    engine.prune([("query", fake_fid, ()), ("query", uncacheable_args.id, (lambda: None,))], vacuum_disk=True)
-    
+    engine.prune(
+        [("query", fake_fid, ()), ("query", uncacheable_args.id, (lambda: None,))],
+        vacuum_disk=True,
+    )
+
     # Also verify that a completely missing key handled gracefully
     engine.prune([("query", "missing:fid", ())], vacuum_disk=True)
-    
+
     engine.shutdown()
 
 

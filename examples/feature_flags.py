@@ -6,26 +6,30 @@ from cascade import Engine
 
 engine = Engine()
 
+
 @engine.input
 def user_plan(user_id: str) -> str:
     return "free"
+
 
 @engine.input
 def global_feature_toggle(feature: str) -> bool:
     return True
 
+
 @engine.query
 def check_permission(user_id: str, feature: str) -> bool:
     print(f"⏳ Calculating permission for {user_id} on {feature}...")
-    time.sleep(1) 
-    
+    time.sleep(1)
+
     if not global_feature_toggle(feature):
         return False
-        
+
     plan = user_plan(user_id)
     if feature == "pro_stats":
         return plan in ["pro", "enterprise"]
     return True
+
 
 # --- Scenario ---
 

@@ -49,7 +49,10 @@ def run_concurrency_demo() -> None:
         print("Fresh value after mutation:", expensive())
 
     dedup_waits = sum(1 for event in engine.traces() if event.event == "dedup_wait")
-    print("Trace summary:", {"dedup_wait_events": dedup_waits, "total_trace_events": len(engine.traces())})
+    print(
+        "Trace summary:",
+        {"dedup_wait_events": dedup_waits, "total_trace_events": len(engine.traces())},
+    )
     print("Example complete.")
 
 

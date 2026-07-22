@@ -1,5 +1,6 @@
 from cascade import Engine
 
+
 def test_memoize_false():
     engine = Engine()
 
@@ -36,7 +37,7 @@ def test_memoize_false():
     assert aggregated_result() == 20
     # mapped_data MUST be re-evaluated
     assert eval_count == 3
-    
+
     # Verify that mapped_data doesn't hold the value in the cache
     keys = [k for k in engine._store.memos if k[0] == "query" and "mapped_data" in k[1]]
     assert len(keys) == 1
@@ -45,33 +46,34 @@ def test_memoize_false():
     # We strip the value to save memory
     assert memo.value is None
 
+
 def test_memoize_false_multiple_calls_same_revision():
     engine = Engine()
-    
+
     eval_count = 0
-    
+
     @engine.input
     def root() -> int:
         return 10
-        
+
     @engine.query(memoize=False)
     def unmemoized() -> int:
         nonlocal eval_count
         eval_count += 1
         return root()
-        
+
     @engine.query
     def d1() -> int:
         return unmemoized()
-        
+
     @engine.query
     def d2() -> int:
         return unmemoized()
-        
+
     @engine.query
     def final() -> int:
         return d1() + d2()
-        
+
     assert final() == 20
     # unmemoized should be called twice because its result isn't cached in memos
     assert eval_count == 2

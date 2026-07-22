@@ -9,6 +9,7 @@ from ._state import QueryKey, Snapshot
 
 UNSET = object()
 
+
 @dataclass
 class RuntimeFrame:
     key: QueryKey

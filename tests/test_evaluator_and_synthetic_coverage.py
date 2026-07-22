@@ -91,7 +91,9 @@ def test_fanout_chain_pipeline_leaf_and_default_counts_branch() -> None:
     assert aggregate() == expected_fanout_chain_total(depth=1, fanout=2, values=[0, 0])
     leaf.set(0, 10)
     leaf.set(1, 20)
-    assert aggregate() == expected_fanout_chain_total(depth=1, fanout=2, values=[10, 20])
+    assert aggregate() == expected_fanout_chain_total(
+        depth=1, fanout=2, values=[10, 20]
+    )
 
 
 def test_fanout_chain_pipeline_accepts_explicit_counts_dict() -> None:

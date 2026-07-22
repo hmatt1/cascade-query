@@ -13,7 +13,9 @@ if _src.exists():
 from cascade import Engine  # noqa: E402
 
 
-def _make_engine_and_calls(durations: dict[str, float]) -> tuple[Engine, list[tuple[object, tuple[object, ...]]]]:
+def _make_engine_and_calls(
+    durations: dict[str, float],
+) -> tuple[Engine, list[tuple[object, tuple[object, ...]]]]:
     engine = Engine()
     progress = engine.accumulator("progress")
 
@@ -81,4 +83,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from hypothesis import HealthCheck, settings, strategies as st
-from hypothesis.stateful import Bundle, RuleBasedStateMachine, invariant, precondition, rule
+from hypothesis.stateful import (
+    Bundle,
+    RuleBasedStateMachine,
+    invariant,
+    precondition,
+    rule,
+)
 
 from cascade import Engine, Snapshot
 from tests.scale_helpers import assert_internal_dependents_consistent
@@ -21,7 +27,9 @@ class EngineStateMachine(RuleBasedStateMachine):
         self._tmpdir = TemporaryDirectory()
         self._state_db = Path(self._tmpdir.name) / "state.db"
         self._revision = 0
-        self._history: dict[tuple[str, tuple[int, ...]], list[tuple[int, int | None]]] = {}
+        self._history: dict[
+            tuple[str, tuple[int, ...]], list[tuple[int, int | None]]
+        ] = {}
         self._id_to_name: dict[str, str] = {}
         self._observed_indexes: set[int] = set()
         self._choose_compute_count = 0
@@ -80,7 +88,9 @@ class EngineStateMachine(RuleBasedStateMachine):
             name = self._id_to_name.get(input_id)
             if name is None:
                 continue
-            rebuilt[(name, args)] = [(version.revision, version.value) for version in versions]
+            rebuilt[(name, args)] = [
+                (version.revision, version.value) for version in versions
+            ]
         self._history = rebuilt
 
     def _default_value(self, name: str, args: tuple[int, ...]) -> int | None:
@@ -149,7 +159,9 @@ class EngineStateMachine(RuleBasedStateMachine):
     def read_pair_live(self, index: int) -> None:
         actual = self.pair(index)
         self._sync_from_engine()
-        expected = self._expected_choose(index, self._revision) + self._expected_choose(index + 1, self._revision)
+        expected = self._expected_choose(index, self._revision) + self._expected_choose(
+            index + 1, self._revision
+        )
         assert actual == expected
         self._observed_indexes.update({index, index + 1})
 
@@ -163,10 +175,14 @@ class EngineStateMachine(RuleBasedStateMachine):
     @rule(snapshot=snapshots, index=INDEXES)
     def read_choose_snapshot(self, snapshot: Snapshot, index: int) -> None:
         self._sync_from_engine()
-        assert self.choose(index, snapshot=snapshot) == self._expected_choose(index, snapshot.revision)
+        assert self.choose(index, snapshot=snapshot) == self._expected_choose(
+            index, snapshot.revision
+        )
 
     @rule(index=INDEXES, value=MAYBE_INT)
-    def inactive_branch_mutation_does_not_recompute_choose(self, index: int, value: int | None) -> None:
+    def inactive_branch_mutation_does_not_recompute_choose(
+        self, index: int, value: int | None
+    ) -> None:
         self._sync_from_engine()
         assert self.choose(index) == self._expected_choose(index, self._revision)
         self._sync_from_engine()

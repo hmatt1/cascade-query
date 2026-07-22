@@ -4,17 +4,20 @@ from cascade import Engine
 
 engine = Engine()
 
+
 # We can define input sources that return data (or coroutines!)
 @engine.input
 def user_id():
     return "user_1"
 
+
 # Queries can be asynchronous to perform IO-bound operations
 @engine.query
 async def fetch_user_data(uid: str):
     print(f"  [Network] Fetching data for {uid}...")
-    await asyncio.sleep(0.5) # Simulate network IO
+    await asyncio.sleep(0.5)  # Simulate network IO
     return {"id": uid, "name": "Alice", "role": "admin"}
+
 
 @engine.query
 async def fetch_permissions(role: str):
@@ -24,17 +27,16 @@ async def fetch_permissions(role: str):
         return ["read", "write", "delete"]
     return ["read"]
 
+
 # Async queries can call other async queries
 @engine.query
 async def user_profile():
     uid = user_id()
     data = await fetch_user_data(uid)
     perms = await fetch_permissions(data["role"])
-    
-    return {
-        "user": data,
-        "permissions": perms
-    }
+
+    return {"user": data, "permissions": perms}
+
 
 async def main():
     print("--- First Run ---")
@@ -57,7 +59,7 @@ async def main():
     print("--- Input Change ---")
     # Change the input, triggering invalidation
     user_id.set("user_2")
-    
+
     print("--- Third Run (Cache Miss) ---")
     start = time.perf_counter()
     # Cache miss for user data, but wait! Does the role change?
@@ -68,6 +70,7 @@ async def main():
     print(f"Result: {profile}")
     print(f"Took {elapsed:.2f}s\n")
     print("Example complete.")
-    
+
+
 if __name__ == "__main__":
     asyncio.run(main())

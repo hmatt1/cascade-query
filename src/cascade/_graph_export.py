@@ -35,11 +35,11 @@ def _vertices_from_graph(graph: Mapping[str, Any]) -> list[str]:
 
 def condense_graph(graph: Mapping[str, Any], min_group_size: int = 2) -> dict[str, Any]:
     """
-    Condenses a graph dictionary by grouping nodes that share the same base name 
+    Condenses a graph dictionary by grouping nodes that share the same base name
     (ignoring arguments) if there are at least `min_group_size` of them.
     """
     vertices = _vertices_from_graph(graph)
-    
+
     base_name_groups = {}
     for v in vertices:
         match = re.match(r"^(.*?)\(.*\)$", v)
@@ -48,10 +48,10 @@ def condense_graph(graph: Mapping[str, Any], min_group_size: int = 2) -> dict[st
             base_name_groups.setdefault(base_name, []).append(v)
         else:
             base_name_groups.setdefault(v, []).append(v)
-            
+
     node_mapping = {}
     condensed_nodes = []
-    
+
     for base_name, group in base_name_groups.items():
         if len(group) >= min_group_size and base_name != group[0]:
             condensed_name = f"{base_name} ({len(group)} nodes)"
@@ -62,30 +62,29 @@ def condense_graph(graph: Mapping[str, Any], min_group_size: int = 2) -> dict[st
             for v in group:
                 node_mapping[v] = v
                 condensed_nodes.append(v)
-                
+
     condensed_edges = []
     seen_edges = set()
-    
+
     for e in graph.get("edges", ()):
         if len(e) < 2:
             continue
         p, d = e[0], e[1]
-        
+
         new_p = node_mapping.get(p, p)
         new_d = node_mapping.get(d, d)
-        
+
         edge_tuple = (new_p, new_d)
         if edge_tuple not in seen_edges:
             seen_edges.add(edge_tuple)
             condensed_edges.append(edge_tuple)
-            
-    return {
-        "nodes": condensed_nodes,
-        "edges": condensed_edges
-    }
+
+    return {"nodes": condensed_nodes, "edges": condensed_edges}
 
 
-def export_dot(graph: Mapping[str, Any], *, directed: bool = True, condense: bool = False) -> str:
+def export_dot(
+    graph: Mapping[str, Any], *, directed: bool = True, condense: bool = False
+) -> str:
     """Render ``graph`` (``inspect_graph`` / :meth:`~cascade.engine.Engine.subgraph` shape) as Graphviz DOT.
 
     Node names are internal ids ``n0``, ``n1``, … with full keys in ``label`` attributes

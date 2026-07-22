@@ -16,18 +16,24 @@ from ._store import GraphStore
 
 
 class Evaluator:
-    def __init__(self, store: GraphStore, *, disk: DiskCache | None = None, get_executor: Callable[[], concurrent.futures.Executor] | None = None) -> None:
+    def __init__(
+        self,
+        store: GraphStore,
+        *,
+        disk: DiskCache | None = None,
+        get_executor: Callable[[], concurrent.futures.Executor] | None = None,
+    ) -> None:
         self._store = store
         self._disk = disk
         self._get_executor = get_executor
-        self._runtime_var: contextvars.ContextVar[RuntimeState | None] = contextvars.ContextVar(
-            "cascade_runtime", default=None
+        self._runtime_var: contextvars.ContextVar[RuntimeState | None] = (
+            contextvars.ContextVar("cascade_runtime", default=None)
         )
         # Keys currently being verified against the disk cache in this context.
         # Guards against unbounded recursion if a corrupted store ever encodes
         # a dependency cycle; real cycles are still caught by the frame stack.
-        self._hydrating_var: contextvars.ContextVar[frozenset[QueryKey]] = contextvars.ContextVar(
-            "cascade_hydrating", default=frozenset()
+        self._hydrating_var: contextvars.ContextVar[frozenset[QueryKey]] = (
+            contextvars.ContextVar("cascade_hydrating", default=frozenset())
         )
 
     def _run_in_runtime(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
@@ -41,7 +47,9 @@ class Evaluator:
         finally:
             self._runtime_var.reset(token)
 
-    async def _run_in_runtime_async(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
+    async def _run_in_runtime_async(
+        self, runtime: RuntimeState, fn: Callable[[], Any]
+    ) -> Any:
         token = self._runtime_var.set(runtime)
         try:
             result = await fn()
@@ -59,6 +67,24 @@ class Evaluator:
             current = self._store.cancel_epoch
         if current != runtime_cancel_epoch:
             raise QueryCancelled("query cancelled because inputs changed")
+
+    def in_runtime(self) -> bool:
+        """True when the current context is executing inside a query."""
+        return self._runtime_var.get() is not None
+
+    def current_query_node(self) -> str | None:
+        """Node string of the innermost executing query, if any."""
+        runtime = self._runtime_var.get()
+        if runtime is None or not runtime.stack:
+            return None
+        return self._store.key_to_str(runtime.stack[-1].key)
+
+    def current_frame_dep_count(self) -> int:
+        """Dependency count of the innermost frame, or -1 outside a query."""
+        runtime = self._runtime_var.get()
+        if runtime is None or not runtime.stack:
+            return -1
+        return len(runtime.stack[-1].deps)
 
     def push_effect(self, name: str, item: Any) -> None:
         runtime = self._runtime_var.get()
@@ -97,8 +123,12 @@ class Evaluator:
         snapshot: Snapshot | None,
     ) -> Any:
         runtime = self._runtime_var.get()
-        use_snapshot = snapshot or (runtime.snapshot if runtime is not None else self._store.snapshot())
-        snapshot_pinned = snapshot is not None or (runtime.snapshot_pinned if runtime is not None else False)
+        use_snapshot = snapshot or (
+            runtime.snapshot if runtime is not None else self._store.snapshot()
+        )
+        snapshot_pinned = snapshot is not None or (
+            runtime.snapshot_pinned if runtime is not None else False
+        )
         if runtime is not None:
             self.check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
@@ -111,7 +141,9 @@ class Evaluator:
             if not snapshot_pinned:
                 with self._store.lock:
                     latest = self._store.latest_input_version((input_id, args))
-                    should_materialize = latest is None and use_snapshot.revision == self._store.revision
+                    should_materialize = (
+                        latest is None and use_snapshot.revision == self._store.revision
+                    )
             if should_materialize:
                 self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
                 version = self._store.latest_input_version((input_id, args))
@@ -137,8 +169,12 @@ class Evaluator:
         snapshot: Snapshot | None,
     ) -> Any:
         runtime = self._runtime_var.get()
-        use_snapshot = snapshot or (runtime.snapshot if runtime is not None else self._store.snapshot())
-        snapshot_pinned = snapshot is not None or (runtime.snapshot_pinned if runtime is not None else False)
+        use_snapshot = snapshot or (
+            runtime.snapshot if runtime is not None else self._store.snapshot()
+        )
+        snapshot_pinned = snapshot is not None or (
+            runtime.snapshot_pinned if runtime is not None else False
+        )
         if runtime is not None:
             self.check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
@@ -154,7 +190,9 @@ class Evaluator:
             if not snapshot_pinned:
                 with self._store.lock:
                     latest = self._store.latest_input_version((input_id, args))
-                    should_materialize = latest is None and use_snapshot.revision == self._store.revision
+                    should_materialize = (
+                        latest is None and use_snapshot.revision == self._store.revision
+                    )
             if should_materialize:
                 self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
                 version = self._store.latest_input_version((input_id, args))
@@ -212,20 +250,24 @@ class Evaluator:
                     has_fp, fp_val = self._store.lookup_query_fixed_point(query_id)
                     if not has_fp:
                         cycle_start = [f.key for f in runtime.stack[i:]] + [key]
-                        cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
+                        cycle = " -> ".join(
+                            self._store.key_to_str(k) for k in cycle_start
+                        )
                         raise CycleError(f"cycle detected: {cycle}")
                     frame.cycle_guess = fp_val
-                    
+
                 frame.is_cycle_root = True
                 for f in runtime.stack[i:]:
                     frame.cycle_nodes.add(f.key)
-                
+
                 # Record the back-edge dependency so the calling node is properly invalidated later
                 if len(runtime.stack) > 0:
                     runtime.stack[-1].deps[key] = runtime.snapshot.revision
                 return frame.cycle_guess
         self.check_cancelled(runtime.cancel_epoch)
-        entry, replay_needed = self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
+        entry, replay_needed = self.compute_or_get_memo(
+            key, fn, runtime, need_value=need_value
+        )
         self.record_dependency(key, entry.changed_at)
         if replay_needed:
             self.replay_effects(entry.effects)
@@ -275,19 +317,23 @@ class Evaluator:
                     has_fp, fp_val = self._store.lookup_query_fixed_point(query_id)
                     if not has_fp:
                         cycle_start = [f.key for f in runtime.stack[i:]] + [key]
-                        cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
+                        cycle = " -> ".join(
+                            self._store.key_to_str(k) for k in cycle_start
+                        )
                         raise CycleError(f"cycle detected: {cycle}")
                     frame.cycle_guess = fp_val
-                    
+
                 frame.is_cycle_root = True
                 for f in runtime.stack[i:]:
                     frame.cycle_nodes.add(f.key)
-                
+
                 if len(runtime.stack) > 0:
                     runtime.stack[-1].deps[key] = runtime.snapshot.revision
                 return frame.cycle_guess
         self.check_cancelled(runtime.cancel_epoch)
-        entry, replay_needed = await self.compute_or_get_memo_async(key, fn, runtime, need_value=need_value)
+        entry, replay_needed = await self.compute_or_get_memo_async(
+            key, fn, runtime, need_value=need_value
+        )
         self.record_dependency(key, entry.changed_at)
         if replay_needed:
             self.replay_effects(entry.effects)
@@ -308,12 +354,16 @@ class Evaluator:
             is_memoized = self._store.lookup_query_memoize(key[1])
             if existing is not None:
                 self._store.touch_memo_locked(key)
-                
+
                 ttl = self._store.lookup_query_ttl(key[1])
                 is_expired = False
-                if ttl is not None and self._store.monotonic_seconds() - existing.computed_at_time > ttl:
+                if (
+                    ttl is not None
+                    and self._store.monotonic_seconds() - existing.computed_at_time
+                    > ttl
+                ):
                     is_expired = True
-                    
+
                 if not is_expired and existing.verified_at == runtime.snapshot.revision:
                     self._store.trace_event("cache_hit", key)
                     if is_memoized or not need_value:
@@ -376,10 +426,14 @@ class Evaluator:
             is_memoized = self._store.lookup_query_memoize(key[1])
             if existing is not None:
                 self._store.touch_memo_locked(key)
-                
+
                 ttl = self._store.lookup_query_ttl(key[1])
                 is_expired = False
-                if ttl is not None and self._store.monotonic_seconds() - existing.computed_at_time > ttl:
+                if (
+                    ttl is not None
+                    and self._store.monotonic_seconds() - existing.computed_at_time
+                    > ttl
+                ):
                     is_expired = True
 
                 if not is_expired and existing.verified_at == runtime.snapshot.revision:
@@ -434,29 +488,43 @@ class Evaluator:
             with self._store.lock:
                 self._store.in_flight.pop((key, runtime.snapshot.revision), None)
 
-    def try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
+    def try_mark_green(
+        self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
+    ) -> bool:
         ttl = self._store.lookup_query_ttl(key[1])
-        if ttl is not None and self._store.monotonic_seconds() - entry.computed_at_time > ttl:
+        if (
+            ttl is not None
+            and self._store.monotonic_seconds() - entry.computed_at_time > ttl
+        ):
             self._store.trace_event("cache_red_ttl", key)
             return False
 
         for dep in entry.deps:
             dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
-                self._store.trace_event("cache_red", key, detail=self._store.key_to_str(dep.key))
+                self._store.trace_event(
+                    "cache_red", key, detail=self._store.key_to_str(dep.key)
+                )
                 return False
         return True
 
-    async def try_mark_green_async(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:  # pragma: no cover
+    async def try_mark_green_async(
+        self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
+    ) -> bool:  # pragma: no cover
         ttl = self._store.lookup_query_ttl(key[1])
-        if ttl is not None and self._store.monotonic_seconds() - entry.computed_at_time > ttl:
+        if (
+            ttl is not None
+            and self._store.monotonic_seconds() - entry.computed_at_time > ttl
+        ):
             self._store.trace_event("cache_red_ttl", key)
             return False
 
         for dep in entry.deps:
             dep_changed_at = await self.dependency_changed_at_async(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
-                self._store.trace_event("cache_red", key, detail=self._store.key_to_str(dep.key))
+                self._store.trace_event(
+                    "cache_red", key, detail=self._store.key_to_str(dep.key)
+                )
                 return False
         return True
 
@@ -488,7 +556,15 @@ class Evaluator:
                     cancel_epoch=None,
                     snapshot_pinned=True,
                 ),
-                lambda: self.query_call(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None, need_value=False),
+                lambda: self.query_call(
+                    fid,
+                    fn,
+                    args,
+                    snapshot=snapshot,
+                    effects=None,
+                    cancel_epoch=None,
+                    need_value=False,
+                ),
             )
         else:
             # Dependency verification should not add edges to currently executing frame.
@@ -503,7 +579,13 @@ class Evaluator:
             self._run_in_runtime(
                 shadow,
                 lambda: self.query_call(
-                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch, need_value=False
+                    fid,
+                    fn,
+                    args,
+                    snapshot=snapshot,
+                    effects=None,
+                    cancel_epoch=runtime.cancel_epoch,
+                    need_value=False,
                 ),
             )
 
@@ -513,7 +595,9 @@ class Evaluator:
                 raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
             return refreshed.changed_at
 
-    async def dependency_changed_at_async(self, key: QueryKey, snapshot: Snapshot) -> int:  # pragma: no cover
+    async def dependency_changed_at_async(
+        self, key: QueryKey, snapshot: Snapshot
+    ) -> int:  # pragma: no cover
         kind, fid, args = key
         if kind == "input":
             version = self._store.input_version_at((fid, args), snapshot.revision)
@@ -542,7 +626,15 @@ class Evaluator:
                     snapshot_pinned=True,
                     is_async=True,
                 ),
-                lambda: self.query_call_async(fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=None, need_value=False),
+                lambda: self.query_call_async(
+                    fid,
+                    fn,
+                    args,
+                    snapshot=snapshot,
+                    effects=None,
+                    cancel_epoch=None,
+                    need_value=False,
+                ),
             )
         else:
             shadow = RuntimeState(
@@ -557,7 +649,13 @@ class Evaluator:
             await self._run_in_runtime_async(
                 shadow,
                 lambda: self.query_call_async(
-                    fid, fn, args, snapshot=snapshot, effects=None, cancel_epoch=runtime.cancel_epoch, need_value=False
+                    fid,
+                    fn,
+                    args,
+                    snapshot=snapshot,
+                    effects=None,
+                    cancel_epoch=runtime.cancel_epoch,
+                    need_value=False,
                 ),
             )
 
@@ -577,14 +675,14 @@ class Evaluator:
         runtime.stack.append(frame)
         start = self._store.monotonic_seconds()
         self._store.trace_event("recompute_start", key)
-        
+
         with self._store.lock:
             old_memo = self._store.memos.get(key)
             if old_memo is not None and old_memo.cycle_nodes:
                 for k in old_memo.cycle_nodes:
                     if k != key:
                         self._store.drop_memo_locked(k)
-                        
+
         error: BaseException | None = None
         while True:
             try:
@@ -603,16 +701,18 @@ class Evaluator:
                     should_cache = isinstance(exc, Exception)
                 elif isinstance(cache_ex, tuple):
                     should_cache = isinstance(exc, cache_ex)
-                    
+
                 if should_cache:
                     error = exc
                     result = None
                 else:
                     runtime.stack.pop()
                     raise
-                
+
             if frame.is_cycle_root:
-                if error is None and self._store.stable_hash(result) != self._store.stable_hash(frame.cycle_guess):
+                if error is None and self._store.stable_hash(
+                    result
+                ) != self._store.stable_hash(frame.cycle_guess):
                     frame.cycle_guess = result
                     frame.is_cycle_root = False
                     with self._store.lock:
@@ -624,10 +724,10 @@ class Evaluator:
                     frame.deps.clear()
                     frame.effects.clear()
                     continue
-                    
+
             runtime.stack.pop()
             break
-            
+
         elapsed = self._store.monotonic_seconds() - start
         duration_ms = elapsed * 1000.0
 
@@ -636,11 +736,11 @@ class Evaluator:
             value_hash = self._store.stable_hash(error)
         else:
             value_hash = self._store.stable_hash(result)
-        
+
         if frame.cycle_nodes:
             for k in frame.cycle_nodes:
                 frame.deps.pop(k, None)
-            
+
         is_memoized = self._store.lookup_query_memoize(key[1])
         with self._store.lock:
             previous = self._store.memos.get(key)
@@ -710,14 +810,14 @@ class Evaluator:
         try:
             start = self._store.monotonic_seconds()
             self._store.trace_event("recompute_start", key)
-            
+
             with self._store.lock:
                 old_memo = self._store.memos.get(key)
                 if old_memo is not None and old_memo.cycle_nodes:
                     for k in old_memo.cycle_nodes:
                         if k != key:
                             self._store.drop_memo_locked(k)
-                            
+
             error: BaseException | None = None
             while True:
                 try:
@@ -733,48 +833,56 @@ class Evaluator:
                 except BaseException as exc:
                     cache_ex = self._store.lookup_query_cache_exceptions(key[1])
                     should_cache = False
-                    if isinstance(exc, (QueryCancelled, CycleError, PersistentCacheError)):
+                    if isinstance(
+                        exc, (QueryCancelled, CycleError, PersistentCacheError)
+                    ):
                         pass
                     elif cache_ex is True:
                         should_cache = isinstance(exc, Exception)
                     elif isinstance(cache_ex, tuple):
                         should_cache = isinstance(exc, cache_ex)
-                        
+
                     if should_cache:
                         error = exc
                         result = None
                     else:
                         raise
-                    
+
                 if frame.is_cycle_root:
-                    if error is None and self._store.stable_hash(result) != self._store.stable_hash(frame.cycle_guess):
+                    if error is None and self._store.stable_hash(
+                        result
+                    ) != self._store.stable_hash(frame.cycle_guess):
                         frame.cycle_guess = result
                         frame.is_cycle_root = False
                         with self._store.lock:
                             self._store.revision += 1
-                            new_runtime.snapshot = Snapshot(revision=self._store.revision)
+                            new_runtime.snapshot = Snapshot(
+                                revision=self._store.revision
+                            )
                             for k in frame.cycle_nodes:
                                 if k != key:
                                     self._store.drop_memo_locked(k)
                         frame.deps.clear()
                         frame.effects.clear()
                         continue
-                        
+
                 break
-                
+
             elapsed = self._store.monotonic_seconds() - start
             duration_ms = elapsed * 1000.0
 
-            frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
+            frozen_effects = {
+                name: tuple(items) for name, items in frame.effects.items()
+            }
             if error is not None:
                 value_hash = self._store.stable_hash(error)
             else:
                 value_hash = self._store.stable_hash(result)
-            
+
             if frame.cycle_nodes:
                 for k in frame.cycle_nodes:
                     frame.deps.pop(k, None)
-                
+
             is_memoized = self._store.lookup_query_memoize(key[1])
             with self._store.lock:
                 previous = self._store.memos.get(key)
@@ -819,7 +927,9 @@ class Evaluator:
                 self._store.evict_if_needed_locked()
             if self._disk is not None and is_memoized:
                 self._persist_entry(key, full_memo)
-            self._store.trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
+            self._store.trace_event(
+                "recompute_done", key, detail=f"{duration_ms:.3f}ms"
+            )
             if self._store.is_stats_enabled():
                 self._store.record_query_body_time(key, elapsed)
             return full_memo
@@ -829,7 +939,9 @@ class Evaluator:
 
     # --- persistent disk cache ---
 
-    def _try_hydrate_from_disk(self, key: QueryKey, runtime: RuntimeState) -> MemoEntry | None:
+    def _try_hydrate_from_disk(
+        self, key: QueryKey, runtime: RuntimeState
+    ) -> MemoEntry | None:
         disk = self._disk
         if disk is None:
             return None  # pragma: no cover
@@ -846,14 +958,22 @@ class Evaluator:
         if record is None:
             self._store.trace_event("disk_miss", key)
             return None  # pragma: no cover
-            
+
         fn_hash = record.get("fn_hash")
         with self._store.lock:
-            current_fn_hash = self._store.query_hashes.get(fid) if kind == "query" else self._store.input_hashes.get(fid)
-        if fn_hash is not None and current_fn_hash is not None and fn_hash != current_fn_hash:
+            current_fn_hash = (
+                self._store.query_hashes.get(fid)
+                if kind == "query"
+                else self._store.input_hashes.get(fid)
+            )
+        if (
+            fn_hash is not None
+            and current_fn_hash is not None
+            and fn_hash != current_fn_hash
+        ):
             self._store.trace_event("disk_red", key, detail="function hash changed")
             return None  # pragma: no cover
-            
+
         token = self._hydrating_var.set(hydrating | {key})
         try:
             observed = self._verify_disk_deps(key, record, runtime)
@@ -866,7 +986,9 @@ class Evaluator:
             return None  # pragma: no cover
         blob = disk.load_blob(value_hash)
         if blob is None or _canonical.digest_bytes(blob) != value_hash:
-            self._store.trace_event("disk_red", key, detail="value blob missing or corrupt")
+            self._store.trace_event(
+                "disk_red", key, detail="value blob missing or corrupt"
+            )
             return None  # pragma: no cover
         try:
             value = _canonical.decode(blob)
@@ -876,12 +998,12 @@ class Evaluator:
         except Exception:  # pragma: no cover
             self._store.trace_event("disk_red", key, detail="record decode failed")
             return None  # pragma: no cover
-            
+
         error = None
         if is_error:
             error = value
             value = None
-            
+
         with self._store.lock:
             self._store.next_access_id += 1
             memo = self._store.entry_from_runtime(
@@ -918,7 +1040,11 @@ class Evaluator:
             if not isinstance(row, list) or len(row) != 4:
                 return None  # pragma: no cover
             dep_kind, dep_fid, dep_args_blob, fingerprint = row
-            if not (isinstance(dep_kind, str) and isinstance(dep_fid, str) and isinstance(dep_args_blob, bytes)):
+            if not (
+                isinstance(dep_kind, str)
+                and isinstance(dep_fid, str)
+                and isinstance(dep_args_blob, bytes)
+            ):
                 return None  # pragma: no cover
             try:
                 dep_args = _canonical.decode(dep_args_blob)
@@ -930,13 +1056,17 @@ class Evaluator:
             if dep_kind == "input":
                 version = self._current_input_version(dep_fid, dep_args, runtime)
                 if version is None or version.value_hash != fingerprint:
-                    self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))
+                    self._store.trace_event(
+                        "disk_red", key, detail=self._store.key_to_str(dep_key)
+                    )
                     return None  # pragma: no cover
                 observed[dep_key] = version.changed_at
             elif dep_kind == "query":
                 state = self._current_query_state(dep_fid, dep_args, runtime)
                 if state is None or state[0] != fingerprint:
-                    self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))
+                    self._store.trace_event(
+                        "disk_red", key, detail=self._store.key_to_str(dep_key)
+                    )
                     return None  # pragma: no cover
                 observed[dep_key] = state[1]
             else:
@@ -964,8 +1094,10 @@ class Evaluator:
         # convention for never-set default inputs, so green checks stay stable.
         value = fn(*args)
         import types
+
         if isinstance(value, types.CoroutineType):
             import asyncio
+
             value = asyncio.run(value)
         return InputVersion(
             revision=runtime.snapshot.revision,
@@ -998,7 +1130,12 @@ class Evaluator:
         self._run_in_runtime(
             shadow,
             lambda: self.query_call(
-                query_id, fn, args, snapshot=runtime.snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+                query_id,
+                fn,
+                args,
+                snapshot=runtime.snapshot,
+                effects=None,
+                cancel_epoch=runtime.cancel_epoch,
             ),
         )
         with self._store.lock:
@@ -1007,8 +1144,9 @@ class Evaluator:
                 return None
             return memo.value_hash, memo.changed_at
 
-
-    async def _try_hydrate_from_disk_async(self, key: QueryKey, runtime: RuntimeState) -> MemoEntry | None:  # pragma: no cover
+    async def _try_hydrate_from_disk_async(
+        self, key: QueryKey, runtime: RuntimeState
+    ) -> MemoEntry | None:  # pragma: no cover
         disk = self._disk
         if disk is None:
             return None  # pragma: no cover
@@ -1025,14 +1163,24 @@ class Evaluator:
         if record is None:
             self._store.trace_event("disk_miss", key)  # pragma: no cover
             return None  # pragma: no cover
-            
+
         fn_hash = record.get("fn_hash")
         with self._store.lock:
-            current_fn_hash = self._store.query_hashes.get(fid) if kind == "query" else self._store.input_hashes.get(fid)
-        if fn_hash is not None and current_fn_hash is not None and fn_hash != current_fn_hash:
-            self._store.trace_event("disk_red", key, detail="function hash changed")  # pragma: no cover
+            current_fn_hash = (
+                self._store.query_hashes.get(fid)
+                if kind == "query"
+                else self._store.input_hashes.get(fid)
+            )
+        if (
+            fn_hash is not None
+            and current_fn_hash is not None
+            and fn_hash != current_fn_hash
+        ):
+            self._store.trace_event(
+                "disk_red", key, detail="function hash changed"
+            )  # pragma: no cover
             return None  # pragma: no cover
-            
+
         token = self._hydrating_var.set(hydrating | {key})
         try:
             observed = await self._verify_disk_deps_async(key, record, runtime)
@@ -1045,7 +1193,9 @@ class Evaluator:
             return None  # pragma: no cover
         blob = disk.load_blob(value_hash)
         if blob is None or _canonical.digest_bytes(blob) != value_hash:
-            self._store.trace_event("disk_red", key, detail="value blob missing or corrupt")  # pragma: no cover
+            self._store.trace_event(
+                "disk_red", key, detail="value blob missing or corrupt"
+            )  # pragma: no cover
             return None  # pragma: no cover
         try:
             value = _canonical.decode(blob)
@@ -1053,14 +1203,16 @@ class Evaluator:
             effects = {str(name): tuple(items) for name, items in effects_raw.items()}
             is_error = record.get("is_error", False)
         except Exception:  # pragma: no cover
-            self._store.trace_event("disk_red", key, detail="record decode failed")  # pragma: no cover
+            self._store.trace_event(
+                "disk_red", key, detail="record decode failed"
+            )  # pragma: no cover
             return None  # pragma: no cover
-            
+
         error = None
         if is_error:
             error = value
             value = None
-            
+
         with self._store.lock:
             self._store.next_access_id += 1
             memo = self._store.entry_from_runtime(
@@ -1096,7 +1248,11 @@ class Evaluator:
             if not isinstance(row, list) or len(row) != 4:  # pragma: no cover
                 return None  # pragma: no cover
             dep_kind, dep_fid, dep_args_blob, fingerprint = row
-            if not (isinstance(dep_kind, str) and isinstance(dep_fid, str) and isinstance(dep_args_blob, bytes)):
+            if not (
+                isinstance(dep_kind, str)
+                and isinstance(dep_fid, str)
+                and isinstance(dep_args_blob, bytes)
+            ):
                 return None  # pragma: no cover
             try:
                 dep_args = _canonical.decode(dep_args_blob)
@@ -1106,15 +1262,23 @@ class Evaluator:
                 return None  # pragma: no cover
             dep_key: QueryKey = (dep_kind, dep_fid, dep_args)
             if dep_kind == "input":
-                version = await self._current_input_version_async(dep_fid, dep_args, runtime)
+                version = await self._current_input_version_async(
+                    dep_fid, dep_args, runtime
+                )
                 if version is None or version.value_hash != fingerprint:
-                    self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))  # pragma: no cover
+                    self._store.trace_event(
+                        "disk_red", key, detail=self._store.key_to_str(dep_key)
+                    )  # pragma: no cover
                     return None  # pragma: no cover
                 observed[dep_key] = version.changed_at
             elif dep_kind == "query":
-                state = await self._current_query_state_async(dep_fid, dep_args, runtime)
+                state = await self._current_query_state_async(
+                    dep_fid, dep_args, runtime
+                )
                 if state is None or state[0] != fingerprint:
-                    self._store.trace_event("disk_red", key, detail=self._store.key_to_str(dep_key))  # pragma: no cover
+                    self._store.trace_event(
+                        "disk_red", key, detail=self._store.key_to_str(dep_key)
+                    )  # pragma: no cover
                     return None  # pragma: no cover
                 observed[dep_key] = state[1]
             else:
@@ -1134,16 +1298,18 @@ class Evaluator:
         fn = self._store.lookup_input(input_id)
         if fn is None:
             return None  # pragma: no cover
-            
+
         import inspect
+
         if inspect.iscoroutinefunction(fn):
             value = await fn(*args)
         else:
             import asyncio
+
             loop = asyncio.get_running_loop()
             executor = self._get_executor() if self._get_executor else None
             value = await loop.run_in_executor(executor, fn, *args)
-            
+
         return InputVersion(
             revision=runtime.snapshot.revision,
             changed_at=-1,
@@ -1162,7 +1328,7 @@ class Evaluator:
             fn = self._store.lookup_query(query_id)
         except KeyError:
             return None  # pragma: no cover
-            
+
         shadow = RuntimeState(
             snapshot=runtime.snapshot,
             stack=[],
@@ -1175,7 +1341,12 @@ class Evaluator:
         await self._run_in_runtime_async(
             shadow,
             lambda: self.query_call_async(
-                query_id, fn, args, snapshot=runtime.snapshot, effects=None, cancel_epoch=runtime.cancel_epoch
+                query_id,
+                fn,
+                args,
+                snapshot=runtime.snapshot,
+                effects=None,
+                cancel_epoch=runtime.cancel_epoch,
             ),
         )
         with self._store.lock:
@@ -1210,12 +1381,18 @@ class Evaluator:
         if _canonical.digest_bytes(value_blob) != memo.value_hash:
             # The result object mutated between hashing and persistence; storing
             # it would poison future runs, so skip and recompute next session.
-            self._store.trace_event("disk_skip", key, detail="value mutated before persist")
+            self._store.trace_event(
+                "disk_skip", key, detail="value mutated before persist"
+            )
             return
         try:
             effects_node = {name: list(items) for name, items in memo.effects.items()}
             with self._store.lock:
-                fn_hash = self._store.query_hashes.get(fid) if kind == "query" else self._store.input_hashes.get(fid)
+                fn_hash = (
+                    self._store.query_hashes.get(fid)
+                    if kind == "query"
+                    else self._store.input_hashes.get(fid)
+                )
             record = {
                 "kind": kind,
                 "id": fid,
@@ -1226,7 +1403,12 @@ class Evaluator:
                 "is_error": memo.error is not None,
                 "computed_at_time": memo.computed_at_time,
             }
-            disk.store_entry(_disk_cache.entry_key(kind, fid, args_blob), record, memo.value_hash, value_blob)
+            disk.store_entry(
+                _disk_cache.entry_key(kind, fid, args_blob),
+                record,
+                memo.value_hash,
+                value_blob,
+            )
         except PersistentCacheError:
             raise
         except TypeError as exc:  # pragma: no cover
@@ -1236,18 +1418,26 @@ class Evaluator:
             ) from exc
         self._store.trace_event("disk_store", key)
 
-    def _dep_fingerprint_rows(self, key: QueryKey, memo: MemoEntry) -> list[list[Any]] | None:
+    def _dep_fingerprint_rows(
+        self, key: QueryKey, memo: MemoEntry
+    ) -> list[list[Any]] | None:
         rows: list[list[Any]] = []
         for dep in memo.deps:
             dep_kind, dep_fid, dep_args = dep.key
             try:
                 dep_args_blob = _canonical.encode(dep_args)
             except TypeError:  # pragma: no cover
-                self._store.trace_event("disk_unkeyed", key, detail=self._store.key_to_str(dep.key))  # pragma: no cover
+                self._store.trace_event(
+                    "disk_unkeyed", key, detail=self._store.key_to_str(dep.key)
+                )  # pragma: no cover
                 return None  # pragma: no cover
-            fingerprint = self._observed_dep_fingerprint(dep.key, dep.observed_changed_at, memo.verified_at)
+            fingerprint = self._observed_dep_fingerprint(
+                dep.key, dep.observed_changed_at, memo.verified_at
+            )
             if fingerprint is None:
-                self._store.trace_event("disk_skip", key, detail=self._store.key_to_str(dep.key))
+                self._store.trace_event(
+                    "disk_skip", key, detail=self._store.key_to_str(dep.key)
+                )
                 return None  # pragma: no cover
             rows.append([dep_kind, dep_fid, dep_args_blob, fingerprint])
         return rows
@@ -1292,6 +1482,7 @@ class Evaluator:
             return
 
         import collections
+
         wanted_entries = set()
         wanted_blobs = set()
         queue = collections.deque()

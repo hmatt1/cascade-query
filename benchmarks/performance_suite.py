@@ -155,7 +155,11 @@ def _scenario_dedup_contention() -> ScenarioResult:
     # Scale wall-time budget by measured owner compute to reduce false negatives
     # on slower CI/VM hardware while keeping a strict collapse expectation.
     wall_budget_ms = max(500.0, owner_compute_ms * 8.0)
-    passed = contention_computes == 1 and collapse_ratio >= threshold and wall_ms <= wall_budget_ms
+    passed = (
+        contention_computes == 1
+        and collapse_ratio >= threshold
+        and wall_ms <= wall_budget_ms
+    )
     return ScenarioResult(
         name="dedup-under-contention",
         concern="Concurrent identical queries should collapse to one in-flight compute.",
@@ -197,7 +201,9 @@ def _run_compute_many_once(workers: int, calls_count: int, iterations: int) -> f
         base.set(i, i)
 
     start = time.perf_counter()
-    result = engine.compute_many([(job, (i,)) for i in range(calls_count)], workers=workers)
+    result = engine.compute_many(
+        [(job, (i,)) for i in range(calls_count)], workers=workers
+    )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     expected = [_cpu_burn(i, iterations=iterations) + i for i in range(calls_count)]
     if result != expected:
@@ -216,8 +222,12 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     pair_speedups: list[float] = []
     # Interleaving serial and parallel rounds dampens host-load drift noise.
     for _ in range(rounds):
-        serial_ms = _run_compute_many_once(workers=1, calls_count=calls_count, iterations=iterations)
-        parallel_ms = _run_compute_many_once(workers=workers, calls_count=calls_count, iterations=iterations)
+        serial_ms = _run_compute_many_once(
+            workers=1, calls_count=calls_count, iterations=iterations
+        )
+        parallel_ms = _run_compute_many_once(
+            workers=workers, calls_count=calls_count, iterations=iterations
+        )
         serial_samples.append(serial_ms)
         parallel_samples.append(parallel_ms)
         pair_speedups.append(serial_ms / max(parallel_ms, 1e-9))
@@ -225,6 +235,7 @@ def _scenario_parallel_scheduler_speedup() -> ScenarioResult:
     parallel_ms = _median(parallel_samples)
     speedup = _median(pair_speedups)
     import sys
+
     # If GIL is enabled (Python < 3.13 or not free-threaded build), we expect near 1.0x due to serialization.
     has_gil = getattr(sys, "_is_gil_enabled", lambda: True)()
     threshold = 1.1 if not has_gil else 0.95
@@ -437,7 +448,10 @@ _SCENARIO_FACTORIES: tuple[tuple[str, Callable[[], ScenarioResult]], ...] = (
     ("cache-hit-speedup", _scenario_cache_hit_speedup),
     ("dedup-under-contention", _scenario_dedup_contention),
     ("compute-many-parallel-speedup", _scenario_parallel_scheduler_speedup),
-    ("giant-graph-targeted-mutation-latency", _scenario_giant_graph_targeted_mutation_latency),
+    (
+        "giant-graph-targeted-mutation-latency",
+        _scenario_giant_graph_targeted_mutation_latency,
+    ),
     ("mark-green-depth-overhead", _scenario_mark_green_depth_overhead),
     ("prune-runtime-scaling", _scenario_prune_runtime_scaling),
 )
@@ -445,7 +459,9 @@ _SCENARIO_BY_NAME: dict[str, Callable[[], ScenarioResult]] = dict(_SCENARIO_FACT
 PARALLEL_SPEEDUP_SCENARIO = "compute-many-parallel-speedup"
 # The parallel scheduler speedup probe is intentionally asserted in a dedicated
 # test/CI step because it is the most VM-load-sensitive scenario.
-PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS: frozenset[str] = frozenset({PARALLEL_SPEEDUP_SCENARIO})
+PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS: frozenset[str] = frozenset(
+    {PARALLEL_SPEEDUP_SCENARIO}
+)
 
 
 def _selected_scenarios(
@@ -458,7 +474,9 @@ def _selected_scenarios(
     unknown_excludes = (exclude_scenarios or set()) - known
     unknown = unknown_includes | unknown_excludes
     if unknown:
-        raise ValueError(f"Unknown performance scenario(s): {', '.join(sorted(unknown))}")
+        raise ValueError(
+            f"Unknown performance scenario(s): {', '.join(sorted(unknown))}"
+        )
 
     selected: list[Callable[[], ScenarioResult]] = []
     for name, factory in _SCENARIO_FACTORIES:
@@ -494,7 +512,12 @@ def run_performance_suite_with_filters(
     else:
         runtime_mode = "gil-disabled"
 
-    results = [factory() for factory in _selected_scenarios(include_scenarios=include_scenarios, exclude_scenarios=exclude_scenarios)]
+    results = [
+        factory()
+        for factory in _selected_scenarios(
+            include_scenarios=include_scenarios, exclude_scenarios=exclude_scenarios
+        )
+    ]
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "python_version": platform.python_version(),
@@ -513,9 +536,15 @@ def assert_report_thresholds(
     excluded_scenarios: set[str] | frozenset[str] | None = None,
 ) -> None:
     excluded = (
-        set(PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS) if excluded_scenarios is None else set(excluded_scenarios)
+        set(PERFORMANCE_ASSERTION_EXCLUDED_SCENARIOS)
+        if excluded_scenarios is None
+        else set(excluded_scenarios)
     )
-    failed = [row for row in report["results"] if not row["passed"] and row["name"] not in excluded]
+    failed = [
+        row
+        for row in report["results"]
+        if not row["passed"] and row["name"] not in excluded
+    ]
     if not failed:
         return
     lines = ["Performance regression thresholds failed:"]
@@ -593,11 +622,17 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             f"| {result['name']} | {result['metric_name']} | {observed} | {threshold} | {status} |"
         )
 
-    lines = header + rows + ["", "## Raw details", "", "```json", json.dumps(report, indent=2), "```", ""]
+    lines = (
+        header
+        + rows
+        + ["", "## Raw details", "", "```json", json.dumps(report, indent=2), "```", ""]
+    )
     return "\n".join(lines)
 
 
-def write_performance_report(report: dict[str, Any], report_dir: Path) -> tuple[Path, Path]:
+def write_performance_report(
+    report: dict[str, Any], report_dir: Path
+) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     json_path = report_dir / "performance-report.json"
     md_path = report_dir / "performance-report.md"
@@ -608,7 +643,9 @@ def write_performance_report(report: dict[str, Any], report_dir: Path) -> tuple[
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run query-cascade performance suite.")
-    parser.add_argument("--report-dir", type=Path, default=Path("artifacts/performance"))
+    parser.add_argument(
+        "--report-dir", type=Path, default=Path("artifacts/performance")
+    )
     parser.add_argument("--assert-thresholds", action="store_true")
     parser.add_argument("--include-scenarios", nargs="*", default=None)
     parser.add_argument("--exclude-scenarios", nargs="*", default=None)

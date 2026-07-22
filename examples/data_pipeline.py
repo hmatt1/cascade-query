@@ -6,13 +6,16 @@ from cascade import Engine
 
 engine = Engine()
 
+
 @engine.input
 def raw_sales_data() -> list[int]:
     return [100, 200, 300]
 
+
 @engine.input
 def tax_rate() -> float:
     return 0.1
+
 
 @engine.query
 def total_revenue() -> int:
@@ -20,12 +23,14 @@ def total_revenue() -> int:
     time.sleep(1)
     return sum(raw_sales_data())
 
+
 @engine.query
 def net_profit() -> float:
     print("⏳ Calculating net profit...")
     time.sleep(1)
     revenue = total_revenue()
     return revenue * (1 - tax_rate())
+
 
 # --- Demo ---
 

@@ -6,7 +6,7 @@ the return types of functions. If two functions call each other (mutual recursio
 the compiler encounters a circular dependency.
 
 Using a fixed-point solver, the compiler starts by assuming the return type is "Unknown"
-(an empty set) and continuously runs the type-checker until the union of all discovered 
+(an empty set) and continuously runs the type-checker until the union of all discovered
 types stabilizes!
 """
 
@@ -15,12 +15,12 @@ from cascade import Engine
 engine = Engine()
 
 # Scenario: We are inferring the return types of two mutually recursive functions:
-# 
+#
 # function ping(n) {
 #     if (n === 0) return "done";   // Returns a STRING
 #     return pong(n - 1);           // Returns whatever pong() returns
 # }
-# 
+#
 # function pong(n) {
 #     if (n === 0) return 42;       // Returns a NUMBER
 #     return ping(n - 1);           // Returns whatever ping() returns
@@ -30,12 +30,14 @@ engine = Engine()
 # type(ping) = "string" UNION type(pong)
 # type(pong) = "number" UNION type(ping)
 
+
 @engine.query(fixed_point=frozenset())
 def infer_ping_type() -> frozenset[str]:
     # ping() returns a "string", plus whatever pong() returns
     types = set(["string"])
     types.update(infer_pong_type())
     return frozenset(types)
+
 
 @engine.query
 def infer_pong_type() -> frozenset[str]:
@@ -47,9 +49,9 @@ def infer_pong_type() -> frozenset[str]:
 
 def main() -> None:
     print("Step 1: Running Type Inference Engine...")
-    
+
     # We expect the engine to gracefully resolve the circular type constraint:
-    # 
+    #
     # Iteration 1:
     #   ping_guess = empty set ()
     #   pong evaluates to: "number" UNION () = ("number")
@@ -61,14 +63,14 @@ def main() -> None:
     #   pong evaluates to: "number" UNION ("string", "number") = ("string", "number")
     #   ping evaluates to: "string" UNION ("string", "number") = ("string", "number")
     #   Matches guess! Converged.
-    
+
     ping_type = infer_ping_type()
     pong_type = infer_pong_type()
-    
+
     # Sort for deterministic printing
     print(f"  Inferred return type for ping(): {' | '.join(sorted(ping_type))}")
     print(f"  Inferred return type for pong(): {' | '.join(sorted(pong_type))}")
-    
+
     print("\nExample complete.")
 
 

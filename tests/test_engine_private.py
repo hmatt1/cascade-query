@@ -1,9 +1,10 @@
 from cascade import Engine
 from cascade._runtime import RuntimeState
 
+
 def test_engine_private_wrappers() -> None:
     engine = Engine()
-    
+
     @engine.input
     def val() -> int:
         return 1
@@ -13,18 +14,20 @@ def test_engine_private_wrappers() -> None:
         return val() + 10
 
     assert query() == 11
-    
+
     engine._check_cancelled(None)
-    
+
     snapshot = engine.snapshot()
-    
+
     try:
         engine._read_input("test", lambda: 1, (), snapshot=snapshot)
     except Exception:
         pass
-        
+
     try:
-        engine._query_call("test", lambda: 1, (), snapshot=snapshot, effects=None, cancel_epoch=None)
+        engine._query_call(
+            "test", lambda: 1, (), snapshot=snapshot, effects=None, cancel_epoch=None
+        )
     except Exception:
         pass
 
@@ -33,7 +36,14 @@ def test_engine_private_wrappers() -> None:
     except Exception:
         pass
 
-    runtime = RuntimeState(snapshot=snapshot, stack=[], root_effects=None, staged_root_effects={}, cancel_epoch=0, snapshot_pinned=False)
+    runtime = RuntimeState(
+        snapshot=snapshot,
+        stack=[],
+        root_effects=None,
+        staged_root_effects={},
+        cancel_epoch=0,
+        snapshot_pinned=False,
+    )
     try:
         engine._compute_or_get_memo(("query", "test", ()), lambda: 1, runtime)
     except Exception:

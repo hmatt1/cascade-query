@@ -178,7 +178,9 @@ def run_runtime_toggle() -> None:
     engine.enable_stats(True)
     i.set(2)  # invalidate so q recomputes
     q()
-    assert engine.stats_summary()["by_key"], "expected one timed recompute after enable_stats"
+    assert engine.stats_summary()["by_key"], (
+        "expected one timed recompute after enable_stats"
+    )
     print("After enable_stats and input bump, by_key is non-empty.\n")
 
 
@@ -189,7 +191,9 @@ def main() -> None:
     run_nested_queries_real_time()
     print("Step 3: LRU eviction counters with a tiny memo table.")
     run_lru_evictions()
-    print("Step 4: Enable stats after cold runs, then bump input and time one recompute.")
+    print(
+        "Step 4: Enable stats after cold runs, then bump input and time one recompute."
+    )
     run_runtime_toggle()
     print("Example complete.")
 

@@ -20,7 +20,9 @@ def _cpu_heavy_mix(seed: int, rounds: int) -> int:
     return value
 
 
-def _measure_compute_many(task_count: int, rounds: int, workers: int, repeats: int) -> tuple[list[float], int]:
+def _measure_compute_many(
+    task_count: int, rounds: int, workers: int, repeats: int
+) -> tuple[list[float], int]:
     engine = Engine()
 
     @engine.input
@@ -64,10 +66,27 @@ def main(argv: list[str] | None = None) -> None:
             "Compare python3.14 (GIL enabled) vs python3.14t (GIL disabled)."
         )
     )
-    parser.add_argument("--tasks", type=int, default=max(8, default_workers * 4), help="Number of independent query keys to run.")
-    parser.add_argument("--rounds", type=int, default=40_000, help="CPU loop iterations per task.")
-    parser.add_argument("--workers", type=int, default=default_workers, help="Worker threads for the parallel run.")
-    parser.add_argument("--repeats", type=int, default=1, help="How many measured runs per configuration.")
+    parser.add_argument(
+        "--tasks",
+        type=int,
+        default=max(8, default_workers * 4),
+        help="Number of independent query keys to run.",
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=40_000, help="CPU loop iterations per task."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=default_workers,
+        help="Worker threads for the parallel run.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="How many measured runs per configuration.",
+    )
     args, _unknown = parser.parse_known_args(argv)
 
     if args.tasks < 1:
@@ -87,7 +106,12 @@ def main(argv: list[str] | None = None) -> None:
     print(f"runtime GIL state: {_gil_state()}")
     print(
         "workload:",
-        {"tasks": args.tasks, "rounds": args.rounds, "workers": args.workers, "repeats": args.repeats},
+        {
+            "tasks": args.tasks,
+            "rounds": args.rounds,
+            "workers": args.workers,
+            "repeats": args.repeats,
+        },
     )
     print()
 
@@ -106,14 +130,18 @@ def main(argv: list[str] | None = None) -> None:
         repeats=args.repeats,
     )
     if serial_checksum != parallel_checksum:
-        raise RuntimeError("Sanity check failed: checksums differ between serial and parallel runs.")
+        raise RuntimeError(
+            "Sanity check failed: checksums differ between serial and parallel runs."
+        )
 
     serial_median = statistics.median(serial_times)
     parallel_median = statistics.median(parallel_times)
     speedup = serial_median / parallel_median
 
     print(f"serial times (workers=1):    {[round(value, 3) for value in serial_times]}")
-    print(f"parallel times (workers={args.workers}): {[round(value, 3) for value in parallel_times]}")
+    print(
+        f"parallel times (workers={args.workers}): {[round(value, 3) for value in parallel_times]}"
+    )
     print(f"median serial seconds:   {serial_median:.3f}")
     print(f"median parallel seconds: {parallel_median:.3f}")
     print(f"threaded speedup in this runtime: {speedup:.2f}x")

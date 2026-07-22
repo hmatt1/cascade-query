@@ -3,9 +3,11 @@ from cascade.engine import Engine
 
 engine = Engine()
 
+
 @engine.input
 def config(key: str) -> str:
     return ""
+
 
 @engine.query
 def render_ui() -> str:
@@ -14,6 +16,7 @@ def render_ui() -> str:
     layout = config("layout")
     return f"UI(theme={theme}, layout={layout})"
 
+
 if __name__ == "__main__":
     print("=== First Run ===")
     config.set("theme", "light")
@@ -21,7 +24,9 @@ if __name__ == "__main__":
     print("Result:", render_ui())
 
     print("\n=== Without Transactions (Flapping) ===")
-    print("If we set theme and layout separately, an intermediate read might observe inconsistent state.")
+    print(
+        "If we set theme and layout separately, an intermediate read might observe inconsistent state."
+    )
     config.set("theme", "dark")
     # Imagine a concurrent read happens here! It sees theme="dark", layout="grid"
     config.set("layout", "list")
@@ -32,7 +37,7 @@ if __name__ == "__main__":
     with engine.transaction():
         config.set("theme", "blue")
         config.set("layout", "sidebar")
-    
+
     @engine.query
     def read_all() -> int:
         # A query that depends on 100 inputs
@@ -60,7 +65,7 @@ if __name__ == "__main__":
     tx_time = time.time() - start_time
     print(f"100 batched sets + 1 read took {tx_time:.4f} seconds.")
     if tx_time > 0:
-        print(f"Transactions were {no_tx_time/tx_time:.1f}x faster in this scenario.")
-    
+        print(f"Transactions were {no_tx_time / tx_time:.1f}x faster in this scenario.")
+
     print("\nStep 1")
     print("Example complete.")

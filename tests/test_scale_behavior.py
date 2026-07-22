@@ -22,18 +22,24 @@ def test_giant_graph_selective_invalidation_counts() -> None:
     depth = 10
     fanout = 64
     counts: dict[str, int] = defaultdict(int)
-    leaf, _, aggregate = build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout, counts=counts)
+    leaf, _, aggregate = build_fanout_chain_pipeline(
+        engine, depth=depth, fanout=fanout, counts=counts
+    )
 
     values = [index * 3 for index in range(fanout)]
     for branch, value in enumerate(values):
         leaf.set(branch, value)
-    assert aggregate() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=values)
+    assert aggregate() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=values
+    )
 
     baseline = dict(counts)
     mutated_branch = fanout // 2
     values[mutated_branch] += 11
     leaf.set(mutated_branch, values[mutated_branch])
-    assert aggregate() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=values)
+    assert aggregate() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=values
+    )
 
     for level in range(depth):
         key = f"level_{level}"
@@ -42,7 +48,9 @@ def test_giant_graph_selective_invalidation_counts() -> None:
 
     no_change_baseline = dict(counts)
     leaf.set(mutated_branch, values[mutated_branch])
-    assert aggregate() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=values)
+    assert aggregate() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=values
+    )
     for level in range(depth):
         key = f"level_{level}"
         assert counts[key] - no_change_baseline.get(key, 0) == 0
@@ -78,13 +86,15 @@ def test_dependency_churn_rewrites_dynamic_edges() -> None:
         source.set(idx + 1_000, idx + 100)
 
     mode.set(0)
-    assert engine.compute_many([(dynamic_value, (idx,)) for idx in range(width)], workers=6) == [idx * 2 for idx in range(width)]
+    assert engine.compute_many(
+        [(dynamic_value, (idx,)) for idx in range(width)], workers=6
+    ) == [idx * 2 for idx in range(width)]
     assert counts["dynamic"] == width
 
     mode.set(1)
-    assert engine.compute_many([(dynamic_value, (idx,)) for idx in range(width)], workers=6) == [
-        (idx + 100) * 2 for idx in range(width)
-    ]
+    assert engine.compute_many(
+        [(dynamic_value, (idx,)) for idx in range(width)], workers=6
+    ) == [(idx + 100) * 2 for idx in range(width)]
     assert counts["dynamic"] == width * 2
 
     # After switching to mode=1, old branch inputs must no longer invalidate.
@@ -104,11 +114,15 @@ def test_prune_stress_keeps_consistent_reachable_subgraph() -> None:
     engine = Engine()
     depth = 9
     fanout = 180
-    leaf, levels, aggregate = build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
+    leaf, levels, aggregate = build_fanout_chain_pipeline(
+        engine, depth=depth, fanout=fanout
+    )
 
     for idx in range(fanout):
         leaf.set(idx, idx)
-    assert aggregate() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=list(range(fanout)))
+    assert aggregate() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=list(range(fanout))
+    )
 
     root_branch = fanout - 1
     engine.prune([("query", levels[-1].id, (root_branch,))])
@@ -134,25 +148,35 @@ def test_persistence_scale_roundtrip_preserves_hot_cache(tmp_path: Path) -> None
     fanout = 120
 
     engine_a = Engine()
-    leaf_a, _, aggregate_a = build_fanout_chain_pipeline(engine_a, depth=depth, fanout=fanout)
+    leaf_a, _, aggregate_a = build_fanout_chain_pipeline(
+        engine_a, depth=depth, fanout=fanout
+    )
     values = [(idx * 5) % 97 for idx in range(fanout)]
     for idx, value in enumerate(values):
         leaf_a.set(idx, value)
-    assert aggregate_a() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=values)
+    assert aggregate_a() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=values
+    )
     engine_a.save(str(db_path))
 
     counts_b: dict[str, int] = defaultdict(int)
     engine_b = Engine()
-    leaf_b, _, aggregate_b = build_fanout_chain_pipeline(engine_b, depth=depth, fanout=fanout, counts=counts_b)
+    leaf_b, _, aggregate_b = build_fanout_chain_pipeline(
+        engine_b, depth=depth, fanout=fanout, counts=counts_b
+    )
     engine_b.load(str(db_path))
 
-    assert aggregate_b() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=values)
+    assert aggregate_b() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=values
+    )
     assert counts_b == {}
 
     changed_branch = fanout // 3
     values[changed_branch] += 9
     leaf_b.set(changed_branch, values[changed_branch])
-    assert aggregate_b() == expected_fanout_chain_total(depth=depth, fanout=fanout, values=values)
+    assert aggregate_b() == expected_fanout_chain_total(
+        depth=depth, fanout=fanout, values=values
+    )
     for level in range(depth):
         assert counts_b[f"level_{level}"] == 1
     assert counts_b["aggregate"] == 1
@@ -238,7 +262,11 @@ def test_concurrency_stress_submit_compute_many_and_writes() -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             submitted = [engine.submit(sum_cells, executor=pool) for _ in range(8)]
             frozen_reads_future = pool.submit(
-                lambda: engine.compute_many([(read_cell, (idx,)) for idx in range(width)], workers=4, snapshot=snapshot)
+                lambda: engine.compute_many(
+                    [(read_cell, (idx,)) for idx in range(width)],
+                    workers=4,
+                    snapshot=snapshot,
+                )
             )
             writer = threading.Thread(target=churn_inputs, daemon=True)
             writer.start()

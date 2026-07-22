@@ -18,7 +18,9 @@ def build_line_counter(
     @engine.query
     def non_empty_lines(name: str) -> int:
         if recompute_counter is not None:
-            recompute_counter["line_count_runs"] = recompute_counter.get("line_count_runs", 0) + 1
+            recompute_counter["line_count_runs"] = (
+                recompute_counter.get("line_count_runs", 0) + 1
+            )
         return len([line for line in source(name).splitlines() if line.strip()])
 
     return engine, source, non_empty_lines
@@ -37,7 +39,10 @@ def run_persistence_demo() -> None:
     graph_before = engine_a.inspect_graph()
     print(
         "Graph summary before save:",
-        {"memo_count": graph_before["memo_count"], "input_count": graph_before["input_count"]},
+        {
+            "memo_count": graph_before["memo_count"],
+            "input_count": graph_before["input_count"],
+        },
     )
 
     with TemporaryDirectory() as tmp_dir:
@@ -58,17 +63,25 @@ def run_persistence_demo() -> None:
         print(f"Nodes after pruning: {graph_pruned['memo_count']}")
 
         counters: dict[str, int] = {}
-        engine_b, _source_b, non_empty_lines_b = build_line_counter(recompute_counter=counters)
+        engine_b, _source_b, non_empty_lines_b = build_line_counter(
+            recompute_counter=counters
+        )
         print("Step 5: Load state and query values from engine B.")
         engine_b.load(str(db_path))
         print("main line count:", non_empty_lines_b("main"))
         print("lib line count:", non_empty_lines_b("lib"))
-        print("Query recomputations (results retrieved from cache):", counters.get("line_count_runs", 0))
+        print(
+            "Query recomputations (results retrieved from cache):",
+            counters.get("line_count_runs", 0),
+        )
 
         graph_after = engine_b.inspect_graph()
         print(
             "Graph summary after load:",
-            {"memo_count": graph_after["memo_count"], "input_count": graph_after["input_count"]},
+            {
+                "memo_count": graph_after["memo_count"],
+                "input_count": graph_after["input_count"],
+            },
         )
     print("Example complete.")
 

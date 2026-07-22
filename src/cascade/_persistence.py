@@ -10,7 +10,9 @@ def save_payload(path: str, payload: dict[str, Any]) -> None:
     blob = dumps_payload(payload)
     conn = sqlite3.connect(path)
     try:
-        conn.execute("create table if not exists cascade_state (id integer primary key, payload blob not null)")
+        conn.execute(
+            "create table if not exists cascade_state (id integer primary key, payload blob not null)"
+        )
         conn.execute("delete from cascade_state")
         conn.execute("insert into cascade_state(id, payload) values (1, ?)", (blob,))
         conn.commit()

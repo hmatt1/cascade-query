@@ -65,7 +65,9 @@ def test_query_dedup_replays_effects_to_all_concurrent_callers() -> None:
     source.set("todo")
     effects_by_call: list[dict[str, list[str]]] = [{} for _ in range(24)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-        futures = [pool.submit(lint_len, effects=effects) for effects in effects_by_call]
+        futures = [
+            pool.submit(lint_len, effects=effects) for effects in effects_by_call
+        ]
         assert started.wait(timeout=1.0)
         time.sleep(0.03)
         release.set()
@@ -115,7 +117,10 @@ def test_query_dedup_failure_propagates_and_recovers() -> None:
 
     mode.set(2)
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        values = [future.result(timeout=2.0) for future in [pool.submit(flaky) for _ in range(6)]]
+        values = [
+            future.result(timeout=2.0)
+            for future in [pool.submit(flaky) for _ in range(6)]
+        ]
 
     assert values == [42] * 6
     assert runs == 2
@@ -179,11 +184,15 @@ def test_submit_replays_effects_on_cache_hit() -> None:
     source.set("warn me")
 
     effects_1: dict[str, list[str]] = {}
-    assert engine.submit(lint_len, effects=effects_1).result(timeout=2.0) == len("warn me")
+    assert engine.submit(lint_len, effects=effects_1).result(timeout=2.0) == len(
+        "warn me"
+    )
     assert effects_1["warnings"] == ["has warn"]
 
     effects_2: dict[str, list[str]] = {}
-    assert engine.submit(lint_len, effects=effects_2).result(timeout=2.0) == len("warn me")
+    assert engine.submit(lint_len, effects=effects_2).result(timeout=2.0) == len(
+        "warn me"
+    )
     assert effects_2["warnings"] == ["has warn"]
 
 
@@ -448,7 +457,9 @@ def test_compute_many_uses_single_snapshot_for_all_calls() -> None:
     result_box: list[list[int]] = []
 
     def run_batch() -> None:
-        result_box.append(engine.compute_many([(read_cell, (i,)) for i in range(width)], workers=4))
+        result_box.append(
+            engine.compute_many([(read_cell, (i,)) for i in range(width)], workers=4)
+        )
 
     worker = threading.Thread(target=run_batch, daemon=True)
     worker.start()
@@ -460,7 +471,9 @@ def test_compute_many_uses_single_snapshot_for_all_calls() -> None:
     worker.join(timeout=3.0)
     assert not worker.is_alive()
     assert result_box == [list(range(width))]
-    assert engine.compute_many([(read_cell, (i,)) for i in range(width)], workers=4) == [i + 1000 for i in range(width)]
+    assert engine.compute_many(
+        [(read_cell, (i,)) for i in range(width)], workers=4
+    ) == [i + 1000 for i in range(width)]
 
 
 def test_submit_replays_cached_effects_with_shared_external_executor() -> None:
@@ -486,8 +499,12 @@ def test_submit_replays_cached_effects_with_shared_external_executor() -> None:
     effects_2: dict[str, list[str]] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        assert engine.submit(lint, effects=effects_1, executor=pool).result(timeout=2.0) == len("todo")
-        assert engine.submit(lint, effects=effects_2, executor=pool).result(timeout=2.0) == len("todo")
+        assert engine.submit(lint, effects=effects_1, executor=pool).result(
+            timeout=2.0
+        ) == len("todo")
+        assert engine.submit(lint, effects=effects_2, executor=pool).result(
+            timeout=2.0
+        ) == len("todo")
 
     assert effects_1["warnings"] == ["contains todo"]
     assert effects_2["warnings"] == ["contains todo"]
@@ -521,7 +538,9 @@ def test_compute_many_deduplicates_identical_calls_within_batch() -> None:
 
     def run_batch() -> None:
         try:
-            result_box.append(engine.compute_many([(expensive, ()) for _ in range(40)], workers=12))
+            result_box.append(
+                engine.compute_many([(expensive, ()) for _ in range(40)], workers=12)
+            )
         except BaseException as exc:  # pragma: no cover - defensive
             error_box.append(exc)
 
