@@ -113,7 +113,9 @@ class Evaluator:
         if runtime is None or not runtime.stack:
             return
         frame = runtime.stack[-1]
-        frame.deps[dep_key] = observed_changed_at
+        existing = frame.deps.get(dep_key)
+        if existing is None or observed_changed_at > existing:
+            frame.deps[dep_key] = observed_changed_at
 
     def read_input(
         self,
