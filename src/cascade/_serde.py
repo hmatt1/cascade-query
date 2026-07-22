@@ -164,18 +164,21 @@ def _to_jsonable(obj: Any) -> Any:
             }
         }
     if isinstance(obj, MemoEntry):
-        return {
-            "__MemoEntry__": {
-                "value": _to_jsonable(obj.value),
-                "value_hash": obj.value_hash,
-                "changed_at": obj.changed_at,
-                "verified_at": obj.verified_at,
-                "deps": _to_jsonable(list(obj.deps)),
-                "effects": _to_jsonable(obj.effects),
-                "last_access": obj.last_access,
-                "computed_at_time": _to_jsonable(obj.computed_at_time),
-            }
+        out = {
+            "value": _to_jsonable(obj.value),
+            "value_hash": obj.value_hash,
+            "changed_at": obj.changed_at,
+            "verified_at": obj.verified_at,
+            "deps": _to_jsonable(list(obj.deps)),
+            "effects": _to_jsonable(obj.effects),
+            "last_access": obj.last_access,
+            "computed_at_time": _to_jsonable(obj.computed_at_time),
         }
+        if obj.error is not None:
+            out["error"] = _to_jsonable(obj.error)
+        if obj.cycle_nodes:
+            out["cycle_nodes"] = _to_jsonable(list(obj.cycle_nodes))
+        return {"__MemoEntry__": out}
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return {
@@ -293,6 +296,12 @@ def _from_jsonable(obj: Any) -> Any:
             deps_raw = _from_jsonable(d["deps"])
             if not isinstance(deps_raw, list):
                 raise ValueError("MemoEntry.deps must decode to a list")
+            error_raw = d.get("error")
+            error = _from_jsonable(error_raw) if error_raw is not None else None
+            cycle_nodes_raw = d.get("cycle_nodes")
+            cycle_nodes_list = _from_jsonable(cycle_nodes_raw) if cycle_nodes_raw is not None else []
+            if not isinstance(cycle_nodes_list, list):
+                raise ValueError("MemoEntry.cycle_nodes must decode to a list")
             return MemoEntry(
                 value=_from_jsonable(d["value"]),
                 value_hash=d["value_hash"],
@@ -302,6 +311,8 @@ def _from_jsonable(obj: Any) -> Any:
                 effects=_from_jsonable(d["effects"]),
                 last_access=d["last_access"],
                 computed_at_time=_from_jsonable(d.get("computed_at_time", 0.0)),
+                error=error,
+                cycle_nodes=tuple(cycle_nodes_list),
             )
         if sole_key == "__dataclass__":
             d = sole_val
