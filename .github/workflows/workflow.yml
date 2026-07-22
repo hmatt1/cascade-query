@@ -63,7 +63,7 @@ jobs:
             --cov-branch \
             --cov-report=term-missing \
             --cov-report=json:coverage.json \
-            --cov-fail-under=95
+            ${{ matrix.python-version == '3.12' && '--cov-fail-under=95' || '' }}
 
       - name: Run performance test suite separately
         if: matrix.python-version == '3.14t'
@@ -216,6 +216,7 @@ jobs:
           path: artifacts/performance/
 
       - name: Enforce branch coverage threshold
+        if: matrix.python-version == '3.12'
         run: |
           python - <<'PY'
           import json
