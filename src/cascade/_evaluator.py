@@ -308,7 +308,13 @@ class Evaluator:
             is_memoized = self._store.lookup_query_memoize(key[1])
             if existing is not None:
                 self._store.touch_memo_locked(key)
-                if existing.verified_at == runtime.snapshot.revision:
+                
+                ttl = self._store.lookup_query_ttl(key[1])
+                is_expired = False
+                if ttl is not None and self._store.monotonic_seconds() - existing.computed_at_time > ttl:
+                    is_expired = True
+                    
+                if not is_expired and existing.verified_at == runtime.snapshot.revision:
                     self._store.trace_event("cache_hit", key)
                     if is_memoized or not need_value:
                         return existing, True
@@ -370,7 +376,13 @@ class Evaluator:
             is_memoized = self._store.lookup_query_memoize(key[1])
             if existing is not None:
                 self._store.touch_memo_locked(key)
-                if existing.verified_at == runtime.snapshot.revision:
+                
+                ttl = self._store.lookup_query_ttl(key[1])
+                is_expired = False
+                if ttl is not None and self._store.monotonic_seconds() - existing.computed_at_time > ttl:
+                    is_expired = True
+
+                if not is_expired and existing.verified_at == runtime.snapshot.revision:
                     self._store.trace_event("cache_hit", key)
                     if is_memoized or not need_value:
                         return existing, True
@@ -423,6 +435,11 @@ class Evaluator:
                 self._store.in_flight.pop((key, runtime.snapshot.revision), None)
 
     def try_mark_green(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:
+        ttl = self._store.lookup_query_ttl(key[1])
+        if ttl is not None and self._store.monotonic_seconds() - entry.computed_at_time > ttl:
+            self._store.trace_event("cache_red_ttl", key)
+            return False
+
         for dep in entry.deps:
             dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
@@ -431,6 +448,11 @@ class Evaluator:
         return True
 
     async def try_mark_green_async(self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot) -> bool:  # pragma: no cover
+        ttl = self._store.lookup_query_ttl(key[1])
+        if ttl is not None and self._store.monotonic_seconds() - entry.computed_at_time > ttl:
+            self._store.trace_event("cache_red_ttl", key)
+            return False
+
         for dep in entry.deps:
             dep_changed_at = await self.dependency_changed_at_async(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
@@ -636,6 +658,7 @@ class Evaluator:
                 deps=frame.deps,
                 effects=frozen_effects,
                 last_access=self._store.next_access_id,
+                computed_at_time=start,
                 cycle_nodes=tuple(frame.cycle_nodes),
                 error=error,
             )
@@ -650,6 +673,7 @@ class Evaluator:
                     deps=frame.deps,
                     effects=frozen_effects,
                     last_access=self._store.next_access_id,
+                    computed_at_time=start,
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
                 )
@@ -768,6 +792,7 @@ class Evaluator:
                     deps=frame.deps,
                     effects=frozen_effects,
                     last_access=self._store.next_access_id,
+                    computed_at_time=start,
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
                 )
@@ -782,6 +807,7 @@ class Evaluator:
                         deps=frame.deps,
                         effects=frozen_effects,
                         last_access=self._store.next_access_id,
+                        computed_at_time=start,
                         cycle_nodes=tuple(frame.cycle_nodes),
                         error=error,
                     )
@@ -866,6 +892,7 @@ class Evaluator:
                 deps=observed,
                 effects=effects,
                 last_access=self._store.next_access_id,
+                computed_at_time=record.get("computed_at_time", 0.0),
                 error=error,
             )
             self._store.drop_memo_locked(key)
@@ -1197,6 +1224,7 @@ class Evaluator:
                 "deps": deps_records,
                 "effects": effects_node,
                 "is_error": memo.error is not None,
+                "computed_at_time": memo.computed_at_time,
             }
             disk.store_entry(_disk_cache.entry_key(kind, fid, args_blob), record, memo.value_hash, value_blob)
         except PersistentCacheError:

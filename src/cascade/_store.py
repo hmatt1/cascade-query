@@ -49,6 +49,7 @@ class GraphStore:
         self.query_memoize: dict[str, bool] = {}
         self.query_fixed_points: dict[str, Any] = {}
         self.query_cache_exceptions: dict[str, bool | tuple[type[BaseException], ...]] = {}
+        self.query_ttl: dict[str, float | None] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
@@ -106,7 +107,7 @@ class GraphStore:
             sk = self.key_to_str(key)
             self._stats_by_key[sk] = self._stats_by_key.get(sk, 0.0) + seconds
 
-    def register_query(self, query_id: str, fn: Callable[..., Any], *, memoize: bool = True, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False) -> None:
+    def register_query(self, query_id: str, fn: Callable[..., Any], *, memoize: bool = True, fixed_point: Any = None, has_fixed_point: bool = False, cache_exceptions: bool | tuple[type[BaseException], ...] = False, ttl: float | None = None) -> None:
         fn_hash = hash_bytecode(fn)
         with self.lock:
             if query_id in self.query_hashes and self.query_hashes[query_id] != fn_hash:
@@ -117,8 +118,13 @@ class GraphStore:
             self.query_hashes[query_id] = fn_hash
             self.query_memoize[query_id] = memoize
             self.query_cache_exceptions[query_id] = cache_exceptions
+            self.query_ttl[query_id] = ttl
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
+
+    def lookup_query_ttl(self, query_id: str) -> float | None:
+        with self.lock:
+            return self.query_ttl.get(query_id)
 
     def lookup_query_memoize(self, query_id: str) -> bool:
         with self.lock:
@@ -495,6 +501,7 @@ class GraphStore:
         deps: dict[QueryKey, int],
         effects: dict[str, tuple[Any, ...]],
         last_access: int,
+        computed_at_time: float,
         cycle_nodes: tuple[QueryKey, ...] = (),
         error: BaseException | None = None,
     ) -> MemoEntry:
@@ -506,6 +513,7 @@ class GraphStore:
             deps=tuple(Dependency(dep_key, observed) for dep_key, observed in deps.items()),
             effects=effects,
             last_access=last_access,
+            computed_at_time=computed_at_time,
             cycle_nodes=cycle_nodes,
             error=error,
         )

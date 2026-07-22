@@ -47,10 +47,10 @@ def render_profile(uid: str):
     return f"Profile Card: {user['name']} ({user['role']})"
 
 def main():
-    print("--- FIRST RUN (Cold Cache) ---")
+    print("Step 1: --- FIRST RUN (Cold Cache) ---")
     print(render_profile("user_1"))
     
-    print("\n--- SECOND RUN (Cache Hit) ---")
+    print("\nStep 2: --- CHANGING A GLOBAL FLAG ---")
     # This will hit the cache instantly without hitting the DB or re-rendering
     print(render_profile("user_1"))
     
@@ -74,6 +74,7 @@ def main():
     # The DB returns DIFFERENT data.
     # Cascade propagates the change, forcing render_profile to re-run.
     print(render_profile("user_1"))
+    print("\nExample complete.")
 
 if __name__ == "__main__":
     main()

@@ -23,7 +23,7 @@
 Input Validation Hooks: Allow attaching pre-flight validators directly to inputs (@engine.input(validate=pydantic_model)). This ensures bad data is
   rejected before it taints the dependency graph and forces a recompute.
 
-5. Time-To-Live Cache Invalidation
+[x] 5. Time-To-Live Cache Invalidation
 
 Introduce a ⁠ttl⁠ flag for cached outputs to expire stale data automatically.
 

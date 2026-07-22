@@ -16,7 +16,7 @@ from typing import Any
 
 from ._state import Dependency, InputVersion, MemoEntry, TraceEvent
 
-PERSISTENCE_FORMAT = 1
+PERSISTENCE_FORMAT = 2
 
 # Used for canonical key ordering; kept separate so tests can monkeypatch `json.dumps`
 # on this module without breaking recursive sorting inside `_to_jsonable`.
@@ -168,6 +168,7 @@ def _to_jsonable(obj: Any) -> Any:
                 "deps": _to_jsonable(list(obj.deps)),
                 "effects": _to_jsonable(obj.effects),
                 "last_access": obj.last_access,
+                "computed_at_time": _to_jsonable(obj.computed_at_time),
             }
         }
 
@@ -290,6 +291,7 @@ def _from_jsonable(obj: Any) -> Any:
                 deps=tuple(deps_raw),
                 effects=_from_jsonable(d["effects"]),
                 last_access=d["last_access"],
+                computed_at_time=_from_jsonable(d.get("computed_at_time", 0.0)),
             )
         if sole_key == "__dataclass__":
             d = sole_val

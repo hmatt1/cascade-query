@@ -31,6 +31,7 @@ class MemoEntry:
     deps: tuple[Dependency, ...]
     effects: dict[str, tuple[Any, ...]]
     last_access: int
+    computed_at_time: float = 0.0
     cycle_nodes: tuple[QueryKey, ...] = ()
     error: BaseException | None = None
 

@@ -120,6 +120,16 @@ A few things to know:
 
 ## Advanced Features
 
+### Time-To-Live Cache Invalidation
+Cascade supports expiring cache entries automatically based on wall-clock time. By passing the `ttl` flag to `@engine.query`, you can guarantee that a node will recompute its value if it is accessed after the specified number of seconds has elapsed since its last evaluation. 
+
+```python
+@engine.query(ttl=5.0)
+def fetch_external_data():
+    return request.get("https://api.example.com/data")
+```
+When a TTL expires, Cascade evaluates the function again. If the newly returned value is identical to the previous one, downstream queries are **not** re-evaluated—early bail-out works exactly as it does for regular dependency changes.
+
 ### Asynchronous Execution
 Cascade natively supports asynchronous queries via `async def`. This is extremely useful for I/O-bound workflows (such as making database or network calls). When an asynchronous query evaluates, it runs cooperatively on the active `asyncio` event loop.
 
@@ -245,6 +255,7 @@ pip install query-cascade
 |--------|----------------|
 | `compiler_pipeline.py` | `source → parse → symbols → typecheck`, warnings accumulator, cache-hit narration |
 | `async_execution.py` | Asynchronous query evaluation and asyncio event loop integration for IO-bound work |
+| `ttl_invalidation.py` | Expiring stale query caches automatically based on wall-clock time |
 | `error_caching.py` | Basic exception caching to prevent repeated re-evaluation on failure |
 | `error_caching_persistence.py` | Disk cache hydration of exceptions across process runs |
 | `code_versioning.py` | Automatic cache invalidation when a function's bytecode logic changes |
