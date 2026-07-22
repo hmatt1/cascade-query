@@ -9,6 +9,7 @@ in-memory engine keeps working without it; enabling ``cache_dir`` requires it.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import importlib
 from typing import Any
@@ -32,6 +33,11 @@ _EXT_MAP = 4  # dict with at least one non-str key
 _EXT_BIGINT = 5  # int outside the native msgpack 64-bit range
 _EXT_DATACLASS = 6
 _EXT_NAMEDTUPLE = 7
+_EXT_DATETIME = 9
+_EXT_DATE = 10
+_EXT_TIME = 11
+_EXT_TIMEDELTA = 12
+_EXT_TIMEZONE = 13
 
 _INT64_MIN = -(2**63)
 _UINT64_MAX = 2**64 - 1
@@ -93,6 +99,16 @@ def _encode_node(obj: Any) -> Any:
         return obj
     if t is bytearray:
         return bytes(obj)
+    if isinstance(obj, datetime.datetime):
+        return _ext(_EXT_DATETIME, obj.isoformat())
+    if isinstance(obj, datetime.date):
+        return _ext(_EXT_DATE, obj.isoformat())
+    if isinstance(obj, datetime.time):
+        return _ext(_EXT_TIME, obj.isoformat())
+    if isinstance(obj, datetime.timedelta):
+        return _ext(_EXT_TIMEDELTA, [obj.days, obj.seconds, obj.microseconds])
+    if isinstance(obj, datetime.timezone):
+        return _ext(_EXT_TIMEZONE, [_encode_node(obj.utcoffset(None)), obj.tzname(None)])
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return _ext(
@@ -137,7 +153,7 @@ def _encode_node(obj: Any) -> Any:
 
     raise TypeError(
         f"cascade persistent cache: cannot serialize {type(obj).__module__}.{type(obj).__qualname__!r}; "
-        "supported types are primitives, bytes, list/tuple/set/frozenset/dict, "
+        "supported types are primitives, bytes, list/tuple/set/frozenset/dict, datetime, "
         "@dataclass instances, typing.NamedTuple instances, and BaseException."
     )
 
@@ -212,4 +228,14 @@ def _decode_ext(ext: Any) -> Any:
         if not (isinstance(cls, type) and issubclass(cls, BaseException)):
             raise TypeError(f"{module_name}.{qualname!r} is not an Exception")
         return cls(*vals)
+    if ext.code == _EXT_DATETIME:
+        return datetime.datetime.fromisoformat(payload)
+    if ext.code == _EXT_DATE:
+        return datetime.date.fromisoformat(payload)
+    if ext.code == _EXT_TIME:
+        return datetime.time.fromisoformat(payload)
+    if ext.code == _EXT_TIMEDELTA:
+        return datetime.timedelta(days=payload[0], seconds=payload[1], microseconds=payload[2])
+    if ext.code == _EXT_TIMEZONE:
+        return datetime.timezone(_decode_node(payload[0]), payload[1])
     raise ValueError(f"cascade persistent cache: unknown extension code {ext.code}")

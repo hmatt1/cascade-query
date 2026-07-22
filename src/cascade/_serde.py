@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import datetime
 import hashlib
 import importlib
 import json
@@ -136,6 +137,16 @@ def _to_jsonable(obj: Any) -> Any:
         return {"__bytes__": base64.standard_b64encode(obj).decode("ascii")}
     if type(obj) is bytearray:
         return {"__bytes__": base64.standard_b64encode(bytes(obj)).decode("ascii")}
+    if isinstance(obj, datetime.datetime):
+        return {"__datetime__": obj.isoformat()}
+    if isinstance(obj, datetime.date):
+        return {"__date__": obj.isoformat()}
+    if isinstance(obj, datetime.time):
+        return {"__time__": obj.isoformat()}
+    if isinstance(obj, datetime.timedelta):
+        return {"__timedelta__": [obj.days, obj.seconds, obj.microseconds]}
+    if isinstance(obj, datetime.timezone):
+        return {"__timezone__": [_to_jsonable(obj.utcoffset(None)), obj.tzname(None)]}
 
     if isinstance(obj, TraceEvent):
         return {
@@ -225,7 +236,7 @@ def _to_jsonable(obj: Any) -> Any:
 
     raise TypeError(
         f"cascade serde: unsupported type {type(obj).__module__}.{type(obj).__qualname__!r}; "
-        "use primitives, bytes, collections, @dataclass / typing.NamedTuple instances, "
+        "use primitives, bytes, collections, datetime, @dataclass / typing.NamedTuple instances, "
         "cascade state types (MemoEntry, InputVersion, …), or BaseException."
     )
 
@@ -268,6 +279,16 @@ def _from_jsonable(obj: Any) -> Any:
                     raise ValueError("invalid __map__ entry")
                 out[_from_jsonable(pair[0])] = _from_jsonable(pair[1])
             return out
+        if sole_key == "__datetime__":
+            return datetime.datetime.fromisoformat(sole_val)
+        if sole_key == "__date__":
+            return datetime.date.fromisoformat(sole_val)
+        if sole_key == "__time__":
+            return datetime.time.fromisoformat(sole_val)
+        if sole_key == "__timedelta__":
+            return datetime.timedelta(days=sole_val[0], seconds=sole_val[1], microseconds=sole_val[2])
+        if sole_key == "__timezone__":
+            return datetime.timezone(_from_jsonable(sole_val[0]), sole_val[1])
         if sole_key == "__TraceEvent__":
             d = sole_val
             return TraceEvent(
