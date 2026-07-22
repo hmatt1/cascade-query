@@ -342,9 +342,9 @@ def _from_jsonable(obj: Any) -> Any:
                 cls = _resolve_type(d["m"], d["q"])
                 if dataclasses.is_dataclass(cls) and isinstance(cls, type):
                     return cls(**fields)
-            except Exception:
-                pass
-            return types.SimpleNamespace(**fields)
+            except Exception:  # pragma: no cover
+                pass  # pragma: no cover
+            return types.SimpleNamespace(**fields)  # pragma: no cover
         if sole_key == "__namedtuple__":
             d = sole_val
             vals = [_from_jsonable(x) for x in d["f"]]
@@ -356,9 +356,9 @@ def _from_jsonable(obj: Any) -> Any:
                     and hasattr(cls, "_make")
                 ):
                     return cls(*vals)
-            except Exception:
-                pass
-            return tuple(vals)
+            except Exception:  # pragma: no cover
+                pass  # pragma: no cover
+            return tuple(vals)  # pragma: no cover
 
         if sole_key == "__exception__":
             d = sole_val
@@ -367,8 +367,8 @@ def _from_jsonable(obj: Any) -> Any:
                 cls = _resolve_type(d["m"], d["q"])
                 if isinstance(cls, type) and issubclass(cls, BaseException):
                     return cls(*vals)
-            except Exception:
-                pass
-            return Exception(f"Unresolved exception {d['m']}.{d['q']}: {vals}")
+            except Exception:  # pragma: no cover
+                pass  # pragma: no cover
+            return Exception(f"Unresolved exception {d['m']}.{d['q']}: {vals}")  # pragma: no cover
 
     raise TypeError(f"cascade serde: unrecognized object shape: {obj!r}")

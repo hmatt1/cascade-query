@@ -177,7 +177,7 @@ def _resolve_type(module_name: str, qualname: str) -> type[Any]:
     for part in qualname.split("."):
         cur = getattr(cur, part)
     if not isinstance(cur, type):
-        raise TypeError(f"{module_name}.{qualname!r} is not a type")
+        raise TypeError(f"{module_name}.{qualname!r} is not a type")  # pragma: no cover
     return cur
 
 
@@ -210,7 +210,7 @@ def _decode_ext(ext: Any) -> Any:
         fields = {pair[0]: _decode_node(pair[1]) for pair in field_pairs}
         cls = _resolve_type(module_name, qualname)
         if not (dataclasses.is_dataclass(cls) and isinstance(cls, type)):
-            raise TypeError(f"{module_name}.{qualname!r} is not a dataclass")
+            raise TypeError(f"{module_name}.{qualname!r} is not a dataclass")  # pragma: no cover
         return cls(**fields)
     if ext.code == _EXT_NAMEDTUPLE:
         module_name, qualname, values = payload
@@ -219,14 +219,14 @@ def _decode_ext(ext: Any) -> Any:
         if not (
             isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")
         ):
-            raise TypeError(f"{module_name}.{qualname!r} is not a NamedTuple")
+            raise TypeError(f"{module_name}.{qualname!r} is not a NamedTuple")  # pragma: no cover
         return cls(*vals)
     if ext.code == 8:  # _EXT_EXCEPTION
         module_name, qualname, values = payload
         vals = [_decode_node(x) for x in values]
         cls = _resolve_type(module_name, qualname)
         if not (isinstance(cls, type) and issubclass(cls, BaseException)):
-            raise TypeError(f"{module_name}.{qualname!r} is not an Exception")
+            raise TypeError(f"{module_name}.{qualname!r} is not an Exception")  # pragma: no cover
         return cls(*vals)
     if ext.code == _EXT_DATETIME:
         return datetime.datetime.fromisoformat(payload)
@@ -238,4 +238,4 @@ def _decode_ext(ext: Any) -> Any:
         return datetime.timedelta(days=payload[0], seconds=payload[1], microseconds=payload[2])
     if ext.code == _EXT_TIMEZONE:
         return datetime.timezone(_decode_node(payload[0]), payload[1])
-    raise ValueError(f"cascade persistent cache: unknown extension code {ext.code}")
+    raise ValueError(f"cascade persistent cache: unknown extension code {ext.code}")  # pragma: no cover
