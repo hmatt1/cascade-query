@@ -46,7 +46,8 @@ def hash_bytecode(fn: Any) -> str:
             if hasattr(const, "co_code"):
                 h.update(_hash_code(const))
             else:
-                h.update(str(const).encode("utf-8"))
+                h.update(type(const).__name__.encode("utf-8"))
+                h.update(repr(const).encode("utf-8"))
         for name in c.co_names:
             h.update(name.encode("utf-8"))
         for varname in c.co_varnames:
