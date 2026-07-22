@@ -457,8 +457,8 @@ class Engine:
     def clear_traces(self) -> None:
         self._store.clear_traces()
 
-    def inspect_graph(self) -> dict[str, Any]:
-        return self._store.inspect_graph()
+    def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
+        return self._store.inspect_graph(condense=condense)
 
     def subgraph(
         self,

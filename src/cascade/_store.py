@@ -358,7 +358,9 @@ class GraphStore:
                 self.trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
             return self.revision
 
-    def inspect_graph(self) -> dict[str, Any]:
+    def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
+        from ._graph_export import condense_graph
+
         with self.lock:
             nodes = [self.key_to_str(k) for k in self.memos.keys()]
             edges = []
@@ -366,13 +368,18 @@ class GraphStore:
                 parent_s = self.key_to_str(parent)
                 for dep in memo.deps:
                     edges.append((parent_s, self.key_to_str(dep.key)))
-            return {
+            graph = {
                 "revision": self.revision,
                 "memo_count": len(self.memos),
                 "input_count": len(self.inputs),
                 "nodes": nodes,
                 "edges": edges,
             }
+            if condense:
+                condensed = condense_graph(graph)
+                graph["nodes"] = condensed["nodes"]
+                graph["edges"] = condensed["edges"]
+            return graph
 
     def subgraph(self, roots: Sequence[QueryKey | str], *, direction: str) -> dict[str, Any]:
         if direction not in ("deps", "dependents"):
