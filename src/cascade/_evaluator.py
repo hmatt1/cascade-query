@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import inspect
+import time
 import types
 from typing import Any, Callable, Mapping, Sequence
 
@@ -359,7 +360,7 @@ class Evaluator:
                 is_expired = False
                 if (
                     ttl is not None
-                    and self._store.monotonic_seconds() - existing.computed_at_time
+                    and time.time() - existing.computed_at_time
                     > ttl
                 ):
                     is_expired = True
@@ -431,7 +432,7 @@ class Evaluator:
                 is_expired = False
                 if (
                     ttl is not None
-                    and self._store.monotonic_seconds() - existing.computed_at_time
+                    and time.time() - existing.computed_at_time
                     > ttl
                 ):
                     is_expired = True
@@ -494,7 +495,7 @@ class Evaluator:
         ttl = self._store.lookup_query_ttl(key[1])
         if (
             ttl is not None
-            and self._store.monotonic_seconds() - entry.computed_at_time > ttl
+            and time.time() - entry.computed_at_time > ttl
         ):
             self._store.trace_event("cache_red_ttl", key)
             return False
@@ -514,7 +515,7 @@ class Evaluator:
         ttl = self._store.lookup_query_ttl(key[1])
         if (
             ttl is not None
-            and self._store.monotonic_seconds() - entry.computed_at_time > ttl
+            and time.time() - entry.computed_at_time > ttl
         ):
             self._store.trace_event("cache_red_ttl", key)
             return False
@@ -758,7 +759,7 @@ class Evaluator:
                 deps=frame.deps,
                 effects=frozen_effects,
                 last_access=self._store.next_access_id,
-                computed_at_time=start,
+                computed_at_time=time.time(),
                 cycle_nodes=tuple(frame.cycle_nodes),
                 error=error,
             )
@@ -773,7 +774,7 @@ class Evaluator:
                     deps=frame.deps,
                     effects=frozen_effects,
                     last_access=self._store.next_access_id,
-                    computed_at_time=start,
+                    computed_at_time=time.time(),
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
                 )
@@ -900,7 +901,7 @@ class Evaluator:
                     deps=frame.deps,
                     effects=frozen_effects,
                     last_access=self._store.next_access_id,
-                    computed_at_time=start,
+                    computed_at_time=time.time(),
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
                 )
@@ -915,7 +916,7 @@ class Evaluator:
                         deps=frame.deps,
                         effects=frozen_effects,
                         last_access=self._store.next_access_id,
-                        computed_at_time=start,
+                        computed_at_time=time.time(),
                         cycle_nodes=tuple(frame.cycle_nodes),
                         error=error,
                     )
@@ -973,6 +974,12 @@ class Evaluator:
         ):
             self._store.trace_event("disk_red", key, detail="function hash changed")
             return None  # pragma: no cover
+
+        ttl = self._store.lookup_query_ttl(fid)
+        computed_at_time = record.get("computed_at_time", 0.0)
+        if ttl is not None and time.time() - computed_at_time > ttl:
+            self._store.trace_event("disk_red_ttl", key)
+            return None
 
         token = self._hydrating_var.set(hydrating | {key})
         try:
@@ -1180,6 +1187,12 @@ class Evaluator:
                 "disk_red", key, detail="function hash changed"
             )  # pragma: no cover
             return None  # pragma: no cover
+
+        ttl = self._store.lookup_query_ttl(fid)
+        computed_at_time = record.get("computed_at_time", 0.0)
+        if ttl is not None and time.time() - computed_at_time > ttl:
+            self._store.trace_event("disk_red_ttl", key)
+            return None
 
         token = self._hydrating_var.set(hydrating | {key})
         try:
