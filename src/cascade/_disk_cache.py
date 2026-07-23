@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import threading
 from typing import Any
 
@@ -27,6 +28,27 @@ LMDB_INSTALL_HINT = (
     "cascade persistent caching requires the 'lmdb' package for the on-disk store; "
     "there is no fallback. Install it with: pip install lmdb"
 )
+
+_FREE_THREADED = False
+if hasattr(sys, "_is_gil_enabled"):
+    _FREE_THREADED = not sys._is_gil_enabled()
+
+_FT_LOCK = threading.RLock()
+
+
+class _FTContextManager:
+    def __init__(self, ctx: Any) -> None:
+        self.ctx = ctx
+
+    def __enter__(self) -> Any:
+        _FT_LOCK.acquire()  # pragma: no cover
+        return self.ctx.__enter__()
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+        try:
+            return self.ctx.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            _FT_LOCK.release()  # pragma: no cover
 
 DISK_FORMAT = 1
 _FORMAT_KEY = b"format"
@@ -54,17 +76,21 @@ def _acquire_env(path: str, map_size: int) -> tuple[str, Any]:
             shared.refs += 1
             return registry_key, shared.env
         try:
-            # sync=False trades durability of the last few writes for speed.
-            # A crash can lose recent entries, never corrupt the store, and a
-            # lost entry only costs one recompute.
-            env = lmdb.open(
-                path,
-                map_size=map_size,
-                max_dbs=4,
-                subdir=True,
-                sync=False,
-                metasync=False,
-            )
+            if _FREE_THREADED:  # pragma: no cover
+                _FT_LOCK.acquire()
+            try:
+                env = lmdb.open(
+                    path,
+                    map_size=map_size,
+                    max_dbs=4,
+                    subdir=True,
+                    sync=False,
+                    metasync=False,
+                )
+            finally:
+                if _FREE_THREADED:  # pragma: no cover
+                    _FT_LOCK.release()
+
         except lmdb.Error as exc:
             raise PersistentCacheError(
                 f"failed to open persistent cache at {path!r}: {exc}"
@@ -81,8 +107,14 @@ def _release_env(registry_key: str) -> None:
         shared.refs -= 1
         if shared.refs <= 0:
             del _ENV_REGISTRY[registry_key]
-            shared.env.sync(True)
-            shared.env.close()
+            if _FREE_THREADED:  # pragma: no cover
+                _FT_LOCK.acquire()
+            try:
+                shared.env.sync(True)
+                shared.env.close()
+            finally:
+                if _FREE_THREADED:  # pragma: no cover
+                    _FT_LOCK.release()
 
 
 def entry_key(kind: str, function_id: str, args_blob: bytes) -> bytes:
@@ -105,10 +137,16 @@ class DiskCache:
         path = os.fspath(cache_dir)
         os.makedirs(path, exist_ok=True)
         self._registry_key, self._env = _acquire_env(path, map_size)
-        self._meta = self._env.open_db(b"meta")
-        self._blobs = self._env.open_db(b"blobs")
-        self._sys = self._env.open_db(b"sys")
-        self._collections = self._env.open_db(b"collections")
+        if _FREE_THREADED:  # pragma: no cover
+            _FT_LOCK.acquire()
+        try:
+            self._meta = self._env.open_db(b"meta")
+            self._blobs = self._env.open_db(b"blobs")
+            self._sys = self._env.open_db(b"sys")
+            self._collections = self._env.open_db(b"collections")
+        finally:
+            if _FREE_THREADED:  # pragma: no cover
+                _FT_LOCK.release()
         self._closed = False
         self._ensure_format()
 
@@ -116,9 +154,15 @@ class DiskCache:
     def path(self) -> str:
         return self._env.path()
 
+    def _begin(self, **kwargs: Any) -> Any:
+        ctx = self._env.begin(**kwargs)
+        if _FREE_THREADED:  # pragma: no cover
+            return _FTContextManager(ctx)
+        return ctx
+
     def _ensure_format(self) -> None:
         stamp = DISK_FORMAT.to_bytes(4, "big")
-        with self._env.begin(write=True) as txn:
+        with self._begin(write=True) as txn:
             current = txn.get(_FORMAT_KEY, db=self._sys)
             if current == stamp:
                 return
@@ -128,7 +172,7 @@ class DiskCache:
             txn.put(_FORMAT_KEY, stamp, db=self._sys)
 
     def load_entry(self, key: bytes) -> dict[str, Any] | None:
-        with self._env.begin() as txn:
+        with self._begin() as txn:
             raw = txn.get(key, db=self._meta)
         if raw is None:
             return None  # pragma: no cover
@@ -141,7 +185,7 @@ class DiskCache:
         return record
 
     def load_blob(self, value_hash: str) -> bytes | None:
-        with self._env.begin() as txn:
+        with self._begin() as txn:
             raw = txn.get(value_hash.encode("ascii"), db=self._blobs)
         return None if raw is None else bytes(raw)  # pragma: no cover
 
@@ -150,7 +194,7 @@ class DiskCache:
     ) -> None:
         record_blob = _canonical.encode(record)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._begin(write=True) as txn:
                 txn.put(value_hash.encode("ascii"), value_blob, db=self._blobs)
                 txn.put(key, record_blob, db=self._meta)
         except lmdb.MapFullError as exc:
@@ -160,7 +204,7 @@ class DiskCache:
             ) from exc
 
     def clear(self) -> None:
-        with self._env.begin(write=True) as txn:
+        with self._begin(write=True) as txn:
             txn.drop(self._meta, delete=False)
             txn.drop(self._blobs, delete=False)
             txn.drop(self._collections, delete=False)
@@ -186,7 +230,7 @@ class DiskCache:
     ) -> tuple[dict[str, Any] | None, list[tuple[int, dict[str, Any]]]]:
         """Snapshot record (or None) plus the ordered tail of diffs after it."""
         prefix = self._log_prefix(name)
-        with self._env.begin() as txn:
+        with self._begin() as txn:
             raw = txn.get(self._snap_key(name), db=self._collections)
             snapshot = _canonical.decode(bytes(raw)) if raw is not None else None
             tail: list[tuple[int, dict[str, Any]]] = []
@@ -206,7 +250,7 @@ class DiskCache:
             (self._log_key(name, rev), _canonical.encode(diff)) for rev, diff in batch
         ]
         try:
-            with self._env.begin(write=True) as txn:
+            with self._begin(write=True) as txn:
                 for key, blob in blobs:
                     txn.put(key, blob, db=self._collections)
         except lmdb.MapFullError as exc:
@@ -222,7 +266,7 @@ class DiskCache:
         blob = _canonical.encode(record)
         prefix = self._log_prefix(name)
         try:
-            with self._env.begin(write=True) as txn:
+            with self._begin(write=True) as txn:
                 txn.put(self._snap_key(name), blob, db=self._collections)
                 drop: list[bytes] = []
                 with txn.cursor(db=self._collections) as curs:
@@ -243,7 +287,7 @@ class DiskCache:
 
     def retain(self, wanted_entries: set[bytes], wanted_blobs: set[str]) -> None:
         """Drop all meta entries and blobs not in the provided sets."""
-        with self._env.begin(write=True) as txn:
+        with self._begin(write=True) as txn:
             drop_meta = []
             with txn.cursor(db=self._meta) as curs:
                 if curs.first():
