@@ -43,6 +43,8 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Run extended nightly performance loop
+        env:
+          CASCADE_QUERY_PARALLEL_PERF_RETRIES: "2"
         run: |
           python - <<'PY'
           import json
