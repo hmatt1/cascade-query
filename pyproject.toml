@@ -50,3 +50,10 @@ tests_dir = ["tests/"]
 runner = "python -m pytest -q -m \"not slow\" --ignore=tests/test_performance.py"
 mutate_only_covered_lines = true
 also_copy = ["pyproject.toml", "benchmarks"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
