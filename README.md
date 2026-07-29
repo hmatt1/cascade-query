@@ -172,7 +172,7 @@ def mapped_data() -> list[int]:
 ```
 
 ### Garbage Collection & Pruning
-*   **`engine.prune(roots, vacuum_disk=False)`**: Removes cached query results from the in-memory LRU cache that are not reachable from the specified roots. Set `vacuum_disk=True` to deep vacuum the persistent LMDB disk cache.
+*   **`engine.prune(roots, vacuum_disk=False)`**: Removes cached query results from the in-memory LRU cache that are not reachable from the specified roots. Set `vacuum_disk=True` to deep vacuum the persistent MDBX disk cache.
 *   **`engine.access_id`**: Property returning a monotonically increasing sequence number for memo accesses.
 *   **`engine.sweep_unaccessed(since_access_id)`**: Evicts all memos that haven't been accessed since `since_access_id`. Useful for generational garbage collection.
 
@@ -200,13 +200,13 @@ print(effects["warnings"])
 ```
 
 ### Persistent Disk Caching
-Passing `cache_dir` to the `Engine` turns on zero-config persistence. Cascade provisions an embedded LMDB store, serializes query results with a deterministic msgpack encoding, and fingerprints every input value by hashing its serialized bytes with blake2b.
+Passing `cache_dir` to the `Engine` turns on zero-config persistence. Cascade provisions an embedded MDBX store, serializes query results with a deterministic msgpack encoding, and fingerprints every input value by hashing its serialized bytes with blake2b.
 
 ```python
 from cascade import Engine
 engine = Engine(max_entries=10_000, cache_dir=".cascade_cache")
 ```
-*   `lmdb` and `msgpack` are required (`pip install query-cascade[disk]`).
+*   `libmdbx` and `msgpack` are required (`pip install query-cascade[disk]`).
 *   Values and arguments must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.).
 *   **`engine.clear_disk_cache()`**: Deletes every entry in the persistent disk cache.
 

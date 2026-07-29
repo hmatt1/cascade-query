@@ -26,7 +26,7 @@ A priority queue dictates the execution order when multiple nodes are ready for 
   element changes, downstream queries would only receive the diff (additions/removals) for ultra-fast granular updates.
 
 
-  15.  Pluggable Storage Backends: Abstract the persistent disk cache to allow swapping LMDB for SQLite, RocksDB, or even ephemeral in-memory stores like Redis.
+  15.  Pluggable Storage Backends: Abstract the persistent disk cache to allow swapping MDBX for SQLite, RocksDB, or even ephemeral in-memory stores like Redis.
 
 
   4. Memory Compression: Automatically compress large objects (like large ASTs or string blobs) in the in-memory LRU cache using LZ4 or Zstandard to

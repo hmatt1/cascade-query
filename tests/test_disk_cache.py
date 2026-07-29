@@ -104,11 +104,11 @@ def test_entry_key_is_deterministic_and_arg_sensitive() -> None:
 # --- missing dependency errors ---
 
 
-def test_missing_lmdb_raises_with_install_hint(
+def test_missing_mdbx_raises_with_install_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(disk_cache_mod, "lmdb", None)
-    with pytest.raises(PersistentCacheError, match="pip install lmdb"):
+    monkeypatch.setattr(disk_cache_mod, "mdbx", None)
+    with pytest.raises(PersistentCacheError, match="pip install libmdbx"):
         Engine(cache_dir=tmp_path / "cache")
 
 
@@ -365,11 +365,12 @@ def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path) -> None:
     engine_a.shutdown()
 
     disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24)
-    with disk._env.begin(write=True) as txn:  # noqa: SLF001
-        cursor = txn.cursor(db=disk._blobs)  # noqa: SLF001
-        keys = [bytes(key) for key, _ in cursor]
+    import mdbx
+    with disk._begin(write=True) as txn:  # noqa: SLF001
+        with mdbx.Cursor(disk._blobs, txn) as cursor:  # noqa: SLF001
+            keys = [bytes(key) for key, _ in cursor.iter()]
         for key in keys:
-            txn.put(key, b"corrupted", db=disk._blobs)  # noqa: SLF001
+            disk._blobs.put(txn, key, b"corrupted")  # noqa: SLF001
     disk.close()
 
     runs.clear()
@@ -390,8 +391,8 @@ def test_format_bump_wipes_stale_cache(tmp_path: Path) -> None:
     engine_a.shutdown()
 
     disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24)
-    with disk._env.begin(write=True) as txn:  # noqa: SLF001
-        txn.put(b"format", (999).to_bytes(4, "big"), db=disk._sys)  # noqa: SLF001
+    with disk._begin(write=True) as txn:  # noqa: SLF001
+        disk._sys.put(txn, b"format", (999).to_bytes(4, "big"))  # noqa: SLF001
     disk.close()
 
     runs.clear()
@@ -589,15 +590,16 @@ def test_disk_cache_prune_vacuum(tmp_path: Path) -> None:
     disk = engine._disk
     assert disk is not None
 
+    import mdbx
     def count_meta_entries() -> int:
-        with disk._env.begin() as txn:
-            with txn.cursor(db=disk._meta) as curs:
-                return len(list(curs.iternext(keys=True, values=False)))
+        with disk._begin() as txn:
+            with mdbx.Cursor(disk._meta, txn) as curs:
+                return len(list(curs.iter()))
 
     def count_blob_entries() -> int:
-        with disk._env.begin() as txn:
-            with txn.cursor(db=disk._blobs) as curs:
-                return len(list(curs.iternext(keys=True, values=False)))
+        with disk._begin() as txn:
+            with mdbx.Cursor(disk._blobs, txn) as curs:
+                return len(list(curs.iter()))
 
     meta_count = count_meta_entries()
     blob_count = count_blob_entries()
@@ -662,8 +664,8 @@ def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path) -> None:
     args_blob = canonical.encode(())
     ekey = entry_key("query", fake_fid, args_blob)
 
-    # Store a bad record using raw lmdb put
-    with disk._env.begin(write=True) as txn:
+    # Store a bad record using raw mdbx put
+    with disk._begin(write=True) as txn:
         # A record with no value_hash and a non-query dep
         bad_record = canonical.encode(
             {
@@ -676,7 +678,7 @@ def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path) -> None:
                 "effects": {},
             }
         )
-        txn.put(ekey, bad_record, db=disk._meta)
+        disk._meta.put(txn, ekey, bad_record)
 
     # Now attempt to prune with the fake query as root
     # It will read the bad record, skip value_hash, and skip the input dep

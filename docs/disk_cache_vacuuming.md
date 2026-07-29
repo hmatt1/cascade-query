@@ -1,11 +1,11 @@
 # Disk Cache Vacuuming
 
-The `engine.prune(roots, vacuum_disk=True)` method allows for fine-grained garbage collection of the persistent LMDB disk cache, reclaiming logical space by deleting cache entries and blobs that are no longer reachable from the provided roots.
+The `engine.prune(roots, vacuum_disk=True)` method allows for fine-grained garbage collection of the persistent MDBX disk cache, reclaiming logical space by deleting cache entries and blobs that are no longer reachable from the provided roots.
 
 While this implementation handles logical cleanup gracefully, there are several known limitations and gaps to be aware of:
 
 ## 1. Multi-Process Hostility
-LMDB enables multiple Cascade `Engine` instances (across different Python processes) to safely share the same `.cascade_cache` directory. However, `vacuum_disk=True` is a **global, destructive operation**. If Process A triggers a vacuum using its own graph roots, it has no knowledge of Process B's graph roots and will aggressively delete Process B's cached entries. There is no cross-process reference counting.
+MDBX enables multiple Cascade `Engine` instances (across different Python processes) to safely share the same `.cascade_cache` directory. However, `vacuum_disk=True` is a **global, destructive operation**. If Process A triggers a vacuum using its own graph roots, it has no knowledge of Process B's graph roots and will aggressively delete Process B's cached entries. There is no cross-process reference counting.
 **Recommendation:** Do not use `vacuum_disk=True` if multiple independent processes actively rely on the same cache directory with disparate query graphs.
 
 ## 2. Intra-Process Concurrency Races
@@ -13,7 +13,7 @@ Currently, the disk cache traversal runs *outside* of the `GraphStore`'s strict 
 **Recommendation:** Vacuuming should ideally be done when the engine is quiescent.
 
 ## 3. Physical File Shrinkage (Fragmentation)
-Deleting records in an LMDB database marks the pages as free to be reused by future writes, preventing the cache from growing infinitely. However, it **does not shrink the physical `data.mdb` file size** on the OS disk. To truly return bytes to the operating system, LMDB requires doing an environment copy to a new compacted database, which this pruning method does not perform. 
+Deleting records in an MDBX database marks the pages as free to be reused by future writes, preventing the cache from growing infinitely. However, it **does not shrink the physical `data.mdb` file size** on the OS disk. To truly return bytes to the operating system, MDBX requires doing an environment copy to a new compacted database, which this pruning method does not perform. 
 **Recommendation:** To completely recover physical disk space, simply stop all engine instances and delete the `data.mdb` file or the entire cache directory.
 
 ## 4. Memory Footprint During Traversal
