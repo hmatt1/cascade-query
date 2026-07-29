@@ -360,11 +360,7 @@ class Evaluator:
 
                 ttl = self._store.lookup_query_ttl(key[1])
                 is_expired = False
-                if (
-                    ttl is not None
-                    and time.time() - existing.computed_at_time
-                    > ttl
-                ):
+                if ttl is not None and time.time() - existing.computed_at_time > ttl:
                     is_expired = True
 
                 if not is_expired and existing.verified_at == runtime.snapshot.revision:
@@ -432,11 +428,7 @@ class Evaluator:
 
                 ttl = self._store.lookup_query_ttl(key[1])
                 is_expired = False
-                if (
-                    ttl is not None
-                    and time.time() - existing.computed_at_time
-                    > ttl
-                ):
+                if ttl is not None and time.time() - existing.computed_at_time > ttl:
                     is_expired = True
 
                 if not is_expired and existing.verified_at == runtime.snapshot.revision:
@@ -495,10 +487,7 @@ class Evaluator:
         self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
     ) -> bool:
         ttl = self._store.lookup_query_ttl(key[1])
-        if (
-            ttl is not None
-            and time.time() - entry.computed_at_time > ttl
-        ):
+        if ttl is not None and time.time() - entry.computed_at_time > ttl:
             self._store.trace_event("cache_red_ttl", key)
             return False
 
@@ -515,10 +504,7 @@ class Evaluator:
         self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
     ) -> bool:  # pragma: no cover
         ttl = self._store.lookup_query_ttl(key[1])
-        if (
-            ttl is not None
-            and time.time() - entry.computed_at_time > ttl
-        ):
+        if ttl is not None and time.time() - entry.computed_at_time > ttl:
             self._store.trace_event("cache_red_ttl", key)
             return False
 

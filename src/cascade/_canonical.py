@@ -109,7 +109,9 @@ def _encode_node(obj: Any) -> Any:
         return _ext(_EXT_TIMEDELTA, [obj.days, obj.seconds, obj.microseconds])
     if isinstance(obj, datetime.timezone):
         td = obj.utcoffset(None)
-        return _ext(_EXT_TIMEZONE, [[td.days, td.seconds, td.microseconds], obj.tzname(None)])
+        return _ext(
+            _EXT_TIMEZONE, [[td.days, td.seconds, td.microseconds], obj.tzname(None)]
+        )
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return _ext(
@@ -211,7 +213,9 @@ def _decode_ext(ext: Any) -> Any:
         fields = {pair[0]: _decode_node(pair[1]) for pair in field_pairs}
         cls = _resolve_type(module_name, qualname)
         if not (dataclasses.is_dataclass(cls) and isinstance(cls, type)):
-            raise TypeError(f"{module_name}.{qualname!r} is not a dataclass")  # pragma: no cover
+            raise TypeError(
+                f"{module_name}.{qualname!r} is not a dataclass"
+            )  # pragma: no cover
         return cls(**fields)
     if ext.code == _EXT_NAMEDTUPLE:
         module_name, qualname, values = payload
@@ -220,14 +224,18 @@ def _decode_ext(ext: Any) -> Any:
         if not (
             isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")
         ):
-            raise TypeError(f"{module_name}.{qualname!r} is not a NamedTuple")  # pragma: no cover
+            raise TypeError(
+                f"{module_name}.{qualname!r} is not a NamedTuple"
+            )  # pragma: no cover
         return cls(*vals)
     if ext.code == 8:  # _EXT_EXCEPTION
         module_name, qualname, values = payload
         vals = [_decode_node(x) for x in values]
         cls = _resolve_type(module_name, qualname)
         if not (isinstance(cls, type) and issubclass(cls, BaseException)):
-            raise TypeError(f"{module_name}.{qualname!r} is not an Exception")  # pragma: no cover
+            raise TypeError(
+                f"{module_name}.{qualname!r} is not an Exception"
+            )  # pragma: no cover
         return cls(*vals)
     if ext.code == _EXT_DATETIME:
         return datetime.datetime.fromisoformat(payload)
@@ -236,9 +244,15 @@ def _decode_ext(ext: Any) -> Any:
     if ext.code == _EXT_TIME:
         return datetime.time.fromisoformat(payload)
     if ext.code == _EXT_TIMEDELTA:
-        return datetime.timedelta(days=payload[0], seconds=payload[1], microseconds=payload[2])
+        return datetime.timedelta(
+            days=payload[0], seconds=payload[1], microseconds=payload[2]
+        )
     if ext.code == _EXT_TIMEZONE:
         td_payload = payload[0]
-        td = datetime.timedelta(days=td_payload[0], seconds=td_payload[1], microseconds=td_payload[2])
+        td = datetime.timedelta(
+            days=td_payload[0], seconds=td_payload[1], microseconds=td_payload[2]
+        )
         return datetime.timezone(td, payload[1])
-    raise ValueError(f"cascade persistent cache: unknown extension code {ext.code}")  # pragma: no cover
+    raise ValueError(
+        f"cascade persistent cache: unknown extension code {ext.code}"
+    )  # pragma: no cover

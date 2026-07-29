@@ -86,9 +86,7 @@ def _acquire_env(path: str, map_size: int) -> tuple[str, Any]:
                 _FT_LOCK.acquire()
             try:
                 env = mdbx.Env(
-                    path,
-                    maxdbs=4,
-                    geometry=mdbx.Geometry(size_upper=map_size)
+                    path, maxdbs=4, geometry=mdbx.Geometry(size_upper=map_size)
                 )
             finally:
                 if _FREE_THREADED:  # pragma: no cover

@@ -366,6 +366,7 @@ def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path) -> None:
 
     disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24)
     import mdbx
+
     with disk._begin(write=True) as txn:  # noqa: SLF001
         with mdbx.Cursor(disk._blobs, txn) as cursor:  # noqa: SLF001
             keys = [bytes(key) for key, _ in cursor.iter()]
@@ -591,6 +592,7 @@ def test_disk_cache_prune_vacuum(tmp_path: Path) -> None:
     assert disk is not None
 
     import mdbx
+
     def count_meta_entries() -> int:
         with disk._begin() as txn:
             with mdbx.Cursor(disk._meta, txn) as curs:

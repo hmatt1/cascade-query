@@ -1,12 +1,13 @@
-import os
 from dataclasses import dataclass
 from cascade import Engine, CascadeDict
+
 
 # A sample dataclass to use as a key, similar to what you might use in a real project
 @dataclass(frozen=True)
 class MyKey:
     category: str
     id_num: int
+
 
 def main():
     cache_directory = "./my_cascade_cache"
@@ -49,6 +50,7 @@ def main():
     # It automatically flushes and handles the MDBX environment lifecycle when garbage collected.
     print("Example complete.")
     print("Example complete.")
+
 
 if __name__ == "__main__":
     main()

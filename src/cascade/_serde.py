@@ -287,7 +287,9 @@ def _from_jsonable(obj: Any) -> Any:
         if sole_key == "__time__":
             return datetime.time.fromisoformat(sole_val)
         if sole_key == "__timedelta__":
-            return datetime.timedelta(days=sole_val[0], seconds=sole_val[1], microseconds=sole_val[2])
+            return datetime.timedelta(
+                days=sole_val[0], seconds=sole_val[1], microseconds=sole_val[2]
+            )
         if sole_key == "__timezone__":
             return datetime.timezone(_from_jsonable(sole_val[0]), sole_val[1])
         if sole_key == "__TraceEvent__":
@@ -321,7 +323,9 @@ def _from_jsonable(obj: Any) -> Any:
             error_raw = d.get("error")
             error = _from_jsonable(error_raw) if error_raw is not None else None
             cycle_nodes_raw = d.get("cycle_nodes")
-            cycle_nodes_list = _from_jsonable(cycle_nodes_raw) if cycle_nodes_raw is not None else []
+            cycle_nodes_list = (
+                _from_jsonable(cycle_nodes_raw) if cycle_nodes_raw is not None else []
+            )
             if not isinstance(cycle_nodes_list, list):
                 raise ValueError("MemoEntry.cycle_nodes must decode to a list")
             return MemoEntry(
@@ -370,6 +374,8 @@ def _from_jsonable(obj: Any) -> Any:
                     return cls(*vals)
             except Exception:  # pragma: no cover
                 pass  # pragma: no cover
-            return Exception(f"Unresolved exception {d['m']}.{d['q']}: {vals}")  # pragma: no cover
+            return Exception(
+                f"Unresolved exception {d['m']}.{d['q']}: {vals}"
+            )  # pragma: no cover
 
     raise TypeError(f"cascade serde: unrecognized object shape: {obj!r}")

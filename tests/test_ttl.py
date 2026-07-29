@@ -19,17 +19,17 @@ def test_ttl_invalidation_basic():
     with unittest.mock.patch("cascade._evaluator.time.time", side_effect=lambda: clock):
         assert my_query() == "value"
         assert compute_count == 1
-    
+
         # Still within TTL
         clock = 1.0
         assert my_query() == "value"
         assert compute_count == 1
-    
+
         # Exceed TTL
         clock = 3.0
         assert my_query() == "value"
         assert compute_count == 2
-    
+
         # Still within new TTL
         clock = 4.0
         assert my_query() == "value"
@@ -54,14 +54,16 @@ def test_ttl_invalidation_async():
 
     async def run():
         nonlocal clock
-        with unittest.mock.patch("cascade._evaluator.time.time", side_effect=lambda: clock):
+        with unittest.mock.patch(
+            "cascade._evaluator.time.time", side_effect=lambda: clock
+        ):
             assert await my_async_query() == "async_value"
             assert compute_count == 1
-    
+
             clock = 1.0
             assert await my_async_query() == "async_value"
             assert compute_count == 1
-    
+
             clock = 2.0
             assert await my_async_query() == "async_value"
             assert compute_count == 2
