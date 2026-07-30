@@ -226,7 +226,10 @@ jobs:
           with open("coverage.json", encoding="utf-8") as fh:
               totals = json.load(fh)["totals"]
 
-          branch_cov = totals["percent_branches_covered"]
+          branch_cov = totals.get("percent_branches_covered")
+          if branch_cov is None:
+              branch_cov = (totals["covered_branches"] / totals["num_branches"]) * 100 if totals["num_branches"] > 0 else 100.0
+              
           threshold = 90.0
           print(f"Branch coverage: {branch_cov:.2f}% (threshold {threshold:.2f}%)")
           if branch_cov < threshold:
@@ -250,7 +253,9 @@ jobs:
         run: wget -qN https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 
       - name: Run TLC Model Checker
-        run: java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock docs/formal/CascadeCore.tla -config docs/formal/CascadeCore.cfg
+        run: |
+          cd docs/formal
+          java -cp ../../tla2tools.jar tlc2.TLC -workers auto -deadlock CascadeCore.tla -config CascadeCore.cfg
 
   package:
     name: Package build

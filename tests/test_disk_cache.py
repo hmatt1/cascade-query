@@ -863,7 +863,10 @@ def test_deep_dependency_chain_cross_session(tmp_path: Path) -> None:
     assert len(runs) == 50
     engine_3.shutdown()
 
-def test_collection_snapshot_does_not_scan_entire_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_collection_snapshot_does_not_scan_entire_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cache = tmp_path / "cache"
     disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24)
     name = "test_col"
@@ -873,6 +876,7 @@ def test_collection_snapshot_does_not_scan_entire_log(tmp_path: Path, monkeypatc
 
     iterations = 0
     import mdbx
+
     original_iter = mdbx.Cursor.iter
 
     def mocked_iter(self, start_key=None):
@@ -884,8 +888,7 @@ def test_collection_snapshot_does_not_scan_entire_log(tmp_path: Path, monkeypatc
     monkeypatch.setattr(mdbx.Cursor, "iter", mocked_iter)
 
     disk.collection_snapshot(name, {"snap": True}, upto_rev=5)
-    
+
     # Revisions 1 through 5, plus revision 6 which breaks the loop
     assert iterations == 6
     disk.close()
-
