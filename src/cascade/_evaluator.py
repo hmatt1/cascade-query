@@ -9,7 +9,7 @@ import types
 from typing import Any, Callable, Mapping, Sequence
 
 from . import _canonical, _disk_cache
-from ._disk_cache import DiskCache
+from ._disk_cache import DiskCacheProtocol
 from ._errors import CycleError, PersistentCacheError, QueryCancelled
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
 from ._state import InputVersion, MemoEntry, QueryKey, Snapshot
@@ -21,7 +21,7 @@ class Evaluator:
         self,
         store: GraphStore,
         *,
-        disk: DiskCache | None = None,
+        disk: DiskCacheProtocol | None = None,
         get_executor: Callable[[], concurrent.futures.Executor] | None = None,
     ) -> None:
         self._store = store

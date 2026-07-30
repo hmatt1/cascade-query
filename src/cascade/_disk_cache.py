@@ -14,10 +14,21 @@ import hashlib
 import os
 import sys
 import threading
-from typing import Any
+from typing import Any, Protocol
 
 from . import _canonical
 from ._errors import PersistentCacheError
+
+
+try:
+    import lmdb
+except ImportError:  # pragma: no cover
+    lmdb = None  # type: ignore[assignment]
+
+LMDB_INSTALL_HINT = (
+    "cascade persistent caching requires the 'lmdb' package for the on-disk store; "
+    "there is no fallback. Install it with: pip install lmdb"
+)
 
 try:
     import mdbx
@@ -137,7 +148,7 @@ def entry_key(kind: str, function_id: str, args_blob: bytes) -> bytes:
     return h.digest()
 
 
-class DiskCache:
+class MdbxDiskCache:
     def __init__(self, cache_dir: str | os.PathLike[str], *, map_size: int) -> None:
         if mdbx is None:
             raise PersistentCacheError(MDBX_INSTALL_HINT)
@@ -321,3 +332,256 @@ class DiskCache:
         if not self._closed:
             self._closed = True
             _release_env(self._registry_key)
+
+
+class LmdbTxnContext:
+    def __init__(self, env: Any, write: bool, kwargs: dict[str, Any], lock: threading.RLock) -> None:
+        self.env = env
+        self.write = write
+        self.kwargs = kwargs
+        self.lock = lock
+        self.txn: Any = None
+
+    def __enter__(self) -> Any:
+        if _FREE_THREADED:
+            _FT_LOCK.acquire()
+        elif self.write:
+            self.lock.acquire()
+        try:
+            self.txn = self.env.begin(write=self.write, **self.kwargs)
+        except Exception:
+            if _FREE_THREADED:
+                _FT_LOCK.release()
+            elif self.write:
+                self.lock.release()
+            raise
+        return self.txn
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+        try:
+            if exc_type is None and self.write:
+                self.txn.commit()
+            elif exc_type is not None and self.write:
+                self.txn.abort()
+        finally:
+            if _FREE_THREADED:
+                _FT_LOCK.release()
+            elif self.write:
+                self.lock.release()
+
+def _acquire_lmdb_env(path: str, map_size: int) -> tuple[str, Any]:
+    registry_key = "lmdb:" + os.path.realpath(path)
+    with _ENV_LOCK:
+        shared = _ENV_REGISTRY.get(registry_key)
+        if shared is not None:
+            shared.refs += 1
+            return registry_key, shared.env
+        try:
+            if _FREE_THREADED:  # pragma: no cover
+                _FT_LOCK.acquire()
+            try:
+                env = lmdb.open(
+                    path,
+                    map_size=map_size,
+                    max_dbs=4,
+                    sync=False,
+                    metasync=False
+                )
+            finally:
+                if _FREE_THREADED:  # pragma: no cover
+                    _FT_LOCK.release()
+
+        except lmdb.Error as exc:
+            raise PersistentCacheError(
+                f"failed to open persistent cache at {path!r}: {exc}"
+            ) from exc
+        _ENV_REGISTRY[registry_key] = _SharedEnv(env)
+        return registry_key, env
+
+class LmdbDiskCache:
+    def __init__(self, cache_dir: str | os.PathLike[str], *, map_size: int) -> None:
+        if lmdb is None:
+            raise PersistentCacheError(LMDB_INSTALL_HINT)
+        _canonical.require_msgpack()
+        path = os.fspath(cache_dir)
+        os.makedirs(path, exist_ok=True)
+        self._registry_key, self._env = _acquire_lmdb_env(path, map_size)
+        self._lock = threading.RLock()
+        
+        with self._begin(write=True) as txn:
+            self._meta = self._env.open_db(b"meta", txn=txn)
+            self._blobs = self._env.open_db(b"blobs", txn=txn)
+            self._sys = self._env.open_db(b"sys", txn=txn)
+            self._collections = self._env.open_db(b"collections", txn=txn)
+
+        self._closed = False
+        self._ensure_format()
+
+    @property
+    def path(self) -> str:
+        return self._env.path()
+
+    def _begin(self, write: bool = False, **kwargs: Any) -> Any:
+        return LmdbTxnContext(self._env, write, kwargs, self._lock)
+
+    def _ensure_format(self) -> None:
+        stamp = DISK_FORMAT.to_bytes(4, "big")
+        with self._begin(write=True) as txn:
+            current = txn.get(_FORMAT_KEY, db=self._sys)
+            if current == stamp:
+                return
+            if current is not None:
+                txn.drop(self._meta, delete=False)
+                txn.drop(self._blobs, delete=False)
+            txn.put(_FORMAT_KEY, stamp, db=self._sys)
+
+    def load_entry(self, key: bytes) -> dict[str, Any] | None:
+        with self._begin() as txn:
+            raw = txn.get(key, db=self._meta)
+        if raw is None:
+            return None  # pragma: no cover
+        try:
+            record = _canonical.decode(bytes(raw))
+        except Exception:  # pragma: no cover
+            return None  # pragma: no cover
+        if not isinstance(record, dict):
+            return None  # pragma: no cover
+        return record
+
+    def load_blob(self, value_hash: str) -> bytes | None:
+        with self._begin() as txn:
+            raw = txn.get(value_hash.encode("ascii"), db=self._blobs)
+        return None if raw is None else bytes(raw)  # pragma: no cover
+
+    def store_entry(
+        self, key: bytes, record: dict[str, Any], value_hash: str, value_blob: bytes
+    ) -> None:
+        record_blob = _canonical.encode(record)
+        try:
+            with self._begin(write=True) as txn:
+                txn.put(value_hash.encode("ascii"), value_blob, db=self._blobs)
+                txn.put(key, record_blob, db=self._meta)
+        except lmdb.MapFullError as exc:
+            raise PersistentCacheError(
+                f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
+                "to Engine, or clear the cache with engine.clear_disk_cache()."
+            ) from exc
+
+    def clear(self) -> None:
+        with self._begin(write=True) as txn:
+            txn.drop(self._meta, delete=False)
+            txn.drop(self._blobs, delete=False)
+            txn.drop(self._collections, delete=False)
+
+    @staticmethod
+    def _snap_key(name: str) -> bytes:
+        return b"s\x00" + name.encode("utf-8")
+
+    @staticmethod
+    def _log_prefix(name: str) -> bytes:
+        return b"l\x00" + name.encode("utf-8") + b"\x00"
+
+    def _log_key(self, name: str, rev: int) -> bytes:
+        return self._log_prefix(name) + rev.to_bytes(8, "big")
+
+    def collection_load(
+        self, name: str
+    ) -> tuple[dict[str, Any] | None, list[tuple[int, dict[str, Any]]]]:
+        prefix = self._log_prefix(name)
+        with self._begin() as txn:
+            raw = txn.get(self._snap_key(name), db=self._collections)
+            snapshot = _canonical.decode(bytes(raw)) if raw is not None else None
+            tail: list[tuple[int, dict[str, Any]]] = []
+            with txn.cursor(db=self._collections) as curs:
+                if curs.set_range(prefix):
+                    for key, value in curs:
+                        if not bytes(key).startswith(prefix):
+                            break
+                        rev = int.from_bytes(bytes(key)[len(prefix) :], "big")
+                        tail.append((rev, _canonical.decode(bytes(value))))
+        return snapshot, tail
+
+    def collection_append_many(
+        self, name: str, batch: list[tuple[int, dict[str, Any]]]
+    ) -> None:
+        blobs = [
+            (self._log_key(name, rev), _canonical.encode(diff)) for rev, diff in batch
+        ]
+        try:
+            with self._begin(write=True) as txn:
+                for key, blob in blobs:
+                    txn.put(key, blob, db=self._collections)
+        except lmdb.MapFullError as exc:
+            raise PersistentCacheError(
+                f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
+                "to Engine, or clear the cache with engine.clear_disk_cache()."
+            ) from exc
+
+    def collection_snapshot(
+        self, name: str, record: dict[str, Any], upto_rev: int
+    ) -> None:
+        blob = _canonical.encode(record)
+        prefix = self._log_prefix(name)
+        try:
+            with self._begin(write=True) as txn:
+                txn.put(self._snap_key(name), blob, db=self._collections)
+                drop: list[bytes] = []
+                with txn.cursor(db=self._collections) as curs:
+                    if curs.set_range(prefix):
+                        for key, _ in curs:
+                            kb = bytes(key)
+                            if not kb.startswith(prefix):
+                                break
+                            if int.from_bytes(kb[len(prefix) :], "big") <= upto_rev:
+                                drop.append(kb)
+                            else:
+                                break
+                for key in drop:
+                    txn.delete(key, db=self._collections)
+        except lmdb.MapFullError as exc:
+            raise PersistentCacheError(
+                f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
+                "to Engine, or clear the cache with engine.clear_disk_cache()."
+            ) from exc
+
+    def retain(self, wanted_entries: set[bytes], wanted_blobs: set[str]) -> None:
+        with self._begin(write=True) as txn:
+            drop_meta = []
+            with txn.cursor(db=self._meta) as curs:
+                for key, _ in curs:
+                    if key not in wanted_entries:
+                        drop_meta.append(key)
+            for k in drop_meta:
+                txn.delete(k, db=self._meta)
+
+            drop_blobs = []
+            with txn.cursor(db=self._blobs) as curs:
+                for key, _ in curs:
+                    if key.decode("ascii") not in wanted_blobs:
+                        drop_blobs.append(key)
+            for k in drop_blobs:
+                txn.delete(k, db=self._blobs)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            _release_env(self._registry_key)
+
+class DiskCacheProtocol(Protocol):
+    @property
+    def path(self) -> str: ...
+    def load_entry(self, key: bytes) -> dict[str, Any] | None: ...
+    def load_blob(self, value_hash: str) -> bytes | None: ...
+    def store_entry(self, key: bytes, record: dict[str, Any], value_hash: str, value_blob: bytes) -> None: ...
+    def clear(self) -> None: ...
+    def collection_load(self, name: str) -> tuple[dict[str, Any] | None, list[tuple[int, dict[str, Any]]]]: ...
+    def collection_append_many(self, name: str, batch: list[tuple[int, dict[str, Any]]]) -> None: ...
+    def collection_snapshot(self, name: str, record: dict[str, Any], upto_rev: int) -> None: ...
+    def retain(self, wanted_entries: set[bytes], wanted_blobs: set[str]) -> None: ...
+    def close(self) -> None: ...
+
+def DiskCache(cache_dir: str | os.PathLike[str], *, map_size: int, cache_backend: str = "mdbx") -> DiskCacheProtocol:
+    if cache_backend == "lmdb":
+        return LmdbDiskCache(cache_dir, map_size=map_size)
+    return MdbxDiskCache(cache_dir, map_size=map_size)
+

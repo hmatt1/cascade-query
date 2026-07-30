@@ -12,11 +12,13 @@ readme = "README.md"
 [project.optional-dependencies]
 disk = [
     "libmdbx",
+    "lmdb",
     "msgpack",
 ]
 dev = [
     "hypothesis",
     "libmdbx",
+    "lmdb",
     "msgpack",
     "mutmut",
     "pytest",

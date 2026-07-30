@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from . import _canonical
 from ._ast_rewrite import rewrite_query
-from ._disk_cache import DiskCache
+from ._disk_cache import DiskCache, DiskCacheProtocol
 from ._errors import CancellationError, CycleError, PersistentCacheError, QueryCancelled
 from ._evaluator import Evaluator
 from ._incremental import IncrementalRuntime
@@ -254,6 +254,7 @@ class Engine:
         stats_clock: Callable[[], float] | None = None,
         cache_dir: str | os.PathLike[str] | None = None,
         cache_map_size: int = 1 << 30,
+        cache_backend: str = "mdbx",
         incremental: bool = True,
     ) -> None:
         self._trace_limit = trace_limit
@@ -263,10 +264,10 @@ class Engine:
         # Passing cache_dir switches on zero-config persistence: MDBX store,
         # deterministic msgpack serialization, and content fingerprints as the
         # cross-session revision markers. Missing libmdbx/msgpack raises here.
-        self._disk: DiskCache | None = None
+        self._disk: DiskCacheProtocol | None = None
         value_digest: Callable[[Any], str] | None = None
         if cache_dir is not None:
-            self._disk = DiskCache(cache_dir, map_size=cache_map_size)
+            self._disk = DiskCache(cache_dir, map_size=cache_map_size, cache_backend=cache_backend)
             value_digest = _canonical.value_digest
         self._store = GraphStore(
             max_entries=max_entries,
