@@ -223,6 +223,22 @@ class MdbxDiskCache:
                 ) from exc
             raise
 
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None:
+        if not entries:
+            return
+        try:
+            with self._begin(write=True) as txn:
+                for key, record_blob, value_hash, value_blob in entries:
+                    self._blobs.put(txn, value_hash.encode("ascii"), value_blob)
+                    self._meta.put(txn, key, record_blob)
+        except mdbx.MDBXErrorExc as exc:
+            if "MDBX_MAP_FULL" in str(exc):
+                raise PersistentCacheError(
+                    f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
+                    "to Engine, or clear the cache with engine.clear_disk_cache()."
+                ) from exc
+            raise
+
     def clear(self) -> None:
         with self._begin(write=True) as txn:
             self._meta.drop(txn, delete=False)
@@ -467,6 +483,20 @@ class LmdbDiskCache:  # pragma: no cover
                 "to Engine, or clear the cache with engine.clear_disk_cache()."
             ) from exc
 
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None:  # pragma: no cover
+        if not entries:
+            return
+        try:
+            with self._begin(write=True) as txn:
+                for key, record_blob, value_hash, value_blob in entries:
+                    txn.put(value_hash.encode("ascii"), value_blob, db=self._blobs)
+                    txn.put(key, record_blob, db=self._meta)
+        except lmdb.MapFullError as exc:  # pragma: no cover
+            raise PersistentCacheError(
+                f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
+                "to Engine, or clear the cache with engine.clear_disk_cache()."
+            ) from exc
+
     def clear(self) -> None:
         with self._begin(write=True) as txn:
             txn.drop(self._meta, delete=False)
@@ -573,6 +603,7 @@ class DiskCacheProtocol(Protocol):
     def load_entry(self, key: bytes) -> dict[str, Any] | None: ...
     def load_blob(self, value_hash: str) -> bytes | None: ...
     def store_entry(self, key: bytes, record: dict[str, Any], value_hash: str, value_blob: bytes) -> None: ...
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None: ...
     def clear(self) -> None: ...
     def collection_load(self, name: str) -> tuple[dict[str, Any] | None, list[tuple[int, dict[str, Any]]]]: ...
     def collection_append_many(self, name: str, batch: list[tuple[int, dict[str, Any]]]) -> None: ...

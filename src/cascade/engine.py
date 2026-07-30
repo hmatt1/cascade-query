@@ -303,6 +303,7 @@ class Engine:
             raise PersistentCacheError(
                 "engine has no persistent cache; pass cache_dir= to Engine"
             )
+        self._evaluator.flush_disk()
         self._disk.clear()
 
     def transaction(self) -> EngineTransaction:
@@ -350,6 +351,9 @@ class Engine:
     def accumulator(self, name: str) -> Accumulator:
         return Accumulator(self, name=name)
 
+    def flush_disk(self) -> None:
+        self._evaluator.flush_disk()
+
     def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
         """Shut down the lazily created default :meth:`submit` thread pool, if any.
 
@@ -362,6 +366,7 @@ class Engine:
             self._submit_executor = None
         if pool is not None:
             pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+        self._evaluator.shutdown(wait=wait)
         if self._disk is not None:
             self._disk.close()
 

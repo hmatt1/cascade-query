@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 import concurrent.futures
 import contextvars
 import inspect
@@ -36,6 +38,12 @@ class Evaluator:
         self._hydrating_var: contextvars.ContextVar[frozenset[QueryKey]] = (
             contextvars.ContextVar("cascade_hydrating", default=frozenset())
         )
+        self._disk_queue: queue.Queue[tuple[QueryKey, list[list[Any]], Any, Any, str, str | None, int, dict[str, list[Any]]] | None] | None = None
+        self._disk_thread: threading.Thread | None = None
+        if self._disk is not None:
+            self._disk_queue = queue.Queue()
+            self._disk_thread = threading.Thread(target=self._disk_worker, daemon=True)
+            self._disk_thread.start()
 
     def _run_in_runtime(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
         token = self._runtime_var.set(runtime)
@@ -1356,68 +1364,108 @@ class Evaluator:
                 return None  # pragma: no cover
             return memo.value_hash, memo.changed_at
 
+    def _disk_worker(self) -> None:
+        if self._disk is None or self._disk_queue is None:
+            return  # pragma: no cover
+        while True:
+            item = self._disk_queue.get()
+            if item is None:
+                self._disk_queue.task_done()
+                break
+            batch = [item]
+            try:
+                for _ in range(999):
+                    next_item = self._disk_queue.get_nowait()
+                    if next_item is None:
+                        self._disk_queue.put(None)
+                        break
+                    batch.append(next_item)
+            except queue.Empty:
+                pass
+
+            entries = []
+            for key, deps_records, memo_value, memo_error, memo_value_hash, fn_hash, computed_at_time, effects_node in batch:
+                kind, fid, args = key
+                try:
+                    args_blob = _canonical.encode(args)
+                except TypeError:  # pragma: no cover
+                    self._store.trace_event("disk_unkeyed", key)
+                    continue
+                try:
+                    if memo_error is not None:
+                        value_blob = _canonical.encode(memo_error)
+                    else:
+                        value_blob = _canonical.encode(memo_value)
+                except TypeError:  # pragma: no cover
+                    continue
+
+                if _canonical.digest_bytes(value_blob) != memo_value_hash:
+                    self._store.trace_event("disk_skip", key, detail="value mutated before persist")
+                    continue
+
+                record = {
+                    "kind": kind,
+                    "id": fid,
+                    "fn_hash": fn_hash,
+                    "value_hash": memo_value_hash,
+                    "deps": deps_records,
+                    "effects": effects_node,
+                    "is_error": memo_error is not None,
+                    "computed_at_time": computed_at_time,
+                }
+                
+                try:
+                    record_blob = _canonical.encode(record)
+                except TypeError:  # pragma: no cover
+                    continue
+                    
+                entries.append((
+                    _disk_cache.entry_key(kind, fid, args_blob),
+                    record_blob,
+                    memo_value_hash,
+                    value_blob
+                ))
+
+            if entries:
+                try:
+                    self._disk.store_entry_many(entries)
+                except PersistentCacheError:
+                    pass
+                for entry in batch:
+                    self._store.trace_event("disk_store", entry[0])
+            for _ in batch:
+                self._disk_queue.task_done()
+
+    def flush_disk(self) -> None:
+        if self._disk_queue is not None:
+            self._disk_queue.join()
+
+    def shutdown(self, wait: bool = True) -> None:
+        if self._disk_queue is not None:
+            self._disk_queue.put(None)
+            if wait and self._disk_thread is not None:
+                self._disk_thread.join()
+
     def _persist_entry(self, key: QueryKey, memo: MemoEntry) -> None:
-        disk = self._disk
-        if disk is None:
+        if self._disk_queue is None:
             return
-        kind, fid, args = key
-        try:
-            args_blob = _canonical.encode(args)
-        except TypeError:  # pragma: no cover
-            self._store.trace_event("disk_unkeyed", key)  # pragma: no cover
-            return
+            
         deps_records = self._dep_fingerprint_rows(key, memo)
         if deps_records is None:
             return
-        try:
-            if memo.error is not None:
-                value_blob = _canonical.encode(memo.error)
-            else:
-                value_blob = _canonical.encode(memo.value)
-        except TypeError as exc:  # pragma: no cover
-            raise PersistentCacheError(
-                f"query {self._store.key_to_str(key)!r} returned a value the persistent cache "
-                f"cannot serialize: {exc}"
-            ) from exc
-        if _canonical.digest_bytes(value_blob) != memo.value_hash:
-            # The result object mutated between hashing and persistence; storing
-            # it would poison future runs, so skip and recompute next session.
-            self._store.trace_event(
-                "disk_skip", key, detail="value mutated before persist"
+            
+        effects_node = {name: list(items) for name, items in memo.effects.items()}
+        kind, fid, _ = key
+        with self._store.lock:
+            fn_hash = (
+                self._store.query_hashes.get(fid)
+                if kind == "query"
+                else self._store.input_hashes.get(fid)
             )
-            return
-        try:
-            effects_node = {name: list(items) for name, items in memo.effects.items()}
-            with self._store.lock:
-                fn_hash = (
-                    self._store.query_hashes.get(fid)
-                    if kind == "query"
-                    else self._store.input_hashes.get(fid)
-                )
-            record = {
-                "kind": kind,
-                "id": fid,
-                "fn_hash": fn_hash,
-                "value_hash": memo.value_hash,
-                "deps": deps_records,
-                "effects": effects_node,
-                "is_error": memo.error is not None,
-                "computed_at_time": memo.computed_at_time,
-            }
-            disk.store_entry(
-                _disk_cache.entry_key(kind, fid, args_blob),
-                record,
-                memo.value_hash,
-                value_blob,
-            )
-        except PersistentCacheError:
-            raise
-        except TypeError as exc:  # pragma: no cover
-            raise PersistentCacheError(
-                f"accumulator effects recorded by {self._store.key_to_str(key)!r} cannot be "
-                f"serialized for the persistent cache: {exc}"
-            ) from exc
-        self._store.trace_event("disk_store", key)
+            
+        self._disk_queue.put((
+            key, deps_records, memo.value, memo.error, memo.value_hash, fn_hash, memo.computed_at_time, effects_node
+        ))
 
     def _dep_fingerprint_rows(
         self, key: QueryKey, memo: MemoEntry

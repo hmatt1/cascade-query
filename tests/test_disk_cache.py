@@ -343,6 +343,7 @@ def test_disk_serves_entries_evicted_from_memory(tmp_path: Path) -> None:
 
     assert doubled("a") == 2
     assert doubled("b") == 4  # evicts "a" from the in-memory LRU
+    engine.flush_disk()
     assert doubled("a") == 2  # rehydrated from disk instead of recomputed
     assert runs == {"a": 1, "b": 1}
     events = [t.event for t in engine.traces()]
@@ -504,6 +505,7 @@ def test_two_engines_share_one_cache_dir(tmp_path: Path) -> None:
     engine_a, _, _, word_count_a = _session(cache, runs)
     engine_b, _, _, word_count_b = _session(cache, runs)
     assert word_count_a(str(data)) == 4
+    engine_a.flush_disk()
     assert word_count_b(str(data)) == 4
     # Engine B was a separate session reading the same store: it hydrates
     # rather than recomputing.
@@ -613,6 +615,7 @@ def test_disk_cache_prune_vacuum(tmp_path: Path, engine_backend: str) -> None:
     engine, val_a, query_a, query_b = build()
     assert query_a() == 11
     assert query_b() == 22
+    engine.flush_disk()
 
     # Verify both are in the disk cache
     disk = engine._disk
