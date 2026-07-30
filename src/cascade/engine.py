@@ -579,11 +579,11 @@ class Engine:
         if vacuum_disk and self._disk is not None:
             self._evaluator.prune_disk_cache(root_list)
 
-    def save(self, path: str) -> None:
-        save_payload(path, self._store.make_persistence_payload())
+    def save(self, path: str, backend: Literal["sqlite", "mdbx", "lmdb"] = "sqlite") -> None:
+        save_payload(path, self._store.make_persistence_payload(), backend=backend)
 
-    def load(self, path: str) -> None:
-        payload = load_payload(path)
+    def load(self, path: str, backend: Literal["sqlite", "mdbx", "lmdb"] = "sqlite") -> None:
+        payload = load_payload(path, backend=backend)
         if payload is None:
             return
         self._store.assign_loaded_state(payload)

@@ -54,9 +54,10 @@ def test_permutation_incremental_lmdb(tmp_path: Path):
     assert runs2 == {}  # Hydrated from disk, no recompute
     engine2.shutdown()
 
-def test_permutation_snapshot_sqlite(tmp_path: Path):
-    """Permutation B: Pure in-memory with manual save()/load() to SQLite."""
-    db_file = tmp_path / "state.db"
+@pytest.mark.parametrize("backend", ["sqlite", "mdbx", "lmdb"])
+def test_permutation_snapshot(tmp_path: Path, backend: str):
+    """Permutation B: Pure in-memory with manual save()/load() to a backend container."""
+    db_file = tmp_path / ("state.db" if backend == "sqlite" else "state_dir")
     
     # Session 1
     engine1 = Engine(cache_dir=None)
@@ -65,7 +66,7 @@ def test_permutation_snapshot_sqlite(tmp_path: Path):
     assert runs1 == {"multiply_seed": 1}
     
     # Save snapshot
-    engine1.save(str(db_file))
+    engine1.save(str(db_file), backend=backend)
     engine1.shutdown()
     
     # Session 2
@@ -73,7 +74,7 @@ def test_permutation_snapshot_sqlite(tmp_path: Path):
     mult2, runs2 = setup_pipeline(engine2)
     
     # Load snapshot BEFORE executing
-    engine2.load(str(db_file))
+    engine2.load(str(db_file), backend=backend)
     
     assert mult2(5) == 50
     assert runs2 == {}  # Hydrated from snapshot, no recompute

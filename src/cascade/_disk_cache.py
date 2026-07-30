@@ -597,6 +597,215 @@ class LmdbDiskCache:  # pragma: no cover
             self._closed = True
             _release_env(self._registry_key)
 
+
+class SqliteDiskCache:
+    def __init__(self, cache_dir: str | os.PathLike[str], *, map_size: int) -> None:
+        _canonical.require_msgpack()
+        import sqlite3
+        
+        path_dir = os.fspath(cache_dir)
+        os.makedirs(path_dir, exist_ok=True)
+        self._path = os.path.join(path_dir, "cache.db")
+        
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
+        self._closed = False
+        
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            
+        self._ensure_format()
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def _ensure_format(self) -> None:
+        stamp = DISK_FORMAT.to_bytes(4, "big")
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                self._conn.execute("create table if not exists sys (k blob primary key, v blob)")
+                self._conn.execute("create table if not exists meta (k blob primary key, v blob)")
+                self._conn.execute("create table if not exists blobs (k blob primary key, v blob)")
+                self._conn.execute("create table if not exists collections (k blob primary key, v blob)")
+                
+                row = self._conn.execute("select v from sys where k = ?", (_FORMAT_KEY,)).fetchone()
+                current = row[0] if row else None
+                
+                if current == stamp:
+                    self._conn.execute("commit")
+                    return
+                    
+                if current is not None:
+                    self._conn.execute("delete from meta")
+                    self._conn.execute("delete from blobs")
+                    self._conn.execute("delete from collections")
+                    
+                self._conn.execute("insert or replace into sys (k, v) values (?, ?)", (_FORMAT_KEY, stamp))
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    def load_entry(self, key: bytes) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("select v from meta where k = ?", (key,)).fetchone()
+            if row is None:
+                return None
+            try:
+                record = _canonical.decode(bytes(row[0]))
+            except Exception:
+                return None
+            if not isinstance(record, dict):
+                return None
+            return record
+
+    def load_blob(self, value_hash: str) -> bytes | None:
+        with self._lock:
+            row = self._conn.execute("select v from blobs where k = ?", (value_hash.encode("ascii"),)).fetchone()
+            return None if row is None else bytes(row[0])
+
+    def store_entry(
+        self, key: bytes, record: dict[str, Any], value_hash: str, value_blob: bytes
+    ) -> None:
+        record_blob = _canonical.encode(record)
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                self._conn.execute("insert or replace into blobs (k, v) values (?, ?)", (value_hash.encode("ascii"), value_blob))
+                self._conn.execute("insert or replace into meta (k, v) values (?, ?)", (key, record_blob))
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None:
+        if not entries:
+            return
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                for key, record_blob, value_hash, value_blob in entries:
+                    self._conn.execute("insert or replace into blobs (k, v) values (?, ?)", (value_hash.encode("ascii"), value_blob))
+                    self._conn.execute("insert or replace into meta (k, v) values (?, ?)", (key, record_blob))
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    def clear(self) -> None:
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                self._conn.execute("delete from meta")
+                self._conn.execute("delete from blobs")
+                self._conn.execute("delete from collections")
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    @staticmethod
+    def _snap_key(name: str) -> bytes:
+        return b"s\x00" + name.encode("utf-8")
+
+    @staticmethod
+    def _log_prefix(name: str) -> bytes:
+        return b"l\x00" + name.encode("utf-8") + b"\x00"
+
+    def _log_key(self, name: str, rev: int) -> bytes:
+        return self._log_prefix(name) + rev.to_bytes(8, "big")
+
+    def collection_load(
+        self, name: str
+    ) -> tuple[dict[str, Any] | None, list[tuple[int, dict[str, Any]]]]:
+        prefix = self._log_prefix(name)
+        with self._lock:
+            row = self._conn.execute("select v from collections where k = ?", (self._snap_key(name),)).fetchone()
+            snapshot = _canonical.decode(bytes(row[0])) if row is not None else None
+            
+            tail: list[tuple[int, dict[str, Any]]] = []
+            
+            # Since SQLite orders blobs byte-by-byte (memcmp), we can just do >= and < bounds
+            # prefix ends with \x00, so prefix + ÿ is the upper bound
+            upper_bound = prefix[:-1] + b"\xff"
+            
+            cursor = self._conn.execute("select k, v from collections where k >= ? and k < ? order by k asc", (prefix, upper_bound))
+            for k, v in cursor:
+                if not bytes(k).startswith(prefix):
+                    break
+                rev = int.from_bytes(bytes(k)[len(prefix):], "big")
+                tail.append((rev, _canonical.decode(bytes(v))))
+                
+        return snapshot, tail
+
+    def collection_append_many(
+        self, name: str, batch: list[tuple[int, dict[str, Any]]]
+    ) -> None:
+        blobs = [
+            (self._log_key(name, rev), _canonical.encode(diff)) for rev, diff in batch
+        ]
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                for k, v in blobs:
+                    self._conn.execute("insert or replace into collections (k, v) values (?, ?)", (k, v))
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    def collection_snapshot(
+        self, name: str, record: dict[str, Any], upto_rev: int
+    ) -> None:
+        snap_blob = _canonical.encode(record)
+        prefix = self._log_prefix(name)
+        
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                self._conn.execute("insert or replace into collections (k, v) values (?, ?)", (self._snap_key(name), snap_blob))
+                
+                # Delete older log entries
+                upper_bound = prefix + (upto_rev + 1).to_bytes(8, "big")
+                self._conn.execute("delete from collections where k >= ? and k < ?", (prefix, upper_bound))
+                
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    def retain(self, wanted_entries: set[bytes], wanted_blobs: set[str]) -> None:
+        with self._lock:
+            self._conn.execute("begin")
+            try:
+                # Meta
+                rows = self._conn.execute("select k from meta").fetchall()
+                for row in rows:
+                    if row[0] not in wanted_entries:
+                        self._conn.execute("delete from meta where k = ?", (row[0],))
+                        
+                # Blobs
+                wanted_blobs_bytes = {b.encode("ascii") for b in wanted_blobs}
+                rows = self._conn.execute("select k from blobs").fetchall()
+                for row in rows:
+                    if row[0] not in wanted_blobs_bytes:
+                        self._conn.execute("delete from blobs where k = ?", (row[0],))
+                        
+                self._conn.execute("commit")
+            except Exception:
+                self._conn.execute("rollback")
+                raise
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            with self._lock:
+                self._conn.close()
+
+
 class DiskCacheProtocol(Protocol):
     @property
     def path(self) -> str: ...
@@ -614,5 +823,7 @@ class DiskCacheProtocol(Protocol):
 def DiskCache(cache_dir: str | os.PathLike[str], *, map_size: int, cache_backend: str = "mdbx") -> DiskCacheProtocol:
     if cache_backend == "lmdb":
         return LmdbDiskCache(cache_dir, map_size=map_size)
+    if cache_backend == "sqlite":
+        return SqliteDiskCache(cache_dir, map_size=map_size)
     return MdbxDiskCache(cache_dir, map_size=map_size)
 
