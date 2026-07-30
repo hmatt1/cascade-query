@@ -1,6 +1,18 @@
 from __future__ import annotations
 
 import pytest
+from typing import Any
+
+@pytest.fixture(params=["mdbx", "sqlite"], autouse=True)
+def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    original_init = Engine.__init__
+
+    def new_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("cache_backend", request.param)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Engine, "__init__", new_init)
+    return request.param
 from hypothesis import given, settings
 from hypothesis import strategies as st
 

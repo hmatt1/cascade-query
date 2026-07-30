@@ -10,7 +10,7 @@ import cascade._canonical as canonical
 import cascade._disk_cache as disk_cache_mod
 from cascade import Engine, PersistentCacheError
 
-@pytest.fixture(params=["mdbx", "lmdb"], autouse=True)
+@pytest.fixture(params=["mdbx", "lmdb", "sqlite"], autouse=True)
 def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
     original_init = Engine.__init__
 
@@ -126,7 +126,9 @@ def test_entry_key_is_deterministic_and_arg_sensitive() -> None:
 def test_missing_mdbx_raises_with_install_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 , engine_backend: str) -> None:
-    if engine_backend == "lmdb":
+    if engine_backend != "mdbx":
+        pytest.skip("mdbx internal test")
+    if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
     monkeypatch.setattr(disk_cache_mod, "mdbx", None)
     with pytest.raises(PersistentCacheError, match="pip install libmdbx"):
@@ -377,7 +379,9 @@ def test_clear_disk_cache_without_cache_dir_raises() -> None:
 
 
 def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path, engine_backend: str) -> None:
-    if engine_backend == "lmdb":
+    if engine_backend != "mdbx":
+        pytest.skip("mdbx internal test")
+    if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
     data = tmp_path / "a.txt"
     data.write_text("one two")
@@ -406,7 +410,9 @@ def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path, engine_backend: st
 
 
 def test_format_bump_wipes_stale_cache(tmp_path: Path, engine_backend: str) -> None:
-    if engine_backend == "lmdb":
+    if engine_backend != "mdbx":
+        pytest.skip("mdbx internal test")
+    if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
     data = tmp_path / "a.txt"
     data.write_text("one two")
@@ -587,7 +593,7 @@ def test_pinned_snapshot_isolation_holds_with_disk_cache(tmp_path: Path) -> None
 
 
 def test_disk_cache_prune_vacuum(tmp_path: Path, engine_backend: str) -> None:
-    if engine_backend == "lmdb":
+    if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
     cache = tmp_path / "cache"
 
@@ -674,7 +680,7 @@ def test_disk_cache_prune_vacuum_no_disk() -> None:
 
 
 def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path, engine_backend: str) -> None:
-    if engine_backend == "lmdb":
+    if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
     cache = tmp_path / "cache"
     engine = Engine(cache_dir=cache)
@@ -899,7 +905,7 @@ def test_deep_dependency_chain_cross_session(tmp_path: Path) -> None:
 def test_collection_snapshot_does_not_scan_entire_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 , engine_backend: str) -> None:
-    if engine_backend == "lmdb":
+    if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
     cache = tmp_path / "cache"
     disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24)
@@ -926,3 +932,71 @@ def test_collection_snapshot_does_not_scan_entire_log(
     # Revisions 1 through 5, plus revision 6 which breaks the loop
     assert iterations == 6
     disk.close()
+
+
+def test_disk_cache_collections_basic(tmp_path: Path, engine_backend: str) -> None:
+    cache = tmp_path / "cache"
+    disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24, cache_backend=engine_backend)
+    
+    # Empty
+    snap, tail = disk.collection_load("my_col")
+    assert snap is None
+    assert tail == []
+    
+    # Append
+    disk.collection_append_many("my_col", [(1, {"diff": 1}), (2, {"diff": 2})])
+    snap, tail = disk.collection_load("my_col")
+    assert snap is None
+    assert tail == [(1, {"diff": 1}), (2, {"diff": 2})]
+    
+    # Snapshot
+    disk.collection_snapshot("my_col", {"snap": True}, upto_rev=1)
+    
+    # Load after snapshot
+    snap, tail = disk.collection_load("my_col")
+    assert snap == {"snap": True}
+    assert tail == [(2, {"diff": 2})]
+    
+    disk.close()
+
+
+def test_format_bump_sqlite(tmp_path: Path) -> None:
+    data = tmp_path / "a.txt"
+    data.write_text("one two")
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+
+    from cascade import Engine
+
+    engine_a = Engine(cache_dir=cache, cache_backend="sqlite")
+    
+    @engine_a.query
+    def word_count(p: str) -> int:
+        runs["word_count"] = runs.get("word_count", 0) + 1
+        return len(Path(p).read_text().split())
+
+    assert word_count(str(data)) == 2
+    engine_a.shutdown()
+
+    # Manually bump sqlite format
+    import sqlite3
+    import cascade._disk_cache as disk_cache_mod
+    conn = sqlite3.connect(cache / "cache.db")
+    conn.execute("update sys set v = ? where k = ?", ((999).to_bytes(4, "big"), disk_cache_mod._FORMAT_KEY))
+    conn.commit()
+    conn.close()
+
+    runs.clear()
+    engine_b = Engine(cache_dir=cache, cache_backend="sqlite")
+    
+    @engine_b.query
+    def word_count_b(p: str) -> int:
+        runs["word_count"] = runs.get("word_count", 0) + 1
+        return len(Path(p).read_text().split())
+        
+    assert word_count_b(str(data)) == 2
+    assert runs == {"word_count": 1}
+    
+    # Check .path for coverage
+    assert engine_b._disk.path == str(cache / "cache.db")
+    engine_b.shutdown()
