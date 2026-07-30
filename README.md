@@ -67,9 +67,10 @@ print(get_result())
 
 The `Engine` manages caching, execution, and state tracking.
 
-*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, incremental=True)`**: Initializes the engine. 
+*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental=True)`**: Initializes the engine. 
     *   `max_entries` sets the limit for the Least Recently Used (LRU) in-memory cache. 
     *   Passing `cache_dir` enables persistent disk caching.
+    *   `cache_backend` allows you to select the storage engine for persistence (`"mdbx"`, `"sqlite"`, or `"lmdb"`).
 
 ### Defining Nodes: `@engine.input` and `@engine.query`
 
@@ -200,13 +201,17 @@ print(effects["warnings"])
 ```
 
 ### Persistent Disk Caching
-Passing `cache_dir` to the `Engine` turns on zero-config persistence. Cascade provisions an embedded MDBX store, serializes query results with a deterministic msgpack encoding, and fingerprints every input value by hashing its serialized bytes with blake2b.
+Passing `cache_dir` to the `Engine` turns on zero-config persistence. Cascade provisions an embedded store (MDBX by default), serializes query results with a deterministic msgpack encoding, and fingerprints every input value by hashing its serialized bytes with blake2b.
 
 ```python
 from cascade import Engine
+# Uses the default "mdbx" backend:
 engine = Engine(max_entries=10_000, cache_dir=".cascade_cache")
+
+# Or opt into an alternative backend, like SQLite:
+sqlite_engine = Engine(max_entries=10_000, cache_dir=".cascade_cache", cache_backend="sqlite")
 ```
-*   `libmdbx` and `msgpack` are required (`pip install query-cascade[disk]`).
+*   `libmdbx` and `msgpack` are required for the default backend (`pip install query-cascade[disk]`). You can also use `sqlite` which has no external dependencies.
 *   Values and arguments must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.).
 *   **`engine.clear_disk_cache()`**: Deletes every entry in the persistent disk cache.
 

@@ -261,9 +261,10 @@ class Engine:
         # Global opt-out for the map/reduce AST interception; per-query
         # incremental= on @engine.query overrides it in either direction.
         self._incremental_default = incremental
-        # Passing cache_dir switches on zero-config persistence: MDBX store,
-        # deterministic msgpack serialization, and content fingerprints as the
-        # cross-session revision markers. Missing libmdbx/msgpack raises here.
+        # Passing cache_dir switches on zero-config persistence (MDBX by default,
+        # or sqlite/lmdb), deterministic msgpack serialization, and content
+        # fingerprints as the cross-session revision markers. Missing dependencies
+        # (e.g. libmdbx/msgpack) raise here.
         self._disk: DiskCacheProtocol | None = None
         value_digest: Callable[[Any], str] | None = None
         if cache_dir is not None:
