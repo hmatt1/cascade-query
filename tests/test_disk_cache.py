@@ -10,6 +10,25 @@ import cascade._canonical as canonical
 import cascade._disk_cache as disk_cache_mod
 from cascade import Engine, PersistentCacheError
 
+@pytest.fixture(params=["mdbx", "lmdb"], autouse=True)
+def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    original_init = Engine.__init__
+
+    def new_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("cache_backend", request.param)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Engine, "__init__", new_init)
+
+    original_disk_cache = disk_cache_mod.DiskCache
+
+    def new_disk_cache(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("cache_backend", request.param)
+        return original_disk_cache(*args, **kwargs)
+
+    monkeypatch.setattr(disk_cache_mod, "DiskCache", new_disk_cache)
+    return request.param
+
 
 @dataclass(frozen=True)
 class _Ast:
@@ -106,7 +125,9 @@ def test_entry_key_is_deterministic_and_arg_sensitive() -> None:
 
 def test_missing_mdbx_raises_with_install_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+, engine_backend: str) -> None:
+    if engine_backend == "lmdb":
+        pytest.skip("mdbx internal test")
     monkeypatch.setattr(disk_cache_mod, "mdbx", None)
     with pytest.raises(PersistentCacheError, match="pip install libmdbx"):
         Engine(cache_dir=tmp_path / "cache")
@@ -354,7 +375,9 @@ def test_clear_disk_cache_without_cache_dir_raises() -> None:
     engine.shutdown()
 
 
-def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path) -> None:
+def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path, engine_backend: str) -> None:
+    if engine_backend == "lmdb":
+        pytest.skip("mdbx internal test")
     data = tmp_path / "a.txt"
     data.write_text("one two")
     cache = tmp_path / "cache"
@@ -381,7 +404,9 @@ def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path) -> None:
     engine_b.shutdown()
 
 
-def test_format_bump_wipes_stale_cache(tmp_path: Path) -> None:
+def test_format_bump_wipes_stale_cache(tmp_path: Path, engine_backend: str) -> None:
+    if engine_backend == "lmdb":
+        pytest.skip("mdbx internal test")
     data = tmp_path / "a.txt"
     data.write_text("one two")
     cache = tmp_path / "cache"
@@ -559,7 +584,9 @@ def test_pinned_snapshot_isolation_holds_with_disk_cache(tmp_path: Path) -> None
     engine_b.shutdown()
 
 
-def test_disk_cache_prune_vacuum(tmp_path: Path) -> None:
+def test_disk_cache_prune_vacuum(tmp_path: Path, engine_backend: str) -> None:
+    if engine_backend == "lmdb":
+        pytest.skip("mdbx internal test")
     cache = tmp_path / "cache"
 
     def build() -> tuple[Engine, Any, Any, Any]:
@@ -643,7 +670,9 @@ def test_disk_cache_prune_vacuum_no_disk() -> None:
     engine.shutdown()
 
 
-def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path) -> None:
+def test_disk_cache_prune_vacuum_edge_cases(tmp_path: Path, engine_backend: str) -> None:
+    if engine_backend == "lmdb":
+        pytest.skip("mdbx internal test")
     cache = tmp_path / "cache"
     engine = Engine(cache_dir=cache)
     disk = engine._disk
@@ -866,7 +895,9 @@ def test_deep_dependency_chain_cross_session(tmp_path: Path) -> None:
 
 def test_collection_snapshot_does_not_scan_entire_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+, engine_backend: str) -> None:
+    if engine_backend == "lmdb":
+        pytest.skip("mdbx internal test")
     cache = tmp_path / "cache"
     disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24)
     name = "test_col"

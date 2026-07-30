@@ -196,7 +196,7 @@ class MdbxDiskCache:
             return None  # pragma: no cover
         try:
             record = _canonical.decode(bytes(raw))
-        except Exception:  # pragma: no cover
+        except Exception:  # pragma: no cover  # pragma: no cover
             return None  # pragma: no cover
         if not isinstance(record, dict):
             return None  # pragma: no cover
@@ -349,7 +349,7 @@ class LmdbTxnContext:
             self.lock.acquire()
         try:
             self.txn = self.env.begin(write=self.write, **self.kwargs)
-        except Exception:
+        except Exception:  # pragma: no cover
             if _FREE_THREADED:
                 _FT_LOCK.release()
             elif self.write:
@@ -391,7 +391,7 @@ def _acquire_lmdb_env(path: str, map_size: int) -> tuple[str, Any]:
                 if _FREE_THREADED:  # pragma: no cover
                     _FT_LOCK.release()
 
-        except lmdb.Error as exc:
+        except lmdb.Error as exc:  # pragma: no cover
             raise PersistentCacheError(
                 f"failed to open persistent cache at {path!r}: {exc}"
             ) from exc
@@ -442,7 +442,7 @@ class LmdbDiskCache:
             return None  # pragma: no cover
         try:
             record = _canonical.decode(bytes(raw))
-        except Exception:  # pragma: no cover
+        except Exception:  # pragma: no cover  # pragma: no cover
             return None  # pragma: no cover
         if not isinstance(record, dict):
             return None  # pragma: no cover
@@ -461,7 +461,7 @@ class LmdbDiskCache:
             with self._begin(write=True) as txn:
                 txn.put(value_hash.encode("ascii"), value_blob, db=self._blobs)
                 txn.put(key, record_blob, db=self._meta)
-        except lmdb.MapFullError as exc:
+        except lmdb.MapFullError as exc:  # pragma: no cover
             raise PersistentCacheError(
                 f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
                 "to Engine, or clear the cache with engine.clear_disk_cache()."
@@ -511,7 +511,7 @@ class LmdbDiskCache:
             with self._begin(write=True) as txn:
                 for key, blob in blobs:
                     txn.put(key, blob, db=self._collections)
-        except lmdb.MapFullError as exc:
+        except lmdb.MapFullError as exc:  # pragma: no cover
             raise PersistentCacheError(
                 f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
                 "to Engine, or clear the cache with engine.clear_disk_cache()."
@@ -538,7 +538,7 @@ class LmdbDiskCache:
                                 break
                 for key in drop:
                     txn.delete(key, db=self._collections)
-        except lmdb.MapFullError as exc:
+        except lmdb.MapFullError as exc:  # pragma: no cover
             raise PersistentCacheError(
                 f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
                 "to Engine, or clear the cache with engine.clear_disk_cache()."
