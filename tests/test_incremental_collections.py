@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
+from cascade import CascadeDict, CascadeList, CascadeSet, Engine
+
 from typing import Any
 
 @pytest.fixture(params=["mdbx", "sqlite"], autouse=True)
@@ -13,10 +18,7 @@ def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(Engine, "__init__", new_init)
     return request.param
-from hypothesis import given, settings
-from hypothesis import strategies as st
 
-from cascade import CascadeDict, CascadeList, CascadeSet, Engine
 
 
 @pytest.fixture
