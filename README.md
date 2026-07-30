@@ -286,6 +286,25 @@ Rewriting covers comprehensions (`[...]`, `{...}`, `{k: v ...}`), `map`, `filter
 *   `enumerate()` and `zip()` sources are explicitly excluded.
 *   Opt out globally via `Engine(incremental=False)` or per-query `@engine.query(incremental=False)`.
 
+### Batching Mutations for Disk Performance
+
+By design, Cascade collections use an immediate write-ahead pattern for crash-safety. Every time you mutate a collection (`__setitem__`, `append()`, `add()`), Cascade immediately opens a disk transaction, writes the diff to the MDBX event log, and forces an OS sync (`fsync`). 
+
+If you iterate through a loop inserting thousands of records one by one, you will trigger thousands of physical disk syncs, resulting in extremely slow performance (e.g., waiting on disk I/O).
+
+To avoid this, always align disk syncs with your **logical units of work** by batching bulk-inserts using `.update()` or `extend()`. This allows Cascade to group all changes into a single disk transaction:
+
+```python
+# SLOW (10,000 separate disk syncs)
+for i in range(10000):
+    docs[f"doc_{i}"] = i
+
+# FAST (1 single disk sync)
+docs.update({f"doc_{i}": i for i in range(10000)})
+```
+
+*(Note: `.update()` behaves exactly like a standard Python dictionary. If a key already exists, it will seamlessly overwrite the old value by batching an `"upsert"` event to the underlying log, ensuring downstream queries receive the correct diffs.)*
+
 ### Persistence & Inspection
 
 A **named** collection on an engine with `cache_dir` event-sources its log to disk automatically.

@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 .mutmut-cache
 mutants/
+*/data.mdb
+*/lock.mdb
+*/mdbx.dat
+*/mdbx.lck

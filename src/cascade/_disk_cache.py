@@ -37,13 +37,17 @@ _FT_LOCK = threading.RLock()
 
 
 class TxnContext:
-    def __init__(self, txn: Any, write: bool) -> None:
-        self.txn = txn
+    def __init__(self, env: Any, write: bool, kwargs: dict[str, Any]) -> None:
+        self.env = env
         self.write = write
+        self.kwargs = kwargs
+        self.txn: Any = None
 
     def __enter__(self) -> Any:
         if _FREE_THREADED:
             _FT_LOCK.acquire()  # pragma: no cover
+        flags = 0 if self.write else mdbx.MDBXTXNFlags.MDBX_TXN_RDONLY
+        self.txn = self.env.start_transaction(flags=flags, **self.kwargs)
         return self.txn.__enter__()
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
@@ -158,9 +162,7 @@ class DiskCache:
         return self._env.get_path()
 
     def _begin(self, write: bool = False, **kwargs: Any) -> Any:
-        flags = 0 if write else mdbx.MDBXTXNFlags.MDBX_TXN_RDONLY
-        txn = self._env.start_transaction(flags=flags, **kwargs)
-        return TxnContext(txn, write)
+        return TxnContext(self._env, write, kwargs)
 
     def _ensure_format(self) -> None:
         stamp = DISK_FORMAT.to_bytes(4, "big")
@@ -281,6 +283,8 @@ class DiskCache:
                             break
                         if int.from_bytes(kb[len(prefix) :], "big") <= upto_rev:
                             drop.append(kb)
+                        else:
+                            break
                 for key in drop:
                     self._collections.delete(txn, key)
         except mdbx.MDBXErrorExc as exc:
