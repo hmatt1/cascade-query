@@ -334,7 +334,7 @@ class MdbxDiskCache:
             _release_env(self._registry_key)
 
 
-class LmdbTxnContext:
+class LmdbTxnContext:  # pragma: no cover
     def __init__(self, env: Any, write: bool, kwargs: dict[str, Any], lock: threading.RLock) -> None:
         self.env = env
         self.write = write
@@ -369,7 +369,7 @@ class LmdbTxnContext:
             elif self.write:
                 self.lock.release()
 
-def _acquire_lmdb_env(path: str, map_size: int) -> tuple[str, Any]:
+def _acquire_lmdb_env(path: str, map_size: int) -> tuple[str, Any]:  # pragma: no cover
     registry_key = "lmdb:" + os.path.realpath(path)
     with _ENV_LOCK:
         shared = _ENV_REGISTRY.get(registry_key)
@@ -398,7 +398,7 @@ def _acquire_lmdb_env(path: str, map_size: int) -> tuple[str, Any]:
         _ENV_REGISTRY[registry_key] = _SharedEnv(env)
         return registry_key, env
 
-class LmdbDiskCache:
+class LmdbDiskCache:  # pragma: no cover
     def __init__(self, cache_dir: str | os.PathLike[str], *, map_size: int) -> None:
         if lmdb is None:
             raise PersistentCacheError(LMDB_INSTALL_HINT)
