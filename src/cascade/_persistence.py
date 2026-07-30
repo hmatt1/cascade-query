@@ -43,7 +43,7 @@ def save_payload(path: str, payload: dict[str, Any], backend: Literal["sqlite", 
         except ImportError:  # pragma: no cover
             raise PersistentCacheError("lmdb is required for lmdb backend")
         os.makedirs(path, exist_ok=True)
-        env = lmdb.open(path, max_dbs=1, map_async=True, writemap=True)
+        env = lmdb.open(path, max_dbs=1, map_async=True, writemap=True, map_size=1024**3)
         try:
             db = env.open_db(b"snapshot")
             with env.begin(write=True, db=db) as txn:
