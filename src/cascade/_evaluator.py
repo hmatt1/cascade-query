@@ -954,6 +954,7 @@ class Evaluator:
         record = disk.load_entry(_disk_cache.entry_key(kind, fid, args_blob))
         if record is None:
             self._store.trace_event("disk_miss", key)
+            self._store.record_disk_miss()
             return None  # pragma: no cover
 
         fn_hash = record.get("fn_hash")
@@ -1027,6 +1028,7 @@ class Evaluator:
                 self._store.dependents[dep_key].add(key)
             self._store.evict_if_needed_locked()
         self._store.trace_event("disk_hit", key)
+        self._store.record_disk_hit()
         return memo
 
     def _verify_disk_deps(
@@ -1165,6 +1167,7 @@ class Evaluator:
         record = disk.load_entry(_disk_cache.entry_key(kind, fid, args_blob))
         if record is None:
             self._store.trace_event("disk_miss", key)  # pragma: no cover
+            self._store.record_disk_miss()
             return None  # pragma: no cover
 
         fn_hash = record.get("fn_hash")
@@ -1241,6 +1244,7 @@ class Evaluator:
                 self._store.dependents[dep_key].add(key)
             self._store.evict_if_needed_locked()
         self._store.trace_event("disk_hit", key)
+        self._store.record_disk_hit()
         return memo
 
     async def _verify_disk_deps_async(  # pragma: no cover
@@ -1433,6 +1437,7 @@ class Evaluator:
                     pass
                 for entry in batch:
                     self._store.trace_event("disk_store", entry[0])
+                    self._store.record_disk_store()
             for _ in batch:
                 self._disk_queue.task_done()
 

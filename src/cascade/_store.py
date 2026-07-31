@@ -53,6 +53,11 @@ class GraphStore:
             if self._stats_eviction_recent_cap > 0
             else None
         )
+        self._stats_disk_hits = 0
+        self._stats_disk_misses = 0
+        self._stats_disk_stores = 0
+        self._stats_persistence_loads = 0
+        self._stats_persistence_saves = 0
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
         self.input_hashes: dict[str, str] = {}
@@ -107,6 +112,11 @@ class GraphStore:
             self._stats_by_key.clear()
             self._stats_evictions_total = 0
             self._stats_evictions_recent.clear()
+            self._stats_disk_hits = 0
+            self._stats_disk_misses = 0
+            self._stats_disk_stores = 0
+            self._stats_persistence_loads = 0
+            self._stats_persistence_saves = 0
 
     def stats_summary(self) -> dict[str, Any]:
         with self.lock:
@@ -116,7 +126,37 @@ class GraphStore:
                 "evictions_recent": list(self._stats_evictions_recent),
                 "memo_count": len(self.memos),
                 "max_entries": self.max_entries,
+                "disk_hits": self._stats_disk_hits,
+                "disk_misses": self._stats_disk_misses,
+                "disk_stores": self._stats_disk_stores,
+                "persistence_loads": self._stats_persistence_loads,
+                "persistence_saves": self._stats_persistence_saves,
             }
+
+    def record_disk_hit(self) -> None:
+        with self.lock:
+            if self._stats_enabled:
+                self._stats_disk_hits += 1
+
+    def record_disk_miss(self) -> None:
+        with self.lock:
+            if self._stats_enabled:
+                self._stats_disk_misses += 1
+
+    def record_disk_store(self) -> None:
+        with self.lock:
+            if self._stats_enabled:
+                self._stats_disk_stores += 1
+
+    def record_persistence_load(self) -> None:
+        with self.lock:
+            if self._stats_enabled:
+                self._stats_persistence_loads += 1
+
+    def record_persistence_save(self) -> None:
+        with self.lock:
+            if self._stats_enabled:
+                self._stats_persistence_saves += 1
 
     def record_query_body_time(self, key: QueryKey, seconds: float) -> None:
         if seconds < 0:
@@ -424,7 +464,7 @@ class GraphStore:
             return graph
 
     def subgraph(
-        self, roots: Sequence[QueryKey | str], *, direction: str
+        self, roots: Sequence[QueryKey | str], *, direction: str, condense: bool = False
     ) -> dict[str, Any]:
         if direction not in ("deps", "dependents"):
             raise ValueError("direction must be 'deps' or 'dependents'")
@@ -489,13 +529,19 @@ class GraphStore:
             edges_out = [
                 (p, d) for p, d in edges_full if p in reachable and d in reachable
             ]
-            return {
+            graph = {
                 "revision": self.revision,
                 "memo_count": len(nodes_out),
                 "input_count": len(self.inputs),
                 "nodes": nodes_out,
                 "edges": edges_out,
             }
+            if condense:
+                from ._graph_export import condense_graph
+                condensed = condense_graph(graph)
+                graph["nodes"] = condensed["nodes"]
+                graph["edges"] = condensed["edges"]
+            return graph
 
     def prune(self, roots: list[QueryKey]) -> None:
         with self.lock:

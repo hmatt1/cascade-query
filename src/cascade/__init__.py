@@ -1,5 +1,5 @@
 from ._collections import CascadeDict, CascadeList, CascadeSet
-from ._graph_export import export_dot, export_mermaid
+from ._graph_export import condense_graph, export_dot, export_mermaid
 from ._state import QueryKey
 from .engine import (
     Accumulator,
@@ -25,6 +25,7 @@ __all__ = [
     "QueryKey",
     "Snapshot",
     "TraceEvent",
+    "condense_graph",
     "export_dot",
     "export_mermaid",
 ]

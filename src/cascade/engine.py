@@ -517,6 +517,11 @@ class Engine:
         self._store.clear_traces()
 
     def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
+        """Inspect the current state of the computation graph.
+
+        Args:
+            condense: Groups nodes sharing the same base query name (ignoring arguments) into a single summary node when N >= 2.
+        """
         graph = self._store.inspect_graph(condense=condense)
         extra_nodes, extra_edges = self._incremental_rt.graph_extras()
         if extra_nodes:
@@ -536,6 +541,7 @@ class Engine:
         roots: Sequence[QueryKey | str],
         *,
         direction: Literal["deps", "dependents"] = "deps",
+        condense: bool = False,
     ) -> dict[str, Any]:
         """Memoized nodes/edges reachable from ``roots`` (default: transitive dependencies).
 
@@ -548,8 +554,10 @@ class Engine:
         roots are ignored (same policy as :meth:`prune`). ``QueryKey`` roots not
         present in the memo table are ignored. Empty ``roots`` yields empty
         ``nodes`` and ``edges`` (no exception). Thread-safe under the store lock.
+
+        If ``condense`` is True, groups nodes sharing the same base query name (ignoring arguments) into a single summary node when N >= 2.
         """
-        return self._store.subgraph(roots, direction=direction)
+        return self._store.subgraph(roots, direction=direction, condense=condense)
 
     def enable_stats(self, enabled: bool = True) -> None:
         self._store.set_stats_enabled(enabled)
@@ -582,12 +590,14 @@ class Engine:
 
     def save(self, path: str, backend: Literal["sqlite", "mdbx", "lmdb"] = "sqlite") -> None:
         save_payload(path, self._store.make_persistence_payload(), backend=backend)
+        self._store.record_persistence_save()
 
     def load(self, path: str, backend: Literal["sqlite", "mdbx", "lmdb"] = "sqlite") -> None:
         payload = load_payload(path, backend=backend)
         if payload is None:
             return
         self._store.assign_loaded_state(payload)
+        self._store.record_persistence_load()
 
     # --- internals ---
     def _function_id(self, fn: Callable[..., Any]) -> str:
