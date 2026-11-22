@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -145,6 +146,15 @@ def test_missing_msgpack_raises_with_install_hint(
 
 # --- helpers for cross-session scenarios ---
 
+# Query bodies run on worker threads in the compute_many tests. Without the
+# GIL (3.14t), an unlocked ``runs[k] = runs.get(k, 0) + 1`` loses updates.
+_RUNS_LOCK = threading.Lock()
+
+
+def _count_run(runs: dict[str, int], name: str) -> None:
+    with _RUNS_LOCK:
+        runs[name] = runs.get(name, 0) + 1
+
 
 def _build_file_pipeline(
     cache_dir: Path, runs: dict[str, int]
@@ -158,7 +168,7 @@ def _build_file_pipeline(
 
     @engine.query
     def normalized(path: str) -> str:
-        runs["normalized"] = runs.get("normalized", 0) + 1
+        _count_run(runs, "normalized")
         text = source_text(path)
         if "\t" in text:
             warnings.push({"code": "tabs", "path": path})
@@ -166,7 +176,7 @@ def _build_file_pipeline(
 
     @engine.query
     def word_count(path: str) -> int:
-        runs["word_count"] = runs.get("word_count", 0) + 1
+        _count_run(runs, "word_count")
         return len(normalized(path).split())
 
     return engine, source_text, normalized, word_count
@@ -378,11 +388,13 @@ def test_clear_disk_cache_without_cache_dir_raises() -> None:
     engine.shutdown()
 
 
-def test_corrupt_blob_falls_back_to_recompute(tmp_path: Path, engine_backend: str) -> None:
+def test_corrupt_blob_falls_back_to_recompute(
+    tmp_path: Path, engine_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
-    if engine_backend != "mdbx":
-        pytest.skip("mdbx internal test")
+    # Force even small values into the blob store, which this test corrupts.
+    monkeypatch.setattr(disk_cache_mod, "INLINE_VALUE_MAX_BYTES", -1)
     data = tmp_path / "a.txt"
     data.write_text("one two")
     cache = tmp_path / "cache"
@@ -592,9 +604,13 @@ def test_pinned_snapshot_isolation_holds_with_disk_cache(tmp_path: Path) -> None
     engine_b.shutdown()
 
 
-def test_disk_cache_prune_vacuum(tmp_path: Path, engine_backend: str) -> None:
+def test_disk_cache_prune_vacuum(
+    tmp_path: Path, engine_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if engine_backend != "mdbx":
         pytest.skip("mdbx internal test")
+    # Force even small values into the blob store so blob pruning is exercised.
+    monkeypatch.setattr(disk_cache_mod, "INLINE_VALUE_MAX_BYTES", -1)
     cache = tmp_path / "cache"
 
     def build() -> tuple[Engine, Any, Any, Any]:

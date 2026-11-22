@@ -11,32 +11,36 @@ The benchmark was executed using `benchmarks/performance_matrix.py` against a sy
   - **Memory + Save/Load**: Evaluates cold/hot compute times purely in memory, as well as explicit state dump and state hydration operations.
   - **Disk Cache Enabled**: Evaluates cold compute time (which inherently includes background serialization and writing to disk cache) and a secondary "Disk Cache Hit" time (hydrating on an empty engine reading directly from disk cache).
 
-> **Caveat (2026-11-21):** this run used the `Engine` default `max_entries=10_000`
-> against a ~250,000-node graph, so the LRU was evicting throughout and every
-> timing below includes eviction and recompute churn. `performance_matrix.py`
-> now sizes `max_entries` to the graph; rerun it before relying on these
-> numbers. For raw per-node engine overhead, see `benchmarks/engine_overhead.py`.
+> **Rerun 2026-11-21.** The original run used the `Engine` default
+> `max_entries=10_000` against this ~250,000-node graph, so the LRU evicted
+> throughout and its timings mixed in eviction churn (and its Save/Load columns
+> covered only ~10,000 memos). `performance_matrix.py` now sizes `max_entries`
+> to the graph. The numbers below are from that fixed benchmark, after the
+> hot-path and disk format 2 optimizations, on Python 3.12 (GIL build). They are
+> a single run per cell, so differences of 10-20% between rows are noise. For
+> repeatable per-node engine overhead, see `benchmarks/engine_overhead.py`.
 
 ## Results
 
 | Backend | Stats | Mode | Cold (s) | Hot (s) | Save (s) | Load (s) | Disk Cache Hit (s) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| sqlite | False | Memory + Save/Load | 5.6357 | 0.0000 | 0.8740 | 0.5484 | - |
-| sqlite | False | Disk Cache | 30.3790 | - | - | - | 13.3672 |
-| lmdb | False | Memory + Save/Load | 6.3892 | 0.0000 | 0.9992 | 0.6750 | - |
-| lmdb | False | Disk Cache | 12.1140 | - | - | - | 11.0339 |
-| mdbx | False | Memory + Save/Load | 6.8195 | 0.0000 | 1.4244 | 1.0451 | - |
-| mdbx | False | Disk Cache | 26.9976 | - | - | - | 20.9087 |
-| sqlite | True | Memory + Save/Load | 7.6900 | 0.0000 | 1.3127 | 0.9004 | - |
-| sqlite | True | Disk Cache | 34.0900 | - | - | - | 14.7107 |
-| lmdb | True | Memory + Save/Load | 7.9378 | 0.0001 | 1.2986 | 0.9307 | - |
-| lmdb | True | Disk Cache | 14.2435 | - | - | - | 12.1503 |
-| mdbx | True | Memory + Save/Load | 7.8589 | 0.0000 | 1.5756 | 1.2119 | - |
-| mdbx | True | Disk Cache | 26.4062 | - | - | - | 21.3382 |
+| sqlite | False | Memory + Save/Load | 3.1604 | 0.0000 | 11.8244 | 7.0730 | - |
+| sqlite | False | Disk Cache | 16.4262 | - | - | - | 6.2496 |
+| lmdb | False | Memory + Save/Load | 4.4442 | 0.0000 | 12.3047 | 8.0137 | - |
+| lmdb | False | Disk Cache | 6.3084 | - | - | - | 6.1989 |
+| mdbx | False | Memory + Save/Load | 4.0676 | 0.0000 | 14.7320 | 10.6485 | - |
+| mdbx | False | Disk Cache | 12.1854 | - | - | - | 9.8778 |
+| sqlite | True | Memory + Save/Load | 3.6770 | 0.0000 | 13.3678 | 8.8858 | - |
+| sqlite | True | Disk Cache | 16.7904 | - | - | - | 7.3988 |
+| lmdb | True | Memory + Save/Load | 3.6228 | 0.0000 | 12.9674 | 8.8238 | - |
+| lmdb | True | Disk Cache | 6.7653 | - | - | - | 6.4712 |
+| mdbx | True | Memory + Save/Load | 4.3847 | 0.0000 | 15.1434 | 10.8973 | - |
+| mdbx | True | Disk Cache | 12.7424 | - | - | - | 11.0355 |
 
 ## Key Takeaways
 
-1. **LMDB Disk Cache dominates**: LMDB's `Disk Cache` run took only `12.11s` for Cold and `11.03s` for a hit. Compare this to SQLite taking `30.3s` to initially dump the cache to disk and `13.3s` to hydrate it. MDBX was slightly worse at `26s` for Cold and `20s` for a cache hit. LMDB is highly optimized for this library's massive on-disk caches.
-2. **SQLite is great for Memory + Save/Load dumps**: If you're purely running in memory and then explicitly saving/loading state (rather than continuously disk caching as nodes execute), SQLite actually performs the best (saving in `0.87s`, loading in `0.54s`).
-3. **Engine Stats Overhead**: `Stats: True` shows a measurable overhead at this scale (e.g., Memory Cold jumped from `5.6s` to `7.6s` with SQLite). Tracking the graph statistics takes about a 20-30% execution toll on massive graphs.
-4. **Hot compute is flawless (0.0000s)**: The hot memory checks consistently take `0.0000s` and scale beautifully. This happens because the engine tracks a global `revision` that only increments when inputs change. When no inputs change, the engine checks the top-level root query's `memo.verified_at` against the current global `revision`. Since they match, it knows immediately that no dependencies could have changed, returning the cached result in O(1) time without traversing the graph.
+1. **LMDB is fastest for the disk cache on the GIL build, but is not safe on free-threaded Python**: LMDB took `6.3s` cold and `6.2s` for a hit, against `16.4s`/`6.2s` for SQLite and `12.2s`/`9.9s` for MDBX. However, the LMDB bindings segfault under parallel load on Python 3.14t, so prefer `sqlite` or `mdbx` there.
+2. **SQLite hits are as fast as LMDB; its cost is the cold write path**: a SQLite cache hit (`6.2s`) matches LMDB, but the cold run that populates the cache is about 2.6x slower.
+3. **`engine.save()`/`load()` is expensive at full graph size**: with all ~250,000 memos retained, a save takes `12-15s` and a load `7-11s` on every backend, several times the `3-4s` it takes to compute the graph in memory. The earlier sub-second figures only covered the ~10,000 memos that survived eviction. For graphs this cheap to compute, the disk cache or plain recomputation beats explicit save/load.
+4. **Engine stats overhead is now within noise**: `Stats: True` no longer shows a consistent cost (e.g. SQLite memory cold `3.2s` vs `3.7s`, LMDB `4.4s` vs `3.6s`).
+5. **Hot compute is O(1) (0.0000s)**: The engine tracks a global `revision` that only increments when inputs change. When no inputs change, the top-level query's `memo.verified_at` matches the current `revision`, so the cached result is returned without traversing the graph.

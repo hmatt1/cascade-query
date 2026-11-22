@@ -1,9 +1,29 @@
 """Deterministic msgpack encoding and hashing for the persistent disk cache.
 
 Equal values must always produce identical byte streams, so dict keys and set
-elements are ordered by their own encoded bytes before packing. Fingerprints
-are blake2b digests of those byte streams. msgpack is imported lazily so the
-in-memory engine keeps working without it; enabling ``cache_dir`` requires it.
+elements are emitted in a canonical order. Fingerprints are blake2b digests of
+those byte streams. msgpack is imported lazily so the in-memory engine keeps
+working without it; enabling ``cache_dir`` requires it.
+
+Wire format (disk format 2)
+---------------------------
+Values msgpack cannot represent natively (tuples, sets, dataclasses, ...) are
+written as an ordinary msgpack array whose first element is a zero-length
+extension marker carrying the type code::
+
+    (1, "a")      ->  [ext(TUPLE, b""), 1, "a"]
+    {3, 1}        ->  [ext(SET, b""), 1, 3]
+
+A plain ``list`` can never start with such a marker, so the form is
+unambiguous. Because tagged values are ordinary arrays, a whole value is
+packed with a single ``packb`` call and unpacked with a single ``unpackb``
+(the unpacker invokes ``_list_hook`` as each array closes).
+
+Format 1 wrapped every tagged value in an extension whose payload was a
+separately packed msgpack document, which cost one ``packb`` per container.
+Those blobs carry a non-empty payload and are still decoded (see
+``_decode_legacy_ext``) so durable collection logs written by older versions
+remain readable; new writes always use format 2.
 """
 
 from __future__ import annotations
@@ -33,6 +53,7 @@ _EXT_MAP = 4  # dict with at least one non-str key
 _EXT_BIGINT = 5  # int outside the native msgpack 64-bit range
 _EXT_DATACLASS = 6
 _EXT_NAMEDTUPLE = 7
+_EXT_EXCEPTION = 8
 _EXT_DATETIME = 9
 _EXT_DATE = 10
 _EXT_TIME = 11
@@ -42,11 +63,34 @@ _EXT_TIMEZONE = 13
 _INT64_MIN = -(2**63)
 _UINT64_MAX = 2**64 - 1
 
+_PASSTHROUGH_SCALARS = (str, bytes, float, bool, type(None))
+
+
+class _Tag:
+    """Decoded form of a zero-length extension marker."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+
+_TAGS: dict[int, _Tag] = {code: _Tag(code) for code in range(1, 14)}
+# Encode-side markers, built on first use because msgpack is optional.
+_MARKERS: dict[int, Any] = {}
+
 
 def require_msgpack() -> Any:
     if msgpack is None:
         raise PersistentCacheError(MSGPACK_INSTALL_HINT)
     return msgpack
+
+
+def _marker(code: int) -> Any:
+    marker = _MARKERS.get(code)
+    if marker is None:
+        marker = _MARKERS[code] = msgpack.ExtType(code, b"")
+    return marker
 
 
 def encode(value: Any) -> bytes:
@@ -58,15 +102,18 @@ def encode(value: Any) -> bytes:
 def decode(blob: bytes) -> Any:
     """Inverse of :func:`encode`."""
     mp = require_msgpack()
-    node = mp.unpackb(blob, raw=False, use_list=True, strict_map_key=False)
-    return _decode_node(node)
+    return mp.unpackb(
+        blob,
+        raw=False,
+        use_list=True,
+        strict_map_key=False,
+        ext_hook=_ext_hook,
+        list_hook=_list_hook,
+    )
 
 
 def digest_bytes(blob: bytes) -> str:
     return hashlib.blake2b(blob, digest_size=20).hexdigest()
-
-
-_PASSTHROUGH_SCALARS = (str, bytes, float, bool, type(None))
 
 
 def value_digest(value: Any) -> str:
@@ -82,87 +129,82 @@ def _packed(node: Any) -> bytes:
     return msgpack.packb(node, use_bin_type=True)
 
 
-def _ext(code: int, payload_node: Any) -> Any:
-    return msgpack.ExtType(code, _packed(payload_node))
-
-
-def _bigint_payload(value: int) -> list[Any]:
-    magnitude = abs(value)
-    return [
-        value < 0,
-        magnitude.to_bytes((magnitude.bit_length() + 7) // 8 or 1, "big"),
-    ]
-
-
 def _encode_node(obj: Any) -> Any:
-    if obj is None or obj is True or obj is False:
-        return obj
     t = type(obj)
+    # Exact-type fast paths first: these cover nearly every node in practice.
+    if t in _PASSTHROUGH_SCALARS:
+        return obj
     if t is int:
         if _INT64_MIN <= obj <= _UINT64_MAX:
             return obj
-        return _ext(_EXT_BIGINT, _bigint_payload(obj))
-    if t is float or t is str or t is bytes:
-        return obj
+        magnitude = abs(obj)
+        return [
+            _marker(_EXT_BIGINT),
+            obj < 0,
+            magnitude.to_bytes((magnitude.bit_length() + 7) // 8 or 1, "big"),
+        ]
+    if t is tuple:
+        return [_marker(_EXT_TUPLE), *[_encode_node(x) for x in obj]]
+    if t is list:
+        return [_encode_node(x) for x in obj]
+    if t is dict:
+        return _encode_dict(obj)
+
     if t is bytearray:
         return bytes(obj)
     if isinstance(obj, datetime.datetime):
-        return _ext(_EXT_DATETIME, obj.isoformat())
+        return [_marker(_EXT_DATETIME), obj.isoformat()]
     if isinstance(obj, datetime.date):
-        return _ext(_EXT_DATE, obj.isoformat())
+        return [_marker(_EXT_DATE), obj.isoformat()]
     if isinstance(obj, datetime.time):
-        return _ext(_EXT_TIME, obj.isoformat())
+        return [_marker(_EXT_TIME), obj.isoformat()]
     if isinstance(obj, datetime.timedelta):
-        return _ext(_EXT_TIMEDELTA, [obj.days, obj.seconds, obj.microseconds])
+        return [_marker(_EXT_TIMEDELTA), obj.days, obj.seconds, obj.microseconds]
     if isinstance(obj, datetime.timezone):
         td = obj.utcoffset(None)
-        return _ext(
-            _EXT_TIMEZONE, [[td.days, td.seconds, td.microseconds], obj.tzname(None)]
-        )
+        return [
+            _marker(_EXT_TIMEZONE),
+            td.days,
+            td.seconds,
+            td.microseconds,
+            obj.tzname(None),
+        ]
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
-        return _ext(
-            _EXT_NAMEDTUPLE,
-            [
-                type(obj).__module__,
-                type(obj).__qualname__,
-                [_encode_node(getattr(obj, f)) for f in obj._fields],
-            ],
-        )
+        return [
+            _marker(_EXT_NAMEDTUPLE),
+            t.__module__,
+            t.__qualname__,
+            *[_encode_node(getattr(obj, f)) for f in obj._fields],
+        ]
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        names = sorted(obj.__dataclass_fields__.keys())
-        return _ext(
-            _EXT_DATACLASS,
-            [
-                type(obj).__module__,
-                type(obj).__qualname__,
-                [[n, _encode_node(getattr(obj, n))] for n in names],
-            ],
-        )
+        node: list[Any] = [_marker(_EXT_DATACLASS), t.__module__, t.__qualname__]
+        for name in sorted(obj.__dataclass_fields__.keys()):
+            node.append(name)
+            node.append(_encode_node(getattr(obj, name)))
+        return node
 
     if isinstance(obj, tuple):
-        return _ext(_EXT_TUPLE, [_encode_node(x) for x in obj])
+        return [_marker(_EXT_TUPLE), *[_encode_node(x) for x in obj]]
     if isinstance(obj, list):
         return [_encode_node(x) for x in obj]
     if isinstance(obj, frozenset):
-        return _ext(_EXT_FROZENSET, _sorted_nodes(obj))
+        return [_marker(_EXT_FROZENSET), *_sorted_nodes(obj)]
     if isinstance(obj, set):
-        return _ext(_EXT_SET, _sorted_nodes(obj))
+        return [_marker(_EXT_SET), *_sorted_nodes(obj)]
     if isinstance(obj, dict):
         return _encode_dict(obj)
 
     if isinstance(obj, BaseException):
-        return _ext(
-            8,  # _EXT_EXCEPTION
-            [
-                type(obj).__module__,
-                type(obj).__qualname__,
-                [_encode_node(x) for x in obj.args],
-            ],
-        )
+        return [
+            _marker(_EXT_EXCEPTION),
+            t.__module__,
+            t.__qualname__,
+            *[_encode_node(x) for x in obj.args],
+        ]
 
     raise TypeError(
-        f"cascade persistent cache: cannot serialize {type(obj).__module__}.{type(obj).__qualname__!r}; "
+        f"cascade persistent cache: cannot serialize {t.__module__}.{t.__qualname__!r}; "
         "supported types are primitives, bytes, list/tuple/set/frozenset/dict, datetime, "
         "@dataclass instances, typing.NamedTuple instances, and BaseException."
     )
@@ -170,15 +212,25 @@ def _encode_node(obj: Any) -> Any:
 
 def _sorted_nodes(items: Any) -> list[Any]:
     encoded = [_encode_node(x) for x in items]
+    # Homogeneous str or int sets (the common case) have a natural total
+    # order; anything else is ordered by its own packed bytes.
+    kinds = {type(x) for x in encoded}
+    if kinds == {str} or kinds == {int}:
+        encoded.sort()
+        return encoded
     return sorted(encoded, key=_packed)
 
 
 def _encode_dict(obj: dict[Any, Any]) -> Any:
+    if all(type(k) is str for k in obj):
+        return {k: _encode_node(obj[k]) for k in sorted(obj)}
     pairs = [(_encode_node(k), _encode_node(v)) for k, v in obj.items()]
     pairs.sort(key=lambda kv: _packed(kv[0]))
-    if all(type(k) is str for k in obj.keys()):
-        return {k: v for k, v in pairs}
-    return _ext(_EXT_MAP, [[k, v] for k, v in pairs])
+    node: list[Any] = [_marker(_EXT_MAP)]
+    for k, v in pairs:
+        node.append(k)
+        node.append(v)
+    return node
 
 
 def _resolve_type(module_name: str, qualname: str) -> type[Any]:
@@ -191,75 +243,131 @@ def _resolve_type(module_name: str, qualname: str) -> type[Any]:
     return cur
 
 
-def _decode_node(node: Any) -> Any:
-    if isinstance(node, msgpack.ExtType):
-        return _decode_ext(node)
-    if isinstance(node, list):
-        return [_decode_node(x) for x in node]
-    if isinstance(node, dict):
-        return {k: _decode_node(v) for k, v in node.items()}
-    return node
+def _ext_hook(code: int, data: bytes) -> Any:
+    if not data:
+        tag = _TAGS.get(code)
+        if tag is None:  # pragma: no cover
+            raise ValueError(f"cascade persistent cache: unknown extension code {code}")
+        return tag
+    return _decode_legacy_ext(code, data)
 
 
-def _decode_ext(ext: Any) -> Any:
-    payload = msgpack.unpackb(ext.data, raw=False, use_list=True, strict_map_key=False)
-    if ext.code == _EXT_TUPLE:
-        return tuple(_decode_node(x) for x in payload)
-    if ext.code == _EXT_SET:
-        return {_decode_node(x) for x in payload}
-    if ext.code == _EXT_FROZENSET:
-        return frozenset(_decode_node(x) for x in payload)
-    if ext.code == _EXT_MAP:
-        return {_decode_node(pair[0]): _decode_node(pair[1]) for pair in payload}
-    if ext.code == _EXT_BIGINT:
-        negative, magnitude = payload
-        value = int.from_bytes(magnitude, "big")
-        return -value if negative else value
-    if ext.code == _EXT_DATACLASS:
+def _list_hook(items: list[Any]) -> Any:
+    # Children are already decoded: the unpacker calls this bottom-up.
+    if items and type(items[0]) is _Tag:
+        return _untag(items[0].code, items)
+    return items
+
+
+def _make_dataclass(module_name: str, qualname: str, fields: dict[str, Any]) -> Any:
+    cls = _resolve_type(module_name, qualname)
+    if not (dataclasses.is_dataclass(cls) and isinstance(cls, type)):
+        raise TypeError(
+            f"{module_name}.{qualname!r} is not a dataclass"
+        )  # pragma: no cover
+    return cls(**fields)
+
+
+def _make_namedtuple(module_name: str, qualname: str, values: list[Any]) -> Any:
+    cls = _resolve_type(module_name, qualname)
+    if not (isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")):
+        raise TypeError(
+            f"{module_name}.{qualname!r} is not a NamedTuple"
+        )  # pragma: no cover
+    return cls(*values)
+
+
+def _make_exception(module_name: str, qualname: str, args: list[Any]) -> Any:
+    cls = _resolve_type(module_name, qualname)
+    if not (isinstance(cls, type) and issubclass(cls, BaseException)):
+        raise TypeError(
+            f"{module_name}.{qualname!r} is not an Exception"
+        )  # pragma: no cover
+    return cls(*args)
+
+
+def _make_bigint(negative: bool, magnitude: bytes) -> int:
+    value = int.from_bytes(magnitude, "big")
+    return -value if negative else value
+
+
+def _make_timezone(
+    days: int, seconds: int, microseconds: int, name: str
+) -> datetime.timezone:
+    return datetime.timezone(
+        datetime.timedelta(days=days, seconds=seconds, microseconds=microseconds),
+        name,
+    )
+
+
+def _untag(code: int, items: list[Any]) -> Any:
+    """Rebuild a tagged value from ``[marker, *already-decoded parts]``."""
+    if code == _EXT_TUPLE:
+        return tuple(items[1:])
+    if code == _EXT_SET:
+        return set(items[1:])
+    if code == _EXT_FROZENSET:
+        return frozenset(items[1:])
+    if code == _EXT_MAP:
+        return {items[i]: items[i + 1] for i in range(1, len(items), 2)}
+    if code == _EXT_BIGINT:
+        return _make_bigint(items[1], items[2])
+    if code == _EXT_DATACLASS:
+        fields = {items[i]: items[i + 1] for i in range(3, len(items), 2)}
+        return _make_dataclass(items[1], items[2], fields)
+    if code == _EXT_NAMEDTUPLE:
+        return _make_namedtuple(items[1], items[2], items[3:])
+    if code == _EXT_EXCEPTION:
+        return _make_exception(items[1], items[2], items[3:])
+    if code == _EXT_DATETIME:
+        return datetime.datetime.fromisoformat(items[1])
+    if code == _EXT_DATE:
+        return datetime.date.fromisoformat(items[1])
+    if code == _EXT_TIME:
+        return datetime.time.fromisoformat(items[1])
+    if code == _EXT_TIMEDELTA:
+        return datetime.timedelta(
+            days=items[1], seconds=items[2], microseconds=items[3]
+        )
+    return _make_timezone(items[1], items[2], items[3], items[4])
+
+
+def _decode_legacy_ext(code: int, data: bytes) -> Any:
+    """Decode a format-1 extension: ``data`` is a nested msgpack document."""
+    # Nested format-1 extensions inside the payload come back through
+    # ``_ext_hook``, so ``payload`` is already fully decoded.
+    payload = decode(data)
+    if code == _EXT_TUPLE:
+        return tuple(payload)
+    if code == _EXT_SET:
+        return set(payload)
+    if code == _EXT_FROZENSET:
+        return frozenset(payload)
+    if code == _EXT_MAP:
+        return {pair[0]: pair[1] for pair in payload}
+    if code == _EXT_BIGINT:
+        return _make_bigint(payload[0], payload[1])
+    if code == _EXT_DATACLASS:
         module_name, qualname, field_pairs = payload
-        fields = {pair[0]: _decode_node(pair[1]) for pair in field_pairs}
-        cls = _resolve_type(module_name, qualname)
-        if not (dataclasses.is_dataclass(cls) and isinstance(cls, type)):
-            raise TypeError(
-                f"{module_name}.{qualname!r} is not a dataclass"
-            )  # pragma: no cover
-        return cls(**fields)
-    if ext.code == _EXT_NAMEDTUPLE:
-        module_name, qualname, values = payload
-        vals = [_decode_node(x) for x in values]
-        cls = _resolve_type(module_name, qualname)
-        if not (
-            isinstance(cls, type) and issubclass(cls, tuple) and hasattr(cls, "_make")
-        ):
-            raise TypeError(
-                f"{module_name}.{qualname!r} is not a NamedTuple"
-            )  # pragma: no cover
-        return cls(*vals)
-    if ext.code == 8:  # _EXT_EXCEPTION
-        module_name, qualname, values = payload
-        vals = [_decode_node(x) for x in values]
-        cls = _resolve_type(module_name, qualname)
-        if not (isinstance(cls, type) and issubclass(cls, BaseException)):
-            raise TypeError(
-                f"{module_name}.{qualname!r} is not an Exception"
-            )  # pragma: no cover
-        return cls(*vals)
-    if ext.code == _EXT_DATETIME:
+        return _make_dataclass(
+            module_name, qualname, {pair[0]: pair[1] for pair in field_pairs}
+        )
+    if code == _EXT_NAMEDTUPLE:
+        return _make_namedtuple(payload[0], payload[1], payload[2])
+    if code == _EXT_EXCEPTION:
+        return _make_exception(payload[0], payload[1], payload[2])
+    if code == _EXT_DATETIME:
         return datetime.datetime.fromisoformat(payload)
-    if ext.code == _EXT_DATE:
+    if code == _EXT_DATE:
         return datetime.date.fromisoformat(payload)
-    if ext.code == _EXT_TIME:
+    if code == _EXT_TIME:
         return datetime.time.fromisoformat(payload)
-    if ext.code == _EXT_TIMEDELTA:
+    if code == _EXT_TIMEDELTA:
         return datetime.timedelta(
             days=payload[0], seconds=payload[1], microseconds=payload[2]
         )
-    if ext.code == _EXT_TIMEZONE:
-        td_payload = payload[0]
-        td = datetime.timedelta(
-            days=td_payload[0], seconds=td_payload[1], microseconds=td_payload[2]
-        )
-        return datetime.timezone(td, payload[1])
+    if code == _EXT_TIMEZONE:
+        return _make_timezone(*payload[0], payload[1])
     raise ValueError(
-        f"cascade persistent cache: unknown extension code {ext.code}"
+        f"cascade persistent cache: unknown extension code {code}"
     )  # pragma: no cover

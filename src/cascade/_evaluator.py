@@ -55,6 +55,13 @@ class Evaluator:
             | None
         ) = None
         self._disk_thread: threading.Thread | None = None
+        # QueryKey -> (canonical args blob, disk entry key). A key is otherwise
+        # re-encoded when it is hydrated, once per dependent that records it,
+        # and again by the writer thread. Keys that compare equal share an
+        # entry (1, 1.0 and True are one memo key in memory as well).
+        self._key_blobs: dict[QueryKey, tuple[bytes, bytes]] = {}
+        # Reverse direction for dependency rows read back from disk.
+        self._args_by_blob: dict[bytes, tuple[Any, ...]] = {}
         if self._disk is not None:
             self._disk_queue = queue.Queue()
             self._disk_thread = threading.Thread(target=self._disk_worker, daemon=True)
@@ -974,6 +981,31 @@ class Evaluator:
 
     # --- persistent disk cache ---
 
+    def _key_cache_limit(self) -> int:
+        return 2 * self._store.max_entries + 4096
+
+    def _key_blobs_for(self, key: QueryKey) -> tuple[bytes, bytes]:
+        """``(args_blob, entry_key)`` for ``key``; TypeError if not encodable."""
+        cached = self._key_blobs.get(key)
+        if cached is None:
+            kind, fid, args = key
+            args_blob = _canonical.encode(args)
+            cached = (args_blob, _disk_cache.entry_key(kind, fid, args_blob))
+            if len(self._key_blobs) >= self._key_cache_limit():
+                self._key_blobs.clear()
+            self._key_blobs[key] = cached
+        return cached
+
+    def _args_from_blob(self, args_blob: bytes) -> Any:
+        args = self._args_by_blob.get(args_blob)
+        if args is None:
+            args = _canonical.decode(args_blob)
+            if isinstance(args, tuple):
+                if len(self._args_by_blob) >= self._key_cache_limit():
+                    self._args_by_blob.clear()
+                self._args_by_blob[args_blob] = args
+        return args
+
     def _try_hydrate_from_disk(
         self, key: QueryKey, runtime: RuntimeState
     ) -> MemoEntry | None:
@@ -985,11 +1017,11 @@ class Evaluator:
             return None  # pragma: no cover
         kind, fid, args = key
         try:
-            args_blob = _canonical.encode(args)
+            entry_key = self._key_blobs_for(key)[1]
         except TypeError:  # pragma: no cover
             self._store.trace_event("disk_unkeyed", key)
             return None  # pragma: no cover
-        record = disk.load_entry(_disk_cache.entry_key(kind, fid, args_blob))
+        record = disk.load_entry(entry_key)
         if record is None:
             self._store.trace_event("disk_miss", key)
             self._store.record_disk_miss()
@@ -1026,7 +1058,11 @@ class Evaluator:
         value_hash = record.get("value_hash")
         if not isinstance(value_hash, str):
             return None  # pragma: no cover
-        blob = disk.load_blob(value_hash)
+        # Small values travel inside the record itself (one read per
+        # hit); only larger ones live in the content-addressed blob store.
+        blob = record.get("value")
+        if not isinstance(blob, bytes):
+            blob = disk.load_blob(value_hash)
         if blob is None or _canonical.digest_bytes(blob) != value_hash:
             self._store.trace_event(
                 "disk_red", key, detail="value blob missing or corrupt"
@@ -1090,7 +1126,7 @@ class Evaluator:
             ):
                 return None  # pragma: no cover
             try:
-                dep_args = _canonical.decode(dep_args_blob)
+                dep_args = self._args_from_blob(dep_args_blob)
             except Exception:  # pragma: no cover
                 return None  # pragma: no cover
             if not isinstance(dep_args, tuple):
@@ -1198,11 +1234,11 @@ class Evaluator:
             return None  # pragma: no cover
         kind, fid, args = key
         try:
-            args_blob = _canonical.encode(args)
+            entry_key = self._key_blobs_for(key)[1]
         except TypeError:  # pragma: no cover
             self._store.trace_event("disk_unkeyed", key)  # pragma: no cover
             return None  # pragma: no cover
-        record = disk.load_entry(_disk_cache.entry_key(kind, fid, args_blob))
+        record = disk.load_entry(entry_key)
         if record is None:
             self._store.trace_event("disk_miss", key)  # pragma: no cover
             self._store.record_disk_miss()
@@ -1241,7 +1277,11 @@ class Evaluator:
         value_hash = record.get("value_hash")
         if not isinstance(value_hash, str):  # pragma: no cover
             return None  # pragma: no cover
-        blob = disk.load_blob(value_hash)
+        # Small values travel inside the record itself (one read per
+        # hit); only larger ones live in the content-addressed blob store.
+        blob = record.get("value")
+        if not isinstance(blob, bytes):
+            blob = disk.load_blob(value_hash)
         if blob is None or _canonical.digest_bytes(blob) != value_hash:
             self._store.trace_event(
                 "disk_red", key, detail="value blob missing or corrupt"
@@ -1306,7 +1346,7 @@ class Evaluator:
             ):
                 return None  # pragma: no cover
             try:
-                dep_args = _canonical.decode(dep_args_blob)
+                dep_args = self._args_from_blob(dep_args_blob)
             except Exception:  # pragma: no cover
                 return None  # pragma: no cover
             if not isinstance(dep_args, tuple):  # pragma: no cover
@@ -1438,7 +1478,7 @@ class Evaluator:
             ) in batch:
                 kind, fid, args = key
                 try:
-                    args_blob = _canonical.encode(args)
+                    entry_key = self._key_blobs_for(key)[1]
                 except TypeError:  # pragma: no cover
                     self._store.trace_event("disk_unkeyed", key)
                     continue
@@ -1466,20 +1506,17 @@ class Evaluator:
                     "is_error": memo_error is not None,
                     "computed_at_time": computed_at_time,
                 }
+                stored_blob: bytes | None = value_blob
+                if len(value_blob) <= _disk_cache.INLINE_VALUE_MAX_BYTES:
+                    record["value"] = value_blob
+                    stored_blob = None
 
                 try:
                     record_blob = _canonical.encode(record)
                 except TypeError:  # pragma: no cover
                     continue
 
-                entries.append(
-                    (
-                        _disk_cache.entry_key(kind, fid, args_blob),
-                        record_blob,
-                        memo_value_hash,
-                        value_blob,
-                    )
-                )
+                entries.append((entry_key, record_blob, memo_value_hash, stored_blob))
 
             if entries:
                 try:
@@ -1539,7 +1576,7 @@ class Evaluator:
         for dep in memo.deps:
             dep_kind, dep_fid, dep_args = dep.key
             try:
-                dep_args_blob = _canonical.encode(dep_args)
+                dep_args_blob = self._key_blobs_for(dep.key)[0]
             except TypeError:  # pragma: no cover
                 self._store.trace_event(
                     "disk_unkeyed", key, detail=self._store.key_to_str(dep.key)
@@ -1604,10 +1641,10 @@ class Evaluator:
         for key in roots:
             kind, fid, args = key
             try:
-                args_blob = _canonical.encode(args)
+                entry_key = self._key_blobs_for(key)[1]
             except TypeError:  # pragma: no cover
                 continue
-            ekey = _disk_cache.entry_key(kind, fid, args_blob)
+            ekey = entry_key
             queue.append(ekey)
             wanted_entries.add(ekey)
 

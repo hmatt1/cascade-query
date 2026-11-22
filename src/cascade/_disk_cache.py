@@ -71,7 +71,14 @@ class TxnContext:
                 _FT_LOCK.release()  # pragma: no cover
 
 
-DISK_FORMAT = 1
+# 2: single-pass canonical encoding (see _canonical) and inline small values.
+DISK_FORMAT = 2
+
+# Values whose canonical encoding is at most this many bytes are stored
+# inside their meta record instead of the content-addressed blob store, so
+# a cache hit needs one read instead of two. Larger values keep using
+# blobs, where identical results are deduplicated.
+INLINE_VALUE_MAX_BYTES = 1024
 _FORMAT_KEY = b"format"
 
 
@@ -223,13 +230,14 @@ class MdbxDiskCache:
                 ) from exc
             raise
 
-    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None:
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes | None]]) -> None:
         if not entries:  # pragma: no cover
             return
         try:
             with self._begin(write=True) as txn:
                 for key, record_blob, value_hash, value_blob in entries:
-                    self._blobs.put(txn, value_hash.encode("ascii"), value_blob)
+                    if value_blob is not None:
+                        self._blobs.put(txn, value_hash.encode("ascii"), value_blob)
                     self._meta.put(txn, key, record_blob)
         except mdbx.MDBXErrorExc as exc:
             if "MDBX_MAP_FULL" in str(exc):
@@ -483,13 +491,14 @@ class LmdbDiskCache:  # pragma: no cover
                 "to Engine, or clear the cache with engine.clear_disk_cache()."
             ) from exc
 
-    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None:  # pragma: no cover
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes | None]]) -> None:  # pragma: no cover
         if not entries:  # pragma: no cover
             return
         try:
             with self._begin(write=True) as txn:
                 for key, record_blob, value_hash, value_blob in entries:
-                    txn.put(value_hash.encode("ascii"), value_blob, db=self._blobs)
+                    if value_blob is not None:
+                        txn.put(value_hash.encode("ascii"), value_blob, db=self._blobs)
                     txn.put(key, record_blob, db=self._meta)
         except lmdb.MapFullError as exc:  # pragma: no cover
             raise PersistentCacheError(
@@ -639,9 +648,10 @@ class SqliteDiskCache:
                     return
                     
                 if current is not None:
+                    # Collections are durable user state, not recomputable
+                    # cache: keep them, as the mdbx and lmdb backends do.
                     self._conn.execute("delete from meta")
                     self._conn.execute("delete from blobs")
-                    self._conn.execute("delete from collections")
                     
                 self._conn.execute("insert or replace into sys (k, v) values (?, ?)", (_FORMAT_KEY, stamp))
                 self._conn.execute("commit")
@@ -681,14 +691,15 @@ class SqliteDiskCache:
                 self._conn.execute("rollback")
                 raise
 
-    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None:
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes | None]]) -> None:
         if not entries:  # pragma: no cover
             return
         with self._lock:
             self._conn.execute("begin")
             try:
                 for key, record_blob, value_hash, value_blob in entries:
-                    self._conn.execute("insert or replace into blobs (k, v) values (?, ?)", (value_hash.encode("ascii"), value_blob))
+                    if value_blob is not None:
+                        self._conn.execute("insert or replace into blobs (k, v) values (?, ?)", (value_hash.encode("ascii"), value_blob))
                     self._conn.execute("insert or replace into meta (k, v) values (?, ?)", (key, record_blob))
                 self._conn.execute("commit")
             except Exception:  # pragma: no cover
@@ -812,7 +823,7 @@ class DiskCacheProtocol(Protocol):
     def load_entry(self, key: bytes) -> dict[str, Any] | None: ...
     def load_blob(self, value_hash: str) -> bytes | None: ...
     def store_entry(self, key: bytes, record: dict[str, Any], value_hash: str, value_blob: bytes) -> None: ...
-    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes]]) -> None: ...
+    def store_entry_many(self, entries: list[tuple[bytes, bytes, str, bytes | None]]) -> None: ...
     def clear(self) -> None: ...
     def collection_load(self, name: str) -> tuple[dict[str, Any] | None, list[tuple[int, dict[str, Any]]]]: ...
     def collection_append_many(self, name: str, batch: list[tuple[int, dict[str, Any]]]) -> None: ...
