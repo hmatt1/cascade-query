@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,3 +48,16 @@ class InputVersion:
 @dataclass(frozen=True)
 class Snapshot:
     revision: int
+
+
+class InFlight:
+    """Dedup slot for a query being computed by one owner thread or task.
+
+    ``future`` stays ``None`` until a second caller asks for the same key at the
+    same revision; only then is a ``concurrent.futures.Future`` allocated.
+    """
+
+    __slots__ = ("future",)
+
+    def __init__(self) -> None:
+        self.future: concurrent.futures.Future[MemoEntry] | None = None

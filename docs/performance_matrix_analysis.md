@@ -11,6 +11,12 @@ The benchmark was executed using `benchmarks/performance_matrix.py` against a sy
   - **Memory + Save/Load**: Evaluates cold/hot compute times purely in memory, as well as explicit state dump and state hydration operations.
   - **Disk Cache Enabled**: Evaluates cold compute time (which inherently includes background serialization and writing to disk cache) and a secondary "Disk Cache Hit" time (hydrating on an empty engine reading directly from disk cache).
 
+> **Caveat (2026-11-21):** this run used the `Engine` default `max_entries=10_000`
+> against a ~250,000-node graph, so the LRU was evicting throughout and every
+> timing below includes eviction and recompute churn. `performance_matrix.py`
+> now sizes `max_entries` to the graph; rerun it before relying on these
+> numbers. For raw per-node engine overhead, see `benchmarks/engine_overhead.py`.
+
 ## Results
 
 | Backend | Stats | Mode | Cold (s) | Hot (s) | Save (s) | Load (s) | Disk Cache Hit (s) |

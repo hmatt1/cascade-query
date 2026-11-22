@@ -22,6 +22,8 @@ PERSISTENCE_FORMAT = 2
 # Used for canonical key ordering; kept separate so tests can monkeypatch `json.dumps`
 # on this module without breaking recursive sorting inside `_to_jsonable`.
 _json_dumps = json.dumps
+# What json.dumps(..., ensure_ascii=False) emits for a str.
+_encode_json_str = json.encoder.encode_basestring
 
 
 def _resolve_type(module_name: str, qualname: str) -> type[Any]:
@@ -57,8 +59,26 @@ def hash_bytecode(fn: Any) -> str:
     return _hash_code(fn.__code__).hex()
 
 
+_JSON_SCALAR_TEXT: dict[Any, str] = {None: "null", True: "true", False: "false"}
+
+
+def _scalar_json_text(value: Any) -> str | None:
+    """Canonical JSON text for common scalars, identical to the general path."""
+    t = type(value)
+    if t is int:
+        return int.__repr__(value)
+    if t is str:
+        return _encode_json_str(value)
+    if value is None or value is True or value is False:
+        return _JSON_SCALAR_TEXT[value]
+    return None
+
+
 def stable_value_digest(value: Any) -> str:
     """Blake2b hex digest of the canonical JSON form of ``value``."""
+    text = _scalar_json_text(value)
+    if text is not None:
+        return hashlib.blake2b(text.encode("utf-8"), digest_size=20).hexdigest()
     blob = json.dumps(
         _to_jsonable(value),
         sort_keys=True,

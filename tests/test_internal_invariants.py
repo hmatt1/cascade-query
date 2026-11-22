@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from unittest.mock import patch
 
 from cascade import Engine
@@ -90,7 +91,7 @@ def test_push_memo_lru_locked_is_safe_when_memo_missing() -> None:
     assert ghost not in store.memos
 
 
-def test_lru_eviction_recovers_when_heap_contains_only_stale_entries() -> None:
+def test_lru_eviction_recovers_when_lru_contains_only_stale_entries() -> None:
     engine = Engine(max_entries=1)
 
     @engine.input
@@ -110,16 +111,16 @@ def test_lru_eviction_recovers_when_heap_contains_only_stale_entries() -> None:
     store = engine._internals._store  # noqa: SLF001
     stale = ("query", "ghost:fn", ())
     with store.lock:
-        store._lru_heap = [(0, stale)]
+        store._lru = OrderedDict([(stale, None)])
     assert b() == 2
     assert len(store.memos) == 1
 
 
-def test_pop_lru_victim_returns_none_when_heap_empty() -> None:
+def test_pop_lru_victim_returns_none_when_lru_empty() -> None:
     engine = Engine()
     store = engine._internals._store  # noqa: SLF001
     with store.lock:
-        store._lru_heap.clear()
+        store._lru.clear()
         assert store._pop_lru_victim_key_locked() is None
 
 
@@ -146,7 +147,7 @@ def test_drop_memo_tolerates_absent_dependent_buckets() -> None:
     assert qkey not in store.memos
 
 
-def test_evict_rebuilds_heap_and_uses_min_fallback_when_pop_finds_no_victim() -> None:
+def test_evict_rebuilds_lru_and_uses_min_fallback_when_pop_finds_no_victim() -> None:
     engine = Engine(max_entries=5)
 
     @engine.input

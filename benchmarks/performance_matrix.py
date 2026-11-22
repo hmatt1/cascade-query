@@ -12,11 +12,14 @@ BACKENDS = ["sqlite", "lmdb", "mdbx"]
 
 def run_matrix(depth: int, fanout: int) -> list[dict[str, Any]]:
     results = []
+    # Size the LRU to hold the whole graph; the Engine default (10_000) would
+    # otherwise evict throughout large runs and skew every timing.
+    max_entries = depth * fanout + 16
     
     for stats_enabled, backend in itertools.product([False, True], BACKENDS):
         # 1. Baseline Memory (No Disk Cache) + State Save/Load
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            engine = Engine(stats=stats_enabled)
+            engine = Engine(stats=stats_enabled, max_entries=max_entries)
             leaf, _, aggregate = build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
             
             for i in range(fanout):
@@ -39,7 +42,7 @@ def run_matrix(depth: int, fanout: int) -> list[dict[str, Any]]:
             save_time = time.perf_counter() - start
             
             # Load state
-            engine2 = Engine(stats=stats_enabled)
+            engine2 = Engine(stats=stats_enabled, max_entries=max_entries)
             start = time.perf_counter()
             engine2.load(str(save_path), backend=backend) # type: ignore
             load_time = time.perf_counter() - start
@@ -61,7 +64,12 @@ def run_matrix(depth: int, fanout: int) -> list[dict[str, Any]]:
         # 2. Disk Cache Enabled
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cache_dir = Path(tmp) / f"cache_{backend}"
-            engine = Engine(stats=stats_enabled, cache_dir=cache_dir, cache_backend=backend)
+            engine = Engine(
+                stats=stats_enabled,
+                max_entries=max_entries,
+                cache_dir=cache_dir,
+                cache_backend=backend,
+            )
             leaf, _, aggregate = build_fanout_chain_pipeline(engine, depth=depth, fanout=fanout)
             
             for i in range(fanout):
@@ -77,7 +85,12 @@ def run_matrix(depth: int, fanout: int) -> list[dict[str, Any]]:
                 engine._disk.close()
             
             # Re-instantiate Engine to test Disk Cache Hit
-            engine_hot = Engine(stats=stats_enabled, cache_dir=cache_dir, cache_backend=backend)
+            engine_hot = Engine(
+                stats=stats_enabled,
+                max_entries=max_entries,
+                cache_dir=cache_dir,
+                cache_backend=backend,
+            )
             leaf_hot, _, aggregate_hot = build_fanout_chain_pipeline(engine_hot, depth=depth, fanout=fanout)
             for i in range(fanout):
                 leaf_hot.set(i, i)

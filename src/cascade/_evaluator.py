@@ -14,7 +14,7 @@ from . import _canonical, _disk_cache
 from ._disk_cache import DiskCacheProtocol
 from ._errors import CycleError, PersistentCacheError, QueryCancelled
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
-from ._state import InputVersion, MemoEntry, QueryKey, Snapshot
+from ._state import InFlight, InputVersion, MemoEntry, QueryKey, Snapshot
 from ._store import GraphStore
 
 
@@ -38,7 +38,22 @@ class Evaluator:
         self._hydrating_var: contextvars.ContextVar[frozenset[QueryKey]] = (
             contextvars.ContextVar("cascade_hydrating", default=frozenset())
         )
-        self._disk_queue: queue.Queue[tuple[QueryKey, list[list[Any]], Any, Any, str, str | None, int, dict[str, list[Any]]] | None] | None = None
+        self._disk_queue: (
+            queue.Queue[
+                tuple[
+                    QueryKey,
+                    list[list[Any]],
+                    Any,
+                    Any,
+                    str,
+                    str | None,
+                    int,
+                    dict[str, list[Any]],
+                ]
+                | None
+            ]
+            | None
+        ) = None
         self._disk_thread: threading.Thread | None = None
         if self._disk is not None:
             self._disk_queue = queue.Queue()
@@ -72,9 +87,9 @@ class Evaluator:
     def check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         if runtime_cancel_epoch is None:
             return
-        with self._store.lock:
-            current = self._store.cancel_epoch
-        if current != runtime_cancel_epoch:
+        # Lock-free: a single int attribute read is atomic, and cancel_epoch
+        # only ever moves forward. Called 2-3 times per recompute.
+        if self._store.cancel_epoch != runtime_cancel_epoch:
             raise QueryCancelled("query cancelled because inputs changed")
 
     def in_runtime(self) -> bool:
@@ -390,17 +405,11 @@ class Evaluator:
                         return existing, True
 
             in_flight_key = (key, runtime.snapshot.revision)
-            owner_future = self._store.in_flight.get(in_flight_key)
-            if owner_future is None:
-                owner_future = concurrent.futures.Future()
-                self._store.in_flight[in_flight_key] = owner_future
-                is_owner = True
-            else:
-                is_owner = False
+            slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
 
-        if not is_owner:
+        if waiter_future is not None:
             self._store.trace_event("dedup_wait", key)
-            result = owner_future.result()
+            result = waiter_future.result()
             return result, True
 
         try:
@@ -408,17 +417,14 @@ class Evaluator:
             if self._disk is not None and existing is None and is_memoized:
                 hydrated = self._try_hydrate_from_disk(key, runtime)
             if hydrated is not None:
-                owner_future.set_result(hydrated)
+                self._release_in_flight(in_flight_key, slot, result=hydrated)
                 return hydrated, True
             result = self.recompute(key, fn, runtime)
-            owner_future.set_result(result)
-            return result, False
         except BaseException as exc:
-            owner_future.set_exception(exc)
+            self._release_in_flight(in_flight_key, slot, exc=exc)
             raise
-        finally:
-            with self._store.lock:
-                self._store.in_flight.pop((key, runtime.snapshot.revision), None)
+        self._release_in_flight(in_flight_key, slot, result=result)
+        return result, False
 
     async def compute_or_get_memo_async(  # pragma: no cover
         self,
@@ -461,17 +467,11 @@ class Evaluator:
 
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
-            owner_future = self._store.in_flight.get(in_flight_key)
-            if owner_future is None:
-                owner_future = concurrent.futures.Future()
-                self._store.in_flight[in_flight_key] = owner_future
-                is_owner = True
-            else:
-                is_owner = False
+            slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
 
-        if not is_owner:
+        if waiter_future is not None:
             self._store.trace_event("dedup_wait", key)
-            result = await asyncio.wrap_future(owner_future)
+            result = await asyncio.wrap_future(waiter_future)
             return result, True
 
         try:
@@ -479,17 +479,55 @@ class Evaluator:
             if self._disk is not None and existing is None and is_memoized:
                 hydrated = await self._try_hydrate_from_disk_async(key, runtime)
             if hydrated is not None:
-                owner_future.set_result(hydrated)
+                self._release_in_flight(in_flight_key, slot, result=hydrated)
                 return hydrated, True
             result = await self.recompute_async(key, fn, runtime)
-            owner_future.set_result(result)
-            return result, False
         except BaseException as exc:
-            owner_future.set_exception(exc)
+            self._release_in_flight(in_flight_key, slot, exc=exc)
             raise
-        finally:
-            with self._store.lock:
-                self._store.in_flight.pop((key, runtime.snapshot.revision), None)
+        self._release_in_flight(in_flight_key, slot, result=result)
+        return result, False
+
+    def _claim_in_flight_locked(
+        self, in_flight_key: tuple[QueryKey, int]
+    ) -> tuple[InFlight, concurrent.futures.Future[MemoEntry] | None]:
+        """Register as owner of ``in_flight_key`` or join the existing owner.
+
+        Returns ``(slot, None)`` for the owner and ``(slot, future)`` for a
+        waiter. The Future (and the Condition/RLock it allocates) is created
+        only once a second caller shows up, so uncontended computes never pay
+        for it. Caller must hold ``store.lock``.
+        """
+        slot = self._store.in_flight.get(in_flight_key)
+        if slot is None:
+            slot = InFlight()
+            self._store.in_flight[in_flight_key] = slot
+            return slot, None
+        if slot.future is None:
+            slot.future = concurrent.futures.Future()
+        return slot, slot.future
+
+    def _release_in_flight(
+        self,
+        in_flight_key: tuple[QueryKey, int],
+        slot: InFlight,
+        *,
+        result: MemoEntry | None = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        # Unregister and read the waiter future in one critical section: a
+        # waiter either attached its future before this point, or finds no slot
+        # and becomes the owner of a fresh computation.
+        with self._store.lock:
+            if self._store.in_flight.get(in_flight_key) is slot:
+                del self._store.in_flight[in_flight_key]
+            future = slot.future
+        if future is None:
+            return
+        if exc is not None:
+            future.set_exception(exc)
+        else:
+            future.set_result(result)  # type: ignore[arg-type]
 
     def try_mark_green(
         self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
@@ -1388,7 +1426,16 @@ class Evaluator:
                 pass
 
             entries = []
-            for key, deps_records, memo_value, memo_error, memo_value_hash, fn_hash, computed_at_time, effects_node in batch:
+            for (
+                key,
+                deps_records,
+                memo_value,
+                memo_error,
+                memo_value_hash,
+                fn_hash,
+                computed_at_time,
+                effects_node,
+            ) in batch:
                 kind, fid, args = key
                 try:
                     args_blob = _canonical.encode(args)
@@ -1404,7 +1451,9 @@ class Evaluator:
                     continue
 
                 if _canonical.digest_bytes(value_blob) != memo_value_hash:
-                    self._store.trace_event("disk_skip", key, detail="value mutated before persist")
+                    self._store.trace_event(
+                        "disk_skip", key, detail="value mutated before persist"
+                    )
                     continue
 
                 record = {
@@ -1417,18 +1466,20 @@ class Evaluator:
                     "is_error": memo_error is not None,
                     "computed_at_time": computed_at_time,
                 }
-                
+
                 try:
                     record_blob = _canonical.encode(record)
                 except TypeError:  # pragma: no cover
                     continue
-                    
-                entries.append((
-                    _disk_cache.entry_key(kind, fid, args_blob),
-                    record_blob,
-                    memo_value_hash,
-                    value_blob
-                ))
+
+                entries.append(
+                    (
+                        _disk_cache.entry_key(kind, fid, args_blob),
+                        record_blob,
+                        memo_value_hash,
+                        value_blob,
+                    )
+                )
 
             if entries:
                 try:
@@ -1454,11 +1505,11 @@ class Evaluator:
     def _persist_entry(self, key: QueryKey, memo: MemoEntry) -> None:
         if self._disk_queue is None:
             return
-            
+
         deps_records = self._dep_fingerprint_rows(key, memo)
         if deps_records is None:
             return
-            
+
         effects_node = {name: list(items) for name, items in memo.effects.items()}
         kind, fid, _ = key
         with self._store.lock:
@@ -1467,10 +1518,19 @@ class Evaluator:
                 if kind == "query"
                 else self._store.input_hashes.get(fid)
             )
-            
-        self._disk_queue.put((
-            key, deps_records, memo.value, memo.error, memo.value_hash, fn_hash, memo.computed_at_time, effects_node
-        ))
+
+        self._disk_queue.put(
+            (
+                key,
+                deps_records,
+                memo.value,
+                memo.error,
+                memo.value_hash,
+                fn_hash,
+                memo.computed_at_time,
+                effects_node,
+            )
+        )
 
     def _dep_fingerprint_rows(
         self, key: QueryKey, memo: MemoEntry

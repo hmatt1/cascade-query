@@ -18,7 +18,15 @@ from ._incremental import IncrementalRuntime
 from ._persistence import load_payload, save_payload
 from ._runtime import RuntimeState
 from ._scheduler import WorkStealingExecutor
-from ._state import InputKey, InputVersion, MemoEntry, QueryKey, Snapshot, TraceEvent
+from ._state import (
+    InFlight,
+    InputKey,
+    InputVersion,
+    MemoEntry,
+    QueryKey,
+    Snapshot,
+    TraceEvent,
+)
 from ._store import GraphStore
 
 _get_loop = getattr(asyncio, "_get_running_loop", None)
@@ -219,7 +227,7 @@ class _EngineInternals:
     @property
     def in_flight(
         self,
-    ) -> dict[tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]]:
+    ) -> dict[tuple[QueryKey, int], InFlight]:
         return self._store.in_flight
 
     @property

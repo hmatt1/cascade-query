@@ -66,8 +66,15 @@ def digest_bytes(blob: bytes) -> str:
     return hashlib.blake2b(blob, digest_size=20).hexdigest()
 
 
+_PASSTHROUGH_SCALARS = (str, bytes, float, bool, type(None))
+
+
 def value_digest(value: Any) -> str:
     """Blake2b hex fingerprint of the canonical byte stream of ``value``."""
+    t = type(value)
+    if t in _PASSTHROUGH_SCALARS or (t is int and _INT64_MIN <= value <= _UINT64_MAX):
+        # Same bytes encode() would produce: _encode_node returns these as-is.
+        return digest_bytes(require_msgpack().packb(value, use_bin_type=True))
     return digest_bytes(encode(value))
 
 

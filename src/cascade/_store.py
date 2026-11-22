@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import bisect
-import concurrent.futures
-import heapq
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Sequence
 from typing import Any, Callable
 
 from ._serde import hash_bytecode, stable_value_digest
 from ._state import (
     Dependency,
+    InFlight,
     InputKey,
     InputVersion,
     MemoEntry,
@@ -19,6 +18,12 @@ from ._state import (
     Snapshot,
     TraceEvent,
 )
+
+_TraceRow = tuple[str, "QueryKey | str", int, str, float]
+
+
+def _version_revision(version: InputVersion) -> int:
+    return version.revision
 
 
 class GraphStore:
@@ -39,7 +44,11 @@ class GraphStore:
         self.next_access_id = 0
         self.max_entries = max_entries
         self.trace_limit = trace_limit
-        self.trace: deque[TraceEvent] = deque(maxlen=trace_limit)
+        # Raw rows (event, key, revision, detail, timestamp). ``key`` is the
+        # QueryKey tuple, formatted to a string only when traces are read, or an
+        # already-formatted string for rows restored by ``assign_loaded_state``.
+        # Building TraceEvent objects eagerly cost ~10% of a cold compute.
+        self.trace: deque[_TraceRow] = deque(maxlen=trace_limit)
 
         self._monotonic_seconds: Callable[[], float] = (
             monotonic_seconds or time.perf_counter
@@ -73,11 +82,12 @@ class GraphStore:
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
-        self.in_flight: dict[
-            tuple[QueryKey, int], concurrent.futures.Future[MemoEntry]
-        ] = {}
-        # Lazy min-heap (last_access, key); stale entries removed on pop (touches push new tuples).
-        self._lru_heap: list[tuple[int, QueryKey]] = []
+        self.in_flight: dict[tuple[QueryKey, int], InFlight] = {}
+        # Recency order of memo keys, least recently used first. Mirrors
+        # ``memos`` and agrees with ``MemoEntry.last_access`` ordering. Replaces
+        # a lazy heap that gained an entry per cache hit and was only drained by
+        # eviction, so it grew without bound on hot read paths.
+        self._lru: OrderedDict[QueryKey, None] = OrderedDict()
         # Refcount: memo rows participating in an in-flight cache/verify sequence must not
         # be LRU-evicted (nested recompute can otherwise drop the parent before verify ends).
         self._memo_verify_pin_count: dict[QueryKey, int] = {}
@@ -134,26 +144,36 @@ class GraphStore:
             }
 
     def record_disk_hit(self) -> None:
+        if not self._stats_enabled:
+            return
         with self.lock:
             if self._stats_enabled:
                 self._stats_disk_hits += 1
 
     def record_disk_miss(self) -> None:
+        if not self._stats_enabled:
+            return
         with self.lock:
             if self._stats_enabled:
                 self._stats_disk_misses += 1
 
     def record_disk_store(self) -> None:
+        if not self._stats_enabled:
+            return
         with self.lock:
             if self._stats_enabled:
                 self._stats_disk_stores += 1
 
     def record_persistence_load(self) -> None:
+        if not self._stats_enabled:
+            return
         with self.lock:
             if self._stats_enabled:
                 self._stats_persistence_loads += 1
 
     def record_persistence_save(self) -> None:
+        if not self._stats_enabled:
+            return
         with self.lock:
             if self._stats_enabled:
                 self._stats_persistence_saves += 1
@@ -194,23 +214,24 @@ class GraphStore:
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
 
+    # The per-query config lookups below run several times per query on the
+    # hot path. They read a single key from a dict that only register_query
+    # writes (under the lock); a lone dict read is atomic both with the GIL and
+    # on free-threaded builds, so they skip the RLock round trip.
+
     def lookup_query_ttl(self, query_id: str) -> float | None:
-        with self.lock:
-            return self.query_ttl.get(query_id)
+        return self.query_ttl.get(query_id)
 
     def lookup_query_memoize(self, query_id: str) -> bool:
-        with self.lock:
-            return self.query_memoize.get(query_id, True)
+        return self.query_memoize.get(query_id, True)
 
     def lookup_query(self, query_id: str) -> Callable[..., Any]:
-        with self.lock:
-            return self.queries[query_id]
+        return self.queries[query_id]
 
     def lookup_query_cache_exceptions(
         self, query_id: str
     ) -> bool | tuple[type[BaseException], ...]:
-        with self.lock:
-            return self.query_cache_exceptions.get(query_id, False)
+        return self.query_cache_exceptions.get(query_id, False)
 
     def lookup_query_fixed_point(self, query_id: str) -> tuple[bool, Any]:
         """Returns (has_fixed_point, fixed_point_value)."""
@@ -230,8 +251,7 @@ class GraphStore:
             self.input_hashes[input_id] = fn_hash
 
     def lookup_input(self, input_id: str) -> Callable[..., Any] | None:
-        with self.lock:
-            return self.input_fns.get(input_id)
+        return self.input_fns.get(input_id)
 
     def snapshot(self) -> Snapshot:
         with self.lock:
@@ -239,25 +259,31 @@ class GraphStore:
 
     def traces(self) -> list[TraceEvent]:
         with self.lock:
-            return list(self.trace)
+            return self._materialize_traces_locked()
+
+    def _materialize_traces_locked(self) -> list[TraceEvent]:
+        return [
+            TraceEvent(
+                event=event,
+                key=key if isinstance(key, str) else self.key_to_str(key),
+                revision=revision,
+                detail=detail,
+                timestamp=timestamp,
+            )
+            for event, key, revision, detail, timestamp in self.trace
+        ]
 
     def clear_traces(self) -> None:
         with self.lock:
             self.trace.clear()
 
     def trace_event(self, event: str, key: QueryKey, detail: str = "") -> None:
+        if self.trace_limit == 0:
+            return
         # Must synchronize with readers/writers of `trace` and with `revision`
         # (recorded on each event). Evaluator paths invoke this from many threads.
         with self.lock:
-            self.trace.append(
-                TraceEvent(
-                    event=event,
-                    key=self.key_to_str(key),
-                    revision=self.revision,
-                    detail=detail,
-                    timestamp=time.time(),
-                )
-            )
+            self.trace.append((event, key, self.revision, detail, time.time()))
 
     def key_to_str(self, key: QueryKey) -> str:
         kind, fid, args = key
@@ -270,7 +296,8 @@ class GraphStore:
         memo = self.memos[key]
         self.next_access_id += 1
         memo.last_access = self.next_access_id
-        heapq.heappush(self._lru_heap, (memo.last_access, key))
+        self._lru[key] = None
+        self._lru.move_to_end(key)
 
     def pin_memo_verification_locked(self, key: QueryKey) -> None:
         self._memo_verify_pin_count[key] = self._memo_verify_pin_count.get(key, 0) + 1
@@ -283,13 +310,14 @@ class GraphStore:
             self._memo_verify_pin_count[key] = n - 1
 
     def push_memo_lru_locked(self, key: QueryKey) -> None:
-        memo = self.memos.get(key)
-        if memo is None:
+        if key not in self.memos:
             return
-        heapq.heappush(self._lru_heap, (memo.last_access, key))
+        self._lru[key] = None
+        self._lru.move_to_end(key)
 
     def drop_memo_locked(self, key: QueryKey) -> None:
         self._memo_verify_pin_count.pop(key, None)
+        self._lru.pop(key, None)
         memo = self.memos.pop(key, None)
         if memo is None:
             return
@@ -301,20 +329,26 @@ class GraphStore:
             if not dependents:
                 self.dependents.pop(dep.key, None)
 
-    def _rebuild_lru_heap_locked(self) -> None:
-        self._lru_heap = [(memo.last_access, k) for k, memo in self.memos.items()]
-        heapq.heapify(self._lru_heap)
+    def _rebuild_lru_locked(self) -> None:
+        ordered = sorted(self.memos.items(), key=lambda item: item[1].last_access)
+        self._lru = OrderedDict((k, None) for k, _ in ordered)
 
     def _pop_lru_victim_key_locked(self) -> QueryKey | None:
-        while self._lru_heap:
-            last_acc, key = heapq.heappop(self._lru_heap)
-            memo = self.memos.get(key)
-            if memo is None or memo.last_access != last_acc:
+        stale: list[QueryKey] = []
+        victim: QueryKey | None = None
+        # Pinned rows are skipped, not removed; there are at most a handful
+        # (one per frame of an in-progress verification).
+        for key in self._lru:
+            if key not in self.memos:
+                stale.append(key)
                 continue
             if self._memo_verify_pin_count.get(key, 0) > 0:
                 continue
-            return key
-        return None
+            victim = key
+            break
+        for key in stale:
+            del self._lru[key]
+        return victim
 
     def _unpinned_lru_fallback_key_locked(self) -> QueryKey | None:
         best_k: QueryKey | None = None
@@ -331,7 +365,7 @@ class GraphStore:
         while len(self.memos) > self.max_entries:
             victim = self._pop_lru_victim_key_locked()
             if victim is None:
-                self._rebuild_lru_heap_locked()
+                self._rebuild_lru_locked()
                 victim = self._pop_lru_victim_key_locked()
             if victim is None:
                 victim = self._unpinned_lru_fallback_key_locked()
@@ -353,7 +387,7 @@ class GraphStore:
             ]
             for key in remove:
                 self.drop_memo_locked(key)
-            self._rebuild_lru_heap_locked()
+            self._rebuild_lru_locked()
 
     def latest_input_version(self, input_key: InputKey) -> InputVersion | None:
         versions = self.inputs.get(input_key)
@@ -367,8 +401,10 @@ class GraphStore:
         versions = self.inputs.get(input_key)
         if not versions:
             return None
-        revs = [v.revision for v in versions]
-        idx = bisect.bisect_right(revs, revision) - 1
+        latest = versions[-1]
+        if latest.revision <= revision:
+            return latest
+        idx = bisect.bisect_right(versions, revision, key=_version_revision) - 1
         if idx < 0:
             return None
         return versions[idx]
@@ -538,6 +574,7 @@ class GraphStore:
             }
             if condense:
                 from ._graph_export import condense_graph
+
                 condensed = condense_graph(graph)
                 graph["nodes"] = condensed["nodes"]
                 graph["edges"] = condensed["edges"]
@@ -570,13 +607,19 @@ class GraphStore:
             self.dependents = defaultdict(set)
             for k, v in deps_in.items():
                 self.dependents[k] = set(v)
-            self.trace = deque(payload["trace"], maxlen=self.trace_limit)
+            self.trace = deque(
+                (
+                    (ev.event, ev.key, ev.revision, ev.detail, ev.timestamp)
+                    for ev in payload["trace"]
+                ),
+                maxlen=self.trace_limit,
+            )
             self.next_access_id = payload["access_id"]
             # In-flight dedup futures are process-local/transient and should never
             # survive a load boundary.
             self.in_flight.clear()
             self._memo_verify_pin_count.clear()
-            self._rebuild_lru_heap_locked()
+            self._rebuild_lru_locked()
 
     def make_persistence_payload(self) -> dict[str, Any]:
         with self.lock:
@@ -586,7 +629,7 @@ class GraphStore:
                 "inputs": self.inputs,
                 "memos": self.memos,
                 "dependents": self.dependents,
-                "trace": list(self.trace),
+                "trace": self._materialize_traces_locked(),
                 "access_id": self.next_access_id,
             }
 
