@@ -566,6 +566,7 @@ class Evaluator:
             self._store.trace_event("cache_red_ttl", key)
             return False
 
+        self._settle_dependencies(key, entry, snapshot)
         for dep in entry.deps:
             dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
             if dep_changed_at != dep.observed_changed_at:
@@ -574,6 +575,83 @@ class Evaluator:
                 )
                 return False
         return True
+
+    def _settle_dependencies(
+        self, root: QueryKey, root_entry: MemoEntry, snapshot: Snapshot
+    ) -> None:
+        """Verify ``root``'s unverified query dependencies deepest-first.
+
+        ``dependency_changed_at`` verifies a stale dependency by recursing into
+        it, which costs several Python frames per level, so a long chain of
+        stale memos (pinned snapshots, TTL or cycle memos below, memos loaded by
+        ``load()``) overflowed the recursion limit. This explicit-stack pass
+        settles each dependency only once its own dependencies are settled, so
+        the nested call it makes finds everything beneath already verified and
+        returns at constant depth.
+
+        It visits exactly what the recursive walk would, in the same order: a
+        memo's dependencies are examined in recorded order, and the scan stops
+        at the first one whose ``changed_at`` differs, because the memo will be
+        recomputed and its later dependencies may no longer be read. Anything
+        it cannot handle (missing memos, fixed-point cycles, frames already
+        executing) is left to the normal path in ``try_mark_green``.
+        """
+        store = self._store
+        runtime = self._runtime_var.get()
+        executing = (
+            {frame.key for frame in runtime.stack} if runtime is not None else set()
+        )
+        revision = snapshot.revision
+        # Frames are [key, memo, index of the next dependency to examine].
+        stack: list[list[Any]] = [[root, root_entry, 0]]
+        visiting = {root}
+        settled: set[QueryKey] = set()
+        while stack:
+            frame = stack[-1]
+            deps = frame[1].deps
+            index = frame[2]
+            pushed = False
+            while index < len(deps):
+                dep = deps[index]
+                dep_key = dep.key
+                if dep_key[0] == "input":
+                    version = store.input_version_at((dep_key[1], dep_key[2]), revision)
+                    changed_at = -1 if version is None else version.changed_at
+                    if changed_at != dep.observed_changed_at:
+                        break
+                    index += 1
+                    continue
+                with store.lock:
+                    dep_memo = store.memos.get(dep_key)
+                    current = dep_memo is not None and store.is_current_locked(
+                        dep_memo, revision
+                    )
+                if current:
+                    if dep_memo.changed_at != dep.observed_changed_at:  # type: ignore[union-attr]
+                        break
+                    index += 1
+                    continue
+                if dep_key in settled or dep_key in visiting or dep_key in executing:
+                    break
+                if dep_memo is None:
+                    # Nothing to walk; computing it is the only way forward.
+                    self.dependency_changed_at(dep_key, snapshot)
+                    settled.add(dep_key)
+                    continue
+                frame[2] = index
+                stack.append([dep_key, dep_memo, 0])
+                visiting.add(dep_key)
+                pushed = True
+                break
+            if pushed:
+                continue
+            stack.pop()
+            visiting.discard(frame[0])
+            if stack:
+                # All of this memo's examined dependencies are now verified,
+                # so verifying the memo itself does not recurse further.
+                self.dependency_changed_at(frame[0], snapshot)
+                settled.add(frame[0])
 
     async def try_mark_green_async(
         self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
