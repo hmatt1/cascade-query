@@ -128,50 +128,14 @@ def test_unsupported_type_still_raises_type_error() -> None:
         canonical.encode((1, Opaque()))
 
 
-# Blobs produced by the format-1 encoder (nested, separately packed payloads).
-LEGACY_BLOBS: dict[str, tuple[str, Any]] = {
-    "tuple": ("c70a019301a161c703019202c0", (1, "a", (2, None))),
-    "set": ("c70302920103", {3, 1}),
-    "frozenset": ("c7050392a161a162", frozenset({"b", "a"})),
-    "map": ("c70e04929201a17892c703019202039104", {1: "x", (2, 3): [4]}),
-    "bigint": ("c70f0592c3c40b0100000000000000000000", -(2**80)),
-    "datetime": (
-        "c71a09b9323032342d30312d30325430333a30343a30352b30303a3030",
-        datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc),
-    ),
-    "date": ("c70b0aaa323032342d30312d3032", datetime.date(2024, 1, 2)),
-    "time": ("c7090ba830333a30343a3035", datetime.time(3, 4, 5)),
-    "timedelta": (
-        "d60c93010203",
-        datetime.timedelta(days=1, seconds=2, microseconds=3),
-    ),
-    "timezone": (
-        "c70d0d9293ffce00010b3000a3455354",
-        datetime.timezone(datetime.timedelta(hours=-5), "EST"),
-    ),
-}
-
-
-@pytest.mark.parametrize("name", sorted(LEGACY_BLOBS))
-def test_format_1_blobs_remain_decodable(name: str) -> None:
-    blob_hex, expected = LEGACY_BLOBS[name]
-    assert _same(expected, canonical.decode(bytes.fromhex(blob_hex)))
-
-
-def test_format_1_class_backed_blobs_remain_decodable() -> None:
-    def legacy(code: int, payload: Any) -> bytes:
-        return msgpack.packb(
-            msgpack.ExtType(code, msgpack.packb(payload, use_bin_type=True)),
-            use_bin_type=True,
-        )
-
-    module, tuple_ext = __name__, msgpack.ExtType(1, msgpack.packb([2, 3]))
-    point = canonical.decode(legacy(6, [module, "Point", [["x", 1], ["y", tuple_ext]]]))
-    assert point == Point(1, (2, 3))
-    pair = canonical.decode(legacy(7, [module, "Pair", [1, [2]]]))
-    assert pair == Pair(1, [2]) and type(pair) is Pair
-    exc = canonical.decode(legacy(8, ["builtins", "ValueError", ["boom", 3]]))
-    assert type(exc) is ValueError and exc.args == ("boom", 3)
+def test_foreign_extension_payload_is_rejected() -> None:
+    # Format 1 wrapped tagged values in extensions carrying a packed payload.
+    legacy_tuple = bytes.fromhex("c70302920103")
+    with pytest.raises(ValueError, match="not disk format 2"):
+        canonical.decode(legacy_tuple)
+    unknown_code = msgpack.packb(msgpack.ExtType(99, b""))
+    with pytest.raises(ValueError, match="not disk format 2"):
+        canonical.decode(unknown_code)
 
 
 # --- engine-level behavior ---------------------------------------------------
@@ -333,22 +297,29 @@ def test_key_and_args_caches_are_bounded(tmp_path: Path) -> None:
     _close(engine)
 
 
-def test_sqlite_format_bump_keeps_collection_logs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ["sqlite", "mdbx"])
+def test_format_change_wipes_collection_logs(tmp_path: Path, backend: str) -> None:
     cache = tmp_path / "cache"
-    disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24, cache_backend="sqlite")
+
+    def open_disk() -> Any:
+        return disk_cache_mod.DiskCache(cache, map_size=1 << 24, cache_backend=backend)
+
+    disk = open_disk()
     disk.collection_append_many("col", [(1, {"diff": (1, 2)})])
+    assert disk.collection_load("col") == (None, [(1, {"diff": (1, 2)})])
     disk.close()
 
-    conn = sqlite3.connect(cache / "cache.db")
-    conn.execute(
-        "update sys set v = ? where k = ?",
-        ((1).to_bytes(4, "big"), disk_cache_mod._FORMAT_KEY),  # noqa: SLF001
-    )
-    conn.commit()
-    conn.close()
+    # Reopening under a different format number must not try to decode it.
+    old_format = disk_cache_mod.DISK_FORMAT
+    disk_cache_mod.DISK_FORMAT = old_format + 1
+    try:
+        disk = open_disk()
+        assert disk.collection_load("col") == (None, [])
+        disk.close()
+    finally:
+        disk_cache_mod.DISK_FORMAT = old_format
 
-    disk = disk_cache_mod.DiskCache(cache, map_size=1 << 24, cache_backend="sqlite")
-    snapshot, tail = disk.collection_load("col")
-    assert snapshot is None
-    assert tail == [(1, {"diff": (1, 2)})]
-    disk.close()
+
+def test_unknown_cache_backend_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown cache_backend 'lmdb'"):
+        Engine(cache_dir=tmp_path / "cache", cache_backend="lmdb")

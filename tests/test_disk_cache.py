@@ -11,7 +11,7 @@ import cascade._canonical as canonical
 import cascade._disk_cache as disk_cache_mod
 from cascade import Engine, PersistentCacheError
 
-@pytest.fixture(params=["mdbx", "lmdb", "sqlite"], autouse=True)
+@pytest.fixture(params=["mdbx", "sqlite"], autouse=True)
 def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
     original_init = Engine.__init__
 

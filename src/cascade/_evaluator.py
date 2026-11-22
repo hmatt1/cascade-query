@@ -393,24 +393,33 @@ class Evaluator:
                 if ttl is not None and time.time() - existing.computed_at_time > ttl:
                     is_expired = True
 
-                if not is_expired and existing.verified_at == runtime.snapshot.revision:
+                if not is_expired and self._store.is_current_locked(
+                    existing, runtime.snapshot.revision
+                ):
+                    existing.verified_at = runtime.snapshot.revision
                     self._store.trace_event("cache_hit", key)
                     if is_memoized or not need_value:
                         return existing, True
 
                 self._store.pin_memo_verification_locked(key)
-                try:
-                    green = self.try_mark_green(key, existing, runtime.snapshot)
-                finally:
+
+        if existing is not None:
+            # The dependency walk runs WITHOUT the store lock. It can reach a
+            # dependency another thread is computing and block on that
+            # thread's result; the owner needs the lock to finish, so waiting
+            # with it held deadlocks. The pin keeps the row from LRU eviction.
+            try:
+                green = self.try_mark_green(key, existing, runtime.snapshot)
+            finally:
+                with self._store.lock:
                     self._store.unpin_memo_verification_locked(key)
+            if green:
+                self._commit_green(key, existing, runtime.snapshot.revision)
+                self._store.trace_event("cache_green", key)
+                if is_memoized or not need_value:
+                    return existing, True
 
-                if green:
-                    existing.verified_at = runtime.snapshot.revision
-                    self._store.touch_memo_locked(key)
-                    self._store.trace_event("cache_green", key)
-                    if is_memoized or not need_value:
-                        return existing, True
-
+        with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
             slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
 
@@ -452,7 +461,10 @@ class Evaluator:
                 if ttl is not None and time.time() - existing.computed_at_time > ttl:
                     is_expired = True
 
-                if not is_expired and existing.verified_at == runtime.snapshot.revision:
+                if not is_expired and self._store.is_current_locked(
+                    existing, runtime.snapshot.revision
+                ):
+                    existing.verified_at = runtime.snapshot.revision
                     self._store.trace_event("cache_hit", key)
                     if is_memoized or not need_value:
                         return existing, True
@@ -465,9 +477,7 @@ class Evaluator:
                 with self._store.lock:
                     self._store.unpin_memo_verification_locked(key)
             if green:
-                with self._store.lock:
-                    existing.verified_at = runtime.snapshot.revision
-                    self._store.touch_memo_locked(key)
+                self._commit_green(key, existing, runtime.snapshot.revision)
                 self._store.trace_event("cache_green", key)
                 if is_memoized or not need_value:
                     return existing, True
@@ -494,6 +504,18 @@ class Evaluator:
             raise
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
+
+    def _commit_green(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
+        """Record that ``memo`` was verified unchanged at ``revision``."""
+        with self._store.lock:
+            memo.verified_at = revision
+            # The walk ran unlocked, so the row may have been dropped or
+            # replaced meanwhile. ``memo`` is still a correct answer at
+            # ``revision`` for this caller, but only the stored row is
+            # touched or marked clean.
+            if self._store.memos.get(key) is memo:
+                self._store.refresh_head_clean_locked(memo, revision, key[1])
+                self._store.touch_memo_locked(key)
 
     def _claim_in_flight_locked(
         self, in_flight_key: tuple[QueryKey, int]
@@ -578,9 +600,11 @@ class Evaluator:
 
         with self._store.lock:
             memo = self._store.memos.get(key)
+            if memo is not None and self._store.is_current_locked(
+                memo, snapshot.revision
+            ):
+                return memo.changed_at
         fn = self._store.lookup_query(fid)
-        if memo is not None and memo.verified_at == snapshot.revision:
-            return memo.changed_at
 
         runtime = self._runtime_var.get()
         if runtime is not None:
@@ -647,9 +671,11 @@ class Evaluator:
 
         with self._store.lock:
             memo = self._store.memos.get(key)
+            if memo is not None and self._store.is_current_locked(
+                memo, snapshot.revision
+            ):
+                return memo.changed_at
         fn = self._store.lookup_query(fid)
-        if memo is not None and memo.verified_at == snapshot.revision:
-            return memo.changed_at
 
         runtime = self._runtime_var.get()
         if runtime is not None:
@@ -824,6 +850,9 @@ class Evaluator:
             self._store.push_memo_lru_locked(key)
             for dep_key in frame.deps.keys():
                 self._store.dependents[dep_key].add(key)
+            self._store.refresh_head_clean_locked(
+                stored_memo, runtime.snapshot.revision, key[1]
+            )
             self._store.evict_if_needed_locked()
         if self._disk is not None and is_memoized:
             self._persist_entry(key, full_memo)
@@ -966,6 +995,9 @@ class Evaluator:
                 self._store.push_memo_lru_locked(key)
                 for dep_key in frame.deps.keys():
                     self._store.dependents[dep_key].add(key)
+                self._store.refresh_head_clean_locked(
+                    stored_memo, new_runtime.snapshot.revision, key[1]
+                )
                 self._store.evict_if_needed_locked()
             if self._disk is not None and is_memoized:
                 self._persist_entry(key, full_memo)
@@ -1100,6 +1132,9 @@ class Evaluator:
             self._store.push_memo_lru_locked(key)
             for dep_key in observed:
                 self._store.dependents[dep_key].add(key)
+            self._store.refresh_head_clean_locked(
+                memo, runtime.snapshot.revision, key[1]
+            )
             self._store.evict_if_needed_locked()
         self._store.trace_event("disk_hit", key)
         self._store.record_disk_hit()
@@ -1320,6 +1355,9 @@ class Evaluator:
             self._store.push_memo_lru_locked(key)
             for dep_key in observed:
                 self._store.dependents[dep_key].add(key)
+            self._store.refresh_head_clean_locked(
+                memo, runtime.snapshot.revision, key[1]
+            )
             self._store.evict_if_needed_locked()
         self._store.trace_event("disk_hit", key)
         self._store.record_disk_hit()

@@ -318,9 +318,9 @@ def _scenario_giant_graph_targeted_mutation_latency() -> ScenarioResult:
     )
 
 
-def _scenario_mark_green_depth_overhead() -> ScenarioResult:
+def _scenario_unrelated_input_depth_independence() -> ScenarioResult:
     rounds = 7
-    depths = [8, 24, 48]
+    depths = [8, 48, 96]
     medians: dict[int, float] = {}
 
     for depth in depths:
@@ -366,16 +366,19 @@ def _scenario_mark_green_depth_overhead() -> ScenarioResult:
     shallow = medians[depths[0]]
     deep = medians[depths[-1]]
     growth = deep / max(shallow, 1e-9)
-    threshold = 1.4
-    passed = growth >= threshold
+    # Before dirty propagation every revision bump re-walked the chain, so this
+    # ratio tracked depth (about 12x for these depths). Changing an input the
+    # chain never reads must now cost the same at any depth.
+    threshold = 3.0
+    passed = growth <= threshold
     return ScenarioResult(
-        name="mark-green-depth-overhead",
-        concern="Dependency verification overhead should reflect dependency depth and remain measurable at scale.",
+        name="unrelated-input-depth-independence",
+        concern="Changing an input a query never reads must not re-verify its dependency chain.",
         metric_name=f"depth{depths[-1]}_vs_depth{depths[0]}_verification_growth",
         metric_value=growth,
         unit="x",
         threshold=threshold,
-        comparator=">=",
+        comparator="<=",
         passed=passed,
         details={
             "depth_medians_ms": {str(depth): medians[depth] for depth in depths},
@@ -452,7 +455,10 @@ _SCENARIO_FACTORIES: tuple[tuple[str, Callable[[], ScenarioResult]], ...] = (
         "giant-graph-targeted-mutation-latency",
         _scenario_giant_graph_targeted_mutation_latency,
     ),
-    ("mark-green-depth-overhead", _scenario_mark_green_depth_overhead),
+    (
+        "unrelated-input-depth-independence",
+        _scenario_unrelated_input_depth_independence,
+    ),
     ("prune-runtime-scaling", _scenario_prune_runtime_scaling),
 )
 _SCENARIO_BY_NAME: dict[str, Callable[[], ScenarioResult]] = dict(_SCENARIO_FACTORIES)

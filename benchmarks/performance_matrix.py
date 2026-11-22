@@ -8,7 +8,7 @@ from typing import Any
 from cascade import Engine
 from cascade._synthetic_graph import build_fanout_chain_pipeline
 
-BACKENDS = ["sqlite", "lmdb", "mdbx"]
+BACKENDS = ["sqlite", "mdbx"]
 
 def run_matrix(depth: int, fanout: int) -> list[dict[str, Any]]:
     results = []

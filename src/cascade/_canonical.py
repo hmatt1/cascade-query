@@ -18,12 +18,6 @@ A plain ``list`` can never start with such a marker, so the form is
 unambiguous. Because tagged values are ordinary arrays, a whole value is
 packed with a single ``packb`` call and unpacked with a single ``unpackb``
 (the unpacker invokes ``_list_hook`` as each array closes).
-
-Format 1 wrapped every tagged value in an extension whose payload was a
-separately packed msgpack document, which cost one ``packb`` per container.
-Those blobs carry a non-empty payload and are still decoded (see
-``_decode_legacy_ext``) so durable collection logs written by older versions
-remain readable; new writes always use format 2.
 """
 
 from __future__ import annotations
@@ -244,12 +238,13 @@ def _resolve_type(module_name: str, qualname: str) -> type[Any]:
 
 
 def _ext_hook(code: int, data: bytes) -> Any:
-    if not data:
-        tag = _TAGS.get(code)
-        if tag is None:  # pragma: no cover
-            raise ValueError(f"cascade persistent cache: unknown extension code {code}")
-        return tag
-    return _decode_legacy_ext(code, data)
+    tag = _TAGS.get(code)
+    if tag is None or data:
+        raise ValueError(
+            f"cascade persistent cache: unexpected extension (code {code}, "
+            f"{len(data)} payload bytes); the blob is not disk format 2"
+        )
+    return tag
 
 
 def _list_hook(items: list[Any]) -> Any:
@@ -330,44 +325,3 @@ def _untag(code: int, items: list[Any]) -> Any:
             days=items[1], seconds=items[2], microseconds=items[3]
         )
     return _make_timezone(items[1], items[2], items[3], items[4])
-
-
-def _decode_legacy_ext(code: int, data: bytes) -> Any:
-    """Decode a format-1 extension: ``data`` is a nested msgpack document."""
-    # Nested format-1 extensions inside the payload come back through
-    # ``_ext_hook``, so ``payload`` is already fully decoded.
-    payload = decode(data)
-    if code == _EXT_TUPLE:
-        return tuple(payload)
-    if code == _EXT_SET:
-        return set(payload)
-    if code == _EXT_FROZENSET:
-        return frozenset(payload)
-    if code == _EXT_MAP:
-        return {pair[0]: pair[1] for pair in payload}
-    if code == _EXT_BIGINT:
-        return _make_bigint(payload[0], payload[1])
-    if code == _EXT_DATACLASS:
-        module_name, qualname, field_pairs = payload
-        return _make_dataclass(
-            module_name, qualname, {pair[0]: pair[1] for pair in field_pairs}
-        )
-    if code == _EXT_NAMEDTUPLE:
-        return _make_namedtuple(payload[0], payload[1], payload[2])
-    if code == _EXT_EXCEPTION:
-        return _make_exception(payload[0], payload[1], payload[2])
-    if code == _EXT_DATETIME:
-        return datetime.datetime.fromisoformat(payload)
-    if code == _EXT_DATE:
-        return datetime.date.fromisoformat(payload)
-    if code == _EXT_TIME:
-        return datetime.time.fromisoformat(payload)
-    if code == _EXT_TIMEDELTA:
-        return datetime.timedelta(
-            days=payload[0], seconds=payload[1], microseconds=payload[2]
-        )
-    if code == _EXT_TIMEZONE:
-        return _make_timezone(*payload[0], payload[1])
-    raise ValueError(
-        f"cascade persistent cache: unknown extension code {code}"
-    )  # pragma: no cover

@@ -7,7 +7,7 @@ synthetic graph are trivial, so the numbers are almost entirely engine cost.
 Usage::
 
     python -m benchmarks.engine_overhead --depth 20 --fanout 1000 --rounds 5
-    python -m benchmarks.engine_overhead --disk sqlite lmdb mdbx
+    python -m benchmarks.engine_overhead --disk sqlite mdbx
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def main() -> int:
         "--disk",
         nargs="*",
         default=[],
-        choices=["sqlite", "lmdb", "mdbx"],
+        choices=["sqlite", "mdbx"],
         help="also benchmark these persistent cache backends",
     )
     args = parser.parse_args()

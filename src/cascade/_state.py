@@ -35,6 +35,10 @@ class MemoEntry:
     computed_at_time: float = 0.0
     cycle_nodes: tuple[QueryKey, ...] = ()
     error: BaseException | None = None
+    # True while this memo is known valid at the store's newest revision
+    # without re-walking its dependencies. Maintained by GraphStore (see
+    # "dirty propagation" there); process-local and never persisted.
+    head_clean: bool = False
 
 
 @dataclass(frozen=True)

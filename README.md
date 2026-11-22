@@ -70,7 +70,7 @@ The `Engine` manages caching, execution, and state tracking.
 *   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental=True)`**: Initializes the engine. 
     *   `max_entries` sets the limit for the Least Recently Used (LRU) in-memory cache. 
     *   Passing `cache_dir` enables persistent disk caching.
-    *   `cache_backend` allows you to select the storage engine for persistence (`"mdbx"`, `"sqlite"`, or `"lmdb"`).
+    *   `cache_backend` allows you to select the storage engine for persistence (`"mdbx"` or `"sqlite"`).
 
 ### Defining Nodes: `@engine.input` and `@engine.query`
 

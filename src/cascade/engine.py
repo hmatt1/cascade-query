@@ -270,7 +270,7 @@ class Engine:
         # incremental= on @engine.query overrides it in either direction.
         self._incremental_default = incremental
         # Passing cache_dir switches on zero-config persistence (MDBX by default,
-        # or sqlite/lmdb), deterministic msgpack serialization, and content
+        # or sqlite), deterministic msgpack serialization, and content
         # fingerprints as the cross-session revision markers. Missing dependencies
         # (e.g. libmdbx/msgpack) raise here.
         self._disk: DiskCacheProtocol | None = None
@@ -596,11 +596,11 @@ class Engine:
         if vacuum_disk and self._disk is not None:
             self._evaluator.prune_disk_cache(root_list)
 
-    def save(self, path: str, backend: Literal["sqlite", "mdbx", "lmdb"] = "sqlite") -> None:
+    def save(self, path: str, backend: Literal["sqlite", "mdbx"] = "sqlite") -> None:
         save_payload(path, self._store.make_persistence_payload(), backend=backend)
         self._store.record_persistence_save()
 
-    def load(self, path: str, backend: Literal["sqlite", "mdbx", "lmdb"] = "sqlite") -> None:
+    def load(self, path: str, backend: Literal["sqlite", "mdbx"] = "sqlite") -> None:
         payload = load_payload(path, backend=backend)
         if payload is None:
             return

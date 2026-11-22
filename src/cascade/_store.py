@@ -247,6 +247,7 @@ class GraphStore:
                 drop_keys = [k for k in self.inputs if k[0] == input_id]
                 for k in drop_keys:
                     self.inputs.pop(k, None)
+                    self.mark_dependents_dirty_locked(("input", k[0], k[1]))
             self.input_fns[input_id] = fn
             self.input_hashes[input_id] = fn_hash
 
@@ -315,12 +316,82 @@ class GraphStore:
         self._lru[key] = None
         self._lru.move_to_end(key)
 
+    # --- dirty propagation ---------------------------------------------------
+    #
+    # Without help, verifying a memo after any revision bump means re-walking
+    # its whole dependency graph. ``MemoEntry.head_clean`` avoids that: a memo
+    # with the flag set is valid at the newest revision as-is.
+    #
+    # Invariants (all mutations happen under ``self.lock``):
+    #   1. A clean memo's query dependencies all have clean memos, so the
+    #      ``dependents`` edges from every input it transitively reads are
+    #      intact.
+    #   2. Hence a dirty memo's dependents are all dirty, and the upward walks
+    #      below may stop at the first memo that is already dirty.
+    #
+    # A memo turns dirty when an input it (transitively) read changes value, or
+    # when any memo beneath it is dropped or replaced. It only turns clean
+    # again through ``refresh_head_clean_locked`` after being verified or
+    # recomputed at the newest revision.
+
+    def mark_dependents_dirty_locked(self, key: QueryKey) -> None:
+        """Clear ``head_clean`` on every memo that transitively depends on ``key``."""
+        dependents = self.dependents
+        memos = self.memos
+        stack = [key]
+        while stack:
+            parents = dependents.get(stack.pop())
+            if not parents:
+                continue
+            for parent in parents:
+                memo = memos.get(parent)
+                if memo is not None and memo.head_clean:
+                    memo.head_clean = False
+                    stack.append(parent)
+
+    def is_current_locked(self, memo: MemoEntry, revision: int) -> bool:
+        """True when ``memo`` needs no dependency walk to be used at ``revision``."""
+        return memo.verified_at == revision or (
+            memo.head_clean and revision == self.revision
+        )
+
+    def refresh_head_clean_locked(
+        self, memo: MemoEntry, revision: int, query_id: str
+    ) -> None:
+        """Mark a memo just verified/stored at ``revision`` clean if it qualifies.
+
+        Memos with a TTL, memos in a fixed-point cycle, and anything depending
+        on a memo that is not itself clean stay dirty and keep being verified
+        the slow way.
+
+        This only ever sets the flag. Clearing it here would break invariant 2
+        (the memo's dependents would stay clean): a memo that is clean at the
+        newest revision stays so when it is also verified at an older pinned
+        snapshot, because that walk changes neither its value nor its edges.
+        """
+        if (
+            revision != self.revision
+            or memo.cycle_nodes
+            or self.query_ttl.get(query_id) is not None
+        ):
+            return
+        memos = self.memos
+        for dep in memo.deps:
+            if dep.key[0] != "query":
+                continue
+            dep_memo = memos.get(dep.key)
+            if dep_memo is None or not dep_memo.head_clean:
+                return
+        memo.head_clean = True
+
     def drop_memo_locked(self, key: QueryKey) -> None:
         self._memo_verify_pin_count.pop(key, None)
         self._lru.pop(key, None)
         memo = self.memos.pop(key, None)
         if memo is None:
             return
+        # Dependents can no longer rely on the edges this memo carried.
+        self.mark_dependents_dirty_locked(key)
         for dep in memo.deps:
             dependents = self.dependents.get(dep.key)
             if dependents is None:
@@ -438,6 +509,8 @@ class GraphStore:
                 )
             )
             trace_key = ("input", input_id, args)
+            if changed_at == self.revision:
+                self.mark_dependents_dirty_locked(trace_key)
             self.trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
             return self.revision
 
@@ -471,6 +544,8 @@ class GraphStore:
                     )
                 )
                 trace_key = ("input", input_id, args)
+                if changed_at == self.revision:
+                    self.mark_dependents_dirty_locked(trace_key)
                 self.trace_event(
                     "input_set", trace_key, detail=f"changed_at={changed_at}"
                 )
@@ -603,6 +678,9 @@ class GraphStore:
             self.cancel_epoch = payload["cancel_epoch"]
             self.inputs = payload["inputs"]
             self.memos = payload["memos"]
+            # Loaded memos must earn head_clean again through verification.
+            for memo in self.memos.values():
+                memo.head_clean = False
             deps_in = payload["dependents"]
             self.dependents = defaultdict(set)
             for k, v in deps_in.items():
