@@ -1,7 +1,4 @@
-"""Canonical JSON-compatible encoding for persistence and stable value hashing.
-
-Avoids pickle for safer load paths and deterministic, inspectable on-disk state.
-"""
+"""Canonical JSON encoding used for stable value hashing, plus bytecode hashing."""
 
 from __future__ import annotations
 
@@ -9,31 +6,12 @@ import base64
 import dataclasses
 import datetime
 import hashlib
-import importlib
 import json
 import math
-import types
 from typing import Any
 
-from ._state import Dependency, InputVersion, MemoEntry, TraceEvent
-
-PERSISTENCE_FORMAT = 2
-
-# Used for canonical key ordering; kept separate so tests can monkeypatch `json.dumps`
-# on this module without breaking recursive sorting inside `_to_jsonable`.
-_json_dumps = json.dumps
 # What json.dumps(..., ensure_ascii=False) emits for a str.
 _encode_json_str = json.encoder.encode_basestring
-
-
-def _resolve_type(module_name: str, qualname: str) -> type[Any]:
-    mod = importlib.import_module(module_name)
-    cur: Any = mod
-    for part in qualname.split("."):
-        cur = getattr(cur, part)
-    if not isinstance(cur, type):
-        raise TypeError(f"{module_name}.{qualname!r} is not a type")
-    return cur
 
 
 def hash_bytecode(fn: Any) -> str:
@@ -88,37 +66,8 @@ def stable_value_digest(value: Any) -> str:
     return hashlib.blake2b(blob, digest_size=20).hexdigest()
 
 
-def dumps_payload(payload: dict[str, Any]) -> bytes:
-    """Serialize a graph-store persistence dict to UTF-8 JSON bytes."""
-    envelope = {"format": PERSISTENCE_FORMAT, "payload": _to_jsonable(payload)}
-    return json.dumps(
-        envelope,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-
-def loads_payload(blob: bytes) -> dict[str, Any]:
-    """Decode ``dumps_payload`` output back to a persistence dict."""
-    text = blob.decode("utf-8")
-    envelope = json.loads(text)
-    if not isinstance(envelope, dict):
-        raise ValueError("persistence envelope must be a JSON object")
-    fmt = envelope.get("format")
-    if fmt != PERSISTENCE_FORMAT:
-        raise ValueError(f"unsupported persistence format: {fmt!r}")
-    body = envelope.get("payload")
-    if body is None:
-        raise ValueError("missing payload field")
-    raw = _from_jsonable(body)
-    if not isinstance(raw, dict):
-        raise ValueError("payload must decode to a dict")
-    return raw  # type: ignore[return-value]
-
-
 def _sort_key(obj: Any) -> str:
-    return _json_dumps(
+    return json.dumps(
         _to_jsonable(obj),
         sort_keys=True,
         separators=(",", ":"),
@@ -132,17 +81,6 @@ def _encode_float(f: float) -> dict[str, Any]:
     if math.isinf(f):
         return {"__float__": "inf", "sign": 1.0 if f > 0 else -1.0}
     return {"__float__": "h", "v": float.hex(f)}
-
-
-def _decode_float(d: dict[str, Any]) -> float:
-    tag = d["__float__"]
-    if tag == "nan":
-        return float(math.copysign(float("nan"), d["sign"]))
-    if tag == "inf":
-        s = float(d["sign"])
-        return float("inf") if s > 0 else float("-inf")
-    assert tag == "h"
-    return float.fromhex(d["v"])
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -168,49 +106,6 @@ def _to_jsonable(obj: Any) -> Any:
         return {"__timedelta__": [obj.days, obj.seconds, obj.microseconds]}
     if isinstance(obj, datetime.timezone):
         return {"__timezone__": [_to_jsonable(obj.utcoffset(None)), obj.tzname(None)]}
-
-    if isinstance(obj, TraceEvent):
-        return {
-            "__TraceEvent__": {
-                "event": obj.event,
-                "key": obj.key,
-                "revision": obj.revision,
-                "detail": obj.detail,
-                "timestamp": _to_jsonable(obj.timestamp),
-            }
-        }
-    if isinstance(obj, Dependency):
-        return {
-            "__Dependency__": {
-                "key": _to_jsonable(obj.key),
-                "observed_changed_at": obj.observed_changed_at,
-            }
-        }
-    if isinstance(obj, InputVersion):
-        return {
-            "__InputVersion__": {
-                "revision": obj.revision,
-                "changed_at": obj.changed_at,
-                "value_hash": obj.value_hash,
-                "value": _to_jsonable(obj.value),
-            }
-        }
-    if isinstance(obj, MemoEntry):
-        out = {
-            "value": _to_jsonable(obj.value),
-            "value_hash": obj.value_hash,
-            "changed_at": obj.changed_at,
-            "verified_at": obj.verified_at,
-            "deps": _to_jsonable(list(obj.deps)),
-            "effects": _to_jsonable(obj.effects),
-            "last_access": obj.last_access,
-            "computed_at_time": _to_jsonable(obj.computed_at_time),
-        }
-        if obj.error is not None:
-            out["error"] = _to_jsonable(obj.error)
-        if obj.cycle_nodes:
-            out["cycle_nodes"] = _to_jsonable(list(obj.cycle_nodes))
-        return {"__MemoEntry__": out}
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return {
@@ -258,144 +153,5 @@ def _to_jsonable(obj: Any) -> Any:
     raise TypeError(
         f"cascade serde: unsupported type {type(obj).__module__}.{type(obj).__qualname__!r}; "
         "use primitives, bytes, collections, datetime, @dataclass / typing.NamedTuple instances, "
-        "cascade state types (MemoEntry, InputVersion, …), or BaseException."
+        "or BaseException."
     )
-
-
-def _from_jsonable(obj: Any) -> Any:
-    if obj is None or obj is True or obj is False:
-        return obj
-    if type(obj) is int:
-        return obj
-    if type(obj) is float:
-        return obj
-    if type(obj) is str:
-        return obj
-
-    if not isinstance(obj, dict):
-        raise TypeError(
-            f"cascade serde: expected dict, list, or scalar at this position, got {type(obj)!r}"
-        )
-
-    if "__float__" in obj:
-        return _decode_float(obj)
-
-    if len(obj) == 1:
-        sole_key = next(iter(obj))
-        sole_val = obj[sole_key]
-        if sole_key == "__bytes__":
-            return base64.standard_b64decode(str(sole_val))
-        if sole_key == "__tuple__":
-            return tuple(_from_jsonable(x) for x in sole_val)
-        if sole_key == "__list__":
-            return [_from_jsonable(x) for x in sole_val]
-        if sole_key == "__frozenset__":
-            return frozenset(_from_jsonable(x) for x in sole_val)
-        if sole_key == "__set__":
-            return {_from_jsonable(x) for x in sole_val}
-        if sole_key == "__map__":
-            out: dict[Any, Any] = {}
-            for pair in sole_val:
-                if not isinstance(pair, list) or len(pair) != 2:
-                    raise ValueError("invalid __map__ entry")
-                out[_from_jsonable(pair[0])] = _from_jsonable(pair[1])
-            return out
-        if sole_key == "__datetime__":
-            return datetime.datetime.fromisoformat(sole_val)
-        if sole_key == "__date__":
-            return datetime.date.fromisoformat(sole_val)
-        if sole_key == "__time__":
-            return datetime.time.fromisoformat(sole_val)
-        if sole_key == "__timedelta__":
-            return datetime.timedelta(
-                days=sole_val[0], seconds=sole_val[1], microseconds=sole_val[2]
-            )
-        if sole_key == "__timezone__":
-            return datetime.timezone(_from_jsonable(sole_val[0]), sole_val[1])
-        if sole_key == "__TraceEvent__":
-            d = sole_val
-            return TraceEvent(
-                event=d["event"],
-                key=d["key"],
-                revision=d["revision"],
-                detail=d["detail"],
-                timestamp=_from_jsonable(d["timestamp"]),
-            )
-        if sole_key == "__Dependency__":
-            d = sole_val
-            return Dependency(
-                key=_from_jsonable(d["key"]),
-                observed_changed_at=d["observed_changed_at"],
-            )
-        if sole_key == "__InputVersion__":
-            d = sole_val
-            return InputVersion(
-                revision=d["revision"],
-                changed_at=d["changed_at"],
-                value_hash=d["value_hash"],
-                value=_from_jsonable(d["value"]),
-            )
-        if sole_key == "__MemoEntry__":
-            d = sole_val
-            deps_raw = _from_jsonable(d["deps"])
-            if not isinstance(deps_raw, list):
-                raise ValueError("MemoEntry.deps must decode to a list")
-            error_raw = d.get("error")
-            error = _from_jsonable(error_raw) if error_raw is not None else None
-            cycle_nodes_raw = d.get("cycle_nodes")
-            cycle_nodes_list = (
-                _from_jsonable(cycle_nodes_raw) if cycle_nodes_raw is not None else []
-            )
-            if not isinstance(cycle_nodes_list, list):
-                raise ValueError("MemoEntry.cycle_nodes must decode to a list")
-            return MemoEntry(
-                value=_from_jsonable(d["value"]),
-                value_hash=d["value_hash"],
-                changed_at=d["changed_at"],
-                verified_at=d["verified_at"],
-                deps=tuple(deps_raw),
-                effects=_from_jsonable(d["effects"]),
-                last_access=d["last_access"],
-                computed_at_time=_from_jsonable(d.get("computed_at_time", 0.0)),
-                error=error,
-                cycle_nodes=tuple(cycle_nodes_list),
-            )
-        if sole_key == "__dataclass__":
-            d = sole_val
-            fields = {pair[0]: _from_jsonable(pair[1]) for pair in d["f"]}
-            try:
-                cls = _resolve_type(d["m"], d["q"])
-                if dataclasses.is_dataclass(cls) and isinstance(cls, type):
-                    return cls(**fields)
-            except Exception:  # pragma: no cover
-                pass  # pragma: no cover
-            return types.SimpleNamespace(**fields)  # pragma: no cover
-        if sole_key == "__namedtuple__":
-            d = sole_val
-            vals = [_from_jsonable(x) for x in d["f"]]
-            try:
-                cls = _resolve_type(d["m"], d["q"])
-                if (
-                    isinstance(cls, type)
-                    and issubclass(cls, tuple)
-                    and hasattr(cls, "_make")
-                ):
-                    return cls(*vals)
-            except Exception:  # pragma: no cover
-                pass  # pragma: no cover
-            return tuple(vals)  # pragma: no cover
-
-        if sole_key == "__exception__":
-            d = sole_val
-            vals = [_from_jsonable(x) for x in d["a"]]
-            try:
-                cls = _resolve_type(d["m"], d["q"])
-                if isinstance(cls, type) and issubclass(cls, BaseException):
-                    return cls(*vals)
-            except Exception:  # pragma: no cover
-                pass  # pragma: no cover
-            return Exception(
-                f"Unresolved exception {d['m']}.{d['q']}: {vals}"
-            )  # pragma: no cover
-
-    raise TypeError(f"cascade serde: unrecognized object shape: {obj!r}")

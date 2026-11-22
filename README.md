@@ -214,9 +214,7 @@ sqlite_engine = Engine(max_entries=10_000, cache_dir=".cascade_cache", cache_bac
 *   `libmdbx` and `msgpack` are required for the default backend (`pip install query-cascade[disk]`). You can also use `sqlite` which has no external dependencies.
 *   Values and arguments must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.).
 *   **`engine.clear_disk_cache()`**: Deletes every entry in the persistent disk cache.
-
-### Export / Import
-*   **`engine.save(path)` / `engine.load(path)`**: Persists all inputs and cached results to a SQLite database. Note: Collection event logs are not saved here, use persistent collections instead.
+*   **Reusing results across runs:** each result is written to the cache as soon as its query finishes. A new `Engine` with the same `cache_dir` reuses them once you set the same input values again, and recomputes only the queries whose inputs changed.
 
 ---
 
@@ -329,9 +327,8 @@ items = CascadeList(engine, name="items", compact_every=1024)
 
 1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`.
 2. **Thread Safety:** While Cascade supports parallel query execution, the `Engine` object itself should be modified (`.set()`, `@engine.query`) from a single thread or with external synchronization.
-3. **Persistence Security:** `engine.load()` and the persistent disk cache resolve `@dataclass` and `NamedTuple` types via `importlib`. Only load databases or open cache directories from trusted sources.
+3. **Persistence Security:** The persistent disk cache resolves `@dataclass` and `NamedTuple` types via `importlib`. Only open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.
-5. **Collections & `engine.save()`:** State snapshots via `engine.save()`/`engine.load()` do not carry collection event logs; use a named collection with `cache_dir` for durable collection state.
 
 ### Examples (in `examples/`)
 
@@ -349,7 +346,7 @@ items = CascadeList(engine, name="items", compact_every=1024)
 | `snapshot_isolation.py` | Snapshot reads while live inputs change |
 | `concurrent_background_work.py` | Dedup under concurrency + cancellation after input changes |
 | `compute_many_with_accumulators.py` | `compute_many(..., effects=...)` accumulator collection |
-| `persistence_and_inspection.py` | Save/load and graph summaries |
+| `disk_cache_and_inspection.py` | Reusing results across engine sessions via `cache_dir`, plus graph summaries and pruning |
 | `gil_parallel_speedup.py` | Threaded CPU benchmark: GIL vs free-threaded |
 
 ### Development & Tests

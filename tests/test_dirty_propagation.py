@@ -6,7 +6,6 @@ from __future__ import annotations
 import random
 import threading
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -366,28 +365,6 @@ def test_reregistering_a_query_dirties_its_dependents() -> None:
     engine.query(base_v2)
     a.set(2)
     assert top() == 204
-
-
-def test_loaded_state_is_verified_before_being_trusted(tmp_path: Path) -> None:
-    def build() -> tuple[Engine, Any, Any]:
-        engine = Engine()
-        a, _, _, top = _chain(engine, Counter())
-        return engine, a, top
-
-    engine, a, top = build()
-    a.set(3)
-    assert top() == 7
-    path = str(tmp_path / "state.db")
-    engine.save(path)
-
-    engine2, a2, top2 = build()
-    engine2.load(path)
-    store = _store(engine2)
-    assert not any(memo.head_clean for memo in store.memos.values())
-    assert top2() == 7
-    a2.set(4)
-    assert top2() == 9
-    assert_clean_invariants(engine2)
 
 
 def test_fixed_point_cycle_memos_are_never_marked_clean() -> None:

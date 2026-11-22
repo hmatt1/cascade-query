@@ -19,7 +19,7 @@ from ._state import (
     TraceEvent,
 )
 
-_TraceRow = tuple[str, "QueryKey | str", int, str, float]
+_TraceRow = tuple[str, "QueryKey", int, str, float]
 
 
 def _version_revision(version: InputVersion) -> int:
@@ -45,8 +45,7 @@ class GraphStore:
         self.max_entries = max_entries
         self.trace_limit = trace_limit
         # Raw rows (event, key, revision, detail, timestamp). ``key`` is the
-        # QueryKey tuple, formatted to a string only when traces are read, or an
-        # already-formatted string for rows restored by ``assign_loaded_state``.
+        # QueryKey tuple, formatted to a string only when traces are read.
         # Building TraceEvent objects eagerly cost ~10% of a cold compute.
         self.trace: deque[_TraceRow] = deque(maxlen=trace_limit)
 
@@ -65,8 +64,6 @@ class GraphStore:
         self._stats_disk_hits = 0
         self._stats_disk_misses = 0
         self._stats_disk_stores = 0
-        self._stats_persistence_loads = 0
-        self._stats_persistence_saves = 0
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
         self.input_hashes: dict[str, str] = {}
@@ -125,8 +122,6 @@ class GraphStore:
             self._stats_disk_hits = 0
             self._stats_disk_misses = 0
             self._stats_disk_stores = 0
-            self._stats_persistence_loads = 0
-            self._stats_persistence_saves = 0
 
     def stats_summary(self) -> dict[str, Any]:
         with self.lock:
@@ -139,8 +134,6 @@ class GraphStore:
                 "disk_hits": self._stats_disk_hits,
                 "disk_misses": self._stats_disk_misses,
                 "disk_stores": self._stats_disk_stores,
-                "persistence_loads": self._stats_persistence_loads,
-                "persistence_saves": self._stats_persistence_saves,
             }
 
     def record_disk_hit(self) -> None:
@@ -163,20 +156,6 @@ class GraphStore:
         with self.lock:
             if self._stats_enabled:
                 self._stats_disk_stores += 1
-
-    def record_persistence_load(self) -> None:
-        if not self._stats_enabled:
-            return
-        with self.lock:
-            if self._stats_enabled:
-                self._stats_persistence_loads += 1
-
-    def record_persistence_save(self) -> None:
-        if not self._stats_enabled:
-            return
-        with self.lock:
-            if self._stats_enabled:
-                self._stats_persistence_saves += 1
 
     def record_query_body_time(self, key: QueryKey, seconds: float) -> None:
         if seconds < 0:
@@ -266,7 +245,7 @@ class GraphStore:
         return [
             TraceEvent(
                 event=event,
-                key=key if isinstance(key, str) else self.key_to_str(key),
+                key=self.key_to_str(key),
                 revision=revision,
                 detail=detail,
                 timestamp=timestamp,
@@ -671,45 +650,6 @@ class GraphStore:
             remove = [k for k in self.memos.keys() if k not in wanted]
             for key in remove:
                 self.drop_memo_locked(key)
-
-    def assign_loaded_state(self, payload: dict[str, Any]) -> None:
-        with self.lock:
-            self.revision = payload["revision"]
-            self.cancel_epoch = payload["cancel_epoch"]
-            self.inputs = payload["inputs"]
-            self.memos = payload["memos"]
-            # Loaded memos must earn head_clean again through verification.
-            for memo in self.memos.values():
-                memo.head_clean = False
-            deps_in = payload["dependents"]
-            self.dependents = defaultdict(set)
-            for k, v in deps_in.items():
-                self.dependents[k] = set(v)
-            self.trace = deque(
-                (
-                    (ev.event, ev.key, ev.revision, ev.detail, ev.timestamp)
-                    for ev in payload["trace"]
-                ),
-                maxlen=self.trace_limit,
-            )
-            self.next_access_id = payload["access_id"]
-            # In-flight dedup futures are process-local/transient and should never
-            # survive a load boundary.
-            self.in_flight.clear()
-            self._memo_verify_pin_count.clear()
-            self._rebuild_lru_locked()
-
-    def make_persistence_payload(self) -> dict[str, Any]:
-        with self.lock:
-            return {
-                "revision": self.revision,
-                "cancel_epoch": self.cancel_epoch,
-                "inputs": self.inputs,
-                "memos": self.memos,
-                "dependents": self.dependents,
-                "trace": self._materialize_traces_locked(),
-                "access_id": self.next_access_id,
-            }
 
     @staticmethod
     def entry_from_runtime(

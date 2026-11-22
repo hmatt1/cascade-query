@@ -186,7 +186,7 @@ def test_release_does_not_unregister_a_newer_owner() -> None:
     key = (("query", "q", ()), 0)
     with store.lock:
         old_slot, _ = evaluator._claim_in_flight_locked(key)  # noqa: SLF001
-        # Simulate engine.load() clearing in_flight, then a new owner claiming.
+        # Simulate in_flight being cleared, then a new owner claiming.
         store.in_flight.clear()
         new_slot, waiter = evaluator._claim_in_flight_locked(key)  # noqa: SLF001
     assert waiter is None
@@ -240,22 +240,14 @@ def test_input_version_at_returns_historical_versions() -> None:
 
 
 @pytest.mark.parametrize("stats", [False, True])
-def test_disk_and_persistence_counters_respect_stats_flag(stats: bool) -> None:
+def test_disk_counters_respect_stats_flag(stats: bool) -> None:
     store = Engine(stats=stats)._internals._store  # noqa: SLF001
     store.record_disk_hit()
     store.record_disk_miss()
     store.record_disk_store()
-    store.record_persistence_load()
-    store.record_persistence_save()
     summary = store.stats_summary()
     expected = 1 if stats else 0
-    for name in (
-        "disk_hits",
-        "disk_misses",
-        "disk_stores",
-        "persistence_loads",
-        "persistence_saves",
-    ):
+    for name in ("disk_hits", "disk_misses", "disk_stores"):
         assert summary[name] == expected
 
 

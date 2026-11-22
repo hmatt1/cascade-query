@@ -4,7 +4,6 @@ import concurrent.futures
 import threading
 import time
 from collections import defaultdict
-from pathlib import Path
 
 import pytest
 
@@ -138,48 +137,6 @@ def test_prune_stress_keeps_consistent_reachable_subgraph() -> None:
         assert parent in node_set
         if child.startswith("query:"):
             assert child in node_set
-
-
-@pytest.mark.slow
-def test_persistence_scale_roundtrip_preserves_hot_cache(tmp_path: Path) -> None:
-    # Guards against persistence/load paths dropping large memo state and forcing full recompute.
-    db_path = tmp_path / "large-roundtrip.db"
-    depth = 8
-    fanout = 120
-
-    engine_a = Engine()
-    leaf_a, _, aggregate_a = build_fanout_chain_pipeline(
-        engine_a, depth=depth, fanout=fanout
-    )
-    values = [(idx * 5) % 97 for idx in range(fanout)]
-    for idx, value in enumerate(values):
-        leaf_a.set(idx, value)
-    assert aggregate_a() == expected_fanout_chain_total(
-        depth=depth, fanout=fanout, values=values
-    )
-    engine_a.save(str(db_path))
-
-    counts_b: dict[str, int] = defaultdict(int)
-    engine_b = Engine()
-    leaf_b, _, aggregate_b = build_fanout_chain_pipeline(
-        engine_b, depth=depth, fanout=fanout, counts=counts_b
-    )
-    engine_b.load(str(db_path))
-
-    assert aggregate_b() == expected_fanout_chain_total(
-        depth=depth, fanout=fanout, values=values
-    )
-    assert counts_b == {}
-
-    changed_branch = fanout // 3
-    values[changed_branch] += 9
-    leaf_b.set(changed_branch, values[changed_branch])
-    assert aggregate_b() == expected_fanout_chain_total(
-        depth=depth, fanout=fanout, values=values
-    )
-    for level in range(depth):
-        assert counts_b[f"level_{level}"] == 1
-    assert counts_b["aggregate"] == 1
 
 
 def test_eviction_policy_lru_behavior_under_churn() -> None:

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import threading
-import sqlite3
 import time
-from pathlib import Path
 
 import pytest
 
@@ -345,7 +343,7 @@ def test_long_chain_cycle_detection_behavior() -> None:
     assert f"node_{chain_length - 1}" in message
 
 
-def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
+def test_misc_api_edges_and_default_input_paths() -> None:
     engine = Engine()
     warnings = engine.accumulator("warnings")
 
@@ -382,18 +380,6 @@ def test_misc_api_edges_and_default_input_paths(tmp_path: Path) -> None:
     assert engine.traces()
     engine.clear_traces()
     assert engine.traces() == []
-
-    # load() gracefully handles an empty persistence table.
-    empty_path = tmp_path / "empty.db"
-    conn = sqlite3.connect(empty_path)
-    try:
-        conn.execute(
-            "create table if not exists cascade_state (id integer primary key, payload blob not null)"
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    engine.load(str(empty_path))
 
     # prune() tolerates unreachable roots and keeps memo graph consistent.
     run_prune_with_timeout(engine, [("query", plus_one.id, (999,))], timeout=0.5)
@@ -573,61 +559,6 @@ def test_compute_many_shared_dependency_recomputes_once_per_invalidation_wave() 
     assert runs["parent"] == width * 2
     assert runs["shared"] == 2
     assert any(event.event == "dedup_wait" for event in engine.traces())
-
-
-def test_load_missing_state_table_raises_operational_error(tmp_path: Path) -> None:
-    db_path = tmp_path / "missing-table.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        # Intentionally leave out cascade_state table.
-        conn.execute("create table if not exists unrelated (id integer primary key)")
-        conn.commit()
-    finally:
-        conn.close()
-
-    engine = Engine()
-    with pytest.raises(sqlite3.OperationalError, match="no such table: cascade_state"):
-        engine.load(str(db_path))
-
-
-def test_load_corrupt_payload_raises_and_keeps_existing_state(tmp_path: Path) -> None:
-    db_path = tmp_path / "corrupt.db"
-
-    engine = Engine()
-
-    @engine.input
-    def source() -> int:
-        return 0
-
-    @engine.query
-    def value() -> int:
-        return source() + 1
-
-    source.set(10)
-    assert value() == 11
-    revision_before = engine.revision
-    snapshot_before = engine.snapshot()
-
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "create table if not exists cascade_state (id integer primary key, payload blob not null)"
-        )
-        conn.execute("delete from cascade_state")
-        conn.execute(
-            "insert into cascade_state(id, payload) values (1, ?)", (b"not-valid-json",)
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    with pytest.raises(Exception):
-        engine.load(str(db_path))
-
-    # Failed load must not clobber in-memory state.
-    assert engine.revision == revision_before
-    assert value(snapshot=snapshot_before) == 11
-    assert value() == 11
 
 
 def test_trace_event_sequence_for_recompute_then_cache_hit() -> None:

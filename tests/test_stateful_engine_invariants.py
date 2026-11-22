@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from hypothesis import HealthCheck, settings, strategies as st
 from hypothesis.stateful import (
     Bundle,
     RuleBasedStateMachine,
     invariant,
-    precondition,
     rule,
 )
 
@@ -24,8 +21,6 @@ class EngineStateMachine(RuleBasedStateMachine):
 
     def __init__(self) -> None:
         super().__init__()
-        self._tmpdir = TemporaryDirectory()
-        self._state_db = Path(self._tmpdir.name) / "state.db"
         self._revision = 0
         self._history: dict[
             tuple[str, tuple[int, ...]], list[tuple[int, int | None]]
@@ -34,9 +29,6 @@ class EngineStateMachine(RuleBasedStateMachine):
         self._observed_indexes: set[int] = set()
         self._choose_compute_count = 0
         self._build_engine()
-
-    def teardown(self) -> None:
-        self._tmpdir.cleanup()
 
     def _build_engine(self) -> None:
         engine = Engine()
@@ -198,19 +190,6 @@ class EngineStateMachine(RuleBasedStateMachine):
         assert self.choose(index) == self._expected_choose(index, self._revision)
         self._sync_from_engine()
         assert self._choose_compute_count == calls_before
-
-    @precondition(lambda self: self._revision > 0)
-    @rule()
-    def save_and_reload_engine(self) -> None:
-        self._sync_from_engine()
-        self.engine.save(str(self._state_db))
-        self._build_engine()
-        self.engine.load(str(self._state_db))
-        self._sync_from_engine()
-        assert self.engine.revision == self._revision
-        assert self.engine._internals.in_flight == {}  # noqa: SLF001
-        for index in sorted(self._observed_indexes)[:3]:
-            assert self.choose(index) == self._expected_choose(index, self._revision)
 
     @invariant()
     def revision_matches_model(self) -> None:

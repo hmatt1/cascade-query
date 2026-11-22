@@ -8,8 +8,11 @@ from cascade import CascadeDict, CascadeList, CascadeSet, Engine
 
 from typing import Any
 
+
 @pytest.fixture(params=["mdbx", "sqlite"], autouse=True)
-def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+def engine_backend(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> str:
     original_init = Engine.__init__
 
     def new_init(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -18,7 +21,6 @@ def engine_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(Engine, "__init__", new_init)
     return request.param
-
 
 
 @pytest.fixture

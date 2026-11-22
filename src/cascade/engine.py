@@ -15,7 +15,6 @@ from ._disk_cache import DiskCache, DiskCacheProtocol
 from ._errors import CancellationError, CycleError, PersistentCacheError, QueryCancelled
 from ._evaluator import Evaluator
 from ._incremental import IncrementalRuntime
-from ._persistence import load_payload, save_payload
 from ._runtime import RuntimeState
 from ._scheduler import WorkStealingExecutor
 from ._state import (
@@ -276,7 +275,9 @@ class Engine:
         self._disk: DiskCacheProtocol | None = None
         value_digest: Callable[[Any], str] | None = None
         if cache_dir is not None:
-            self._disk = DiskCache(cache_dir, map_size=cache_map_size, cache_backend=cache_backend)
+            self._disk = DiskCache(
+                cache_dir, map_size=cache_map_size, cache_backend=cache_backend
+            )
             value_digest = _canonical.value_digest
         self._store = GraphStore(
             max_entries=max_entries,
@@ -595,17 +596,6 @@ class Engine:
         self._store.prune(root_list)
         if vacuum_disk and self._disk is not None:
             self._evaluator.prune_disk_cache(root_list)
-
-    def save(self, path: str, backend: Literal["sqlite", "mdbx"] = "sqlite") -> None:
-        save_payload(path, self._store.make_persistence_payload(), backend=backend)
-        self._store.record_persistence_save()
-
-    def load(self, path: str, backend: Literal["sqlite", "mdbx"] = "sqlite") -> None:
-        payload = load_payload(path, backend=backend)
-        if payload is None:
-            return
-        self._store.assign_loaded_state(payload)
-        self._store.record_persistence_load()
 
     # --- internals ---
     def _function_id(self, fn: Callable[..., Any]) -> str:

@@ -336,8 +336,7 @@ class IncrementalRuntime:
 
         core = collection._core
         head = core.head_for_current_context()
-        # engine.load() restores input versions but not collection logs; if the
-        # recorded head outruns the live log, trust the log.
+        # If the recorded head outruns the live log, trust the log.
         head = min(head, core.log.head)
         fused = _fuse(stages)
         fingerprint = _env_fingerprint(
