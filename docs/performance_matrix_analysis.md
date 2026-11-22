@@ -44,7 +44,8 @@ runs, Python 3.12):
 | Workload | Before dirty propagation (ms) | Now (ms) |
 | --- | ---: | ---: |
 | Change one leaf, recompute | 85.7 | 3.1 |
-| Set an input to the same value, re-verify | 68.2 | 0.01 |
+| Advance the revision without changing anything the graph reads, re-verify | 68.2 | 0.02 |
+| Set an input to the value it already holds (now a no-op) | - | 0.01 |
 | Memory cold | 185 | 170 |
 
 A memo stays marked clean until an input it transitively read changes value, so
@@ -54,7 +55,7 @@ use the full dependency walk, which is iterative and handles chains of any depth
 
 ## Key Takeaways
 
-1. **Incremental updates are now proportional to what changed**: changing one leaf of a 20,000-node graph recomputes its 21-node cone in about `3ms`, down from `86ms` when every revision bump re-walked the graph. Re-verifying after a same-value input set is effectively free.
+1. **Incremental updates are now proportional to what changed**: changing one leaf of a 20,000-node graph recomputes its 21-node cone in about `3ms`, down from `86ms` when every revision bump re-walked the graph. Re-verifying after a revision bump that changed nothing the graph reads is effectively free, and setting an input to the value it already holds no longer bumps the revision at all.
 2. **The disk cache is now the expensive path**: a cold run that populates the cache takes `9-14s` against `3s` in memory, and a cache hit on a fresh engine (`6-9s`) is still slower than recomputing this graph. The query bodies here are trivial, so this is all serialization and storage overhead; real workloads with expensive queries benefit far more.
 3. **SQLite is the faster backend for cache hits, MDBX for populating the cache**: SQLite hits took `6.4s` against `8.8s` for MDBX, while MDBX's cold run took `9.2s` against `14.0s` for SQLite.
 4. **`engine.save()`/`load()` is expensive at full graph size**: with all ~250,000 memos retained, a save takes `11-15s` and a load `7-10s` on both backends, several times the `3s` it takes to compute the graph in memory. For graphs this cheap to compute, the disk cache or plain recomputation beats explicit save/load. `save()`/`load()` has since been removed: the disk cache already persists results across sessions.

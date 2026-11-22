@@ -467,30 +467,22 @@ class GraphStore:
         *,
         bump_cancel_epoch: bool = True,
     ) -> int:
+        """Record a new value for an input and return the resulting revision.
+
+        Setting the value an input already holds is a no-op: no version is
+        stored, the revision and cancel epoch stay put, and nothing is marked
+        dirty.
+        """
+        key = (input_id, args)
+        value_hash = self.stable_hash(value)
         with self.lock:
+            versions = self.inputs.get(key)
+            if versions and versions[-1].value_hash == value_hash:
+                return self.revision
             self.revision += 1
             if bump_cancel_epoch:
                 self.cancel_epoch += 1
-            key = (input_id, args)
-            versions = self.inputs.setdefault(key, [])
-            current = versions[-1] if versions else None
-            value_hash = self.stable_hash(value)
-            if current is not None and current.value_hash == value_hash:
-                changed_at = current.changed_at
-            else:
-                changed_at = self.revision
-            versions.append(
-                InputVersion(
-                    revision=self.revision,
-                    changed_at=changed_at,
-                    value_hash=value_hash,
-                    value=value,
-                )
-            )
-            trace_key = ("input", input_id, args)
-            if changed_at == self.revision:
-                self.mark_dependents_dirty_locked(trace_key)
-            self.trace_event("input_set", trace_key, detail=f"changed_at={changed_at}")
+            self._record_change_locked(key, value, value_hash)
             return self.revision
 
     def set_inputs(
@@ -499,36 +491,52 @@ class GraphStore:
         *,
         bump_cancel_epoch: bool = True,
     ) -> int:
+        """Apply several input updates as one revision.
+
+        Later updates to the same input win. Inputs whose final value equals
+        their current one are skipped, and when nothing changes the revision
+        and cancel epoch stay put.
+        """
+        final: dict[InputKey, Any] = {}
+        for input_id, args, value in updates:
+            final[(input_id, args)] = value
+        hashed = [(key, value, self.stable_hash(value)) for key, value in final.items()]
         with self.lock:
-            if not updates:
+            changed = []
+            for key, value, value_hash in hashed:
+                versions = self.inputs.get(key)
+                if not versions or versions[-1].value_hash != value_hash:
+                    changed.append((key, value, value_hash))
+            if not changed:
                 return self.revision
             self.revision += 1
             if bump_cancel_epoch:
                 self.cancel_epoch += 1
-            for input_id, args, value in updates:
-                key = (input_id, args)
-                versions = self.inputs.setdefault(key, [])
-                current = versions[-1] if versions else None
-                value_hash = self.stable_hash(value)
-                if current is not None and current.value_hash == value_hash:
-                    changed_at = current.changed_at
-                else:
-                    changed_at = self.revision
-                versions.append(
-                    InputVersion(
-                        revision=self.revision,
-                        changed_at=changed_at,
-                        value_hash=value_hash,
-                        value=value,
-                    )
-                )
-                trace_key = ("input", input_id, args)
-                if changed_at == self.revision:
-                    self.mark_dependents_dirty_locked(trace_key)
-                self.trace_event(
-                    "input_set", trace_key, detail=f"changed_at={changed_at}"
-                )
+            for key, value, value_hash in changed:
+                self._record_change_locked(key, value, value_hash)
             return self.revision
+
+    def _record_change_locked(self, key: InputKey, value: Any, value_hash: str) -> None:
+        """Store a changed value at the current revision and invalidate readers."""
+        self._append_version_locked(
+            key,
+            InputVersion(
+                revision=self.revision,
+                changed_at=self.revision,
+                value_hash=value_hash,
+                value=value,
+            ),
+        )
+        trace_key = ("input", key[0], key[1])
+        self.mark_dependents_dirty_locked(trace_key)
+        self.trace_event("input_set", trace_key, detail=f"changed_at={self.revision}")
+
+    def _append_version_locked(self, key: InputKey, version: InputVersion) -> None:
+        versions = self.inputs.get(key)
+        if versions is None:
+            self.inputs[key] = [version]
+        else:
+            versions.append(version)
 
     def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
         from ._graph_export import condense_graph

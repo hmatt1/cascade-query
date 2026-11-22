@@ -53,19 +53,30 @@ def run_memory(depth: int, fanout: int) -> dict[str, float]:
     leaf.set(0, 10_000)
     one_leaf = _timed(aggregate)
 
-    def no_op_bump() -> None:
-        # Same value: the input backdates, but the revision still advances,
-        # so every memo must be re-verified.
+    @engine.input
+    def unrelated() -> int:
+        return 0
+
+    def unrelated_bump() -> None:
+        # The revision advances but nothing the graph reads changed, so the
+        # whole graph must be confirmed still valid.
+        unrelated.set(engine.revision)
+        aggregate()
+
+    def same_value_set() -> None:
+        # Setting an input to the value it already holds is a no-op.
         leaf.set(1, 1)
         aggregate()
 
-    reverify = _timed(no_op_bump)
+    reverify = _timed(unrelated_bump)
+    noop_set = _timed(same_value_set)
     _close(engine)
     return {
         "cold": cold,
         "hot": hot,
         "one_leaf_mutation": one_leaf,
         "noop_revision_reverify": reverify,
+        "noop_set": noop_set,
     }
 
 
