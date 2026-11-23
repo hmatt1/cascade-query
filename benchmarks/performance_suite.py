@@ -179,10 +179,24 @@ def _scenario_dedup_contention() -> ScenarioResult:
     )
 
 
+_LCG_MULTIPLIER = "1664525"
+_LCG_INCREMENT = "1013904223"
+_LCG_MASK = "4294967295"
+
+
 def _cpu_burn(seed: int, *, iterations: int) -> int:
+    # The constants are rebuilt per call on purpose. On free-threaded CPython
+    # (seen on 3.14.4t), large int constants in an imported module's code are
+    # shared objects, and every thread updating their reference counts
+    # serializes the loop: 8 threads ran no faster than 1. Per-call objects
+    # are owned by the calling thread, so the benchmark measures the
+    # scheduler, not that contention.
+    multiplier = int(_LCG_MULTIPLIER)
+    increment = int(_LCG_INCREMENT)
+    mask = int(_LCG_MASK)
     value = seed + 1
     for step in range(iterations):
-        value = (value * 1_664_525 + 1_013_904_223 + step) & 0xFFFFFFFF
+        value = (value * multiplier + increment + step) & mask
     return value
 
 
