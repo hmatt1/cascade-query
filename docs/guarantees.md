@@ -46,7 +46,7 @@ Every open defect has a failing regression test in
 | G22 | A rewritten query returns what the plain Python would | Broken (D1, D7, D8) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Broken (D12) | Strong for one snapshot |
-| G25 | A transaction applies completely or not at all | Broken (D12, D13, D17) | Strong for inputs only |
+| G25 | A transaction applies completely or not at all | Broken (D12, D17) | Strong for inputs only |
 | G26 | A named collection is restored with the same contents after a restart | Broken (D10, D11, D16) | Good on the happy path |
 
 ## Core evaluation
@@ -443,12 +443,15 @@ Inside `with engine.transaction():`
 - named collections write to disk once per collection at commit, and not at
   all if the block raises;
 - opening a second transaction in the same context raises `RuntimeError`, even
-  for a different engine.
+  for a different engine;
+- a transaction object is single-use: entering it a second time raises
+  `RuntimeError` and changes nothing.
 
 Limits: if the disk write for a later collection fails at commit, earlier
-collections are already on disk. A transaction object is single-use.
+collections are already on disk.
 
-Enforced by: `test_engine.py::test_engine_transaction`, `test_transaction_collections.py`,
+Enforced by: `test_engine.py::test_engine_transaction`, `test_transaction_collections.py`
+(including `::test_transaction_object_cannot_be_entered_twice`),
 `test_history_retention.py::test_collection_mutations_in_one_transaction_store_one_version`,
 `test_incremental_collections.py::test_mutations_inside_transaction_batch_invalidation`.
 
@@ -499,7 +502,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 |---|---|---|
 | D11 | `clear_disk_cache()` wipes the disk log of live named collections. A list holding `[1, 2, 3]`, cleared, then `append(4)`, restores as `[4]` after restart on both backends. | Reproduced |
 | D12 | When a pinned snapshot predates a collection, compaction ignores later snapshots and open transactions. A snapshot read raises the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction leaves 2048 of its 3000 appended items in place. | Reproduced |
-| D13 | Reusing an `EngineTransaction` object replays its old state. A failing second `with tx:` rolled the list back past data committed in between, leaving `[]`. | Reproduced |
 | D14 | `CascadeSet.update` and `difference_update` are not atomic. `s.update([1, [2]])` raises, leaves 1 in storage but not in the log, and queries never see it. | Reproduced |
 | D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
 | D17 | The open transaction leaks across concurrency boundaries. Another thread mutating the same collection during the block has its change deleted on rollback while queries keep the uncommitted value. A task created in the block that calls `set()` after the block exits has the update dropped. | Reproduced: the other thread's append was gone after rollback, and the task's `set(5)` left the input at 1. The "queries keep the uncommitted value" part was not re-run. |
@@ -518,6 +520,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | ID | Defect | Fixed by |
 |---|---|---|
 | D15 | Results were lost when a process ended without `shutdown()` or `flush_disk()` (1224 of 2000 on mdbx after a normal exit). | `fix: results were lost when a script ended without shutdown()` |
+| D13 | Reusing an `EngineTransaction` object replayed its old state and could roll back committed data. Re-entry now raises `RuntimeError`. | `fix: a reused transaction object could undo committed changes` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed

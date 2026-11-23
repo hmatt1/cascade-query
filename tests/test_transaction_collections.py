@@ -152,3 +152,60 @@ def test_aborted_transaction_does_not_trigger_disk_compaction(tmp_path: Path) ->
     reloaded_engine = _disk_engine(cache_dir)
     assert set(CascadeSet(reloaded_engine, name="tags")) == set()
     reloaded_engine.shutdown()
+
+
+def test_transaction_object_cannot_be_entered_twice() -> None:
+    engine = Engine()
+
+    @engine.input
+    def x() -> int:
+        return 0
+
+    xs = CascadeList(engine, [])
+    tx = engine.transaction()
+    with tx:
+        x.set(1)
+        xs.append("first")
+    x.set(2)
+    xs.append("between")
+
+    with pytest.raises(RuntimeError, match="single-use"):
+        with tx:
+            raise AssertionError("the block must not run")  # pragma: no cover
+    # Nothing was replayed (x would be 1 again) and nothing was rolled back.
+    assert x() == 2
+    assert list(xs) == ["first", "between"]
+    # The refused entry left no transaction open in this context.
+    with engine.transaction():
+        x.set(3)
+    assert x() == 3
+
+
+def test_transaction_object_cannot_be_reused_after_a_rollback() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, ["base"])
+    tx = engine.transaction()
+    with pytest.raises(ValueError, match="abort"):
+        with tx:
+            xs.append("doomed")
+            raise ValueError("abort")
+    xs.append("kept")
+    with pytest.raises(RuntimeError, match="single-use"):
+        tx.__enter__()
+    assert list(xs) == ["base", "kept"]
+
+
+def test_transaction_refused_as_nested_is_still_usable_later() -> None:
+    engine = Engine()
+
+    @engine.input
+    def x() -> int:
+        return 0
+
+    inner = engine.transaction()
+    with engine.transaction():
+        with pytest.raises(RuntimeError, match="Nested"):
+            inner.__enter__()
+    with inner:
+        x.set(7)
+    assert x() == 7

@@ -364,7 +364,6 @@ def test_d12_rollback_undoes_everything_after_compaction_in_the_block() -> None:
     assert len(xs) == 0
 
 
-@_defect(13, "reusing an EngineTransaction object replays its old state")
 def test_d13_reused_transaction_object_does_not_roll_back_committed_data() -> None:
     engine = Engine()
     xs = CascadeList(engine, [])

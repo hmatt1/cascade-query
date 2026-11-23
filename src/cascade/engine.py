@@ -64,12 +64,16 @@ class EngineTransaction:
     code inside the block sees them), and are undone if the block raises.
     Named collections hold their disk writes until commit and write them in
     one batch, so a failed transaction never reaches disk.
+
+    A transaction object is single-use: entering it a second time raises
+    ``RuntimeError``. Call ``engine.transaction()`` again for a new one.
     """
 
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         self.updates: list[tuple[str, tuple[Any, ...], Any]] = []
         self._token: contextvars.Token | None = None
+        self._used = False
         # Collections changed in this transaction -> log head before the first
         # change, and disk writes held until commit for named collections.
         self.collections: dict[Any, int] = {}
@@ -78,6 +82,14 @@ class EngineTransaction:
     def __enter__(self) -> EngineTransaction:
         if _active_transaction.get() is not None:
             raise RuntimeError("Nested transactions are not supported")
+        if self._used:
+            # The object still holds the first block's updates and rollback
+            # points; running them again would replay or undo committed work.
+            raise RuntimeError(
+                "this transaction has already been used; a transaction object "
+                "is single-use, call engine.transaction() again for a new one"
+            )
+        self._used = True
         self._token = _active_transaction.set(self)
         return self
 
