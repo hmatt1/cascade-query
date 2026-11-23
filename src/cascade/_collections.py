@@ -67,6 +67,12 @@ def _mutator(method: Callable[..., Any]) -> Callable[..., Any]:
     both means a query reading the collection never sees storage that is
     ahead of the log, and concurrent writers cannot interleave the two steps.
 
+    Every mutator must do everything that can raise (iterating arguments,
+    hashing, index conversion) BEFORE it touches the native storage. A
+    mutator that raised after changing storage but before ``emit`` would
+    leave storage ahead of the log for good: queries would never see the
+    applied part. ``emit`` itself undoes the storage change when it fails.
+
     Mutators are written with ordinary reads (``len(self)``, ``self[i]``,
     ``key in self``). Called inside a query, a second mutation would otherwise
     read at the query's revision, which is already behind the first one, and
@@ -584,6 +590,7 @@ class CascadeList(list):
 
     @_mutator
     def insert(self, index: int, value: Any) -> None:
+        index = _plain_index(index)
         eff = _clamped_insert_index(index, len(self))
         list.insert(self, index, value)
         self._core.emit([self._insert_diff(eff, value)])
@@ -597,6 +604,7 @@ class CascadeList(list):
 
     @_mutator
     def pop(self, index: int = -1) -> Any:
+        index = _plain_index(index)
         value = list.pop(self, index)
         eff = index if index >= 0 else len(self._uids) + index
         uid = self._uids.pop(eff)
@@ -618,6 +626,7 @@ class CascadeList(list):
         if isinstance(index, slice):
             self._set_slice(index, value)
             return
+        index = _plain_index(index)
         list.__setitem__(self, index, value)
         eff = index if index >= 0 else len(self) + index
         uid = self._uids[eff]
@@ -659,6 +668,7 @@ class CascadeList(list):
                 del self._uids[pos]
             self._core.emit(diffs)
             return
+        index = _plain_index(index)
         value = self[index]
         list.__delitem__(self, index)
         eff = index if index >= 0 else len(self._uids) + index
@@ -744,6 +754,20 @@ class CascadeList(list):
         return self._core.read(self, _copy_list)
 
 
+def _plain_index(index: Any) -> Any:
+    """``index`` as an ``int`` when it supports ``__index__``.
+
+    The builtin accepts any ``__index__`` object, but the uid bookkeeping
+    that follows the native call compares the index with ints. Converting
+    first keeps that step from raising after the storage has changed.
+    Anything else is returned as is, for the builtin to reject.
+    """
+    try:
+        return operator.index(index)
+    except TypeError:
+        return index
+
+
 def _clamped_insert_index(index: int, length: int) -> int:
     if index < 0:
         index += length
@@ -817,22 +841,27 @@ class CascadeSet(set):
 
     @_mutator
     def update(self, *others: Iterable[Any]) -> None:
-        added = []
+        # Atomic: an unhashable element or a failing iterable raises before
+        # anything is added, where the builtin would keep the earlier ones.
+        added: dict[Any, None] = {}
         for other in others:
             for v in other:
+                hash(v)
                 if v not in self:
-                    set.add(self, v)
-                    added.append(v)
+                    added[v] = None
+        set.update(self, added)
         self._emit_adds(added)
 
     @_mutator
     def difference_update(self, *others: Iterable[Any]) -> None:
-        removed = []
+        # Atomic, like ``update``: nothing is removed if an element raises.
+        removed: dict[Any, None] = {}
         for other in others:
             for v in other:
+                hash(v)
                 if v in self:
-                    set.discard(self, v)
-                    removed.append(v)
+                    removed[v] = None
+        set.difference_update(self, removed)
         self._emit_removes(removed)
 
     @_mutator

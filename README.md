@@ -331,6 +331,8 @@ Inside `engine.transaction()`, named collections hold their disk writes until th
 
 *(Note: `.update()` behaves exactly like a standard Python dictionary. If a key already exists, it will seamlessly overwrite the old value by batching an `"upsert"` event to the underlying log, ensuring downstream queries receive the correct diffs.)*
 
+A mutating call that raises changes nothing. In particular `CascadeSet.update()` and `difference_update()` are all-or-nothing: `s.update([1, [2]])` raises `TypeError` and adds neither element, where a builtin `set` would keep the `1`.
+
 ### Persistence & Inspection
 
 A **named** collection on an engine with `cache_dir` event-sources its log to disk automatically.

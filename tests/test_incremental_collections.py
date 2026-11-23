@@ -468,3 +468,160 @@ def test_set_log_replay_matches_contents(ops):
             getattr(mirror, op[0])(*op[1:])
         assert set(s) == mirror
         assert replayed(s) == mirror
+
+
+# --- failed mutators leave storage and log in agreement (D14) ---------------
+
+
+class _Index:
+    """Accepted by the builtins as an index, but not comparable with ints."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __index__(self) -> int:
+        return self.value
+
+
+def _exploding(*values: Any):
+    yield from values
+    raise RuntimeError("iterable failed")
+
+
+def _key_error(value: Any) -> Any:
+    raise ZeroDivisionError("key failed")
+
+
+_FAILING_LIST_CALLS = [
+    lambda xs: xs.extend(_exploding(7, 8)),
+    lambda xs: xs.insert("a", 9),
+    lambda xs: xs.remove("missing"),
+    lambda xs: xs.pop(99),
+    lambda xs: xs.pop("a"),
+    lambda xs: xs.__setitem__(99, 0),
+    lambda xs: xs.__setitem__("a", 0),
+    lambda xs: xs.__setitem__(slice(0, 3, 2), [1]),
+    lambda xs: xs.__setitem__(slice(0, 1), _exploding(7)),
+    lambda xs: xs.__delitem__(99),
+    lambda xs: xs.__delitem__("a"),
+    lambda xs: xs.sort(key=_key_error),
+    lambda xs: xs.__iadd__(_exploding(7)),
+    lambda xs: xs.__imul__("a"),
+    lambda xs: xs.__imul__(2.5),
+]
+
+_FAILING_SET_CALLS = [
+    lambda s: s.add([1]),
+    lambda s: s.remove("missing"),
+    lambda s: s.update([10, [11]]),
+    lambda s: s.update([10], _exploding(11)),
+    lambda s: s.update([10, {11}]),
+    lambda s: s.difference_update([1, [2]]),
+    lambda s: s.difference_update([1], _exploding(2)),
+    lambda s: s.intersection_update([1, [2]]),
+    lambda s: s.symmetric_difference_update([1, [2]]),
+    lambda s: s.__ior__([10, [11]]),
+    lambda s: s.__isub__([1, [2]]),
+    lambda s: s.__iand__([1, [2]]),
+    lambda s: s.__ixor__([1, [2]]),
+]
+
+_FAILING_DICT_CALLS = [
+    lambda d: d.__setitem__([1], 0),
+    lambda d: d.__delitem__("missing"),
+    lambda d: d.update([("z", 26), ([1], 0)]),
+    lambda d: d.update(_exploding(("z", 26))),
+    lambda d: d.pop("missing"),
+    lambda d: d.pop([1]),
+    lambda d: d.setdefault([1], 0),
+    lambda d: d.__ior__([("z", 26), ([1], 0)]),
+]
+
+
+@pytest.mark.parametrize("call", range(len(_FAILING_LIST_CALLS)))
+def test_failed_list_mutator_changes_nothing(call: int) -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [3, 1, 2])
+
+    @engine.query
+    def seen() -> list[int]:
+        return [x for x in xs]
+
+    assert seen() == [3, 1, 2]
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        _FAILING_LIST_CALLS[call](xs)
+    assert list(xs) == [3, 1, 2]
+    assert [v for _, v in xs._core.log.contents_at(xs._core.log.head)] == [3, 1, 2]
+    xs.append(4)
+    assert seen() == list(xs) == [3, 1, 2, 4]
+
+
+@pytest.mark.parametrize("call", range(len(_FAILING_SET_CALLS)))
+def test_failed_set_mutator_changes_nothing(call: int) -> None:
+    engine = Engine()
+    s = CascadeSet(engine, [1, 2, 3])
+
+    @engine.query
+    def seen() -> list[int]:
+        return sorted(x for x in s)
+
+    assert seen() == [1, 2, 3]
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        _FAILING_SET_CALLS[call](s)
+    assert sorted(set.__iter__(s)) == [1, 2, 3]
+    assert sorted(s._core.log.contents_at(s._core.log.head)) == [1, 2, 3]
+    assert seen() == [1, 2, 3]
+    s.add(4)
+    assert seen() == sorted(set.__iter__(s)) == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("call", range(len(_FAILING_DICT_CALLS)))
+def test_failed_dict_mutator_changes_nothing(call: int) -> None:
+    engine = Engine()
+    d = CascadeDict(engine, {"a": 1, "b": 2})
+
+    @engine.query
+    def seen() -> list[tuple[str, int]]:
+        return sorted((k, v) for k, v in d.items())
+
+    assert seen() == [("a", 1), ("b", 2)]
+    with pytest.raises(Exception):  # noqa: B017, PT011
+        _FAILING_DICT_CALLS[call](d)
+    assert dict.copy(d) == {"a": 1, "b": 2}
+    assert d._core.log.contents_at(d._core.log.head) == {"a": 1, "b": 2}
+    d["c"] = 3
+    assert seen() == [("a", 1), ("b", 2), ("c", 3)]
+
+
+def test_list_accepts_index_objects_and_keeps_its_log_in_step() -> None:
+    # An ``__index__`` object used to pass the native call and then fail the
+    # uid bookkeeping, leaving the list changed with no diff recorded.
+    engine = Engine()
+    xs = CascadeList(engine, [10, 20, 30, 40])
+
+    @engine.query
+    def seen() -> list[int]:
+        return [x for x in xs]
+
+    assert xs.pop(_Index(0)) == 10
+    xs[_Index(-1)] = 41
+    del xs[_Index(0)]
+    xs.insert(_Index(0), 5)
+    assert list(xs) == [5, 30, 41]
+    assert seen() == [5, 30, 41]
+    assert [v for _, v in xs._core.log.contents_at(xs._core.log.head)] == [5, 30, 41]
+
+
+def test_set_bulk_updates_apply_fully_when_they_succeed() -> None:
+    engine = Engine()
+    s = CascadeSet(engine, [1, 2, 3])
+
+    @engine.query
+    def seen() -> list[int]:
+        return sorted(x for x in s)
+
+    s.update([3, 4, 4], (5,), s)
+    assert seen() == [1, 2, 3, 4, 5]
+    s.difference_update([1, 1, 99], {5})
+    assert seen() == sorted(set.__iter__(s)) == [2, 3, 4]
+    assert sorted(s._core.log.contents_at(s._core.log.head)) == [2, 3, 4]

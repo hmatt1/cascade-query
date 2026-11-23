@@ -382,7 +382,6 @@ def test_d13_reused_transaction_object_does_not_roll_back_committed_data() -> No
     assert list(xs) == ["committed-1", "committed-2"]
 
 
-@_defect(14, "CascadeSet.update is not atomic and loses the applied part")
 def test_d14_failed_set_update_leaves_storage_and_queries_in_agreement() -> None:
     engine = Engine()
     s = CascadeSet(engine, [])

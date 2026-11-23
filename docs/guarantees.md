@@ -42,7 +42,7 @@ Every open defect has a failing regression test in
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
 | G19 | Equal values of the same type encode to the same bytes | Holds | Weak |
 | G20 | A corrupt or old-format cache entry is recomputed, not served | Holds for query results; broken for collections (D16) | Medium |
-| G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5, D14) | Strong for mutators |
+| G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5) | Strong for mutators |
 | G22 | A rewritten query returns what the plain Python would | Broken (D1, D7, D8) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Broken (D12) | Strong for one snapshot |
@@ -375,11 +375,18 @@ mutating method changes storage and logs a diff. Inside a query these reads are
 tracked: iteration, `len`, `in`, indexing, `reversed`, list `==`, `index`,
 `count`, `copy`, dict `get` and the `keys`/`values`/`items` views.
 
+A mutator that raises changes nothing: storage and log stay in agreement, so
+queries see exactly what the collection holds. This makes
+`CascadeSet.update` and `difference_update` atomic, where the builtin keeps
+the elements handled before the failing one.
+
 Limits: dict views are wrappers, not real views, so set operations on them do
 not work. List slices return plain lists. Collections cannot be pickled.
 
-Enforced by: the example tests in `test_incremental_collections.py` and its
-Hypothesis tests `::test_list_log_replay_matches_contents`,
+Enforced by: the example tests in `test_incremental_collections.py`
+(`::test_failed_list_mutator_changes_nothing`, `::test_failed_set_mutator_changes_nothing`
+and `::test_failed_dict_mutator_changes_nothing` cover failing calls of every
+mutator) and its Hypothesis tests `::test_list_log_replay_matches_contents`,
 `::test_dict_log_replay_matches_contents`, `::test_set_log_replay_matches_contents`.
 
 ### G22. Rewrite equivalence
@@ -502,7 +509,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 |---|---|---|
 | D11 | `clear_disk_cache()` wipes the disk log of live named collections. A list holding `[1, 2, 3]`, cleared, then `append(4)`, restores as `[4]` after restart on both backends. | Reproduced |
 | D12 | When a pinned snapshot predates a collection, compaction ignores later snapshots and open transactions. A snapshot read raises the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction leaves 2048 of its 3000 appended items in place. | Reproduced |
-| D14 | `CascadeSet.update` and `difference_update` are not atomic. `s.update([1, [2]])` raises, leaves 1 in storage but not in the log, and queries never see it. | Reproduced |
 | D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
 | D17 | The open transaction leaks across concurrency boundaries. Another thread mutating the same collection during the block has its change deleted on rollback while queries keep the uncommitted value. A task created in the block that calls `set()` after the block exits has the update dropped. | Reproduced: the other thread's append was gone after rollback, and the task's `set(5)` left the input at 1. The "queries keep the uncommitted value" part was not re-run. |
 
@@ -521,6 +527,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 |---|---|---|
 | D15 | Results were lost when a process ended without `shutdown()` or `flush_disk()` (1224 of 2000 on mdbx after a normal exit). | `fix: results were lost when a script ended without shutdown()` |
 | D13 | Reusing an `EngineTransaction` object replayed its old state and could roll back committed data. Re-entry now raises `RuntimeError`. | `fix: a reused transaction object could undo committed changes` |
+| D14 | `CascadeSet.update` and `difference_update` kept the part applied before a failure in storage but not in the log, so queries never saw it. Also found and fixed: list `pop`, `insert`, `xs[i] = v` and `del xs[i]` with an `__index__` object changed the list and then raised before logging. | `fix: a failed set update left elements that queries never saw` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
