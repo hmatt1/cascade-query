@@ -252,3 +252,79 @@ def test_reads_outside_queries_are_live() -> None:
         assert list(xs) == [1, 2]
         assert len(xs) == 2
         assert xs[1] == 2
+
+
+def test_reader_never_sees_a_change_that_is_not_recorded_yet() -> None:
+    """A mutation changes the storage before it records the diff.
+
+    A query reading in between used to get the new contents at the old
+    revision and cache them there. The writer is held between the two steps;
+    the reader must wait for it and then still answer for its own revision.
+    """
+    import threading
+
+    engine = Engine()
+    xs = CascadeList(engine, [1])
+    meta = CascadeDict(engine, {"a": 1})
+
+    @engine.query
+    def view() -> tuple:
+        return len(xs), xs[-1], [v for v in xs], sorted(meta), meta.get("b")
+
+    in_emit = threading.Event()
+    release = threading.Event()
+    real_emit = xs._core.emit
+
+    def held_emit(diffs):
+        in_emit.set()
+        assert release.wait(timeout=5.0)
+        real_emit(diffs)
+
+    xs._core.emit = held_emit  # type: ignore[method-assign]
+
+    def write() -> None:
+        xs.append(2)
+
+    results: list[tuple] = []
+    writer = threading.Thread(target=write, daemon=True)
+    reader = threading.Thread(target=lambda: results.append(view()), daemon=True)
+    writer.start()
+    assert in_emit.wait(timeout=5.0)
+    assert list.__len__(xs) == 2  # storage is already ahead of the log
+    reader.start()
+    reader.join(timeout=0.3)
+    assert reader.is_alive(), "the reader must wait for the change to be recorded"
+    release.set()
+    writer.join(timeout=5.0)
+    reader.join(timeout=5.0)
+    assert not writer.is_alive() and not reader.is_alive()
+
+    xs._core.emit = real_emit  # type: ignore[method-assign]
+    assert results == [(1, 1, [1], ["a"], None)]
+    assert view() == (2, 2, [1, 2], ["a"], None)
+
+
+def test_iteration_inside_a_query_is_not_disturbed_by_a_writer() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2, 3])
+    tags = CascadeSet(engine, {1, 2, 3})
+    meta = CascadeDict(engine, {"a": 1, "b": 2})
+
+    @engine.query
+    def walk() -> tuple:
+        seen = []
+        for value in xs:
+            # Mutating a set or dict while it is being iterated raises in
+            # plain Python; inside a query the iteration is over a copy.
+            xs.append(value * 10)
+            seen.append(value)
+        for tag in tags:
+            tags.add(tag + 100)
+        for key in meta:
+            meta[key + "x"] = 0
+        return tuple(seen)
+
+    assert walk() == (1, 2, 3)
+    assert list(xs) == [1, 2, 3, 10, 20, 30]
+    assert set(tags) == {1, 2, 3, 101, 102, 103}
+    assert dict(meta) == {"a": 1, "b": 2, "ax": 0, "bx": 0}

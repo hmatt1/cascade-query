@@ -3,7 +3,7 @@
 ``CascadeList``, ``CascadeSet``, and ``CascadeDict`` subclass the built-in
 types, so every read path behaves exactly like the plain collection (inside a
 query running at an older revision, reads return the contents as of that
-revision; see ``_CollectionCore.read_view``). Mutating
+revision; see ``_CollectionCore.read``). Mutating
 methods are intercepted: they perform the native mutation first, then append a
 diff record to the collection's log and bump a hidden engine input whose value
 is the log head. That hidden input is how the rest of the engine sees the
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import operator
 import threading
 import uuid
 from typing import Any, Callable, Iterable, Mapping
@@ -59,24 +60,55 @@ _BASE_LEN = {_KIND_LIST: list.__len__, _KIND_SET: set.__len__, _KIND_DICT: dict.
 
 
 def _mutator(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark a mutating method so the reads it makes internally stay live.
+    """Wrap a mutating method: one atomic change, with live internal reads.
+
+    A mutation changes the native storage first and records the diff (log
+    entry, hidden input) afterwards. Holding the collection's lock across
+    both means a query reading the collection never sees storage that is
+    ahead of the log, and concurrent writers cannot interleave the two steps.
 
     Mutators are written with ordinary reads (``len(self)``, ``self[i]``,
     ``key in self``). Called inside a query, a second mutation would otherwise
-    read through ``read_view`` at the query's revision, which is already
-    behind the first one, and emit diffs computed from stale contents.
+    read at the query's revision, which is already behind the first one, and
+    emit diffs computed from stale contents; the depth counter keeps those
+    reads live.
     """
 
     @functools.wraps(method)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        local = self._core.mutating
-        local.depth = getattr(local, "depth", 0) + 1
+        core = self._core
+        local = core.mutating
         try:
-            return method(self, *args, **kwargs)
+            with core.rw:
+                local.depth = getattr(local, "depth", 0) + 1
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    local.depth -= 1
         finally:
-            local.depth -= 1
+            # Compaction asks the pipeline runtime for its checkpoints. That
+            # takes the runtime's lock, which pipelines hold while they read
+            # collections, so it must run after ``core.rw`` is released.
+            if core.compact_due and not local.depth:
+                core.compact_due = False
+                core.compact_memory()
 
     return wrapper
+
+
+# Copies of the native storage for reads that outlive the collection's lock.
+# The ``copy`` methods of the builtins consult overridden ``keys``/``__iter__``
+# on subclasses, which would re-enter the tracked reads.
+def _copy_list(owner: list) -> list:
+    return list(list.__iter__(owner))
+
+
+def _copy_set(owner: set) -> set:
+    return set(set.__iter__(owner))
+
+
+def _copy_dict(owner: dict) -> dict:
+    return dict(dict.items(owner))
 
 
 class _HistoryCompacted(RuntimeError):
@@ -228,6 +260,10 @@ class _CollectionCore:
         self._snapshot_cache: tuple[int, Any] | None = None
         # Per-thread depth of mutating methods in progress (see _mutator).
         self.mutating = threading.local()
+        # Held for a whole mutation and for each read made inside a query.
+        self.rw = threading.RLock()
+        # In-memory compaction a mutation asked for; runs once it lets go.
+        self.compact_due = False
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -280,22 +316,43 @@ class _CollectionCore:
         self.handle = engine.input(_head)
         self.handle.set(self.log.head)
 
-    def read_view(self) -> Any:
-        """Contents a direct read must use, or None for the live storage.
+    def read(
+        self,
+        owner: Any,
+        op: Callable[..., Any],
+        *args: Any,
+        copy: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        """Run a read ``op`` against the contents the caller should see.
 
-        Outside a query this is always None. Inside one it records the
-        dependency on this collection and, when the query runs at a revision
-        older than the collection's newest change (a snapshot read, or a
-        writer that got ahead of a running query), returns the contents as of
-        that revision: a plain list, set, or dict that must not be mutated or
-        handed out. Without this, ``xs[0]``, ``len(xs)``, ``for x in xs`` and
-        every query the AST rewriter leaves alone would read live data.
+        Outside a query that is the live storage, untouched. Inside one the
+        read records the dependency on this collection and runs under the
+        collection's lock against:
+
+        * the live storage, when the query's revision has the newest change.
+          A mutation holds the same lock until its diff is recorded, so the
+          storage cannot be ahead of what the revision says. ``copy`` is
+          applied first for reads that outlive the lock (iterators).
+        * otherwise the contents as of the query's revision (a snapshot read,
+          or a writer that got ahead of a running query), rebuilt from the
+          log as a plain list, set, or dict.
+
+        Without this, ``xs[0]``, ``len(xs)``, ``for x in xs`` and every query
+        the AST rewriter leaves alone would read live data at any revision.
         """
         if not self.engine._evaluator.in_runtime():
-            return None
+            return op(owner, *args)
         head = self.handle()
         if getattr(self.mutating, "depth", 0):
-            return None
+            return op(owner, *args)
+        with self.rw:
+            view = self._view_at_locked(head)
+            if view is None:
+                return op(owner if copy is None else copy(owner), *args)
+            return op(view, *args)
+
+    def _view_at_locked(self, head: int) -> Any:
+        """Contents at log head ``head``, or None when that is the live state."""
         log = self.log
         with log.lock:
             if head != ABSENT_HEAD and head >= log.head:
@@ -361,7 +418,10 @@ class _CollectionCore:
         if tx is None:
             self._maybe_compact_disk()
         if len(self.log.entries) >= self._next_memory_check:
-            self.compact_memory()
+            if getattr(self.mutating, "depth", 0):
+                self.compact_due = True
+            else:
+                self.compact_memory()
 
     def _maybe_compact_disk(self) -> None:
         if (
@@ -392,12 +452,13 @@ class _CollectionCore:
         diffs being dropped are still in the log.
         """
         log = self.log
-        with log.lock:
-            if log.head > head:
-                del log.entries[head - log.base_rev :]
-            # The same head number can now come to mean different contents.
-            self._snapshot_cache = None
-        self._rollback()
+        with self.rw:
+            with log.lock:
+                if log.head > head:
+                    del log.entries[head - log.base_rev :]
+                # The same head number can now come to mean other contents.
+                self._snapshot_cache = None
+            self._rollback()
 
     def _live_len(self) -> int:
         # The owner's own __len__ records a dependency inside a query.
@@ -648,44 +709,39 @@ class CascadeList(list):
         return self
 
     # --- tracked reads ---
-    # Each read goes through ``read_view``: the live storage normally, the
-    # contents as of the reader's revision inside a query that runs behind
-    # the newest change (see ``_CollectionCore.read_view``).
-    def _view(self) -> list:
-        view = self._core.read_view()
-        return self if view is None else view
-
+    # Every read goes through ``_CollectionCore.read``: live storage outside
+    # a query, the contents as of the query's revision inside one.
     def __iter__(self):
-        return list.__iter__(self._view())
+        return self._core.read(self, list.__iter__, copy=_copy_list)
 
     def __reversed__(self):
-        return list.__reversed__(self._view())
+        return self._core.read(self, list.__reversed__, copy=_copy_list)
 
     def __len__(self) -> int:
-        return list.__len__(self._view())
+        return self._core.read(self, list.__len__)
 
     def __getitem__(self, index: Any) -> Any:
-        return list.__getitem__(self._view(), index)
+        return self._core.read(self, list.__getitem__, index)
 
     def __contains__(self, item: Any) -> bool:
-        return list.__contains__(self._view(), item)
+        return self._core.read(self, list.__contains__, item)
 
     def __eq__(self, other: Any) -> bool:
-        return list.__eq__(self._view(), other)
+        return self._core.read(self, list.__eq__, other)
 
     def __ne__(self, other: Any) -> bool:
-        return list.__ne__(self._view(), other)
+        return self._core.read(self, list.__ne__, other)
 
     __hash__ = None
 
     def index(self, value: Any, *args: Any) -> int:
-        return list.index(self._view(), value, *args)
+        return self._core.read(self, list.index, value, *args)
 
     def count(self, value: Any) -> int:
-        return list.count(self._view(), value)
+        return self._core.read(self, list.count, value)
 
     def copy(self) -> list:
-        return list(list.__iter__(self._view()))
+        return self._core.read(self, _copy_list)
 
 
 def _clamped_insert_index(index: int, length: int) -> int:
@@ -818,18 +874,14 @@ class CascadeSet(set):
         return self
 
     # --- tracked reads ---
-    def _view(self) -> set:
-        view = self._core.read_view()
-        return self if view is None else view
-
     def __iter__(self):
-        return set.__iter__(self._view())
+        return self._core.read(self, set.__iter__, copy=_copy_set)
 
     def __len__(self) -> int:
-        return set.__len__(self._view())
+        return self._core.read(self, set.__len__)
 
     def __contains__(self, item: Any) -> bool:
-        return set.__contains__(self._view(), item)
+        return self._core.read(self, set.__contains__, item)
 
 
 class _CascadeDictView:
@@ -843,21 +895,24 @@ class _CascadeDictView:
         self.parent = parent
         self.which = which
 
-    def _raw(self):
+    def _read(self, op: Callable[..., Any], *args: Any, copy: Any = None) -> Any:
         # Records the dependency and honours the reader's revision.
-        return getattr(dict, self.which)(self.parent._view())
+        project = getattr(dict, self.which)
+        return self.parent._core.read(
+            self.parent, lambda data: op(project(data), *args), copy=copy
+        )
 
     def __iter__(self):
-        return iter(self._raw())
+        return self._read(iter, copy=_copy_dict)
 
     def __reversed__(self):
-        return reversed(self._raw())
+        return self._read(reversed, copy=_copy_dict)
 
     def __len__(self) -> int:
-        return len(self._raw())
+        return self._read(len)
 
     def __contains__(self, item: Any) -> bool:
-        return item in self._raw()
+        return self._read(operator.contains, item)
 
     def __repr__(self) -> str:
         live = getattr(dict, self.which)(self.parent)
@@ -963,27 +1018,23 @@ class CascadeDict(dict):
         return _CascadeDictView(self, "items")
 
     # --- tracked reads ---
-    def _view(self) -> dict:
-        view = self._core.read_view()
-        return self if view is None else view
-
     def __iter__(self):
-        return dict.__iter__(self._view())
+        return self._core.read(self, dict.__iter__, copy=_copy_dict)
 
     def __reversed__(self):
-        return dict.__reversed__(self._view())
+        return self._core.read(self, dict.__reversed__, copy=_copy_dict)
 
     def __len__(self) -> int:
-        return dict.__len__(self._view())
+        return self._core.read(self, dict.__len__)
 
     def __getitem__(self, key: Any) -> Any:
-        return dict.__getitem__(self._view(), key)
+        return self._core.read(self, dict.__getitem__, key)
 
     def __contains__(self, key: Any) -> bool:
-        return dict.__contains__(self._view(), key)
+        return self._core.read(self, dict.__contains__, key)
 
     def get(self, key: Any, default: Any = None) -> Any:
-        return dict.get(self._view(), key, default)
+        return self._core.read(self, dict.get, key, default)
 
 
 CASCADE_COLLECTION_TYPES = (CascadeList, CascadeSet, CascadeDict)
