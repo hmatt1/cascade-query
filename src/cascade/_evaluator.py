@@ -104,6 +104,21 @@ class Evaluator:
                 runtime.pins = None
                 self._store.unpin_all(pins)
 
+    async def _run_sync_in_executor(
+        self, fn: Callable[..., Any], args: tuple[Any, ...]
+    ) -> Any:
+        """Run a sync query body or input default off the event loop.
+
+        ``run_in_executor`` does not carry context variables to the worker
+        thread, so without ``copy_context`` the body would run outside the
+        current runtime: its reads would record no dependencies (leaving the
+        memo permanently stale) and would not see the runtime's snapshot.
+        """
+        loop = asyncio.get_running_loop()
+        executor = self._get_executor() if self._get_executor else None
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(executor, ctx.run, fn, *args)
+
     def check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         if runtime_cancel_epoch is None:
             return
@@ -251,9 +266,7 @@ class Evaluator:
             if inspect.iscoroutinefunction(fn):
                 default = await fn(*args)
             else:
-                loop = asyncio.get_running_loop()
-                executor = self._get_executor() if self._get_executor else None
-                default = await loop.run_in_executor(executor, fn, *args)
+                default = await self._run_sync_in_executor(fn, args)
             should_materialize = False
             if not snapshot_explicit:
                 with self._store.lock:
@@ -1037,9 +1050,7 @@ class Evaluator:
                     if inspect.iscoroutinefunction(fn):
                         result = await fn(*key[2])
                     else:
-                        loop = asyncio.get_running_loop()
-                        executor = self._get_executor() if self._get_executor else None
-                        result = await loop.run_in_executor(executor, fn, *key[2])
+                        result = await self._run_sync_in_executor(fn, key[2])
                     self.check_cancelled(new_runtime.cancel_epoch)
                     error = None
                 except BaseException as exc:
@@ -1574,11 +1585,7 @@ class Evaluator:
         if inspect.iscoroutinefunction(fn):
             value = await fn(*args)
         else:
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-            executor = self._get_executor() if self._get_executor else None
-            value = await loop.run_in_executor(executor, fn, *args)
+            value = await self._run_sync_in_executor(fn, args)
 
         return InputVersion(
             revision=runtime.snapshot.revision,
