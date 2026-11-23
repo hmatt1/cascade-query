@@ -246,7 +246,7 @@ sqlite_engine = Engine(max_entries=10_000, cache_dir=".cascade_cache", cache_bac
 ```
 *   `libmdbx` and `msgpack` are required for the default backend (`pip install query-cascade[disk]`). You can also use `sqlite` which has no external dependencies.
 *   Values must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.); this is required for every engine, not only with `cache_dir`. A query whose arguments cannot be serialized is computed but not persisted.
-*   **`engine.clear_disk_cache()`**: Deletes every entry in the persistent disk cache.
+*   **`engine.clear_disk_cache()`**: Deletes every cached query result in the persistent disk cache. Named collections are kept: their contents are data, not cache, and are restored as usual on the next run. To empty a collection, call its `clear()`.
 *   **Reusing results across runs:** results are queued when their query finishes and written to the cache in batches by a background thread. They are on disk once `engine.flush_disk()` or `engine.shutdown()` returns, and a normal interpreter exit (end of script, `sys.exit()`, an unhandled exception) writes whatever is still queued. A process that is killed (`os._exit`, SIGKILL, a crash) loses the results still in the queue, so call `flush_disk()` at the points where that matters. A new `Engine` with the same `cache_dir` reuses them once you set the same input values again, and recomputes only the queries whose inputs changed.
 
 ---

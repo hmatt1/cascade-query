@@ -309,7 +309,6 @@ def test_d10_two_engines_on_one_named_collection(tmp_path: Path, backend: str) -
 # --- Data loss and corruption -----------------------------------------------
 
 
-@_defect(11, "clear_disk_cache() wipes the disk log of live named collections")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_d11_clear_disk_cache_keeps_live_named_collections(
     tmp_path: Path, backend: str

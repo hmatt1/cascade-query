@@ -244,10 +244,16 @@ class MdbxDiskCache:
             raise
 
     def clear(self) -> None:
+        """Delete every cached query result. Collection logs are kept.
+
+        Results can be recomputed; a named collection's log is the only copy
+        of its contents. Dropping the log under a live collection also left
+        its later diffs on disk with nothing before them, so the next run
+        restored a fragment.
+        """
         with self._begin(write=True) as txn:
             self._meta.drop(txn, delete=False)
             self._blobs.drop(txn, delete=False)
-            self._collections.drop(txn, delete=False)
 
     # --- collection event sourcing ---
     # ``s\x00{name}`` holds the compacted snapshot record; ``l\x00{name}\x00{rev}``
@@ -488,12 +494,12 @@ class SqliteDiskCache:
                 raise
 
     def clear(self) -> None:
+        """Delete every cached query result. Collection logs are kept."""
         with self._lock:
             self._conn.execute("begin")
             try:
                 self._conn.execute("delete from meta")
                 self._conn.execute("delete from blobs")
-                self._conn.execute("delete from collections")
                 self._conn.execute("commit")
             except Exception:  # pragma: no cover
                 self._conn.execute("rollback")

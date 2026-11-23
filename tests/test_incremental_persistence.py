@@ -174,16 +174,78 @@ def test_kind_mismatch_on_restore_raises(cache_dir):
     e2.shutdown()
 
 
-def test_clear_disk_cache_wipes_collections(cache_dir):
+def test_clear_disk_cache_keeps_collections(cache_dir):
+    # Was test_clear_disk_cache_wipes_collections. Clearing the cache used to
+    # delete collection logs too, which lost data nothing can recompute and
+    # left live collections restoring as fragments (D11).
     e1 = make_engine(cache_dir)
     CascadeList(e1, [1, 2], name="xs")
     e1.clear_disk_cache()
     snapshot, tail = e1._disk.collection_load("xs")
-    assert snapshot is None and tail == []
+    assert snapshot is not None
+    assert [diff["value"] for _rev, diff in tail] == [1, 2]
     e1.shutdown()
 
     e2 = make_engine(cache_dir)
-    assert list(CascadeList(e2, [7], name="xs")) == [7]
+    assert list(CascadeList(e2, [7], name="xs")) == [1, 2]
+    e2.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["mdbx", "sqlite"])
+def test_clear_disk_cache_drops_results_but_not_collections(tmp_path, backend):
+    def session(clear: bool) -> tuple[list, int, int]:
+        engine = Engine(cache_dir=tmp_path / "cache", cache_backend=backend)
+        runs = [0]
+        try:
+            xs = CascadeList(engine, [1, 2, 3], name="xs", compact_every=4)
+            ys = CascadeDict(engine, {"a": 1}, name="ys")
+            zs = CascadeSet(engine, [5], name="zs")
+
+            @engine.query(incremental=False)
+            def total() -> int:
+                runs[0] += 1
+                return sum(list(xs)) + sum(ys.values()) + sum(zs)
+
+            value = total()
+            if clear:
+                engine.flush_disk()
+                engine.clear_disk_cache()
+                # Mutations after the clear, enough to cross a compaction.
+                for i in range(6):
+                    xs.append(10 + i)
+                del xs[0]
+                ys["b"] = 2
+                zs.add(6)
+            return [list(xs), dict(ys.items()), sorted(zs)], value, runs[0]
+        finally:
+            engine.shutdown()
+
+    session(clear=False)
+    cleared_state, _value, _runs = session(clear=True)
+    assert cleared_state[0] == [2, 3, 10, 11, 12, 13, 14, 15]
+    # The next run restores exactly what the collections held at shutdown,
+    # and recomputes the result the clear dropped.
+    restored_state, value, runs = session(clear=False)
+    assert restored_state == cleared_state
+    assert value == sum(cleared_state[0]) + 3 + 11
+    assert runs == 1
+    # Nothing was cleared since, so this run reuses the result.
+    assert session(clear=False)[2] == 0
+
+
+def test_clear_disk_cache_inside_a_transaction_keeps_pending_collection_writes(
+    cache_dir,
+):
+    e1 = make_engine(cache_dir)
+    xs = CascadeList(e1, [1], name="xs")
+    with e1.transaction():
+        xs.append(2)
+        e1.clear_disk_cache()
+        xs.append(3)
+    e1.shutdown()
+
+    e2 = make_engine(cache_dir)
+    assert list(CascadeList(e2, name="xs")) == [1, 2, 3]
     e2.shutdown()
 
 

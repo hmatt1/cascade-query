@@ -422,7 +422,12 @@ class Engine:
         return None if self._disk is None else self._disk.path
 
     def clear_disk_cache(self) -> None:
-        """Delete all entries in the persistent cache; the next run recomputes."""
+        """Delete every cached query result on disk; the next run recomputes.
+
+        Named collections are not touched. Their logs are data, not cache:
+        nothing could rebuild them. To empty a collection, call its
+        ``clear()``.
+        """
         if self._disk is None:
             raise PersistentCacheError(
                 "engine has no persistent cache; pass cache_dir= to Engine"

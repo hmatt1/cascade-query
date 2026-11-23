@@ -47,7 +47,7 @@ Every open defect has a failing regression test in
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Broken (D12) | Strong for one snapshot |
 | G25 | A transaction applies completely or not at all | Broken (D12, D17) | Strong for inputs only |
-| G26 | A named collection is restored with the same contents after a restart | Broken (D10, D11, D16) | Good on the happy path |
+| G26 | A named collection is restored with the same contents after a restart | Broken (D10, D16) | Good on the happy path |
 
 ## Core evaluation
 
@@ -507,12 +507,19 @@ before applying it in memory. A new engine restores the same contents, and
 compaction preserves them. A value that cannot be encoded raises
 `PersistentCacheError` at the mutating call.
 
+`clear_disk_cache()` deletes cached query results only. Collection logs are
+data that nothing can recompute, so they stay, and a restart after a clear
+restores exactly what each collection held at shutdown. To empty a
+collection, call its `clear()`.
+
 Limits: writes are committed but not fsynced, so they survive a process kill
 but not necessarily a power loss.
 
 Enforced by: `test_incremental_persistence.py::test_named_collections_restore_across_engines`,
 `::test_restored_list_keeps_uid_continuity`, `::test_compaction_squashes_log_tail`,
 `::test_unserializable_value_raises_persistent_cache_error`,
+`::test_clear_disk_cache_keeps_collections`,
+`::test_clear_disk_cache_drops_results_but_not_collections`,
 `test_transaction_collections.py::test_named_collection_writes_to_disk_only_on_commit`.
 
 ---
@@ -542,7 +549,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D11 | `clear_disk_cache()` wipes the disk log of live named collections. A list holding `[1, 2, 3]`, cleared, then `append(4)`, restores as `[4]` after restart on both backends. | Reproduced |
 | D12 | When a pinned snapshot predates a collection, compaction ignores later snapshots and open transactions. A snapshot read raises the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction leaves 2048 of its 3000 appended items in place. | Reproduced |
 | D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
 | D17 | The open transaction leaks across concurrency boundaries. Another thread mutating the same collection during the block has its change deleted on rollback while queries keep the uncommitted value. A task created in the block that calls `set()` after the block exits has the update dropped. | Reproduced: the other thread's append was gone after rollback, and the task's `set(5)` left the input at 1. The "queries keep the uncommitted value" part was not re-run. |
@@ -566,6 +572,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D4 | `compute_many`, `compute_many_stream` or `submit` called inside a query recorded no dependency, so the parent never invalidated. The first two now record each requested query; `submit` inside a query raises `RuntimeError`. | `fix: queries run through compute_many inside a query were not tracked` |
 | D9 | Functions registered under one `module:qualname` shared a cache (`make(1)()` and `make(2)()` both returned 1), and a handle to a replaced function kept running old code into it. A different function now replaces the old one, whose handles raise `StaleHandleError`; `name=` on `engine.query` and `engine.input` gives factories and lambdas distinct identities. | `fix: two functions registered under one name shared cached results` |
 | D8 | A builtin shadowed in an enclosing function was still rewritten (an outer `sum = lambda it: "shadowed"` was ignored). The rewriter now declines when a relevant name is a closure variable. | `fix: a builtin shadowed in an enclosing function was still rewritten` |
+| D11 | `clear_disk_cache()` wiped the disk log of live named collections, so `[1, 2, 3]`, cleared, then `append(4)`, restored as `[4]`. It now deletes cached results only and leaves collection logs alone. | `fix: clearing the disk cache deleted named collections' data` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
