@@ -218,3 +218,159 @@ def test_caught_uncached_error_still_tracks_dependencies(cache_exceptions):
     assert guarded() == "good"
     source.set(value="bad")
     assert guarded() == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_async_caught_cached_error_does_not_escape_on_reverification():
+    engine = Engine()
+    calls = 0
+
+    @engine.input
+    def source():
+        return 1
+
+    @engine.query(cache_exceptions=True)
+    async def failing():
+        raise ValueError(f"bad {source()}")
+
+    @engine.query(cache_exceptions=True)
+    async def steady():
+        source()
+        raise ValueError("bad")
+
+    @engine.query
+    async def guarded():
+        try:
+            return await failing()
+        except ValueError:
+            return "fallback"
+
+    @engine.query
+    async def steady_guarded():
+        nonlocal calls
+        calls += 1
+        try:
+            return await steady()
+        except ValueError:
+            return "fallback"
+
+    @engine.query
+    async def top():
+        return await guarded()
+
+    assert await guarded() == "fallback"
+    assert await top() == "fallback"
+    assert await steady_guarded() == "fallback"
+
+    source.set(2)
+    assert await top() == "fallback"
+    assert await steady_guarded() == "fallback"
+    assert calls == 1  # the error did not change, so the parent is not re-run
+    source.set(3)
+    assert await guarded() == "fallback"
+
+    with pytest.raises(ValueError, match="bad 3"):
+        await failing()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_exceptions", [False, (KeyError,)])
+async def test_async_caught_uncached_error_still_tracks_dependencies(
+    cache_exceptions,
+):
+    engine = Engine()
+
+    @engine.input
+    def source():
+        return "bad"
+
+    @engine.query(cache_exceptions=cache_exceptions)
+    async def parse():
+        value = source()
+        if value == "bad":
+            raise ValueError("bad input")
+        return value
+
+    @engine.query
+    async def guarded():
+        try:
+            return await parse()
+        except ValueError:
+            return "fallback"
+
+    assert await guarded() == "fallback"
+    source.set("good")
+    assert await guarded() == "good"
+    source.set("bad")
+    assert await guarded() == "fallback"
+
+
+def test_uncached_error_two_levels_down_reaches_the_handler():
+    """The error surfaces in the query that handles it, not in the check."""
+    engine = Engine()
+
+    @engine.input
+    def source():
+        return "good"
+
+    @engine.query(cache_exceptions=False)
+    def leaf():
+        value = source()
+        if value == "bad":
+            raise ValueError("bad input")
+        return value
+
+    @engine.query(cache_exceptions=False)
+    def middle():
+        return leaf().upper()
+
+    @engine.query
+    def guarded():
+        try:
+            return middle()
+        except ValueError:
+            return "fallback"
+
+    assert guarded() == "GOOD"
+    source.set("bad")
+    assert guarded() == "fallback"
+    with pytest.raises(ValueError, match="bad input"):
+        middle()
+    source.set("fine")
+    assert guarded() == "FINE"
+
+
+def test_disk_cached_parent_survives_dependency_that_now_raises(tmp_path):
+    """Checking a disk entry against a dependency that raises is a miss."""
+
+    def build(engine):
+        @engine.input
+        def source():
+            return "good"
+
+        @engine.query(cache_exceptions=False)
+        def parse():
+            value = source()
+            if value == "bad":
+                raise ValueError("bad input")
+            return value
+
+        @engine.query
+        def guarded():
+            try:
+                return parse()
+            except ValueError:
+                return "fallback"
+
+        return source, guarded
+
+    first = Engine(cache_dir=str(tmp_path))
+    source, guarded = build(first)
+    assert guarded() == "good"
+    first.shutdown()
+
+    second = Engine(cache_dir=str(tmp_path))
+    source, guarded = build(second)
+    source.set("bad")
+    assert guarded() == "fallback"
+    second.shutdown()
