@@ -144,9 +144,9 @@ asyncio.run(main())
 Synchronous queries can also be called directly from inside asynchronous nodes (and vice versa). Cascade maintains type stability and performance segregation, ensuring pure-Python CPU-bound tasks suffer no context-switching overhead while I/O-bound tasks evaluate concurrently.
 
 ### Parallel & Background Execution
-*   **`engine.submit(query, *args, executor=None)`**: Schedules a query for background execution. Returns a `concurrent.futures.Future`.
-*   **`engine.compute_many(calls, workers=None)`**: Executes a list of queries in parallel using a thread pool. Blocks until all are complete and returns a list of results.
-*   **`engine.compute_many_stream(calls, workers=None)`**: Yields completed results as each call finishes. Yields `(index, value, call_effects)` in completion order.
+*   **`engine.submit(query, *args, executor=None)`**: Schedules a query for background execution. Returns a `concurrent.futures.Future`. Calling it from inside a running query raises `RuntimeError`, because the future could outlive the query and its read could not be tracked; call the query directly or use `compute_many` there.
+*   **`engine.compute_many(calls, workers=None)`**: Executes a list of queries in parallel using a thread pool. Blocks until all are complete and returns a list of results. Inside a running query, each requested query becomes a dependency of the calling query, just as if it had been called directly (`memoize=False` queries then run on the calling thread).
+*   **`engine.compute_many_stream(calls, workers=None)`**: Yields completed results as each call finishes. Yields `(index, value, call_effects)` in completion order. Tracks dependencies inside a query the same way `compute_many` does.
 *   **`engine.shutdown(*, wait=True, cancel_futures=False)`**: Shuts down the default thread pool executor used by `submit`. With `cache_dir`, it also writes any results still queued for the disk cache and closes it.
 *   **`QueryCancelled`**: Exception raised if a background query's dependencies change before it completes. Only queries started with `submit` are cancelled; direct calls, `compute_many` and `compute_many_stream` always run to completion. (Known defect: a direct call that joins a submitted run of the same query can currently receive its `QueryCancelled`; see D19 in `docs/guarantees.md`.)
 

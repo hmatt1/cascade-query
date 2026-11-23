@@ -128,7 +128,6 @@ def test_d3_expired_ttl_dependency_refreshes_through_its_dependent() -> None:
     assert parent() == 20
 
 
-@_defect(4, "compute_many/submit inside a query records no dependency")
 @pytest.mark.parametrize("fan_out", ["compute_many", "submit"])
 def test_d4_fan_out_inside_a_query_tracks_dependencies(fan_out: str) -> None:
     engine = Engine()

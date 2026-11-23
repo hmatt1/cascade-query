@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D9) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D3, D5–D9) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Broken for fixed-point queries (D2) | Strong otherwise |
@@ -60,7 +60,20 @@ How: each cached result records its dependencies and the revision at which
 each was last seen to change. A result is reused only after every recorded
 dependency is confirmed unchanged at the caller's revision.
 
+Dependencies are recorded for direct calls and for `engine.compute_many` and
+`engine.compute_many_stream` called inside a query: worker threads compute
+the requested queries in parallel at the calling query's revision, then the
+calling query reads each result with an ordinary nested call, which is what
+records the dependency, replays effects and raises errors.
+
 Limits, by design:
+
+- **No `engine.submit` inside a query.** It raises `RuntimeError`: the future
+  can outlive the query, so what the query reads through it cannot be
+  recorded.
+- **Fan-out inside a query is parallel only for memoized queries.**
+  `memoize=False` queries keep no value to hand over and run on the calling
+  thread. An explicit `snapshot=` is ignored there, as for a nested call.
 
 - **Queries must be pure.** Anything read that is not an input, a query or a
   tracked collection read is invisible to the engine.
@@ -79,7 +92,10 @@ Limits, by design:
 Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_recomputation`
 (seeded differential test against an independent model, 16 parametrisations),
 `test_stateful_engine_invariants.py` (Hypothesis state machine),
-`test_dirty_propagation.py::test_concurrent_writers_and_readers_only_see_real_states`.
+`test_dirty_propagation.py::test_concurrent_writers_and_readers_only_see_real_states`,
+`test_fan_out_inside_queries.py` (dependencies, snapshots, effects, errors and
+cycles through `compute_many` and `compute_many_stream` inside a query;
+`submit` refused).
 
 ### G2. Minimal re-execution and early bail-out
 
@@ -495,7 +511,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D1 | A rewritten stage that reads an input the query has already read is not detected as impure. `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` still returns 12 after `factor.set(10)`; correct is 60. | Reproduced |
 | D2 | A `fixed_point=` query ignores `snapshot=` and returns the head value (7 where the snapshot value is 1). One read also moved `engine.revision` from 3 to 6. | Reproduced |
 | D3 | An expired TTL query is not refreshed when reached through a dependent that is already verified at the current revision. `parent()` returned 10 before and after expiry. | Reproduced |
-| D4 | `compute_many` or `submit` called inside a query records no dependency, so the parent never invalidates (stayed 1 after the input became 5). | Reproduced |
 | D5 | Collection reads that are not tracked go stale inside queries: `set(s)`, `s \| x`, set and dict `==`, `s.issubset`, `xs + [...]`, `repr`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. | Reproduced |
 | D6 | Early bail-out treats dicts that differ only in insertion order as equal, so a dependent that iterates the dict keeps the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
@@ -528,6 +543,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D15 | Results were lost when a process ended without `shutdown()` or `flush_disk()` (1224 of 2000 on mdbx after a normal exit). | `fix: results were lost when a script ended without shutdown()` |
 | D13 | Reusing an `EngineTransaction` object replayed its old state and could roll back committed data. Re-entry now raises `RuntimeError`. | `fix: a reused transaction object could undo committed changes` |
 | D14 | `CascadeSet.update` and `difference_update` kept the part applied before a failure in storage but not in the log, so queries never saw it. Also found and fixed: list `pop`, `insert`, `xs[i] = v` and `del xs[i]` with an `__index__` object changed the list and then raised before logging. | `fix: a failed set update left elements that queries never saw` |
+| D4 | `compute_many`, `compute_many_stream` or `submit` called inside a query recorded no dependency, so the parent never invalidated. The first two now record each requested query; `submit` inside a query raises `RuntimeError`. | `fix: queries run through compute_many inside a query were not tracked` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
@@ -550,9 +566,10 @@ running it.
 
 Limits that narrow use without stopping it:
 
-- **No thread fan-out inside a query.** `compute_many` and `submit` called from
-  a query lose dependency tracking (D4). `asyncio.gather` over async queries
-  does track dependencies, so parallelism inside the graph is async only.
+- **Thread fan-out inside a query goes through `compute_many`.**
+  `compute_many` and `compute_many_stream` track dependencies there;
+  `submit` raises. `asyncio.gather` over async queries also tracks
+  dependencies.
 - **One process per `cache_dir`.** Two processes on one directory can hang the
   writer (D18) or mix collection state (D10). Parallel CI jobs and
   `pytest-xdist` workers need separate directories.

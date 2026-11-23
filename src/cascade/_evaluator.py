@@ -81,6 +81,12 @@ class Evaluator:
         self._hydrating_var: contextvars.ContextVar[frozenset[QueryKey]] = (
             contextvars.ContextVar("cascade_hydrating", default=frozenset())
         )
+        # Queries that are running on other threads and waiting for this
+        # context to finish (set by ``warm_for_caller``). Waiting for one of
+        # them would never end.
+        self._waiting_callers_var: contextvars.ContextVar[frozenset[QueryKey]] = (
+            contextvars.ContextVar("cascade_waiting_callers", default=frozenset())
+        )
         self._disk_queue: (
             queue.Queue[
                 tuple[
@@ -166,6 +172,67 @@ class Evaluator:
         # only ever moves forward. Called 2-3 times per recompute.
         if self._store.cancel_epoch != runtime_cancel_epoch:
             raise QueryCancelled("query cancelled because inputs changed")
+
+    def current_runtime(self) -> RuntimeState | None:
+        """The runtime of the query executing in this context, if any."""
+        return self._runtime_var.get()
+
+    def caller_keys(self, runtime: RuntimeState) -> frozenset[QueryKey]:
+        """Every query that is waiting for the code running in ``runtime``."""
+        return self._waiting_callers_var.get().union(f.key for f in runtime.stack)
+
+    def warm_for_caller(
+        self,
+        caller: RuntimeState,
+        waiting: frozenset[QueryKey],
+        query_id: str,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+    ) -> None:
+        """Compute a query on this thread for a query running on another.
+
+        Fan-out inside a query (``Engine.compute_many``) works in two steps:
+        worker threads call this to compute the requested queries in parallel
+        at the caller's revision, then the calling query calls each of them
+        itself. That second call is an ordinary nested call, usually a cache
+        hit, and is what records the dependency, replays effects and raises
+        errors. So nothing here needs to reach the caller, and every failure
+        is dropped: the caller's own call meets it again.
+
+        ``caller`` must stay pinned by its owner until this returns.
+        """
+        runtime = RuntimeState(
+            snapshot=caller.snapshot,
+            stack=[],
+            root_effects=None,
+            staged_root_effects={},
+            cancel_epoch=caller.cancel_epoch,
+            snapshot_explicit=caller.snapshot_explicit,
+        )
+        token = self._waiting_callers_var.set(waiting)
+        try:
+            self._run_in_runtime(
+                runtime, lambda: self.query_call(query_id, fn, args, snapshot=None)
+            )
+        except BaseException:  # noqa: BLE001
+            pass
+        finally:
+            self._waiting_callers_var.reset(token)
+
+    def _refuse_wait_on_caller(self, key: QueryKey) -> None:
+        """Raise instead of waiting for a query that is waiting for us.
+
+        Only reachable from ``warm_for_caller``: the query that fanned out is
+        still running on its own thread, blocked until this one finishes, so
+        joining its run would deadlock. On one thread the frame stack catches
+        this as a cycle; the caller's own call still does.
+        """
+        waiting = self._waiting_callers_var.get()
+        if waiting and key in waiting:
+            raise CycleError(
+                f"cycle detected: {self._store.key_to_str(key)} fans out to a "
+                "query that depends on it"
+            )
 
     def in_runtime(self) -> bool:
         """True when the current context is executing inside a query."""
@@ -523,6 +590,7 @@ class Evaluator:
             self._store.trace_event("cache_hit", key)
             return finished, True
         if waiter_future is not None:
+            self._refuse_wait_on_caller(key)
             self._store.trace_event("dedup_wait", key)
             result = waiter_future.result()
             return result, True
@@ -593,6 +661,7 @@ class Evaluator:
             self._store.trace_event("cache_hit", key)
             return finished, True
         if waiter_future is not None:
+            self._refuse_wait_on_caller(key)
             self._store.trace_event("dedup_wait", key)
             result = await asyncio.wrap_future(waiter_future)
             return result, True

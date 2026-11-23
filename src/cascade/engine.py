@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import itertools
 import concurrent.futures
 import os
 import threading
@@ -468,7 +469,20 @@ class Engine:
         when you need isolation, custom limits, or coordinated shutdown with
         other tasks. Call :meth:`shutdown` when dropping the engine if you
         require the default pool to release threads promptly.
+
+        Raises ``RuntimeError`` when called from inside a running query. The
+        returned future can outlive that query and hand its value to code
+        the engine cannot see, so the read cannot be recorded as a
+        dependency. Inside a query call the other query directly, or use
+        :meth:`compute_many` to run several in parallel.
         """
+        if self._evaluator.in_runtime():
+            raise RuntimeError(
+                "engine.submit() cannot be called from inside a query: the "
+                "future can outlive the query, so the engine cannot record "
+                "what the query read through it. Call the query directly, or "
+                "use engine.compute_many() to run several in parallel."
+            )
         store = self._store
         run_snapshot = store.pin_snapshot(snapshot)
         rev = run_snapshot.revision
@@ -502,13 +516,117 @@ class Engine:
         snapshot: Snapshot | None = None,
         effects: dict[str, list[Any]] | None = None,
     ) -> list[Any]:
+        """Run several queries in parallel and return their results in order.
+
+        Called from inside a running query, the requested queries become
+        dependencies of that query, exactly as if it had called each of them
+        directly: they run at the calling query's revision (``snapshot`` is
+        ignored, as it is for a direct nested call), in parallel on worker
+        threads, and the calling query then reads each result in call order.
+        Queries with ``memoize=False`` keep no value to hand over, so they run
+        on the calling thread, one after another.
+        """
         if not calls:
             return []
+        if self._evaluator.current_runtime() is not None:
+            return self._compute_many_in_query(calls, workers, effects)
         run_snapshot = self._store.pin_snapshot(snapshot)
         try:
             return self._compute_many_pinned(calls, workers, run_snapshot, effects)
         finally:
             self._store.unpin(run_snapshot.revision)
+
+    # --- fan-out from inside a query ---
+    #
+    # Worker threads have no access to the calling query's frame, so a query
+    # they run cannot be recorded as its dependency from there. Instead the
+    # workers only warm the cache (Evaluator.warm_for_caller) and the calling
+    # query then makes an ordinary nested call per requested query. Tracking,
+    # effects, errors, cycles and cancellation all come from that call, so
+    # they cannot differ from a direct call.
+
+    def _warm_jobs(
+        self, calls: Sequence[tuple[_QueryHandle, tuple[Any, ...]]]
+    ) -> list[tuple[int, Callable[[], None]]]:
+        """One cache-warming job per distinct memoized call, with its index."""
+        evaluator = self._evaluator
+        runtime = evaluator.current_runtime()
+        assert runtime is not None
+        waiting = evaluator.caller_keys(runtime)
+        jobs: list[tuple[int, Callable[[], None]]] = []
+        seen: set[Any] = set()
+        for idx, (query, args) in enumerate(calls):
+            args = tuple(args)
+            try:
+                if (query.id, args) in seen:
+                    continue
+                seen.add((query.id, args))
+            except TypeError:
+                continue  # unhashable arguments: the caller's call reports it
+            if not self._store.lookup_query_memoize(query.id):
+                continue
+            jobs.append(
+                (
+                    idx,
+                    lambda q=query, a=args: evaluator.warm_for_caller(
+                        runtime, waiting, q.id, q.raw, a
+                    ),
+                )
+            )
+        return jobs
+
+    def _call_in_query(
+        self,
+        query: _QueryHandle,
+        args: tuple[Any, ...],
+        call_effects: dict[str, list[Any]] | None,
+    ) -> Any:
+        """Call ``query`` as the current query would, collecting its effects.
+
+        Effects pushed or replayed by a nested call are appended to the
+        calling frame's lists, so this call's share is whatever those lists
+        gained while it ran.
+        """
+        runtime = self._evaluator.current_runtime()
+        if runtime is None or not runtime.stack:
+            # The stream was handed to code outside the query that made it.
+            return self._query_call(
+                query.id, query.raw, tuple(args), snapshot=None, effects=call_effects
+            )
+        frame = runtime.stack[-1]
+        before = (
+            None
+            if call_effects is None
+            else {name: len(items) for name, items in frame.effects.items()}
+        )
+        value = self._query_call(query.id, query.raw, tuple(args), snapshot=None)
+        if before is not None and call_effects is not None:
+            for name, items in frame.effects.items():
+                gained = items[before.get(name, 0) :]
+                if gained:
+                    call_effects.setdefault(name, []).extend(gained)
+        return value
+
+    def _compute_many_in_query(
+        self,
+        calls: Sequence[tuple[_QueryHandle, tuple[Any, ...]]],
+        workers: int | None,
+        effects: dict[str, list[Any]] | None,
+    ) -> list[Any]:
+        jobs = self._warm_jobs(calls)
+        if len(jobs) > 1:
+            scheduler = WorkStealingExecutor(workers or min(32, len(jobs)))
+            for slot, (_idx, job) in enumerate(jobs):
+                scheduler.submit_indexed(slot, job)
+            scheduler.run(len(jobs))
+        results = []
+        for query, args in calls:
+            call_effects: dict[str, list[Any]] | None = None if effects is None else {}
+            results.append(self._call_in_query(query, args, call_effects))
+            if effects is not None and call_effects:
+                for name, items in call_effects.items():
+                    effects.setdefault(name, []).extend(items)
+        return results
 
     def _compute_many_pinned(
         self,
@@ -567,6 +685,18 @@ class Engine:
         if not calls:
             return
 
+        runtime = self._evaluator.current_runtime()
+        if runtime is not None:
+            # See compute_many: inside a query each call becomes a dependency.
+            # The pin keeps the revision readable for the workers even if the
+            # stream is still being consumed after the calling query ended.
+            pinned = self._store.pin_snapshot(runtime.snapshot)
+            try:
+                yield from self._compute_many_stream_in_query(calls, workers, effects)
+            finally:
+                self._store.unpin(pinned.revision)
+            return
+
         run_snapshot = self._store.pin_snapshot(snapshot)
         try:
             yield from self._compute_many_stream_pinned(
@@ -574,6 +704,40 @@ class Engine:
             )
         finally:
             self._store.unpin(run_snapshot.revision)
+
+    def _compute_many_stream_in_query(
+        self,
+        calls: Sequence[tuple[_QueryHandle, tuple[Any, ...]]],
+        workers: int | None,
+        effects: dict[str, list[Any]] | None,
+    ) -> Iterator[tuple[int, Any, dict[str, list[Any]]]]:
+        jobs = self._warm_jobs(calls)
+        warmed = {idx for idx, _job in jobs}
+        per_call_effects: list[dict[str, list[Any]]] = [{} for _ in calls]
+        worker_count = workers or min(32, max(1, len(jobs)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+            future_to_index = {pool.submit(job): idx for idx, job in jobs}
+            # Warmed calls in completion order, then the ones that run here
+            # (memoize=False, repeated calls).
+            order = itertools.chain(
+                (
+                    future_to_index[fut]
+                    for fut in concurrent.futures.as_completed(future_to_index)
+                ),
+                (idx for idx in range(len(calls)) if idx not in warmed),
+            )
+            for idx in order:
+                query, args = calls[idx]
+                value = self._call_in_query(
+                    query, args, per_call_effects[idx] if effects is not None else None
+                )
+                yield (idx, value, per_call_effects[idx] if effects is not None else {})
+
+        if effects is not None:
+            for call_effects in per_call_effects:
+                for name, items in call_effects.items():
+                    if items:
+                        effects.setdefault(name, []).extend(items)
 
     def _compute_many_stream_pinned(
         self,
