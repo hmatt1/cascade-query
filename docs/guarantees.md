@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D3, D5–D7) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D1, D2, D5–D7) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Broken for fixed-point queries (D2) | Strong otherwise |
@@ -30,7 +30,7 @@ Every open defect has a failing regression test in
 | G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits (D19) | Medium |
 | G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value | Broken with snapshots (D2) | Weak for fixed point |
 | G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits (D20) | Strong |
-| G9 | A TTL query recomputes once its TTL has elapsed | Broken through dependents (D3) | Weak |
+| G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
 | G11 | Re-registering a query with changed code drops its cached results | Holds with limits | Positive cases only |
 | G12 | Accumulator effects are replayed on cache hits, in a fixed order | Holds | Good |
@@ -56,9 +56,12 @@ Every open defect has a failing regression test in
 Calling a query returns the value its function would return if run fresh
 against the inputs and collections at the caller's revision.
 
-How: each cached result records its dependencies and the revision at which
-each was last seen to change. A result is reused only after every recorded
-dependency is confirmed unchanged at the caller's revision.
+How: each cached result records its dependencies and a marker of the value
+each had: for an input the revision that set it, for a query a stamp that is
+new whenever the query's value changes. A result is reused only after every
+recorded dependency is confirmed unchanged at the caller's revision. The
+query stamp is not a revision, because a query's value can change while the
+revision stands still (an expired TTL, G9).
 
 Dependencies are recorded for direct calls and for `engine.compute_many` and
 `engine.compute_many_stream` called inside a query: worker threads compute
@@ -215,11 +218,39 @@ Enforced by: `test_error_caching.py::test_error_is_cached`,
 
 ### G9. TTL
 
-A `ttl=` query called directly after its TTL has elapsed re-runs. If the new
-result is equal, dependents do not re-run.
+A `ttl=` query re-runs when it is needed after its TTL has elapsed: called
+directly, or reached through any query that depends on it, however many
+levels up, at the newest revision or through a snapshot. No revision change
+is needed. If the new result is equal, dependents do not re-run.
+
+How: every cached result carries the earliest time at which a TTL result
+beneath it expires. Until then it is served as before; after it, the result is
+verified again, which re-runs the expired query and then whatever its new
+value changes. A result with no TTL query beneath it carries no expiry and
+pays one attribute check per cache hit.
+
+Limits, by design:
+
+- **The clock is `time.time()`.** A TTL bounds the age of a result when a
+  call starts; a call that is already running keeps what it read.
+- **A TTL result is shared by all revisions.** It is not part of a snapshot:
+  a snapshot read after expiry sees the snapshot's inputs and a fresh TTL
+  result.
+- **A dependent can lag by up to one TTL.** If a TTL result is dropped early
+  (eviction, `prune`) and recomputed with a new value, queries that used the
+  old one keep it until the time the old one would have expired.
 
 Enforced by: `test_ttl.py::test_ttl_invalidation_basic`,
 `::test_ttl_invalidation_async`,
+`::test_expired_ttl_refreshes_a_chain_of_dependents`,
+`::test_expired_ttl_with_an_equal_result_does_not_rerun_dependents`,
+`::test_expired_ttl_refreshes_a_dependent_read_through_a_snapshot`,
+`::test_dependent_expires_with_the_shortest_ttl_beneath_it`,
+`::test_expired_ttl_reaches_a_caller_that_caught_a_dependency_error`,
+`::test_expired_ttl_refreshes_async_dependents`,
+`::test_expired_ttl_refreshes_dependents_loaded_from_disk` (both backends),
+`::test_queries_without_a_ttl_beneath_them_carry_no_expiry`,
+`test_known_defects.py::test_d3_expired_ttl_dependency_refreshes_through_its_dependent`,
 `test_dirty_propagation.py::test_ttl_dependency_keeps_dependents_on_the_slow_path`.
 
 ### G10. `memoize=False`
@@ -539,7 +570,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 |---|---|---|
 | D1 | A rewritten stage that reads an input the query has already read is not detected as impure. `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` still returns 12 after `factor.set(10)`; correct is 60. | Reproduced |
 | D2 | A `fixed_point=` query ignores `snapshot=` and returns the head value (7 where the snapshot value is 1). One read also moved `engine.revision` from 3 to 6. | Reproduced |
-| D3 | An expired TTL query is not refreshed when reached through a dependent that is already verified at the current revision. `parent()` returned 10 before and after expiry. | Reproduced |
 | D5 | Collection reads that are not tracked go stale inside queries: `set(s)`, `s \| x`, set and dict `==`, `s.issubset`, `xs + [...]`, `repr`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. | Reproduced |
 | D6 | Early bail-out treats dicts that differ only in insertion order as equal, so a dependent that iterates the dict keeps the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
@@ -573,6 +603,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D9 | Functions registered under one `module:qualname` shared a cache (`make(1)()` and `make(2)()` both returned 1), and a handle to a replaced function kept running old code into it. A different function now replaces the old one, whose handles raise `StaleHandleError`; `name=` on `engine.query` and `engine.input` gives factories and lambdas distinct identities. | `fix: two functions registered under one name shared cached results` |
 | D8 | A builtin shadowed in an enclosing function was still rewritten (an outer `sum = lambda it: "shadowed"` was ignored). The rewriter now declines when a relevant name is a closure variable. | `fix: a builtin shadowed in an enclosing function was still rewritten` |
 | D11 | `clear_disk_cache()` wiped the disk log of live named collections, so `[1, 2, 3]`, cleared, then `append(4)`, restored as `[4]`. It now deletes cached results only and leaves collection logs alone. | `fix: clearing the disk cache deleted named collections' data` |
+| D3 | An expired TTL query was not refreshed when reached through a dependent already verified at the current revision (`parent()` returned 10 before and after expiry). Two causes: a result verified at a revision was trusted at that revision for ever, and a re-run that changed the value at an unchanged revision looked unchanged to dependents. Results now carry the expiry of the TTL results beneath them, and a query's change marker is a stamp instead of the revision. | `fix: an expired TTL result was still served through queries that depend on it` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
@@ -631,7 +662,9 @@ with a single sequential actor. TLC checks six invariants in CI.
 - `ReadLive` is defined but not part of `Next`; `ReadLiveReturnsChoose` is
   defined but not listed in `CascadeCore.cfg`.
 - Not modelled: threads, in-flight deduplication, cancellation of running work,
-  transactions, collections, compaction, errors, TTL, eviction.
+  transactions, collections, compaction, errors, TTL, eviction. The model
+  uses the revision as the change marker of a query result; the code uses a
+  separate stamp (G1).
 - None of D1–D21 is reachable in the model.
 
 ## Test gaps

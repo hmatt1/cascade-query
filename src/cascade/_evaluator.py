@@ -284,6 +284,25 @@ class Evaluator:
         if existing is None or observed_changed_at > existing:
             frame.deps[dep_key] = observed_changed_at
 
+    @staticmethod
+    def _note_expiry(runtime: RuntimeState, expires_at: float) -> None:
+        """The running query read a result that stops being valid at ``expires_at``."""
+        if runtime.stack:
+            frame = runtime.stack[-1]
+            if frame.expires_at is None or expires_at < frame.expires_at:
+                frame.expires_at = expires_at
+
+    def _usable_locked(self, memo: MemoEntry, revision: int) -> bool:
+        """True when ``memo`` can be used at ``revision`` without a dependency walk.
+
+        A memo verified at this revision is still not usable once a TTL
+        result beneath it has expired: only the walk finds and refreshes it.
+        """
+        expires_at = memo.expires_at
+        if expires_at is not None and time.time() > expires_at:
+            return False
+        return self._store.is_current_locked(memo, revision)
+
     def read_input(
         self,
         input_id: str,
@@ -461,6 +480,8 @@ class Evaluator:
             key, fn, runtime, need_value=need_value
         )
         self.record_dependency(key, entry.changed_at)
+        if entry.expires_at is not None:
+            self._note_expiry(runtime, entry.expires_at)
         if replay_needed:
             self.replay_effects(entry.effects)
         if entry.error is not None:
@@ -529,6 +550,8 @@ class Evaluator:
             key, fn, runtime, need_value=need_value
         )
         self.record_dependency(key, entry.changed_at)
+        if entry.expires_at is not None:
+            self._note_expiry(runtime, entry.expires_at)
         if replay_needed:
             self.replay_effects(entry.effects)
         if entry.error is not None:
@@ -549,12 +572,12 @@ class Evaluator:
             if existing is not None:
                 self._store.touch_memo_locked(key)
 
-                ttl = self._store.lookup_query_ttl(key[1])
-                is_expired = False
-                if ttl is not None and time.time() - existing.computed_at_time > ttl:
-                    is_expired = True
-
-                if not is_expired and self._store.is_current_locked(
+                # Only memos with a TTL at or beneath them carry an expiry,
+                # so everything else pays one attribute read here.
+                expires_at = existing.expires_at
+                if (
+                    expires_at is None or time.time() <= expires_at
+                ) and self._store.is_current_locked(
                     existing, runtime.snapshot.revision
                 ):
                     existing.verified_at = runtime.snapshot.revision
@@ -625,12 +648,12 @@ class Evaluator:
             if existing is not None:
                 self._store.touch_memo_locked(key)
 
-                ttl = self._store.lookup_query_ttl(key[1])
-                is_expired = False
-                if ttl is not None and time.time() - existing.computed_at_time > ttl:
-                    is_expired = True
-
-                if not is_expired and self._store.is_current_locked(
+                # Only memos with a TTL at or beneath them carry an expiry,
+                # so everything else pays one attribute read here.
+                expires_at = existing.expires_at
+                if (
+                    expires_at is None or time.time() <= expires_at
+                ) and self._store.is_current_locked(
                     existing, runtime.snapshot.revision
                 ):
                     existing.verified_at = runtime.snapshot.revision
@@ -766,13 +789,31 @@ class Evaluator:
             self._store.trace_event("cache_red_ttl", key)
             return False
 
+        # The memo is good until its own TTL runs out or, if sooner, until
+        # the first TTL result beneath it does. Dependencies are re-read
+        # below, so this picks up the new expiry of one that was refreshed
+        # with an equal value.
+        expires_at = None if ttl is None else entry.computed_at_time + ttl
         try:
             self._settle_dependencies(key, entry, snapshot)
             for dep in entry.deps:
-                dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
+                dep_key = dep.key
+                if dep_key[0] == "input":
+                    dep_changed_at = self.dependency_changed_at(dep_key, snapshot)
+                else:
+                    dep_entry = self._dependency_entry(dep_key, snapshot)
+                    if dep_entry is None:
+                        dep_changed_at = snapshot.revision
+                    else:
+                        dep_changed_at = dep_entry.changed_at
+                        dep_expires_at = dep_entry.expires_at
+                        if dep_expires_at is not None and (
+                            expires_at is None or dep_expires_at < expires_at
+                        ):
+                            expires_at = dep_expires_at
                 if dep_changed_at != dep.observed_changed_at:
                     self._store.trace_event(
-                        "cache_red", key, detail=self._store.key_to_str(dep.key)
+                        "cache_red", key, detail=self._store.key_to_str(dep_key)
                     )
                     return False
         except _CONTROL_FLOW_ERRORS:
@@ -784,6 +825,7 @@ class Evaluator:
             # from the check.
             self._store.trace_event("cache_red", key, detail="dependency raised")
             return False
+        entry.expires_at = expires_at
         return True
 
     def _settle_dependencies(
@@ -833,7 +875,7 @@ class Evaluator:
                     continue
                 with store.lock:
                     dep_memo = store.memos.get(dep_key)
-                    current = dep_memo is not None and store.is_current_locked(
+                    current = dep_memo is not None and self._usable_locked(
                         dep_memo, revision
                     )
                 if current:
@@ -871,14 +913,27 @@ class Evaluator:
             self._store.trace_event("cache_red_ttl", key)
             return False
 
+        # See try_mark_green.
+        expires_at = None if ttl is None else entry.computed_at_time + ttl
         try:
             for dep in entry.deps:
-                dep_changed_at = await self.dependency_changed_at_async(
-                    dep.key, snapshot
-                )
+                dep_key = dep.key
+                if dep_key[0] == "input":
+                    dep_changed_at = self.dependency_changed_at(dep_key, snapshot)
+                else:
+                    dep_entry = await self._dependency_entry_async(dep_key, snapshot)
+                    if dep_entry is None:
+                        dep_changed_at = snapshot.revision
+                    else:
+                        dep_changed_at = dep_entry.changed_at
+                        dep_expires_at = dep_entry.expires_at
+                        if dep_expires_at is not None and (
+                            expires_at is None or dep_expires_at < expires_at
+                        ):
+                            expires_at = dep_expires_at
                 if dep_changed_at != dep.observed_changed_at:
                     self._store.trace_event(
-                        "cache_red", key, detail=self._store.key_to_str(dep.key)
+                        "cache_red", key, detail=self._store.key_to_str(dep_key)
                     )
                     return False
         except _CONTROL_FLOW_ERRORS:
@@ -887,6 +942,7 @@ class Evaluator:
             # See try_mark_green.
             self._store.trace_event("cache_red", key, detail="dependency raised")
             return False
+        entry.expires_at = expires_at
         return True
 
     def _shadow_entry(
@@ -927,20 +983,27 @@ class Evaluator:
         if kind == "input":
             version = self._store.input_version_at((fid, args), snapshot.revision)
             return -1 if version is None else version.changed_at
+        entry = self._dependency_entry(key, snapshot)
+        return snapshot.revision if entry is None else entry.changed_at
 
+    def _dependency_entry(self, key: QueryKey, snapshot: Snapshot) -> MemoEntry | None:
+        """The memo of query ``key`` brought up to date at ``snapshot``.
+
+        None when the query is running further up this context's stack: it
+        has no result yet.
+        """
+        fid = key[1]
         with self._store.lock:
             memo = self._store.memos.get(key)
-            if memo is not None and self._store.is_current_locked(
-                memo, snapshot.revision
-            ):
-                return memo.changed_at
+            if memo is not None and self._usable_locked(memo, snapshot.revision):
+                return memo
         fn = self._store.lookup_query(fid)
 
         runtime = self._runtime_var.get()
         if runtime is not None:
             for frame in runtime.stack:
                 if frame.key == key:
-                    return snapshot.revision
+                    return None
 
         if runtime is None:
             self._store.pin_snapshot(snapshot)
@@ -974,7 +1037,7 @@ class Evaluator:
         # The entry verified at ``snapshot``, not ``memos[key]``: a reader at
         # another revision may already have replaced that row, and its
         # changed_at says nothing about this revision.
-        return entry.changed_at
+        return entry
 
     async def dependency_changed_at_async(
         self, key: QueryKey, snapshot: Snapshot
@@ -983,20 +1046,24 @@ class Evaluator:
         if kind == "input":
             version = self._store.input_version_at((fid, args), snapshot.revision)
             return -1 if version is None else version.changed_at
+        entry = await self._dependency_entry_async(key, snapshot)
+        return snapshot.revision if entry is None else entry.changed_at
 
+    async def _dependency_entry_async(
+        self, key: QueryKey, snapshot: Snapshot
+    ) -> MemoEntry | None:  # pragma: no cover
+        fid = key[1]
         with self._store.lock:
             memo = self._store.memos.get(key)
-            if memo is not None and self._store.is_current_locked(
-                memo, snapshot.revision
-            ):
-                return memo.changed_at
+            if memo is not None and self._usable_locked(memo, snapshot.revision):
+                return memo
         fn = self._store.lookup_query(fid)
 
         runtime = self._runtime_var.get()
         if runtime is not None:
             for frame in runtime.stack:
                 if frame.key == key:
-                    return snapshot.revision
+                    return None
 
         if runtime is None:
             self._store.pin_snapshot(snapshot)
@@ -1028,7 +1095,7 @@ class Evaluator:
                 lambda: self._shadow_entry_async(key, fn, need_value=False),
             )
 
-        return entry.changed_at
+        return entry
 
     def _restart_cycle(
         self, runtime: RuntimeState, frame: RuntimeFrame, key: QueryKey
@@ -1061,10 +1128,15 @@ class Evaluator:
         if not stack or isinstance(exc, QueryCancelled):
             return
         executing = {f.key for f in stack}
-        caller_deps = stack[-1].deps
+        caller = stack[-1]
+        caller_deps = caller.deps
         for dep_key, observed in frame.deps.items():
             if dep_key not in executing:
                 caller_deps.setdefault(dep_key, observed)
+        if frame.expires_at is not None and (
+            caller.expires_at is None or frame.expires_at < caller.expires_at
+        ):
+            caller.expires_at = frame.expires_at
 
     def recompute(
         self,
@@ -1129,6 +1201,7 @@ class Evaluator:
                     self._restart_cycle(runtime, frame, key)
                     frame.deps.clear()
                     frame.effects.clear()
+                    frame.expires_at = None
                     continue
 
             runtime.stack.pop()
@@ -1148,13 +1221,20 @@ class Evaluator:
                 frame.deps.pop(k, None)
 
         is_memoized = self._store.lookup_query_memoize(key[1])
+        computed_at_time = time.time()
+        expires_at = frame.expires_at
+        ttl = self._store.lookup_query_ttl(key[1])
+        if ttl is not None and (
+            expires_at is None or computed_at_time + ttl < expires_at
+        ):
+            expires_at = computed_at_time + ttl
         with self._store.lock:
             previous = self._store.memos.get(key)
             if previous is not None and previous.value_hash == value_hash:
                 changed_at = previous.changed_at
                 self._store.trace_event("backdate", key)
             else:
-                changed_at = runtime.snapshot.revision
+                changed_at = self._store.new_change_stamp_locked()
             self._store.next_access_id += 1
             full_memo = self._store.entry_from_runtime(
                 value=result,
@@ -1164,9 +1244,10 @@ class Evaluator:
                 deps=frame.deps,
                 effects=frozen_effects,
                 last_access=self._store.next_access_id,
-                computed_at_time=time.time(),
+                computed_at_time=computed_at_time,
                 cycle_nodes=tuple(frame.cycle_nodes),
                 error=error,
+                expires_at=expires_at,
             )
             if is_memoized:
                 stored_memo = full_memo
@@ -1179,9 +1260,10 @@ class Evaluator:
                     deps=frame.deps,
                     effects=frozen_effects,
                     last_access=self._store.next_access_id,
-                    computed_at_time=time.time(),
+                    computed_at_time=computed_at_time,
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
+                    expires_at=expires_at,
                 )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = stored_memo
@@ -1273,6 +1355,7 @@ class Evaluator:
                         self._restart_cycle(new_runtime, frame, key)
                         frame.deps.clear()
                         frame.effects.clear()
+                        frame.expires_at = None
                         continue
 
                 break
@@ -1293,13 +1376,20 @@ class Evaluator:
                     frame.deps.pop(k, None)
 
             is_memoized = self._store.lookup_query_memoize(key[1])
+            computed_at_time = time.time()
+            expires_at = frame.expires_at
+            ttl = self._store.lookup_query_ttl(key[1])
+            if ttl is not None and (
+                expires_at is None or computed_at_time + ttl < expires_at
+            ):
+                expires_at = computed_at_time + ttl
             with self._store.lock:
                 previous = self._store.memos.get(key)
                 if previous is not None and previous.value_hash == value_hash:
                     changed_at = previous.changed_at
                     self._store.trace_event("backdate", key)
                 else:
-                    changed_at = new_runtime.snapshot.revision
+                    changed_at = self._store.new_change_stamp_locked()
                 self._store.next_access_id += 1
                 full_memo = self._store.entry_from_runtime(
                     value=result,
@@ -1309,9 +1399,10 @@ class Evaluator:
                     deps=frame.deps,
                     effects=frozen_effects,
                     last_access=self._store.next_access_id,
-                    computed_at_time=time.time(),
+                    computed_at_time=computed_at_time,
                     cycle_nodes=tuple(frame.cycle_nodes),
                     error=error,
+                    expires_at=expires_at,
                 )
                 if is_memoized:
                     stored_memo = full_memo
@@ -1324,9 +1415,10 @@ class Evaluator:
                         deps=frame.deps,
                         effects=frozen_effects,
                         last_access=self._store.next_access_id,
-                        computed_at_time=time.time(),
+                        computed_at_time=computed_at_time,
                         cycle_nodes=tuple(frame.cycle_nodes),
                         error=error,
+                        expires_at=expires_at,
                     )
                 self._store.drop_memo_locked(key)
                 self._store.memos[key] = stored_memo
@@ -1421,11 +1513,16 @@ class Evaluator:
 
         token = self._hydrating_var.set(hydrating | {key})
         try:
-            observed = self._verify_disk_deps(key, record, runtime)
+            verified = self._verify_disk_deps(key, record, runtime)
         finally:
             self._hydrating_var.reset(token)
-        if observed is None:
+        if verified is None:
             return None  # pragma: no cover
+        observed, expires_at = verified
+        if ttl is not None and (
+            expires_at is None or computed_at_time + ttl < expires_at
+        ):
+            expires_at = computed_at_time + ttl
         value_hash = record.get("value_hash")
         if not isinstance(value_hash, str):
             return None  # pragma: no cover
@@ -1458,13 +1555,14 @@ class Evaluator:
             memo = self._store.entry_from_runtime(
                 value=value,
                 value_hash=value_hash,
-                changed_at=runtime.snapshot.revision,
+                changed_at=self._store.new_change_stamp_locked(),
                 verified_at=runtime.snapshot.revision,
                 deps=observed,
                 effects=effects,
                 last_access=self._store.next_access_id,
-                computed_at_time=record.get("computed_at_time", 0.0),
+                computed_at_time=computed_at_time,
                 error=error,
+                expires_at=expires_at,
             )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = memo
@@ -1484,11 +1582,17 @@ class Evaluator:
         key: QueryKey,
         record: dict[str, Any],
         runtime: RuntimeState,
-    ) -> dict[QueryKey, int] | None:
+    ) -> tuple[dict[QueryKey, int], float | None] | None:
+        """Check a stored record's dependencies against the current state.
+
+        Returns what a run would have recorded, and the earliest expiry among
+        the TTL-bound results it depends on; None if any dependency differs.
+        """
         deps_raw = record.get("deps")
         if not isinstance(deps_raw, list):
             return None  # pragma: no cover
         observed: dict[QueryKey, int] = {}
+        expires_at: float | None = None
         for row in deps_raw:
             if not isinstance(row, list) or len(row) != 4:
                 return None  # pragma: no cover
@@ -1528,9 +1632,13 @@ class Evaluator:
                     )
                     return None  # pragma: no cover
                 observed[dep_key] = state[1]
+                if state[2] is not None and (
+                    expires_at is None or state[2] < expires_at
+                ):
+                    expires_at = state[2]
             else:
                 return None  # pragma: no cover
-        return observed
+        return observed, expires_at
 
     def _current_input_version(
         self,
@@ -1570,7 +1678,8 @@ class Evaluator:
         query_id: str,
         args: tuple[Any, ...],
         runtime: RuntimeState,
-    ) -> tuple[str, int] | None:
+    ) -> tuple[str, int, float | None] | None:
+        """``(value_hash, changed_at, expires_at)`` of a query brought up to date."""
         dep_key: QueryKey = ("query", query_id, args)
         try:
             fn = self._store.lookup_query(query_id)
@@ -1592,7 +1701,7 @@ class Evaluator:
         )
         # As in dependency_changed_at: use the entry valid at this revision,
         # not whatever row is stored by now.
-        return entry.value_hash, entry.changed_at
+        return entry.value_hash, entry.changed_at, entry.expires_at
 
     async def _try_hydrate_from_disk_async(
         self, key: QueryKey, runtime: RuntimeState
@@ -1640,11 +1749,16 @@ class Evaluator:
 
         token = self._hydrating_var.set(hydrating | {key})
         try:
-            observed = await self._verify_disk_deps_async(key, record, runtime)
+            verified = await self._verify_disk_deps_async(key, record, runtime)
         finally:
             self._hydrating_var.reset(token)
-        if observed is None:
+        if verified is None:
             return None  # pragma: no cover
+        observed, expires_at = verified
+        if ttl is not None and (
+            expires_at is None or computed_at_time + ttl < expires_at
+        ):
+            expires_at = computed_at_time + ttl
         value_hash = record.get("value_hash")
         if not isinstance(value_hash, str):  # pragma: no cover
             return None  # pragma: no cover
@@ -1679,12 +1793,13 @@ class Evaluator:
             memo = self._store.entry_from_runtime(
                 value=value,
                 value_hash=value_hash,
-                changed_at=runtime.snapshot.revision,
+                changed_at=self._store.new_change_stamp_locked(),
                 verified_at=runtime.snapshot.revision,
                 deps=observed,
                 effects=effects,
                 last_access=self._store.next_access_id,
                 error=error,
+                expires_at=expires_at,
             )
             self._store.drop_memo_locked(key)
             self._store.memos[key] = memo
@@ -1704,11 +1819,12 @@ class Evaluator:
         key: QueryKey,
         record: dict[str, Any],
         runtime: RuntimeState,
-    ) -> dict[QueryKey, int] | None:
+    ) -> tuple[dict[QueryKey, int], float | None] | None:
         deps_raw = record.get("deps")
         if not isinstance(deps_raw, list):  # pragma: no cover
             return None  # pragma: no cover
         observed: dict[QueryKey, int] = {}
+        expires_at: float | None = None
         for row in deps_raw:
             if not isinstance(row, list) or len(row) != 4:  # pragma: no cover
                 return None  # pragma: no cover
@@ -1751,9 +1867,13 @@ class Evaluator:
                     )  # pragma: no cover
                     return None  # pragma: no cover
                 observed[dep_key] = state[1]
+                if state[2] is not None and (
+                    expires_at is None or state[2] < expires_at
+                ):
+                    expires_at = state[2]
             else:
                 return None  # pragma: no cover
-        return observed
+        return observed, expires_at
 
     async def _current_input_version_async(  # pragma: no cover
         self,
@@ -1788,7 +1908,7 @@ class Evaluator:
         query_id: str,
         args: tuple[Any, ...],
         runtime: RuntimeState,
-    ) -> tuple[str, int] | None:
+    ) -> tuple[str, int, float | None] | None:
         dep_key: QueryKey = ("query", query_id, args)
         try:
             fn = self._store.lookup_query(query_id)
@@ -1808,7 +1928,7 @@ class Evaluator:
             shadow,
             lambda: self._shadow_entry_async(dep_key, fn, need_value=True),
         )
-        return entry.value_hash, entry.changed_at
+        return entry.value_hash, entry.changed_at, entry.expires_at
 
     def _disk_worker(self) -> None:
         if self._disk is None or self._disk_queue is None:

@@ -109,7 +109,6 @@ def test_d2_fixed_point_query_honours_snapshot() -> None:
     assert a(snapshot=snapshot) == 1
 
 
-@_defect(3, "an expired TTL query is not refreshed through a verified dependent")
 def test_d3_expired_ttl_dependency_refreshes_through_its_dependent() -> None:
     engine = Engine()
     runs = {"n": 0}

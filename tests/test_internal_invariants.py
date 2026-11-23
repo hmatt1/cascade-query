@@ -44,7 +44,11 @@ def test_internal_dependency_helpers_and_indexes_are_consistent() -> None:
     assert symbol_count("main", snapshot=snap) == 2
 
     dep_key = ("query", parse.id, ("main",))
-    assert internals.dependency_changed_at(dep_key, snap) == snap.revision
+    # A query's changed_at is a change stamp, not a revision.
+    assert (
+        internals.dependency_changed_at(dep_key, snap)
+        == internals.memos[dep_key].changed_at
+    )
     assert_internal_dependents_consistent(engine)
 
 

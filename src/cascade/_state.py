@@ -27,6 +27,10 @@ class Dependency:
 class MemoEntry:
     value: Any
     value_hash: str
+    # A stamp that is new every time this query's value changes, and kept
+    # when a re-run produces an equal value. Dependents record the stamp they
+    # saw and compare it for equality only. It is not a revision: a value can
+    # change while the revision stands still (an expired TTL, new code).
     changed_at: int
     verified_at: int
     deps: tuple[Dependency, ...]
@@ -39,6 +43,11 @@ class MemoEntry:
     # without re-walking its dependencies. Maintained by GraphStore (see
     # "dirty propagation" there); process-local and never persisted.
     head_clean: bool = False
+    # Wall-clock time after which this memo must be verified again even at
+    # the revision it was verified at: the earliest moment a TTL query it
+    # read, directly or through other queries, expires. None when nothing
+    # beneath it has a TTL.
+    expires_at: float | None = None
 
 
 @dataclass(frozen=True)

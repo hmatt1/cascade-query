@@ -176,7 +176,7 @@ Cascade automatically inspects the Python bytecode of your `@engine.query` and `
 The hash covers only the function's own bytecode, constants and names. It does not cover helper functions the query calls, closure values, default arguments or globals, so editing those leaves cached results in place; clear the cache (`engine.clear_disk_cache()`) after such an edit.
 
 ### Time-To-Live (TTL) Caching
-Cascade supports expiring cache entries automatically based on wall-clock time. By passing the `ttl` flag to `@engine.query`, you ask for a node to recompute its value if it is accessed after the specified number of seconds has elapsed. Today this holds when the TTL query is called directly; reached through a dependent that is already up to date, an expired result can still be served (known defect D3 in `docs/guarantees.md`).
+Cascade supports expiring cache entries automatically based on wall-clock time. By passing the `ttl` flag to `@engine.query`, you ask for a node to recompute its value if it is needed after the specified number of seconds has elapsed. That covers queries that depend on it too: calling one after the TTL has elapsed re-runs the expired query and then whatever its new value changes, with no input change needed. If the new value equals the old one, the dependents are not re-run. Queries with no TTL query beneath them are unaffected.
 
 ```python
 @engine.query(ttl=5.0)

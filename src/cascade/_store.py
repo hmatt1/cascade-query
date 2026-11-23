@@ -87,6 +87,8 @@ class GraphStore:
         self.revision = 0
         self.cancel_epoch = 0
         self.next_access_id = 0
+        # Source of ``MemoEntry.changed_at`` stamps; see ``new_change_stamp_locked``.
+        self._change_stamp = 0
         self.max_entries = max_entries
         self.trace_limit = trace_limit
         # Raw rows (event, key, revision, detail, timestamp). ``key`` is the
@@ -584,6 +586,19 @@ class GraphStore:
     def stable_hash(self, value: Any) -> str:
         return self._value_digest(value)
 
+    def new_change_stamp_locked(self) -> int:
+        """A ``changed_at`` value no memo has carried before.
+
+        Dependents decide whether a query changed by comparing the stamp they
+        recorded with the one its memo carries now. The revision cannot serve
+        as that stamp: a TTL query that expires, or a query registered again
+        with new code, gets a new value while the revision stands still, and
+        a dependent that saw the old value at this revision would find the
+        same number and keep its result.
+        """
+        self._change_stamp += 1
+        return self._change_stamp
+
     def touch_memo_locked(self, key: QueryKey) -> None:
         memo = self.memos[key]
         self.next_access_id += 1
@@ -1012,6 +1027,7 @@ class GraphStore:
         computed_at_time: float,
         cycle_nodes: tuple[QueryKey, ...] = (),
         error: BaseException | None = None,
+        expires_at: float | None = None,
     ) -> MemoEntry:
         return MemoEntry(
             value=value,
@@ -1026,4 +1042,5 @@ class GraphStore:
             computed_at_time=computed_at_time,
             cycle_nodes=cycle_nodes,
             error=error,
+            expires_at=expires_at,
         )

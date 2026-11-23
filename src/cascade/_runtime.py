@@ -18,6 +18,8 @@ class RuntimeFrame:
     cycle_guess: Any = UNSET
     is_cycle_root: bool = False
     cycle_nodes: set[QueryKey] = field(default_factory=set)
+    # Earliest expiry among the TTL-bound results this frame has read.
+    expires_at: float | None = None
 
 
 @dataclass
