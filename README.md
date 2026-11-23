@@ -339,6 +339,7 @@ Rewriting covers comprehensions with a single `for` clause (`[...]`, `{...}`, `{
 *   Arbitrary `for` loops and comprehensions with more than one `for` are never rewritten, but invalidate through read tracking.
 *   Iterating a `CascadeSet`, in a comprehension or a loop, yields its elements in insertion order.
 *   `enumerate()` and `zip()` sources are explicitly excluded.
+*   A comprehension whose element expression, `if` clause or `key=` function itself reads an input, a query or another collection is recomputed in full each time its query re-runs. Read the value once before the comprehension (`f = factor()`) to keep it incremental.
 *   Opt out globally via `Engine(incremental=False)` or per-query `@engine.query(incremental=False)`.
 
 ### Batching Mutations for Disk Performance

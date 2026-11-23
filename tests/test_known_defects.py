@@ -67,7 +67,6 @@ def _run_with_timeout(fn: Any, timeout: float = HANG_TIMEOUT) -> tuple[bool, lis
 # --- Wrong results ----------------------------------------------------------
 
 
-@_defect(1, "a rewritten stage re-reading an input the query already read is stale")
 def test_d1_stage_reading_an_already_read_input_is_invalidated() -> None:
     engine = Engine()
     xs = CascadeList(engine, [1, 2, 3])

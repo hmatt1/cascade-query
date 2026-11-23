@@ -290,12 +290,16 @@ class Evaluator:
             return None
         return self._store.key_to_str(runtime.stack[-1].key)
 
-    def current_frame_dep_count(self) -> int:
-        """Dependency count of the innermost frame, or -1 outside a query."""
+    def current_frame_read_count(self) -> int:
+        """Tracked reads made so far by the innermost frame, or -1 outside a query.
+
+        Counts every read, also one of a dependency the frame already has, so
+        a caller can tell whether code it ran in between read anything.
+        """
         runtime = self._runtime_var.get()
         if runtime is None or not runtime.stack:
             return -1
-        return len(runtime.stack[-1].deps)
+        return runtime.stack[-1].reads
 
     def push_effect(self, name: str, item: Any) -> None:
         runtime = self._runtime_var.get()
@@ -323,6 +327,7 @@ class Evaluator:
         if runtime is None or not runtime.stack:
             return
         frame = runtime.stack[-1]
+        frame.reads += 1
         existing = frame.deps.get(dep_key)
         if existing is None or observed_changed_at > existing:
             frame.deps[dep_key] = observed_changed_at
@@ -1255,6 +1260,7 @@ class Evaluator:
         # The marker is replaced by the head's real one when the cycle
         # converges; until then it must match nothing.
         top.deps[key] = _NEVER_CHANGED_AT
+        top.reads += 1
         if top.cycle_heads is None:
             top.cycle_heads = {key}
         else:
@@ -1410,6 +1416,7 @@ class Evaluator:
         executing = {f.key for f in stack}
         caller = stack[-1]
         caller_deps = caller.deps
+        caller.reads += 1
         for dep_key, observed in frame.deps.items():
             if dep_key not in executing:
                 caller_deps.setdefault(dep_key, observed)

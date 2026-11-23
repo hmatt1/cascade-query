@@ -14,6 +14,10 @@ UNSET = object()
 class RuntimeFrame:
     key: QueryKey
     deps: dict[QueryKey, int] = field(default_factory=dict)
+    # Tracked reads made by this frame, repeated ones included. ``deps``
+    # cannot say whether a stretch of code read anything: a second read of
+    # a dependency leaves it unchanged. Pipelines compare this counter.
+    reads: int = 0
     effects: dict[str, list[Any]] = field(default_factory=lambda: defaultdict(list))
     # Fixed points. ``cycle_guess`` is set once this query has been called
     # again from beneath itself; ``is_cycle_root`` says whether the current

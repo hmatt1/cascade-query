@@ -367,7 +367,7 @@ class IncrementalRuntime:
                 or state.last_rev > head
                 or state.last_rev < core.log.base_rev
             )
-            dep_base = evaluator.current_frame_dep_count()
+            read_base = evaluator.current_frame_read_count()
             try:
                 if needs_rebuild:
                     state = self._build_state(
@@ -395,12 +395,14 @@ class IncrementalRuntime:
             except BaseException:
                 self._states.pop(state_key, None)
                 raise
-            if dep_base >= 0 and evaluator.current_frame_dep_count() > dep_base:
+            if read_base >= 0 and evaluator.current_frame_read_count() > read_base:
                 # A stage or key function read tracked engine state (another
                 # query, an input, another collection). Its per-item results
                 # can change without this collection emitting a diff, so the
                 # cached state cannot be trusted across runs: rebuild each
-                # time. Slower, always correct.
+                # time. Slower, always correct. Reads are counted, not new
+                # dependencies: the query body may have read the same input
+                # or query before the pipeline did.
                 state.impure = True
             self._record_info(state_key, site, reducer_name, core, view, stages, state)
             ctx = _FinalizeCtx(seq=state.seq, reverse=reverse, args=reducer_args)
