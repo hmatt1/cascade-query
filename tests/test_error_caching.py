@@ -123,3 +123,98 @@ def test_selective_exception_caching():
     with pytest.raises(ValueError):
         throws_specific()
     assert calls == 3
+
+
+def test_caught_cached_error_does_not_escape_on_reverification():
+    """Re-checking a parent must not raise an error the parent handles."""
+    engine = Engine()
+
+    @engine.input
+    def source():
+        return 1
+
+    @engine.query(cache_exceptions=True)
+    def failing():
+        raise ValueError(f"bad {source()}")
+
+    @engine.query
+    def guarded():
+        try:
+            return failing()
+        except ValueError:
+            return "fallback"
+
+    @engine.query
+    def top():
+        return guarded()
+
+    assert guarded() == "fallback"
+    assert top() == "fallback"
+
+    # The cached error changes; the parent is re-verified, not just re-run.
+    source.set(value=2)
+    assert top() == "fallback"
+    source.set(value=3)
+    assert guarded() == "fallback"
+
+    # The error is still raised to a caller that asks for it directly.
+    with pytest.raises(ValueError, match="bad 3"):
+        failing()
+
+
+def test_unchanged_cached_error_keeps_handling_parent_cached():
+    engine = Engine()
+    calls = 0
+
+    @engine.input
+    def source():
+        return 1
+
+    @engine.query(cache_exceptions=True)
+    def failing():
+        source()
+        raise ValueError("bad")
+
+    @engine.query
+    def guarded():
+        nonlocal calls
+        calls += 1
+        try:
+            return failing()
+        except ValueError:
+            return "fallback"
+
+    assert guarded() == "fallback"
+    source.set(value=2)
+    assert guarded() == "fallback"
+    assert calls == 1  # same error as before, so the parent is not re-run
+
+
+@pytest.mark.parametrize("cache_exceptions", [False, (KeyError,)])
+def test_caught_uncached_error_still_tracks_dependencies(cache_exceptions):
+    """A fallback for an uncached error must refresh when the inputs change."""
+    engine = Engine()
+
+    @engine.input
+    def source():
+        return "bad"
+
+    @engine.query(cache_exceptions=cache_exceptions)
+    def parse():
+        value = source()
+        if value == "bad":
+            raise ValueError("bad input")
+        return value
+
+    @engine.query
+    def guarded():
+        try:
+            return parse()
+        except ValueError:
+            return "fallback"
+
+    assert guarded() == "fallback"
+    source.set(value="good")
+    assert guarded() == "good"
+    source.set(value="bad")
+    assert guarded() == "fallback"

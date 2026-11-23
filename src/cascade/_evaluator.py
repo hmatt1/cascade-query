@@ -23,6 +23,16 @@ from ._state import InFlight, InputVersion, MemoEntry, QueryKey, Snapshot
 from ._store import GraphStore
 
 
+# Errors that steer the engine itself. They are never cached and always
+# propagate, including out of dependency verification.
+_CONTROL_FLOW_ERRORS = (
+    QueryCancelled,
+    CycleError,
+    PersistentCacheError,
+    SnapshotExpiredError,
+)
+
+
 class Evaluator:
     def __init__(
         self,
@@ -618,14 +628,24 @@ class Evaluator:
             self._store.trace_event("cache_red_ttl", key)
             return False
 
-        self._settle_dependencies(key, entry, snapshot)
-        for dep in entry.deps:
-            dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
-            if dep_changed_at != dep.observed_changed_at:
-                self._store.trace_event(
-                    "cache_red", key, detail=self._store.key_to_str(dep.key)
-                )
-                return False
+        try:
+            self._settle_dependencies(key, entry, snapshot)
+            for dep in entry.deps:
+                dep_changed_at = self.dependency_changed_at(dep.key, snapshot)
+                if dep_changed_at != dep.observed_changed_at:
+                    self._store.trace_event(
+                        "cache_red", key, detail=self._store.key_to_str(dep.key)
+                    )
+                    return False
+        except _CONTROL_FLOW_ERRORS:
+            raise
+        except Exception:
+            # A dependency now raises an error that is not cached. That is a
+            # change, and whether it propagates is up to this query's own
+            # code (it may catch it), so re-run the query rather than raise
+            # from the check.
+            self._store.trace_event("cache_red", key, detail="dependency raised")
+            return False
         return True
 
     def _settle_dependencies(
@@ -713,13 +733,22 @@ class Evaluator:
             self._store.trace_event("cache_red_ttl", key)
             return False
 
-        for dep in entry.deps:
-            dep_changed_at = await self.dependency_changed_at_async(dep.key, snapshot)
-            if dep_changed_at != dep.observed_changed_at:
-                self._store.trace_event(
-                    "cache_red", key, detail=self._store.key_to_str(dep.key)
+        try:
+            for dep in entry.deps:
+                dep_changed_at = await self.dependency_changed_at_async(
+                    dep.key, snapshot
                 )
-                return False
+                if dep_changed_at != dep.observed_changed_at:
+                    self._store.trace_event(
+                        "cache_red", key, detail=self._store.key_to_str(dep.key)
+                    )
+                    return False
+        except _CONTROL_FLOW_ERRORS:
+            raise
+        except Exception:
+            # See try_mark_green.
+            self._store.trace_event("cache_red", key, detail="dependency raised")
+            return False
         return True
 
     def _shadow_entry(
@@ -729,7 +758,7 @@ class Evaluator:
 
         Equivalent to ``query_call`` from a runtime with an empty stack, except
         that it returns the entry verified or computed at the runtime's
-        snapshot. Callers must use that entry instead of re-reading
+        snapshot, including one holding a cached error. Callers must use that entry instead of re-reading
         ``memos[key]`` afterwards: the store keeps one row per key, and a
         concurrent reader at another revision may already have replaced it.
         """
@@ -737,8 +766,10 @@ class Evaluator:
         assert runtime is not None
         self.check_cancelled(runtime.cancel_epoch)
         entry, _ = self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
-        if entry.error is not None:
-            raise entry.error
+        # A cached error is returned, not raised: callers only compare the
+        # entry's changed_at / value_hash. Raising here would throw the
+        # dependency's error out of a parent that is merely being verified,
+        # even when the parent's own code catches it.
         return entry
 
     async def _shadow_entry_async(
@@ -750,8 +781,7 @@ class Evaluator:
         entry, _ = await self.compute_or_get_memo_async(
             key, fn, runtime, need_value=need_value
         )
-        if entry.error is not None:
-            raise entry.error
+        # See _shadow_entry: cached errors are returned, not raised.
         return entry
 
     def dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
@@ -878,6 +908,26 @@ class Evaluator:
                 if k != key:
                     store.drop_memo_locked(k)
 
+    @staticmethod
+    def _inherit_failed_deps(
+        stack: list[RuntimeFrame], frame: RuntimeFrame, exc: BaseException
+    ) -> None:
+        """Hand a failed query's dependencies to its caller.
+
+        A query that raises an error which is not cached leaves no memo, so
+        the caller cannot depend on it. If the caller catches the error and
+        returns a fallback, that fallback still depends on everything the
+        failed query read: without these edges it would never be recomputed
+        when those inputs change.
+        """
+        if not stack or isinstance(exc, QueryCancelled):
+            return
+        executing = {f.key for f in stack}
+        caller_deps = stack[-1].deps
+        for dep_key, observed in frame.deps.items():
+            if dep_key not in executing:
+                caller_deps.setdefault(dep_key, observed)
+
     def recompute(
         self,
         key: QueryKey,
@@ -928,6 +978,7 @@ class Evaluator:
                     result = None
                 else:
                     runtime.stack.pop()
+                    self._inherit_failed_deps(runtime.stack, frame, exc)
                     raise
 
             if frame.is_cycle_root:
@@ -1070,6 +1121,7 @@ class Evaluator:
                         error = exc
                         result = None
                     else:
+                        self._inherit_failed_deps(runtime.stack, frame, exc)
                         raise
 
                 if frame.is_cycle_root:
@@ -1323,7 +1375,13 @@ class Evaluator:
                     return None  # pragma: no cover
                 observed[dep_key] = version.changed_at
             elif dep_kind == "query":
-                state = self._current_query_state(dep_fid, dep_args, runtime)
+                try:
+                    state = self._current_query_state(dep_fid, dep_args, runtime)
+                except _CONTROL_FLOW_ERRORS:
+                    raise
+                except Exception:
+                    # The dependency raises an uncached error: not a match.
+                    state = None
                 if state is None or state[0] != fingerprint:
                     self._store.trace_event(
                         "disk_red", key, detail=self._store.key_to_str(dep_key)
@@ -1539,9 +1597,14 @@ class Evaluator:
                     return None  # pragma: no cover
                 observed[dep_key] = version.changed_at
             elif dep_kind == "query":
-                state = await self._current_query_state_async(
-                    dep_fid, dep_args, runtime
-                )
+                try:
+                    state = await self._current_query_state_async(
+                        dep_fid, dep_args, runtime
+                    )
+                except _CONTROL_FLOW_ERRORS:
+                    raise
+                except Exception:
+                    state = None
                 if state is None or state[0] != fingerprint:
                     self._store.trace_event(
                         "disk_red", key, detail=self._store.key_to_str(dep_key)
