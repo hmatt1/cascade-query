@@ -47,15 +47,24 @@ _EXCLUDED_SOURCES = frozenset({"enumerate", "zip"})
 _ABORT = object()
 
 
-def rewrite_query(fn: Callable[..., Any], rt: Any) -> Callable[..., Any] | None:
-    """Rewritten version of ``fn`` bound to runtime ``rt``, or None to skip."""
+def rewrite_query(
+    fn: Callable[..., Any], rt: Any, *, site: str | None = None
+) -> Callable[..., Any] | None:
+    """Rewritten version of ``fn`` bound to runtime ``rt``, or None to skip.
+
+    ``site`` prefixes the pipeline site keys (default: the function's
+    qualified name). Queries registered under an explicit name pass it, so
+    functions made from one body keep separate pipeline state.
+    """
     try:
-        return _rewrite(fn, rt)
+        return _rewrite(fn, rt, site)
     except Exception:
         return None
 
 
-def _rewrite(fn: Callable[..., Any], rt: Any) -> Callable[..., Any] | None:
+def _rewrite(
+    fn: Callable[..., Any], rt: Any, site: str | None = None
+) -> Callable[..., Any] | None:
     if not hasattr(fn, "__code__") or fn.__name__ == "<lambda>":
         return None
     if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
@@ -75,7 +84,7 @@ def _rewrite(fn: Callable[..., Any], rt: Any) -> Callable[..., Any] | None:
     if _shadows_relevant_names(fdef):
         return None
 
-    rewriter = _Rewriter(fn.__qualname__)
+    rewriter = _Rewriter(fn.__qualname__ if site is None else site)
     fdef.body = rewriter.rewrite_block(fdef.body)
     if rewriter.count == 0:
         return None

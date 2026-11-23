@@ -19,6 +19,7 @@ from ._errors import (
     PersistentCacheError,
     QueryCancelled,
     SnapshotExpiredError,
+    StaleHandleError,
 )
 from ._evaluator import Evaluator
 from ._incremental import IncrementalRuntime
@@ -53,6 +54,7 @@ __all__ = [
     "QueryCancelled",
     "Snapshot",
     "SnapshotExpiredError",
+    "StaleHandleError",
     "TraceEvent",
 ]
 
@@ -124,12 +126,27 @@ _active_transaction: contextvars.ContextVar[EngineTransaction | None] = (
 )
 
 
+def _stale_handle_error(kind: str, handle_id: str) -> StaleHandleError:
+    return StaleHandleError(
+        f"this handle for {kind} {handle_id!r} is stale: a different function "
+        f"was registered under that name after the handle was created. If the "
+        f"code was reloaded, use the handle from the new registration (import "
+        f"it again). If several {kind} functions are made from one body (a "
+        f"factory, a loop, lambdas), give each its own identity with "
+        f"engine.{kind}(name=...)."
+    )
+
+
 class _InputHandle:
-    def __init__(self, engine: Engine, fn: Callable[..., Any]) -> None:
+    def __init__(self, engine: Engine, fn: Callable[..., Any], input_id: str) -> None:
         self._engine = engine
         self._fn = fn
-        self._id = engine._function_id(fn)
+        self._id = input_id
         self._is_async_fn = inspect.iscoroutinefunction(fn)
+
+    def _mark_stale(self) -> None:
+        # Swapping the class keeps the check off the path of live handles.
+        self.__class__ = _StaleInputHandle
 
     def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
         if not self._is_async_fn:
@@ -174,12 +191,33 @@ class _InputHandle:
         return f"<InputHandle {self._id}>"
 
 
+class _StaleInputHandle(_InputHandle):
+    """An input handle whose function was replaced; every use raises."""
+
+    def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
+        raise _stale_handle_error("input", self._id)
+
+    def set(self, *args: Any, value: Any = _UNSET) -> int | None:
+        raise _stale_handle_error("input", self._id)
+
+    def __repr__(self) -> str:
+        return f"<InputHandle {self._id} (stale)>"
+
+
 class _QueryHandle:
-    def __init__(self, engine: Engine, fn: Callable[..., Any]) -> None:
+    def __init__(self, engine: Engine, fn: Callable[..., Any], query_id: str) -> None:
         self._engine = engine
         self._fn = fn
-        self._id = engine._function_id(fn)
+        self._id = query_id
         self._is_async_fn = inspect.iscoroutinefunction(fn)
+
+    def _mark_stale(self) -> None:
+        # Swapping the class keeps the check off the path of live handles.
+        self.__class__ = _StaleQueryHandle
+
+    def _live_fn(self) -> Callable[..., Any]:
+        """The function to run; raises on a stale handle."""
+        return self._fn
 
     def __call__(
         self,
@@ -220,6 +258,24 @@ class _QueryHandle:
 
     def __repr__(self) -> str:
         return f"<QueryHandle {self._id}>"
+
+
+class _StaleQueryHandle(_QueryHandle):
+    """A query handle whose function was replaced; calling it raises."""
+
+    def __call__(
+        self,
+        *args: Any,
+        snapshot: Snapshot | None = None,
+        effects: dict[str, list[Any]] | None = None,
+    ) -> Any:
+        raise _stale_handle_error("query", self._id)
+
+    def _live_fn(self) -> Callable[..., Any]:
+        raise _stale_handle_error("query", self._id)
+
+    def __repr__(self) -> str:
+        return f"<QueryHandle {self._id} (stale)>"
 
 
 class Accumulator:
@@ -384,15 +440,32 @@ class Engine:
             return tx
         return None
 
-    def input(self, fn: Callable[..., Any]) -> _InputHandle:
-        handle = _InputHandle(self, fn)
-        self._store.register_input(handle.id, fn)
-        return handle
+    def input(
+        self, fn: Callable[..., Any] | None = None, *, name: str | None = None
+    ) -> Any:
+        """Register an input. Use as ``@engine.input`` or ``@engine.input(name=...)``.
+
+        ``name`` replaces the default identity ``module:qualname``. Inputs
+        made from one function body (a factory, a loop, lambdas) need
+        distinct names; without them each registration replaces the last.
+        """
+
+        def decorator(f: Callable[..., Any]) -> _InputHandle:
+            input_id = self._resolve_id(f, name)
+            registered = self._store.register_input(input_id, f)
+            handle = _InputHandle(self, registered, input_id)
+            self._store.track_handle("input", input_id, registered, handle)
+            return handle
+
+        if fn is not None:
+            return decorator(fn)
+        return decorator
 
     def query(
         self,
         fn: Callable[..., Any] | None = None,
         *,
+        name: str | None = None,
         memoize: bool = True,
         fixed_point: Any = _UNSET,
         cache_exceptions: bool | tuple[type[BaseException], ...] = True,
@@ -400,16 +473,18 @@ class Engine:
         incremental: bool | None = None,
     ) -> Any:
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
+            query_id = self._resolve_id(f, name)
             enabled = self._incremental_default if incremental is None else incremental
             run_fn = f
             if enabled:
-                rewritten = rewrite_query(f, self._incremental_rt)
+                rewritten = rewrite_query(
+                    f, self._incremental_rt, site=None if name is None else query_id
+                )
                 if rewritten is not None:
                     run_fn = rewritten
-            handle = _QueryHandle(self, run_fn)
             has_fixed_point = fixed_point is not _UNSET
-            self._store.register_query(
-                handle.id,
+            registered = self._store.register_query(
+                query_id,
                 run_fn,
                 memoize=memoize,
                 fixed_point=fixed_point,
@@ -417,6 +492,8 @@ class Engine:
                 cache_exceptions=cache_exceptions,
                 ttl=ttl,
             )
+            handle = _QueryHandle(self, registered, query_id)
+            self._store.track_handle("query", query_id, registered, handle)
             return handle
 
         if fn is not None:
@@ -492,7 +569,7 @@ class Engine:
         def run() -> Any:
             return self._query_call(
                 query.id,
-                query.raw,
+                query._live_fn(),
                 tuple(args),
                 snapshot=run_snapshot,
                 effects=effects,
@@ -569,7 +646,7 @@ class Engine:
                 (
                     idx,
                     lambda q=query, a=args: evaluator.warm_for_caller(
-                        runtime, waiting, q.id, q.raw, a
+                        runtime, waiting, q.id, q._live_fn(), a
                     ),
                 )
             )
@@ -591,7 +668,11 @@ class Engine:
         if runtime is None or not runtime.stack:
             # The stream was handed to code outside the query that made it.
             return self._query_call(
-                query.id, query.raw, tuple(args), snapshot=None, effects=call_effects
+                query.id,
+                query._live_fn(),
+                tuple(args),
+                snapshot=None,
+                effects=call_effects,
             )
         frame = runtime.stack[-1]
         before = (
@@ -599,7 +680,7 @@ class Engine:
             if call_effects is None
             else {name: len(items) for name, items in frame.effects.items()}
         )
-        value = self._query_call(query.id, query.raw, tuple(args), snapshot=None)
+        value = self._query_call(query.id, query._live_fn(), tuple(args), snapshot=None)
         if before is not None and call_effects is not None:
             for name, items in frame.effects.items():
                 gained = items[before.get(name, 0) :]
@@ -647,7 +728,7 @@ class Engine:
                 idx,
                 lambda q=query, a=args, e=per_call_effects[idx]: self._query_call(
                     q.id,
-                    q.raw,
+                    q._live_fn(),
                     a,
                     snapshot=run_snapshot,
                     effects=e,
@@ -757,7 +838,7 @@ class Engine:
                 fut = pool.submit(
                     self._query_call,
                     query.id,
-                    query.raw,
+                    query._live_fn(),
                     args,
                     snapshot=run_snapshot,
                     effects=per_call_effects[idx] if effects is not None else None,
@@ -861,6 +942,13 @@ class Engine:
     # --- internals ---
     def _function_id(self, fn: Callable[..., Any]) -> str:
         return f"{fn.__module__}:{fn.__qualname__}"
+
+    def _resolve_id(self, fn: Callable[..., Any], name: str | None) -> str:
+        if name is None:
+            return self._function_id(fn)
+        if not isinstance(name, str) or not name:
+            raise TypeError("name= must be a non-empty string")
+        return name
 
     def _trace_event(self, event: str, key: QueryKey, detail: str = "") -> None:
         self._store.trace_event(event, key, detail=detail)

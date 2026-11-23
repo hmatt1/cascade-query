@@ -28,6 +28,49 @@ def _version_revision(version: InputVersion) -> int:
     return version.revision
 
 
+def _cell_value(cell: Any) -> Any:
+    try:
+        return cell.cell_contents
+    except ValueError:  # an empty cell
+        return _cell_value
+
+
+def _origin(fn: Any) -> Any:
+    """The function as written: a rewritten query points back at its source."""
+    return getattr(fn, "__wrapped__", fn)
+
+
+def _same_captures(old: Callable[..., Any], new: Callable[..., Any]) -> bool:
+    """True when two functions with equal bytecode also see the same objects.
+
+    Bytecode alone cannot tell apart the functions a factory or a loop makes
+    from one body: they differ only in what they captured. Two functions are
+    the same query when their globals, closure contents and defaults are the
+    very same objects. Identity, not equality: comparing arbitrary captured
+    objects could be slow, raise, or call two separate counters "equal".
+    """
+    if getattr(old, "__globals__", None) is not getattr(new, "__globals__", None):
+        return False
+    old_cells = getattr(old, "__closure__", None) or ()
+    new_cells = getattr(new, "__closure__", None) or ()
+    if len(old_cells) != len(new_cells):
+        return False
+    for a, b in zip(old_cells, new_cells):
+        if a is not b and _cell_value(a) is not _cell_value(b):
+            return False
+    old_defaults = getattr(old, "__defaults__", None) or ()
+    new_defaults = getattr(new, "__defaults__", None) or ()
+    if len(old_defaults) != len(new_defaults):
+        return False
+    if any(a is not b for a, b in zip(old_defaults, new_defaults)):
+        return False
+    old_kw = getattr(old, "__kwdefaults__", None) or {}
+    new_kw = getattr(new, "__kwdefaults__", None) or {}
+    if old_kw.keys() != new_kw.keys():
+        return False
+    return all(old_kw[k] is new_kw[k] for k in old_kw)
+
+
 class GraphStore:
     def __init__(
         self,
@@ -92,6 +135,14 @@ class GraphStore:
         ] = {}
         self.query_ttl: dict[str, float | None] = {}
         self.input_fns: dict[str, Callable[..., Any]] = {}
+        # Bytecode hash of the registered function, before any salt (see
+        # ``_supersede_locked``). ``query_hashes`` / ``input_hashes`` hold the
+        # value stored with, and compared against, persisted results.
+        self._code_hashes: dict[tuple[str, str], str] = {}
+        self._hash_salts: dict[tuple[str, str], int] = {}
+        # Live handles per ("query" | "input", id), told when a different
+        # function takes over their name. Weak: handles die with their users.
+        self._handles: dict[tuple[str, str], weakref.WeakSet[Any]] = {}
         self.memos: dict[QueryKey, MemoEntry] = {}
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
@@ -192,22 +243,109 @@ class GraphStore:
         has_fixed_point: bool = False,
         cache_exceptions: bool | tuple[type[BaseException], ...] = False,
         ttl: float | None = None,
-    ) -> None:
+    ) -> Callable[..., Any]:
+        """Register ``fn`` as ``query_id`` and return the function to run.
+
+        That is ``fn``, unless the same query is already registered (see
+        ``_replace_locked``): then the registered function is returned, and
+        cached results and existing handles stay valid.
+        """
         fn_hash = hash_bytecode(fn)
+        slot = ("query", query_id)
         with self.lock:
-            if query_id in self.query_hashes and self.query_hashes[query_id] != fn_hash:
+            fn, drop = self._replace_locked(
+                slot, self.queries.get(query_id), fn, fn_hash
+            )
+            if drop:
                 drop_keys = [
                     k for k in self.memos if k[0] == "query" and k[1] == query_id
                 ]
                 for k in drop_keys:
                     self.drop_memo_locked(k)
             self.queries[query_id] = fn
-            self.query_hashes[query_id] = fn_hash
+            self.query_hashes[query_id] = self._stored_hash_locked(slot)
             self.query_memoize[query_id] = memoize
             self.query_cache_exceptions[query_id] = cache_exceptions
             self.query_ttl[query_id] = ttl
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
+            return fn
+
+    def _replace_locked(
+        self,
+        slot: tuple[str, str],
+        old: Callable[..., Any] | None,
+        new: Callable[..., Any],
+        new_hash: str,
+    ) -> tuple[Callable[..., Any], bool]:
+        """Work out what registering ``new`` in ``slot`` over ``old`` means.
+
+        Returns the function to register and whether cached results (memos,
+        or input values) must be dropped. Four cases:
+
+        * Nothing registered, or the same function object: register it.
+        * The same source function again, for example with other options
+          (``incremental=False`` turns a rewritten function back into the
+          original): register the new variant and keep existing handles.
+          Results are dropped only if the bytecode differs.
+        * Equal bytecode and the same captured objects, as when a module is
+          reloaded unchanged: the same query. The old function stays, so
+          results and handles remain valid.
+        * Anything else is a different function taking over the name: a
+          reload with changed code, or a second function made from one body
+          by a factory or a loop. Results are dropped and the old handles go
+          stale, so nothing can run the old function into the new one's
+          cache.
+
+        In the last case, if the two functions capture different objects,
+        the slot's salt is bumped. Bytecode cannot tell such functions apart,
+        so without the salt the new one would load, from disk, results the
+        old one wrote earlier in this process (see ``_stored_hash_locked``).
+        """
+        old_hash = self._code_hashes.get(slot)
+        self._code_hashes[slot] = new_hash
+        if old is None or old is new:
+            return new, False
+        same_code = old_hash == new_hash
+        if _origin(old) is _origin(new):
+            return new, not same_code
+        same_captures = _same_captures(old, new)
+        if same_code and same_captures:
+            return old, False
+        handles = self._handles.pop(slot, None)
+        if handles is not None:
+            for handle in list(handles):
+                handle._mark_stale()  # noqa: SLF001
+        if not same_captures:
+            self._hash_salts[slot] = self._hash_salts.get(slot, 0) + 1
+        return new, True
+
+    def _stored_hash_locked(self, slot: tuple[str, str]) -> str:
+        """Hash that persisted results of ``slot`` are stored and checked under.
+
+        The bytecode hash, plus the slot's salt once a function with other
+        captures has taken over the name in this process. Salted results are
+        not reused by a later run; ``name=`` gives such functions their own
+        identity, and with it cross-run reuse.
+        """
+        code_hash = self._code_hashes[slot]
+        salt = self._hash_salts.get(slot, 0)
+        return code_hash if not salt else f"{code_hash}#{salt}"
+
+    def track_handle(
+        self, kind: str, fid: str, fn: Callable[..., Any], handle: Any
+    ) -> None:
+        """Remember ``handle`` so it can be marked stale when ``fn`` is replaced."""
+        with self.lock:
+            registered = (self.queries if kind == "query" else self.input_fns).get(fid)
+            if registered is None or _origin(registered) is not _origin(fn):
+                # Replaced by another thread between registration and here.
+                handle._mark_stale()  # noqa: SLF001
+                return
+            handles = self._handles.get((kind, fid))
+            if handles is None:
+                handles = self._handles[(kind, fid)] = weakref.WeakSet()
+            handles.add(handle)
 
     # The per-query config lookups below run several times per query on the
     # hot path. They read a single key from a dict that only register_query
@@ -235,17 +373,29 @@ class GraphStore:
                 return True, self.query_fixed_points[query_id]
             return False, None
 
-    def register_input(self, input_id: str, fn: Callable[..., Any]) -> None:
+    def register_input(
+        self, input_id: str, fn: Callable[..., Any]
+    ) -> Callable[..., Any]:
+        """Register ``fn`` as the default of ``input_id``; see ``register_query``.
+
+        A different function taking over the name drops the input's values,
+        as a change of the default's code always has.
+        """
         fn_hash = hash_bytecode(fn)
+        slot = ("input", input_id)
         with self.lock:
-            if input_id in self.input_hashes and self.input_hashes[input_id] != fn_hash:
+            fn, drop = self._replace_locked(
+                slot, self.input_fns.get(input_id), fn, fn_hash
+            )
+            if drop:
                 drop_keys = [k for k in self.inputs if k[0] == input_id]
                 for k in drop_keys:
                     self.inputs.pop(k, None)
                     self._multi_version_keys.discard(k)
                     self.mark_dependents_dirty_locked(("input", k[0], k[1]))
             self.input_fns[input_id] = fn
-            self.input_hashes[input_id] = fn_hash
+            self.input_hashes[input_id] = self._stored_hash_locked(slot)
+            return fn
 
     def lookup_input(self, input_id: str) -> Callable[..., Any] | None:
         return self.input_fns.get(input_id)

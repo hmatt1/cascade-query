@@ -10,6 +10,7 @@ from .engine import (
     QueryCancelled,
     Snapshot,
     SnapshotExpiredError,
+    StaleHandleError,
     TraceEvent,
 )
 
@@ -26,6 +27,7 @@ __all__ = [
     "QueryKey",
     "Snapshot",
     "SnapshotExpiredError",
+    "StaleHandleError",
     "TraceEvent",
     "condense_graph",
     "export_dot",

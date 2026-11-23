@@ -19,6 +19,7 @@ from ._errors import (
     PersistentCacheError,
     QueryCancelled,
     SnapshotExpiredError,
+    StaleHandleError,
 )
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
 from ._state import InFlight, InputVersion, MemoEntry, QueryKey, Snapshot
@@ -32,6 +33,7 @@ _CONTROL_FLOW_ERRORS = (
     CycleError,
     PersistentCacheError,
     SnapshotExpiredError,
+    StaleHandleError,
 )
 
 
@@ -1101,6 +1103,7 @@ class Evaluator:
                         CycleError,
                         PersistentCacheError,
                         SnapshotExpiredError,
+                        StaleHandleError,
                     ),
                 ):
                     pass
@@ -1245,6 +1248,7 @@ class Evaluator:
                             CycleError,
                             PersistentCacheError,
                             SnapshotExpiredError,
+                            StaleHandleError,
                         ),
                     ):
                         pass

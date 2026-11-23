@@ -83,7 +83,20 @@ A few rules apply to every engine, with or without `cache_dir`:
 
 *   **Values must be encodable.** Results and input values are fingerprinted with the same encoder the disk cache uses, so they must be primitives, bytes, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions. Anything else (`Enum`, `Path`, `Decimal`, arbitrary class instances) raises `TypeError`.
 *   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache.
-*   **A query's identity is its `module:qualname`.** Two functions with the same module and qualified name (queries built by one factory function, lambdas in one module) are the same query and share cached results.
+*   **A query's or input's identity is a name: its `module:qualname` by default.** One name holds one function. Registering a different function under a name in use replaces the earlier one: its cached results are dropped, and its handle raises `StaleHandleError` when called. That is what you want from a hot reload (pick up the new handle by importing it again), but it also happens when several functions are made from one body, as in a factory, a loop, or lambdas in one module. Give those their own identities with `name=`:
+
+    ```python
+    def make_scaler(k: int):
+        @engine.query(name=f"scale_by_{k}")
+        def scale(x: int) -> int:
+            return k * x
+        return scale
+
+    double, triple = make_scaler(2), make_scaler(3)   # two queries, two caches
+    threshold = engine.input(lambda: 10, name="threshold")
+    ```
+
+    The name is also the identity in the disk cache, so keep it stable across runs.
 *   **Arguments are positional and hashable.**
 
 ### Snapshots & Transactions (Input Debouncing)
@@ -158,7 +171,7 @@ Synchronous queries can also be called directly from inside asynchronous nodes (
 If a function's logic evaluates to a result identical to its previous run, early bail-out prevents re-computation of downstream queries.
 
 ### Code-Aware Auto-Invalidation
-Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic when the function is registered again. If the logic has changed, Cascade invalidates that function's memory and persistent disk caches at that point.
+Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic when the function is registered again. If the logic has changed, Cascade invalidates that function's memory and persistent disk caches at that point. Handles to the old function become stale: calling one raises `StaleHandleError` rather than running the old code, so modules that imported the handle need to import it again after the reload.
 
 The hash covers only the function's own bytecode, constants and names. It does not cover helper functions the query calls, closure values, default arguments or globals, so editing those leaves cached results in place; clear the cache (`engine.clear_disk_cache()`) after such an edit.
 

@@ -362,7 +362,9 @@ def test_reregistering_a_query_dirties_its_dependents() -> None:
 
     a.set(1)
     assert top() == 4
-    engine.query(base_v2)
+    # Rebind the name ``top`` reads, as a reload does: the handle from the
+    # first registration is stale once another function takes its name.
+    base = engine.query(base_v2)
     a.set(2)
     assert top() == 204
 

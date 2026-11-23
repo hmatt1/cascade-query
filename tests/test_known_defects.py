@@ -250,7 +250,6 @@ def test_d8_builtin_shadowed_in_enclosing_scope_is_not_rewritten() -> None:
     assert outer()() == "shadowed"
 
 
-@_defect(9, "queries made by one factory share an identity and a cache")
 def test_d9_factory_made_queries_do_not_share_results() -> None:
     engine = Engine()
 

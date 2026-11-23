@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D3, D5–D9) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D3, D5–D8) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Broken for fixed-point queries (D2) | Strong otherwise |
@@ -79,9 +79,17 @@ Limits, by design:
   tracked collection read is invisible to the engine.
 - **Returned values are shared.** The caller gets the cached object itself, so
   mutating a returned list changes the cache.
-- **Identity is `module:qualname`.** Two functions with the same module and
-  qualified name are the same query (see D9). Lambdas in one module all share
-  one identity. Methods cannot be queries.
+- **Identity is a name: `module:qualname`, or `name=`.** One name holds one
+  function. Registering a different function under a name in use replaces
+  it: the old function's cached results are dropped and its handles go
+  stale, so calling one raises `StaleHandleError` instead of running old
+  code into the new function's cache. This is what a reload with changed
+  code does, and also what a second function made from the same body does
+  (a factory, a loop, lambdas in one module). Functions like that need
+  `engine.query(name=...)` / `engine.input(name=...)` to coexist. Registering
+  the same function again, or one with equal bytecode that captures the same
+  objects (a module reloaded unchanged), keeps results and handles. Methods
+  cannot be queries.
 - **Values must be encodable.** Results and input values are hashed through the
   canonical encoder even without `cache_dir`; an unsupported type raises
   `TypeError`. G18 lists the supported types.
@@ -95,7 +103,8 @@ Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_reco
 `test_dirty_propagation.py::test_concurrent_writers_and_readers_only_see_real_states`,
 `test_fan_out_inside_queries.py` (dependencies, snapshots, effects, errors and
 cycles through `compute_many` and `compute_many_stream` inside a query;
-`submit` refused).
+`submit` refused), `test_query_identity.py` (replaced functions, stale
+handles, `name=`).
 
 ### G2. Minimal re-execution and early bail-out
 
@@ -227,16 +236,27 @@ Enforced by: `test_memoize_false.py::test_memoize_false`,
 Registering a query or input whose bytecode hash differs from the one cached
 drops its results, in memory and on disk, and marks dependents for
 re-verification. This happens at registration, not while the old function is
-still registered.
+still registered. Handles to the replaced function go stale and raise
+`StaleHandleError` when used (see G1, identity).
 
 The hash covers the function's bytecode, constants, names and local variable
 names. It does not cover closure values, default arguments, globals, or any
 helper function the query calls. Editing those leaves stale results in place.
+One exception inside a process: a function registered over one with equal
+bytecode but different captured objects is treated as different code. Its
+results are dropped, and for the rest of the process its persisted results
+are stored under a salted hash, so it cannot load what the earlier function
+wrote. Across runs the blind spot remains: two closures of one body
+registered under one name in different runs can serve each other's persisted
+results. `name=` avoids that.
 
 Enforced by: `test_code_versioning.py::test_memory_cache_invalidation_on_code_change`,
 `::test_disk_cache_invalidation_on_code_change`,
 `::test_input_cache_invalidation_on_code_change`,
-`test_dirty_propagation.py::test_reregistering_a_query_dirties_its_dependents`.
+`test_dirty_propagation.py::test_reregistering_a_query_dirties_its_dependents`,
+`test_query_identity.py::test_reload_with_changed_code_makes_old_handles_stale`,
+`::test_reload_with_unchanged_code_keeps_results_and_handles`,
+`::test_replacing_function_does_not_load_the_old_ones_results_from_disk`.
 
 ### G12. Accumulator effects
 
@@ -294,8 +314,8 @@ current value, a dependency query by the digest of its up-to-date result. An
 input never set in the new session is matched by the digest of its default.
 
 Limits: a query whose arguments cannot be encoded is computed but not
-persisted. Query identity on disk is `module:qualname`, so two scripts run as
-`__main__` with same-named queries share entries.
+persisted. Query identity on disk is `module:qualname` unless `name=` is
+given, so two scripts run as `__main__` with same-named queries share entries.
 
 Enforced by: `test_disk_cache.py::test_cross_session_hit_skips_all_query_bodies`,
 `::test_file_edit_invalidates_only_its_chain`,
@@ -515,7 +535,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D6 | Early bail-out treats dicts that differ only in insertion order as equal, so a dependent that iterates the dict keeps the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
 | D8 | A builtin shadowed in an enclosing function is still rewritten. With an outer `sum = lambda it: "shadowed"`, the query returns 3. | Reproduced |
-| D9 | Queries created by one factory function share an identity and a cache: `make(1)()` and `make(2)()` both return 1. | Reproduced |
 | D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
 
 ### Data loss and corruption
@@ -544,10 +563,19 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D13 | Reusing an `EngineTransaction` object replayed its old state and could roll back committed data. Re-entry now raises `RuntimeError`. | `fix: a reused transaction object could undo committed changes` |
 | D14 | `CascadeSet.update` and `difference_update` kept the part applied before a failure in storage but not in the log, so queries never saw it. Also found and fixed: list `pop`, `insert`, `xs[i] = v` and `del xs[i]` with an `__index__` object changed the list and then raised before logging. | `fix: a failed set update left elements that queries never saw` |
 | D4 | `compute_many`, `compute_many_stream` or `submit` called inside a query recorded no dependency, so the parent never invalidated. The first two now record each requested query; `submit` inside a query raises `RuntimeError`. | `fix: queries run through compute_many inside a query were not tracked` |
+| D9 | Functions registered under one `module:qualname` shared a cache (`make(1)()` and `make(2)()` both returned 1), and a handle to a replaced function kept running old code into it. A different function now replaces the old one, whose handles raise `StaleHandleError`; `name=` on `engine.query` and `engine.input` gives factories and lambdas distinct identities. | `fix: two functions registered under one name shared cached results` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
 because the map was full.
+
+Found while fixing D9, not yet numbered or pinned by a test: re-registering a
+query with changed code while `engine.revision` has not moved since its
+dependents were computed leaves those dependents serving their old results
+(`top()` stayed 2 where a fresh run gives 11). The new result gets the same
+`changed_at` revision as the one it replaces, so re-verification sees no
+change. An input change in between hides it, which is why
+`test_reregistering_a_query_dirties_its_dependents` passes.
 
 ## Limits that restrict who can use the library
 
@@ -560,7 +588,7 @@ running it.
 | Limit | Who it stops | Why it conflicts with the aim |
 |---|---|---|
 | **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
-| **Query identity.** A query is its `module:qualname`. Factories, lambdas and methods either collide silently or do not work. After a reload, a caller still holding the old handle runs the old code and writes its result into the cache the new handle reads. | Libraries that generate queries, class-based designs, hot-reload workflows. | The failure is a silently wrong answer, which is the one thing G1 exists to rule out. |
+| **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
 | **Rewriting is on by default but not exact.** Rewritten reducers differ from the builtins (D7), stages can go stale (D1), and ordinary operations such as `set(s)` or `s \| x` are untracked (D5). | Anyone using collections for numeric work, ordering-sensitive output, or set algebra. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
 
