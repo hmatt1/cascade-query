@@ -328,16 +328,25 @@ long_doc_count()      # processes only "delta"
 
 Rewriting covers comprehensions with a single `for` clause (`[...]`, `{...}`, `{k: v ...}`), `map`, `filter`, `reversed`, and reducers: `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`, `dict`, and string-literal `.join`.
 
+A rewritten expression returns exactly what the same Python returns: the same value, with the same type, the same choice between equal elements, and the same exception when Python raises one. Where an incremental update cannot guarantee that, the reducer does more work instead of returning something else.
+
 | Reducer | Ingest per diff | Finalize |
 |---------|-----------------|----------|
-| `sum`, `len`, `any`, `all` | O(1) | O(1) |
+| `sum` of ints, `len`, `any`, `all` | O(1) | O(1) |
+| `sum` with floats (or anything but ints) | O(1) | O(N): the builtin `sum` over the stored values |
 | `min`, `max` | O(log N) | O(1) |
 | `sorted` | O(log N) | O(output) |
 | `list`, `set`, `dict`, `.join` | O(1) | O(output) |
 | `reversed` | O(1) positional flip | inherited |
 
+*   A float `sum` is re-added from the stored values on every run, because float addition rounds and only the builtin's own pass gives the builtin's result. Your mapping function still runs once per changed element.
+*   `min`, `max` and `sorted` pick between equal elements by position, as the builtins do (`sorted` is stable, also with `reverse=True`). Keys that Python cannot order totally (NaN, mixed types, sets, arbitrary objects) are handed to the builtin on every run.
+*   `any` and `all` evaluate every element, where Python stops at the first that decides the result. If an element raises, Cascade evaluates the expression the plain way instead, so `any(1 / z for z in zs)` over `[1, 0]` is `True` as in Python. The same goes for any exception inside a rewritten expression: the plain evaluation decides what is returned or raised, and it is what runs on each call while the offending element is in the collection.
+*   `len(...)` is rewritten for a list comprehension or a collection. `len(map(...))` and `len(filter(...))` raise `TypeError`, as in Python.
+
 *   Arbitrary `for` loops and comprehensions with more than one `for` are never rewritten, but invalidate through read tracking.
-*   Iterating a `CascadeSet`, in a comprehension or a loop, yields its elements in insertion order.
+*   A rewritten comprehension or reducer visits a `CascadeSet` in insertion order. A `for` loop, a helper function and `list(s)` see the builtin set's order instead; until that is settled (D29 in `docs/guarantees.md`), do not rely on the order of a `CascadeSet` outside rewritten expressions.
+*   Two more open gaps in rewriting: an assignment expression (`:=`) inside a rewritten comprehension does not reach the enclosing function (D30), and `Accumulator.push` calls made per element are not replayed for elements that did not change (D31). Use `@engine.query(incremental=False)` for such a query.
 *   `enumerate()` and `zip()` sources are explicitly excluded.
 *   Reads that are not rewritten are still tracked: indexing, slicing, `in`, `len`, comparisons, `xs + ys`, `s | t` and the other set operators and methods, `d.keys() & other`, `repr`, `list(xs)`, `dict(d)`, `json.dumps(xs)` and so on. Each returns a plain builtin and re-runs the query when the collection changes.
 *   **One limit:** CPython reads a `set` subclass's storage directly when a `CascadeSet` is handed to another set's code, and Cascade cannot see that. Inside a query, `frozenset(s)`, `{*s}`, `plain.union(s)`, `plain |= s`, `frozenset_a | s`, and `set(s)` in a helper function (in the query body itself `set(s)` is rewritten and fine) do not record the dependency. Write `s.copy()`, or put the collection on the left: `s.union(plain)`, `s | frozenset_a`.

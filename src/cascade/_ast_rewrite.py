@@ -17,6 +17,9 @@ Boundaries are strict and fail toward normal execution:
   stream alignment across several diff queues, so neither can be made
   incremental safely.
 * Arbitrary ``for`` loops are never touched.
+* ``len()`` is rewritten over a list comprehension or a bare source only.
+  ``len(map(...))``, ``len(filter(...))`` and ``len(reversed(...))`` are
+  left as written, so they raise the ``TypeError`` Python raises.
 * If any relevant builtin name is shadowed in the function, in a function
   enclosing it, or in its module, or the source cannot be parsed, or the
   function is async or a lambda, the function is registered unmodified.
@@ -198,6 +201,10 @@ class _Rewriter(ast.NodeTransformer):
         if pipeline is _ABORT or pipeline is None:
             return self.generic_visit(node)
         source, stages = pipeline
+        if reducer == "len" and stages and not isinstance(pipe_expr, ast.ListComp):
+            # len() of map(), filter() or reversed() is a TypeError: those
+            # are iterators. Only a list comprehension has a length.
+            return self.generic_visit(node)
         return self._build_run_call(node, reducer, source, stages, extra)
 
     def visit_ListComp(self, node: ast.ListComp) -> ast.AST:
@@ -308,6 +315,10 @@ class _Rewriter(ast.NodeTransformer):
                 )
         for kw in extra:
             kw.value = self.visit(kw.value)
+        # Argument order is evaluation order. Plain Python evaluates the
+        # function expression of the outermost map()/filter() first, then
+        # the inner ones, then the source, then key= and reverse=. So the
+        # stages are passed outermost first and the source after them.
         call = ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id=RT_NAME, ctx=ast.Load()), attr="run", ctx=ast.Load()
@@ -315,8 +326,8 @@ class _Rewriter(ast.NodeTransformer):
             args=[
                 ast.Constant(f"{self.qualname}:{node.lineno}:{node.col_offset}"),
                 ast.Constant(reducer),
+                ast.Tuple(elts=stage_nodes[::-1], ctx=ast.Load()),
                 self.visit(source),
-                ast.Tuple(elts=stage_nodes, ctx=ast.Load()),
             ],
             keywords=extra,
         )

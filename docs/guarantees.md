@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D7) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken for two rewriting cases (D29, D30) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
@@ -33,7 +33,7 @@ Every open defect has a failing regression test in
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
-| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Holds with limits (D26) | Good |
+| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Broken for pushes inside a rewritten stage (D31); limits (D26) | Good |
 | G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Broken for fixed-point cycles (D25) | Strong for eviction and prune |
 | G14 | Async queries behave like sync queries | Holds with limits (D21, D23) | Weak |
 | G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Broken for async queries (D23) | Strong on the sync path |
@@ -43,8 +43,8 @@ Every open defect has a failing regression test in
 | G19 | Values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Good by example |
 | G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
 | G21 | Collections behave like `list`, `set` and `dict`, and every read inside a query is tracked | Holds with limits (D28) | Strong |
-| G22 | A rewritten query returns what the plain Python would | Broken (D7) | Weak on edge cases |
-| G23 | One mutation costs one diff of work | Holds with limits | Adequate |
+| G22 | A rewritten query returns what the plain Python would | Broken for set order and `:=` (D29, D30) | Strong for reducers (Hypothesis, against the builtins) |
+| G23 | One mutation costs one diff of work, where the result can be exact | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
 | G25 | A transaction applies completely or not at all | Broken for a commit that fails on an input value (D27) | Good, threads and tasks included |
 | G26 | A named collection is restored with the same contents after a restart | Broken for two engines on one directory (D10) | Good on the happy path |
@@ -400,7 +400,9 @@ leaks no partial effects. `compute_many(effects=)` merges per-call effects in
 call order.
 
 Limits: effects pushed in the abandoned runs of a fixed-point cycle are not
-dropped for callers above the cycle head (D26).
+dropped for callers above the cycle head (D26). Effects pushed inside the
+element function of a rewritten comprehension are pushed only for the
+elements that changed since the query last ran (D31).
 
 Enforced by: `test_engine.py::test_side_effect_replay_on_cache_hits`,
 `::test_nested_side_effect_replay_propagates_to_parent_effects`,
@@ -657,23 +659,72 @@ mutator) and its Hypothesis tests `::test_list_log_replay_matches_contents`,
 
 ### G22. Rewrite equivalence
 
-Intended: a query rewritten into an incremental pipeline returns exactly what
-the same Python would return without rewriting, after any sequence of
-mutations.
+A query rewritten into an incremental pipeline returns exactly what the same
+Python returns without rewriting, after any sequence of mutations: the same
+value down to its type (`1`, `True` and `1.0` are told apart, and so are
+`0.0` and `-0.0`), or the same exception with the same message.
 
 Rewritten: single-`for` comprehensions, `map`, `filter`, `reversed`, and the
 reducers `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`,
 `dict` and `str.join`.
 
-Not rewritten, falling back to plain Python: comprehensions with more than one
+Not rewritten, running as plain Python: comprehensions with more than one
 `for`, `enumerate`, `zip`, `min`/`max` with `key=` or `default=`, `sum` with a
-start value, lambdas, async queries, and any query for which one of those
-builtin names is rebound: in the query, in a function enclosing it, or at
-module level.
+start value, `len` of anything but a list comprehension or a bare collection
+(`len(map(...))` is the `TypeError` it is in Python), lambdas, async queries,
+and any query for which one of those builtin names is rebound: in the query,
+in a function enclosing it, or at module level.
 
-By design, iterating a `CascadeSet` yields insertion order.
+How each reducer matches its builtin:
 
-Enforced by: `test_incremental_pipeline.py::test_list_reducers_match_recompute_through_mutations`,
+- **`sum`** keeps a running total while every value is an `int` or `bool`.
+  With any other value present (a `float`, a `Fraction`, a string) it calls
+  the builtin `sum` on the stored values in order, so the result is the
+  builtin's to the last bit, and so is the error for values that cannot be
+  added.
+- **`min`, `max`, `sorted`** keep keys in a sorted structure while all keys
+  have one shape that Python orders totally: numbers (no NaN), `str`,
+  `bytes`, or tuples of those with matching positions. Equal keys are
+  ordered by position, as the builtins order them: `min` and `max` return
+  the first of several equal elements, and `sorted` is stable, with
+  `reverse=True` too. With any other key present (NaN, mixed types, sets,
+  objects) the builtin itself is applied to the stored keys and values.
+- **`any`, `all`** count truthy elements.
+- **`list`, `set`, `dict`, `join`** hand the stored values to the builtin in
+  the collection's order, so a `set` or `dict` keeps the first of two equal
+  values and malformed elements raise the builtin's error.
+- **`len`** counts the elements that pass the filters.
+
+Exceptions and laziness. Python evaluates a pipeline lazily and in order:
+`any` and `all` stop at the first element that decides them, and the first
+element that raises ends the call. A pipeline evaluates every element, and in
+the order the changes arrived. So while the collection holds an element for
+which a stage, key function or reducer step raised, the expression is
+evaluated plainly over the collection's contents; that run returns or raises
+exactly as Python does. `any(1 / z for z in [1, 0])` is `True`, and of two
+elements that raise, the first in the collection is the one reported. The
+pipeline remembers which elements raised and keeps the rest of its state, so
+it answers incrementally again once they are removed or replaced. Until then
+each run costs what Python's own evaluation costs: up to the element where it
+stops.
+
+Function expressions are evaluated in Python's order: for
+`sorted(filter(f, map(g, xs)), key=k)` that is `f`, `g`, `xs`, `k`.
+
+Broken: a rewritten comprehension visits a `CascadeSet` in insertion order,
+while unrewritten code iterates it in the builtin set's order (D29). A `:=`
+inside a rewritten comprehension does not reach the enclosing function (D30).
+
+Enforced by: `test_rewrite_differential.py` (Hypothesis: random mutation
+sequences over a list, a dict and a set, about 100 query bodies, each compared
+after every mutation and through a snapshot with the same body over a plain
+`list` or `dict`; values are ints, bools, floats with NaN, infinities and
+`-0.0`, strings, tuples with ties, and mixtures that raise; one run uses lists
+of 20 to 45 elements that are mostly ties),
+`test_rewrite_reducers_exact.py` (one example per former difference, and which
+updates stay incremental), `test_known_defects.py::test_d7_rewritten_float_sum_matches_builtin`,
+`::test_d7_rewritten_sorted_reverse_is_stable`, `::test_d7_rewritten_any_short_circuits`,
+`test_incremental_pipeline.py::test_list_reducers_match_recompute_through_mutations`,
 `::test_property_list_pipeline_equals_recompute` (Hypothesis),
 `::test_property_dict_pipeline_equals_recompute` (Hypothesis),
 `::test_min_max_handle_removal_of_current_extreme`, `::test_empty_collection_reducers`,
@@ -683,8 +734,34 @@ Enforced by: `test_incremental_pipeline.py::test_list_reducers_match_recompute_t
 
 ### G23. Incrementality
 
-After an append, insert, update or remove, a rewritten query runs its mapping
-function once for the changed element.
+After an append, insert, update or remove, a rewritten query runs its mapping,
+filter and key functions once for the changed element. What the reducer then
+does to produce the result:
+
+| Reducer | Per change | Result |
+|---|---|---|
+| `sum` of ints, `len`, `any`, `all` | O(1) | O(1) |
+| `sum` with a non-int value present | O(1) | one pass of the builtin `sum` over the stored values |
+| `min`, `max` | O(log N) | O(1) |
+| `sorted` | O(log N) | O(output) |
+| `list`, `set`, `dict`, `join` | O(1) | O(output) |
+
+Where exactness costs more (G22):
+
+- equal keys are ordered by position, which is known for free only for
+  elements appended at the end or replaced in place. After an insert
+  elsewhere, a group of equal keys that gains a member has to be put in
+  order by looking up its members' positions: one scan of the collection
+  per member for up to eight, one pass over the collection beyond that, and
+  now and then an O(N log N) renumbering of everything. `sorted` does this
+  for every such group, `min` and `max` only for the group that holds the
+  result;
+- keys outside the totally ordered shapes make `min`, `max` and `sorted` run
+  the builtin over the stored keys on every run: no stage function is called
+  again, but the scan or sort is;
+- an element that raises makes every run a plain evaluation while it is in
+  the collection: as far as Python itself gets, so to the first truthy
+  element for `any`, or to the element that raises.
 
 A full rebuild happens after `sort()` or `reverse()`, when a captured closure
 value changes, and when the same query is called with alternating arguments.
@@ -821,16 +898,18 @@ Enforced by: `test_incremental_persistence.py::test_named_collections_restore_ac
 "Reproduced" means re-run independently for this audit on Python 3.12.9, and
 pinned by an expected-failure test in `tests/test_known_defects.py`. D22 was
 found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2;
-D27 while fixing D17; D28 while fixing D5. All were already present at the
-audit commit.
-"Reported" means found and probed during the audit but not re-run a second
-time; it now applies only to the two sub-items of D7 marked that way.
+D27 while fixing D17; D28 while fixing D5; D29 to D31 while fixing D7. All
+were already present at the audit commit.
+"Reported" meant found and probed during the audit but not re-run a second
+time; nothing is in that state now.
 
 ### Wrong results
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
+| D29 | A `CascadeSet` is visited in two different orders. A rewritten comprehension or reducer sees insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gives `[30, 1, 20]`), which is what the README promises for loops too; a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` see the builtin set's order (`[1, 20, 30]`). So the same body gives two results depending on whether it was rewritten. Found while fixing D7; present at the audit commit. | Reproduced |
+| D30 | An assignment expression inside a rewritten comprehension is lost. The element expression is moved into a helper function, where `:=` binds a local of that helper: `last = None; out = [(last := x) for x in xs]; return last` returns `None` where Python returns the last element. The rewriter should decline such a comprehension. Found while fixing D7; present at the audit commit. | Reproduced |
+| D31 | Accumulator effects pushed inside the element function of a rewritten comprehension are not replayed for elements the pipeline already holds. With `sum(note(x) for x in xs)` where `note` pushes `x`, the first run collects `[1, 2, 3]`; after `xs.append(4)` the re-run collects `[4]` where Python collects `[1, 2, 3, 4]`. (Not when the stage function closes over the accumulator object: that pipeline cannot be fingerprinted and is rebuilt on every run.) Found while fixing D7; present at the audit commit. | Reproduced |
 | D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
 | D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
 | D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
@@ -873,6 +952,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D6 | Early bail-out treated dicts that differ only in insertion order as equal, so a dependent that iterated the dict kept the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). The same digest made `input.set` of a reordered dict a no-op, and the disk encoding sorted dict keys, so a stored dict came back in sorted order. Both digests and the disk encoding now keep insertion order; sets are unchanged. `DISK_FORMAT` went from 2 to 3: results stored under 2 are dropped on open, collections are kept. | `fix: a result that only changed a dict's order did not reach its dependents` |
 | D1 | A rewritten stage that read an input the query body had already read was not seen as reading anything, so its cached per-element results were kept: `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` returned 12 after `factor.set(10)` where a fresh run gives 60. The pipeline looked for new dependencies of the query, and a repeated read adds none. Every tracked read is now counted, and a pipeline whose stages read anything is rebuilt on each run. | `fix: a rewritten comprehension kept old results after an input it read changed` |
 | D5 | Collection reads that bypassed tracking went stale inside queries: `s \| x` and the other set operators and methods, set and dict `==`, list `<`, `xs + [...]`, `xs * n`, `repr`, `set.copy()`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. The builtins' implementations ran on the subclass's storage without any method of the collection being called, so no dependency was recorded and a snapshot read saw live contents. Each of these is now a tracked read on the collection. Found and fixed with it: `d.keys() == {'a'}` was always `False` and set operations on dict views raised; `copy.copy(xs)` returned a second collection object sharing the first one's log. What CPython reads without calling the subclass (`set(s)` outside a rewritten body, `frozenset(s)`, `plain.union(s)`, `fs \| s`) cannot be intercepted and is a documented limit (G21). | `fix: set operators, comparisons and repr of a collection went stale inside queries` |
+| D7 | Rewritten reducers differed from the builtins. Float `sum([0.1] * 10)` gave `0.9999999999999999` against `1.0`, and drifted further with each removal. `sorted(..., reverse=True)` reversed equal elements (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`), and any `sorted` did after an insert that was not at the end. `any` and `all` evaluated every element (`any(1 / z for z in [1, 0])` raised `ZeroDivisionError`). `min` and `max` returned the wrong one of several equal elements (`max([1, True])` gave `True`), and with NaN present did not follow the builtin's scan (`min([2.0, nan, 1.0])` gave `2.0` against `1.0`). `len(map(...))` returned a count instead of raising `TypeError`, over plain lists too. Also found and fixed: of two elements that raise, the one whose change arrived first was reported, not the first in the collection; a `set` or `dict` built from equal values of different types kept the wrong one; the function expression of `map`/`filter` was evaluated after the source. Each reducer now either maintains a result that is exact by construction or applies the builtin to the stored values, and anything that raises is settled by plain evaluation (G22). | `fix: rewritten sum, sorted, min, max, any, all and len differed from the builtins` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -893,7 +973,7 @@ running it.
 | **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
-| **Rewriting is on by default but not exact.** Rewritten reducers differ from the builtins (D7). | Anyone using collections for numeric work or ordering-sensitive output. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
+| **Rewriting is on by default and has three open gaps.** Set iteration order differs between rewritten and unrewritten code (D29), `:=` in a comprehension is lost (D30), and accumulator pushes inside a stage are not replayed (D31). | Anyone iterating a `CascadeSet` where order matters, or pushing effects per element. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
 
 Limits that narrow use without stopping it:
 
@@ -933,17 +1013,16 @@ with a single sequential actor. TLC checks six invariants in CI.
   transactions, collections, compaction, errors, TTL, eviction. The model
   uses the revision as the change marker of a query result; the code uses a
   separate stamp (G1).
-- None of D1–D28 is reachable in the model.
+- None of D1–D31 is reachable in the model.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Regression tests for the open defects exist but are expected
-   failures.** `tests/test_known_defects.py` has one test per defect (D1-D28),
+   failures.** `tests/test_known_defects.py` has one test per defect (D1-D31),
    each asserting the correct behaviour; those for open defects run under
-   `xfail(strict=True)`. A fix removes the marker. The two "Reported"
-   sub-items of D7 have no test.
+   `xfail(strict=True)`. A fix removes the marker.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
    exits child processes without `shutdown()` and with `os._exit`. The only
    tests that inject a write failure into a live engine or put two engines on
@@ -953,9 +1032,12 @@ Ordered by the risk they leave open.
    query and snapshots. It copies input history and the revision from the
    engine rather than modelling them, runs 35 examples of 25 steps, and has no
    transactions, collections, errors, TTL, eviction, persistence or threads.
-4. **Rewrite equivalence is tested on small integers only.** No ties, floats,
-   stability, short-circuiting, `min`/`max` or `sorted(key=, reverse=)` in the
-   property tests.
+4. **Rewrite equivalence is tested per reducer, not per program.**
+   `test_rewrite_differential.py` compares each rewritten reducer with the
+   builtin over ints, floats, strings, tuples and mixtures. It does not
+   generate query bodies, so interactions between several pipelines in one
+   body, nested comprehensions and closures over changing values rest on
+   example tests.
 5. **No Hypothesis test for the disk codec** and no cross-process or
    cross-version determinism test.
 6. **Backend parity is partial.** Five tests in `test_disk_cache.py` skip

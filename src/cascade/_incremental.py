@@ -11,6 +11,14 @@ decides between two paths:
 * Source is anything else: silently fall back and evaluate the expression
   with plain Python semantics.
 
+The result is always what the plain expression gives. A reducer keeps
+incremental state only where that state is exact (see each reducer); where
+it is not, it applies the builtin to the values it stored. While any
+element's stage raises, the expression is evaluated plainly over the
+collection's contents instead, because only the lazy, in-order evaluation
+knows which exception Python would raise first, or whether it would have
+stopped before reaching it.
+
 Each (site, collection, view, reducer) pair keeps its own state with its own
 ``last_rev`` checkpoint, so several queries can consume one collection at
 independent paces. Adjacent map and filter stages are condensed into a single
@@ -31,8 +39,10 @@ from ._collections import (
     ABSENT_HEAD,
     CascadeSet,
     _CascadeDictView,
+    _copy_dict,
     _HistoryCompacted,
 )
+from ._errors import QueryCancelled
 from ._serde import hash_bytecode
 
 _VOLATILE = object()
@@ -86,6 +96,46 @@ class SortedKeyList:
             del self._blocks[i]
             del self._maxes[i]
 
+    @classmethod
+    def from_sorted(cls, entries: list[tuple[Any, int, Any]]) -> SortedKeyList:
+        """Build from entries that are already in order."""
+        out = cls()
+        for i in range(0, len(entries), _LOAD):
+            block = entries[i : i + _LOAD]
+            out._blocks.append(block)
+            out._maxes.append(block[-1])
+        out._len = len(entries)
+        return out
+
+    def has_key(self, key: Any) -> bool:
+        """Whether any entry has a key equal to ``key``."""
+        # ``(key,)`` sorts just before every entry that starts with ``key``.
+        probe = (key,)
+        i = bisect_left(self._maxes, probe)
+        if i == len(self._blocks):
+            return False
+        block = self._blocks[i]
+        return block[bisect_left(block, probe)][0] == key
+
+    def with_key(self, key: Any) -> list[tuple[Any, int, Any]]:
+        """Every entry whose key equals ``key``, in order."""
+        probe = (key,)
+        blocks = self._blocks
+        i = bisect_left(self._maxes, probe)
+        out: list[tuple[Any, int, Any]] = []
+        first = True
+        while i < len(blocks):
+            block = blocks[i]
+            j = bisect_left(block, probe) if first else 0
+            first = False
+            while j < len(block) and block[j][0] == key:
+                out.append(block[j])
+                j += 1
+            if j < len(block):
+                break
+            i += 1
+        return out
+
     def first(self) -> tuple[Any, int, Any]:
         return self._blocks[0][0]
 
@@ -103,9 +153,29 @@ class SortedKeyList:
 
 @dataclass
 class _FinalizeCtx:
-    seq: list[Any] | None
+    """What a reducer may ask for when it produces its result.
+
+    ``order`` gives the uids of the collection in the collection's own order
+    (a fresh list each call). It costs a pass over the collection, so
+    reducers call it only when the result depends on the order.
+    """
+
+    order: Callable[[], list[Any]]
     reverse: bool
     args: dict[str, Any]
+    # Positions of some uids in the collection, as a dict that holds at
+    # least those uids.
+    positions: Callable[[list[Any]], dict[Any, int]] | None = None
+
+    def iteration_order(self) -> list[Any]:
+        """The uids in the order the plain expression would visit them."""
+        uids = self.order()
+        if self.reverse:
+            uids.reverse()
+        return uids
+
+
+_MISSING = object()
 
 
 class _Reducer:
@@ -114,42 +184,108 @@ class _Reducer:
     ``contrib`` maps a uid to whatever the reducer needs to undo that
     element's contribution when it is removed or replaced. A uid absent from
     ``contrib`` did not pass the filter stages.
-    """
 
-    needs_seq = False
+    A reducer must give exactly what the builtin gives for the mapped values
+    in iteration order. Where the incremental state cannot promise that (a
+    float sum, keys with no total order, ties whose order is not known), the
+    reducer applies the builtin to the stored values instead: the stage
+    functions are not run again, only the fold is.
+    """
 
     def __init__(self) -> None:
         self.contrib: dict[Any, Any] = {}
+        # Whether ``contrib`` (a dict, so ordered) lists the elements in the
+        # collection's order. True while elements are only appended, removed
+        # or replaced in place; an insert elsewhere makes it False until
+        # ``_values`` puts ``contrib`` back in order. Kept by the reducers
+        # that call ``_values``.
+        self.in_order = True
 
-    def add(self, uid: Any, value: Any) -> None:
+    def add(self, uid: Any, value: Any, appended: bool) -> None:
+        """Take in an element. ``appended``: it is last in the collection."""
         raise NotImplementedError
 
-    def discard(self, uid: Any) -> None:
-        self.contrib.pop(uid, None)
+    def discard(self, uid: Any) -> Any:
+        return self.contrib.pop(uid, None)
+
+    def replace(self, uid: Any, value: Any) -> None:
+        """The element keeps its place and has a new value."""
+        self.discard(uid)
+        self.add(uid, value, False)
 
     def result(self, ctx: _FinalizeCtx) -> Any:
         raise NotImplementedError
+
+    def _values(self, ctx: _FinalizeCtx) -> list[Any]:
+        """The stored values in the order the plain expression yields them."""
+        contrib = self.contrib
+        if not self.in_order:
+            contrib = {uid: contrib[uid] for uid in ctx.order() if uid in contrib}
+            self.contrib = contrib
+            self.in_order = True
+        values = list(contrib.values())
+        if ctx.reverse:
+            values.reverse()
+        return values
 
 
 class _SumReducer(_Reducer):
+    """``sum``: a running total for ints, the builtin's own fold otherwise.
+
+    Int addition is exact and has an inverse, so a total can be kept and
+    adjusted. Nothing else is safe to adjust: float addition rounds (and the
+    builtin compensates for it in its own way), and other types need not
+    have a subtraction at all. With any non-int value present the result is
+    the builtin ``sum`` over the stored values in order.
+    """
+
     def __init__(self) -> None:
         super().__init__()
-        self.total: Any = 0
+        self.int_total = 0
+        self.others = 0
 
-    def add(self, uid: Any, value: Any) -> None:
-        self.total = self.total + value
+    def add(self, uid: Any, value: Any, appended: bool) -> None:
+        if not appended:
+            self.in_order = False
+        kind = type(value)
+        if kind is int or kind is bool:
+            self.int_total += value
+        else:
+            self.others += 1
         self.contrib[uid] = value
 
-    def discard(self, uid: Any) -> None:
-        if uid in self.contrib:
-            self.total = self.total - self.contrib.pop(uid)
+    def replace(self, uid: Any, value: Any) -> None:
+        old = self.contrib.get(uid, _MISSING)
+        if old is _MISSING:
+            self.add(uid, value, False)
+            return
+        self._count(old, -1)
+        self._count(value, 1)
+        self.contrib[uid] = value  # same key: keeps its place
+
+    def discard(self, uid: Any) -> Any:
+        value = self.contrib.pop(uid, _MISSING)
+        if value is not _MISSING:
+            self._count(value, -1)
+        return None
+
+    def _count(self, value: Any, sign: int) -> None:
+        kind = type(value)
+        if kind is int or kind is bool:
+            self.int_total += sign * value
+        else:
+            self.others += sign
 
     def result(self, ctx: _FinalizeCtx) -> Any:
-        return self.total
+        if not self.others:
+            return self.int_total
+        if self.in_order and not ctx.reverse:
+            return sum(self.contrib.values())
+        return sum(self._values(ctx))
 
 
 class _LenReducer(_Reducer):
-    def add(self, uid: Any, value: Any) -> None:
+    def add(self, uid: Any, value: Any, appended: bool) -> None:
         self.contrib[uid] = None
 
     def result(self, ctx: _FinalizeCtx) -> int:
@@ -157,19 +293,30 @@ class _LenReducer(_Reducer):
 
 
 class _AnyAllReducer(_Reducer):
+    """``any``/``all`` from a count of truthy elements.
+
+    The builtins stop at the first element that decides the result and never
+    evaluate the rest. Here every element is evaluated. With functions that
+    do not raise the result is the same; an element that does raise sends
+    the whole call to plain evaluation (see ``IncrementalRuntime.run``),
+    which stops where the builtin stops.
+    """
+
     def __init__(self, mode: str) -> None:
         super().__init__()
         self.mode = mode
         self.true_count = 0
 
-    def add(self, uid: Any, value: Any) -> None:
+    def add(self, uid: Any, value: Any, appended: bool) -> None:
         truth = bool(value)
         self.contrib[uid] = truth
         self.true_count += truth
 
-    def discard(self, uid: Any) -> None:
-        if uid in self.contrib:
-            self.true_count -= self.contrib.pop(uid)
+    def discard(self, uid: Any) -> Any:
+        truth = self.contrib.pop(uid, None)
+        if truth is not None:
+            self.true_count -= truth
+        return None
 
     def result(self, ctx: _FinalizeCtx) -> bool:
         if self.mode == "any":
@@ -177,95 +324,290 @@ class _AnyAllReducer(_Reducer):
         return self.true_count == len(self.contrib)
 
 
-class _OrderedKeyReducer(_Reducer):
-    """Shared machinery for min, max, and sorted: a sorted key structure."""
+def _signature(key: Any) -> Any:
+    """Shape of ``key`` if keys of that shape are totally ordered, else None.
 
-    def __init__(self, key_fn: Callable[[Any], Any] | None = None) -> None:
+    Keys with one signature can be kept in a sorted structure: every pair
+    compares without error, and the comparisons agree with each other. That
+    holds for numbers (``int``, ``bool``, ``float`` except NaN) among
+    themselves, for ``str``, for ``bytes``, and for tuples of equal length
+    whose positions have equal signatures. It does not hold for NaN (every
+    comparison is false), for mixed types (some comparisons raise), or for
+    arbitrary objects.
+    """
+    kind = type(key)
+    if kind is int or kind is bool:
+        return "n"
+    if kind is float:
+        return "n" if key == key else None
+    if kind is str:
+        return "s"
+    if kind is bytes:
+        return "b"
+    if kind is tuple:
+        parts = []
+        for part in key:
+            sig = _signature(part)
+            if sig is None:
+                return None
+            parts.append(sig)
+        return tuple(parts)
+    return None
+
+
+class _OrderedKeyReducer(_Reducer):
+    """Shared machinery for min, max, and sorted: a sorted key structure.
+
+    ``contrib[uid]`` is ``(entry, value, key, ord)``. ``entry`` is the
+    element's ``(key, sign * ord, uid)`` in ``tree``, or None for an element
+    kept outside it because its key's signature is not the tree's (see
+    ``_signature``). While any such element exists the result is computed by
+    the builtin from the stored keys and values in order.
+
+    ``ord`` breaks ties between equal keys, and the builtins break them by
+    position: the first of several equal elements wins, and a sort keeps
+    them in their original order. So within a group of equal keys the ords
+    must rise with the position in the collection.
+
+    Elements appended to the collection get rising ords, and an element
+    replaced in place keeps its ord (its key, and so its group, may change).
+    Those ords rise with position everywhere, so they are right in whatever
+    group the element is in. An element inserted anywhere else gets an ord
+    that says nothing about its position: it is ``floating``. While any
+    element floats, a key that gains a member is noted in ``unsettled``,
+    because the order inside that group can no longer be taken from the
+    ords. Before a result that depends on a group's order, ``_settle`` looks
+    up where its members are in the collection and hands the group's ords
+    out again in that order. That fixes the group, not the ords' meaning
+    elsewhere, so its members float from then on; ``_renumber`` gives every
+    element the ord of its position and ends all floating.
+    """
+
+    def __init__(self, key_fn: Callable[[Any], Any] | None, sign: int) -> None:
         super().__init__()
         self.key_fn = key_fn
+        self.sign = sign
         self.tree = SortedKeyList()
+        self.sig: Any = None
+        self.outside = 0
+        self.floating: set[Any] = set()
+        self.unsettled: set[Any] = set()
+        self._settles = 0
         self._next_ord = 0
 
-    def add(self, uid: Any, value: Any) -> None:
+    def add(
+        self, uid: Any, value: Any, appended: bool, ord_: int | None = None
+    ) -> None:
         key = value if self.key_fn is None else self.key_fn(value)
-        entry = (key, self._next_ord, uid)
-        self._next_ord += 1
-        self.tree.add(entry)
-        self.contrib[uid] = (entry, value)
+        if ord_ is None:
+            ord_ = self._next_ord
+            self._next_ord = ord_ + 1
+        floating = self.floating
+        if not appended:
+            floating.add(uid)
+        kind = type(key)
+        sig = "n" if kind is int else "s" if kind is str else _signature(key)
+        entry = None
+        if sig is not None:
+            tree = self.tree
+            if not tree._len:
+                self.sig = sig
+            if sig == self.sig:
+                if floating and tree.has_key(key):
+                    self.unsettled.add(key)
+                entry = (key, self.sign * ord_, uid)
+                tree.add(entry)
+        if entry is None:
+            self.outside += 1
+        self.contrib[uid] = (entry, value, key, ord_)
 
-    def discard(self, uid: Any) -> None:
+    def replace(self, uid: Any, value: Any) -> None:
+        old = self._drop(uid)
+        if old is None:
+            # It did not pass the filter before: no ord for its position.
+            self.add(uid, value, False)
+        else:
+            # Same place, same ord; it floats on if it floated.
+            self.add(uid, value, True, old[3])
+
+    def discard(self, uid: Any) -> Any:
+        if self.floating:
+            self.floating.discard(uid)
+        return self._drop(uid)
+
+    def _drop(self, uid: Any) -> Any:
         item = self.contrib.pop(uid, None)
         if item is not None:
-            self.tree.remove(item[0])
+            if item[0] is None:
+                self.outside -= 1
+            else:
+                self.tree.remove(item[0])
+        return item
+
+    def _settle(self, keys: list[Any], ctx: _FinalizeCtx) -> None:
+        """Put the ords of each group of equal keys in ``keys`` in position order."""
+        tree = self.tree
+        self._settles += 1
+        if self._settles > 3 or len(keys) * 16 > tree._len:
+            # Settling leaves elements floating, so every later tie needs
+            # settling too. Now and then, and when most of the tree is in
+            # doubt, pay for one pass that puts everything right.
+            self._renumber(ctx.order())
+            return
+        groups = [group for key in keys if len(group := tree.with_key(key)) > 1]
+        if not groups:
+            return
+        contrib = self.contrib
+        sign = self.sign
+        position = ctx.positions([entry[2] for group in groups for entry in group])
+        moved = []
+        for group in groups:
+            by_position = sorted(group, key=lambda entry: position[entry[2]])
+            ords = sorted(contrib[entry[2]][3] for entry in group)
+            for entry, ord_ in zip(by_position, ords):
+                if contrib[entry[2]][3] != ord_:
+                    moved.append((entry, ord_))
+        # All out before any goes back in: two entries must never share an ord.
+        for entry, _ in moved:
+            tree.remove(entry)
+        floating = self.floating
+        for entry, ord_ in moved:
+            key, _, uid = entry
+            new = (key, sign * ord_, uid)
+            tree.add(new)
+            contrib[uid] = (new, contrib[uid][1], key, ord_)
+            floating.add(uid)
+
+    def _renumber(self, order: list[Any]) -> None:
+        """Give every element the ord of its position and rebuild the tree."""
+        contrib = self.contrib
+        sign = self.sign
+        entries = []
+        position = 0
+        for uid in order:
+            item = contrib.get(uid)
+            if item is None:
+                continue
+            entry, value, key, _ = item
+            if entry is not None:
+                entry = (key, sign * position, uid)
+                entries.append(entry)
+            contrib[uid] = (entry, value, key, position)
+            position += 1
+        entries.sort()
+        self.tree = SortedKeyList.from_sorted(entries)
+        self._next_ord = position
+        self.floating.clear()
+        self.unsettled.clear()
+        self._settles = 0
 
 
 class _MinMaxReducer(_OrderedKeyReducer):
-    def __init__(self, mode: str) -> None:
-        super().__init__()
+    """``min``/``max``: the first of the smallest (largest) in iteration order."""
+
+    def __init__(self, mode: str, reverse: bool) -> None:
+        # ``first()`` is the smallest key with the smallest signed ord and
+        # ``last()`` the largest key with the largest: choose the sign that
+        # puts the earliest element in iteration order there.
+        direction = -1 if reverse else 1
+        super().__init__(None, direction if mode == "min" else -direction)
         self.mode = mode
 
     def result(self, ctx: _FinalizeCtx) -> Any:
+        smallest = self.mode == "min"
+        if self.outside:
+            contrib = self.contrib
+            values = [contrib[u][1] for u in ctx.iteration_order() if u in contrib]
+            return min(values) if smallest else max(values)
         if not len(self.tree):
-            return min(()) if self.mode == "min" else max(())
-        entry = self.tree.first() if self.mode == "min" else self.tree.last()
+            return min(()) if smallest else max(())
+        if self.unsettled:
+            # Only the order within the winning group can change the result.
+            key = (self.tree.first() if smallest else self.tree.last())[0]
+            if key in self.unsettled:
+                self._settle([key], ctx)
+                self.unsettled.discard(key)
+        entry = self.tree.first() if smallest else self.tree.last()
         return self.contrib[entry[2]][1]
 
 
 class _SortedReducer(_OrderedKeyReducer):
+    """``sorted``: stable, also with ``reverse=True``."""
+
+    def __init__(
+        self, key_fn: Callable[[Any], Any] | None, reverse: bool, descending: bool
+    ) -> None:
+        # Equal keys keep their iteration order in the output. Ascending
+        # output walks the tree forwards, descending output backwards.
+        direction = -1 if reverse else 1
+        super().__init__(key_fn, -direction if descending else direction)
+        self.descending = descending
+
     def result(self, ctx: _FinalizeCtx) -> list[Any]:
-        order = reversed(self.tree) if ctx.args.get("sort_reverse") else iter(self.tree)
-        return [self.contrib[entry[2]][1] for entry in order]
+        contrib = self.contrib
+        if self.outside:
+            # The builtin's own sort over the stored keys: the same
+            # comparisons in the same order, so the same result or error.
+            uids = [u for u in ctx.iteration_order() if u in contrib]
+            uids.sort(key=lambda u: contrib[u][2], reverse=self.descending)
+            return [contrib[u][1] for u in uids]
+        if self.unsettled:
+            self._settle(list(self.unsettled), ctx)
+            self.unsettled.clear()
+        tree = self.tree
+        order = reversed(tree) if self.descending else iter(tree)
+        return [contrib[entry[2]][1] for entry in order]
 
 
 class _ValueReducer(_Reducer):
-    """Stores the mapped value per uid; subclasses shape the final object."""
+    """Stores the mapped value per uid; the builtin shapes the final object."""
 
-    def add(self, uid: Any, value: Any) -> None:
+    def add(self, uid: Any, value: Any, appended: bool) -> None:
+        if not appended:
+            self.in_order = False
         self.contrib[uid] = value
 
-    def _ordered_values(self, ctx: _FinalizeCtx):
-        seq = reversed(ctx.seq) if ctx.reverse else ctx.seq
-        return (self.contrib[uid] for uid in seq if uid in self.contrib)
+    def replace(self, uid: Any, value: Any) -> None:
+        if uid not in self.contrib:
+            self.in_order = False
+        self.contrib[uid] = value  # an existing key keeps its place
 
 
 class _ListReducer(_ValueReducer):
-    needs_seq = True
-
     def result(self, ctx: _FinalizeCtx) -> list[Any]:
-        return list(self._ordered_values(ctx))
+        return self._values(ctx)
 
 
 class _SetReducer(_ValueReducer):
     def result(self, ctx: _FinalizeCtx) -> set[Any]:
-        return set(self.contrib.values())
+        # In order: of two equal values (1 and True) a set keeps the first.
+        return set(self._values(ctx))
 
 
 class _DictReducer(_ValueReducer):
-    needs_seq = True
-
     def result(self, ctx: _FinalizeCtx) -> dict[Any, Any]:
-        return dict(self._ordered_values(ctx))
+        return dict(self._values(ctx))
 
 
 class _JoinReducer(_ValueReducer):
-    needs_seq = True
-
     def result(self, ctx: _FinalizeCtx) -> str:
-        return ctx.args["sep"].join(self._ordered_values(ctx))
+        return ctx.args["sep"].join(self._values(ctx))
 
 
-_REDUCERS: dict[str, Callable[[dict[str, Any]], _Reducer]] = {
-    "sum": lambda args: _SumReducer(),
-    "len": lambda args: _LenReducer(),
-    "any": lambda args: _AnyAllReducer("any"),
-    "all": lambda args: _AnyAllReducer("all"),
-    "min": lambda args: _MinMaxReducer("min"),
-    "max": lambda args: _MinMaxReducer("max"),
-    "sorted": lambda args: _SortedReducer(args.get("key")),
-    "list": lambda args: _ListReducer(),
-    "set": lambda args: _SetReducer(),
-    "dict": lambda args: _DictReducer(),
-    "join": lambda args: _JoinReducer(),
+_REDUCERS: dict[str, Callable[[dict[str, Any], bool], _Reducer]] = {
+    "sum": lambda args, reverse: _SumReducer(),
+    "len": lambda args, reverse: _LenReducer(),
+    "any": lambda args, reverse: _AnyAllReducer("any"),
+    "all": lambda args, reverse: _AnyAllReducer("all"),
+    "min": lambda args, reverse: _MinMaxReducer("min", reverse),
+    "max": lambda args, reverse: _MinMaxReducer("max", reverse),
+    "sorted": lambda args, reverse: _SortedReducer(
+        args.get("key"), reverse, bool(args.get("sort_reverse", False))
+    ),
+    "list": lambda args, reverse: _ListReducer(),
+    "set": lambda args, reverse: _SetReducer(),
+    "dict": lambda args, reverse: _DictReducer(),
+    "join": lambda args, reverse: _JoinReducer(),
 }
 
 
@@ -296,7 +638,14 @@ class _PipelineState:
     reducer: _Reducer
     env_fp: Any
     last_rev: int = 0
-    seq: list[Any] | None = None
+    # Elements the collection holds at ``last_rev``, filtered out or not.
+    count: int = 0
+    # Uids of elements whose stage, key function or reducer step raised.
+    # They are in the collection but not in the reducer. While there are any,
+    # the reducer's result is not the expression's: plain evaluation decides
+    # whether the call returns (it may stop before it reaches them) or which
+    # exception it raises.
+    failed: set[Any] = field(default_factory=set)
     present: set[Any] = field(default_factory=set)
     impure: bool = False
 
@@ -327,10 +676,32 @@ class IncrementalRuntime:
         self,
         site: str,
         reducer_name: str,
+        rstages: tuple[tuple[Any, ...], ...],
         source: Any,
-        stages: tuple[tuple[Any, ...], ...],
         **reducer_args: Any,
     ) -> Any:
+        """Value of ``reducer(stages(source))``, exactly as plain Python gives it.
+
+        ``rstages`` lists the stages from the outermost in: the order in
+        which the plain expression evaluates their function expressions,
+        all before the source.
+
+        Three paths, all with the same result:
+
+        * the source is not a cascade collection: plain evaluation;
+        * the pipeline's state is brought up to date from the collection's
+          diffs and the reducer answers from it;
+        * if anything raised on the way (a stage, a key function, a
+          comparison, or the reducer's own builtin), the expression is
+          evaluated plainly over the collection's contents. The incremental
+          path evaluates every element, in the order the diffs arrived; the
+          plain expression evaluates them lazily, in the collection's order,
+          and may stop early. Only plain evaluation knows which exception
+          comes first, or that none does: ``any(1 / z for z in [1, 0])`` is
+          True. The state remembers which elements raised and stays in use:
+          once they are gone or replaced, the reducer answers again.
+        """
+        stages = rstages[::-1]
         resolved = self._resolve_source(source, reducer_name)
         if resolved is None:
             return _fallback(reducer_name, source, stages, reducer_args)
@@ -348,6 +719,11 @@ class IncrementalRuntime:
             return _fallback(reducer_name, [], stages, reducer_args)
         # If the recorded head outruns the live log, trust the log.
         head = min(head, core.log.head)
+        if not _args_supported(reducer_name, reducer_args):
+            # Let the builtin reject (or accept) them itself.
+            return _fallback(
+                reducer_name, _items_at(core, view, head), stages, reducer_args
+            )
         fused = _fuse(stages)
         fingerprint = _env_fingerprint(
             [fn for kind, *rest in stages if kind != "reverse" for fn in rest]
@@ -355,6 +731,8 @@ class IncrementalRuntime:
             self._engine._stable_hash,
             self,
         )
+        if fingerprint is not _VOLATILE and reducer_args.get("sort_reverse"):
+            fingerprint += "|descending"
         state_key = (site, core.input_qualname, view, reducer_name)
         evaluator = self._engine._evaluator
         with self._lock:
@@ -371,7 +749,14 @@ class IncrementalRuntime:
             try:
                 if needs_rebuild:
                     state = self._build_state(
-                        reducer_name, reducer_args, fingerprint, core, view, fused, head
+                        reducer_name,
+                        reducer_args,
+                        reverse,
+                        fingerprint,
+                        core,
+                        view,
+                        fused,
+                        head,
                     )
                     self._states[state_key] = state
                 else:
@@ -382,6 +767,7 @@ class IncrementalRuntime:
                         state = self._build_state(
                             reducer_name,
                             reducer_args,
+                            reverse,
                             fingerprint,
                             core,
                             view,
@@ -392,21 +778,41 @@ class IncrementalRuntime:
                     else:
                         self._ingest(state, core, view, fused, diffs)
                         state.last_rev = head
+                if read_base >= 0 and evaluator.current_frame_read_count() > read_base:
+                    # A stage or key function read tracked engine state
+                    # (another query, an input, another collection). Its
+                    # per-item results can change without this collection
+                    # emitting a diff, so the cached state cannot be trusted
+                    # across runs: rebuild each time. Slower, always correct.
+                    # Reads are counted, not new dependencies: the query
+                    # body may have read the same input or query before the
+                    # pipeline did.
+                    state.impure = True
+                self._record_info(
+                    state_key, site, reducer_name, core, view, stages, state
+                )
+                ctx = _FinalizeCtx(
+                    order=lambda: _order_at(core, head),
+                    reverse=reverse,
+                    args=reducer_args,
+                    positions=lambda uids: _positions_at(core, head, uids),
+                )
+                if not state.failed:
+                    return state.reducer.result(ctx)
+            except QueryCancelled:
+                self._states.pop(state_key, None)
+                raise
+            except Exception:
+                # The reducer's builtin raised over the stored values (or
+                # the contents could not be read). Plain evaluation raises
+                # the same; the state may be half updated, so it goes.
+                self._states.pop(state_key, None)
             except BaseException:
                 self._states.pop(state_key, None)
                 raise
-            if read_base >= 0 and evaluator.current_frame_read_count() > read_base:
-                # A stage or key function read tracked engine state (another
-                # query, an input, another collection). Its per-item results
-                # can change without this collection emitting a diff, so the
-                # cached state cannot be trusted across runs: rebuild each
-                # time. Slower, always correct. Reads are counted, not new
-                # dependencies: the query body may have read the same input
-                # or query before the pipeline did.
-                state.impure = True
-            self._record_info(state_key, site, reducer_name, core, view, stages, state)
-            ctx = _FinalizeCtx(seq=state.seq, reverse=reverse, args=reducer_args)
-            return state.reducer.result(ctx)
+        return _fallback(
+            reducer_name, _items_at(core, view, head), stages, reducer_args
+        )
 
     def min_last_rev(self, input_qualname: str) -> int | None:
         """Oldest log head any pipeline over this collection has ingested up to."""
@@ -423,17 +829,16 @@ class IncrementalRuntime:
         self,
         reducer_name: str,
         reducer_args: dict[str, Any],
+        reverse: bool,
         fingerprint: Any,
         core: Any,
         view: str | None,
         fused: Callable[[Any], tuple[bool, Any]],
         head: int,
     ) -> _PipelineState:
-        reducer = _REDUCERS[reducer_name](reducer_args)
+        reducer = _REDUCERS[reducer_name](reducer_args, reverse)
         state = _PipelineState(reducer=reducer, env_fp=fingerprint)
-        if reducer.needs_seq:
-            state.seq = []
-        contents = core.contents_at(head)
+        contents = _raw_at(core, head)
         self._ingest(state, core, view, fused, _synthetic_inserts(core.kind, contents))
         state.last_rev = head
         return state
@@ -447,25 +852,44 @@ class IncrementalRuntime:
         diffs: list[dict[str, Any]],
     ) -> None:
         reducer = state.reducer
-        seq = state.seq
+        failed = state.failed
         for diff in diffs:
             for op, uid, item in _events(core.kind, view, diff, state):
                 if op == "remove":
+                    state.count -= 1
                     reducer.discard(uid)
-                    if seq is not None:
-                        seq.remove(uid)
+                    if failed:
+                        failed.discard(uid)
                     continue
                 if op == "replace":
-                    reducer.discard(uid)
-                elif seq is not None:
-                    index = diff.get("index")
-                    if index is None:
-                        seq.append(uid)
-                    else:
-                        seq.insert(index, uid)
-                ok, mapped = fused(item)
-                if ok:
-                    reducer.add(uid, mapped)
+                    if failed:
+                        failed.discard(uid)
+                    try:
+                        ok, mapped = fused(item)
+                        if ok:
+                            reducer.replace(uid, mapped)
+                        else:
+                            reducer.discard(uid)
+                    except QueryCancelled:
+                        raise
+                    except Exception:
+                        reducer.discard(uid)
+                        failed.add(uid)
+                    continue
+                # Lists say where the element went; sets and dicts append.
+                index = diff.get("index")
+                appended = index is None or index == state.count
+                state.count += 1
+                try:
+                    ok, mapped = fused(item)
+                    if ok:
+                        reducer.add(uid, mapped, appended)
+                except QueryCancelled:
+                    raise
+                except Exception:
+                    # Every reducer's ``add`` raises before it changes
+                    # anything, so the element is simply not in it.
+                    failed.add(uid)
 
     # --- source resolution and bookkeeping ---
     def _resolve_source(
@@ -547,6 +971,79 @@ class IncrementalRuntime:
                     }
                 )
             return sorted(out, key=lambda p: (p["site"], p["source"], p["reducer"]))
+
+
+def _args_supported(reducer_name: str, reducer_args: dict[str, Any]) -> bool:
+    """Whether the reducer's keyword arguments are ones the pipeline handles."""
+    if reducer_name != "sorted":
+        return True
+    key = reducer_args.get("key")
+    if key is not None and not callable(key):
+        return False
+    return type(reducer_args.get("sort_reverse", False)) in (bool, int)
+
+
+def _raw_at(core: Any, head: int) -> Any:
+    """The collection's contents at log head ``head``, in the log's format.
+
+    Lists are ``(uid, value)`` pairs in order, sets a list of values in
+    insertion order, dicts a plain dict. Taken from the live storage when
+    ``head`` is the newest state (a mutation holds ``core.rw`` until its
+    diff is logged, so the two agree), otherwise replayed from the log.
+    """
+    with core.rw:
+        owner = core.owner
+        if owner is not None and head == core.log.head:
+            if core.kind == "list":
+                return list(zip(owner._uids, list.__iter__(owner)))
+            if core.kind == "dict":
+                return _copy_dict(owner)
+        return core.contents_at(head)
+
+
+def _order_at(core: Any, head: int) -> list[Any]:
+    """Uids of the collection at ``head``, in the collection's order."""
+    with core.rw:
+        owner = core.owner
+        if owner is not None and head == core.log.head:
+            if core.kind == "list":
+                return list(owner._uids)
+            if core.kind == "dict":
+                return list(dict.keys(owner))
+        contents = core.contents_at(head)
+    if core.kind == "list":
+        return [uid for uid, _ in contents]
+    return list(contents)
+
+
+def _positions_at(core: Any, head: int, uids: list[Any]) -> dict[Any, int]:
+    """Position in the collection at ``head`` of (at least) each of ``uids``."""
+    if core.kind == "list" and len(uids) <= 8:
+        with core.rw:
+            owner = core.owner
+            if owner is not None and head == core.log.head:
+                index = owner._uids.index
+                return {uid: index(uid) for uid in uids}
+    order = _order_at(core, head)
+    return dict(zip(order, range(len(order))))
+
+
+def _items_at(core: Any, view: str | None, head: int) -> list[Any]:
+    """What iterating the source yields at ``head``, as a plain list."""
+    if core.kind == "list":
+        with core.rw:
+            owner = core.owner
+            if owner is not None and head == core.log.head:
+                return list(list.__iter__(owner))
+        return [value for _, value in core.contents_at(head)]
+    raw = _raw_at(core, head)
+    if core.kind == "set":
+        return raw
+    if view == "values":
+        return list(raw.values())
+    if view == "items":
+        return list(raw.items())
+    return list(raw)
 
 
 def _synthetic_inserts(kind: str, contents: Any) -> list[dict[str, Any]]:
@@ -643,7 +1140,7 @@ def _fallback(
     stages: tuple[tuple[Any, ...], ...],
     reducer_args: dict[str, Any],
 ) -> Any:
-    """Plain-Python execution for non-cascade sources, matching builtin semantics."""
+    """Plain-Python execution: the builtins over the lazily staged source."""
     it: Any = source
     staged = False
     for st in stages:
@@ -655,13 +1152,14 @@ def _fallback(
             it = filter(st[1], it)
         staged = True
     if reducer_name == "len":
-        return sum(1 for _ in it) if staged else len(it)
+        # Staged ``len`` is only ever ``len([... for ...])``.
+        return len(list(it)) if staged else len(it)
     if reducer_name == "sorted":
         kwargs = {}
-        if reducer_args.get("key") is not None:
+        if "key" in reducer_args:
             kwargs["key"] = reducer_args["key"]
-        if reducer_args.get("sort_reverse"):
-            kwargs["reverse"] = True
+        if "sort_reverse" in reducer_args:
+            kwargs["reverse"] = reducer_args["sort_reverse"]
         return sorted(it, **kwargs)
     if reducer_name == "join":
         return reducer_args["sep"].join(it)

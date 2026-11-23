@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D28).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D31).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -192,7 +192,6 @@ def test_d6_dict_order_change_reaches_dependents() -> None:
     assert keys() == ["b", "a"]
 
 
-@_defect(7, "rewritten float sum differs from the builtin")
 def test_d7_rewritten_float_sum_matches_builtin() -> None:
     engine = Engine()
     floats = CascadeList(engine, [0.1] * 10)
@@ -204,7 +203,6 @@ def test_d7_rewritten_float_sum_matches_builtin() -> None:
     assert total() == sum([0.1] * 10)
 
 
-@_defect(7, "rewritten sorted(reverse=True) is not stable")
 def test_d7_rewritten_sorted_reverse_is_stable() -> None:
     engine = Engine()
     pairs = CascadeList(engine, [(1, "a"), (1, "b")])
@@ -216,7 +214,6 @@ def test_d7_rewritten_sorted_reverse_is_stable() -> None:
     assert ordered() == sorted([(1, "a"), (1, "b")], key=lambda p: p[0], reverse=True)
 
 
-@_defect(7, "rewritten any/all do not short-circuit")
 def test_d7_rewritten_any_short_circuits() -> None:
     engine = Engine()
     zs = CascadeList(engine, [1, 0])
@@ -227,6 +224,67 @@ def test_d7_rewritten_any_short_circuits() -> None:
 
     # The builtin stops at the first truthy element and never divides by 0.
     assert any_reciprocal() is True
+
+
+@_defect(29, "a CascadeSet iterates in another order when the body is not rewritten")
+def test_d29_set_order_is_the_same_rewritten_or_not() -> None:
+    engine = Engine()
+    s = CascadeSet(engine, [30, 1, 20])
+
+    @engine.query
+    def rewritten() -> list[int]:
+        return [x for x in s]
+
+    @engine.query(incremental=False)
+    def unrewritten() -> list[int]:
+        return [x for x in s]
+
+    # Either order would do, as long as it is one order.
+    assert rewritten() == unrewritten()
+
+
+@_defect(30, "an assignment expression in a rewritten comprehension is lost")
+def test_d30_walrus_in_a_comprehension_binds_in_the_query() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2, 3])
+
+    @engine.query
+    def last_seen() -> Any:
+        last = None
+        out = [(last := x) for x in xs]
+        return (last, out)
+
+    assert last_seen() == (3, [1, 2, 3])
+
+
+# The accumulator is reached through a global: a stage function that closes
+# over one cannot be fingerprinted, so its pipeline is rebuilt on every run
+# and the defect does not show.
+_D31: dict[str, Any] = {}
+
+
+def _d31_note(x: int) -> int:
+    _D31["seen"].push(x)
+    return x
+
+
+@_defect(31, "effects pushed in a rewritten stage are not replayed for held elements")
+def test_d31_effects_pushed_per_element_survive_an_incremental_update() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2, 3])
+    _D31["seen"] = engine.accumulator("seen")
+
+    @engine.query
+    def total() -> int:
+        return sum(_d31_note(x) for x in xs)
+
+    first: dict[str, list[Any]] = {}
+    assert total(effects=first) == 6
+    assert first == {"seen": [1, 2, 3]}
+    xs.append(4)
+    second: dict[str, list[Any]] = {}
+    assert total(effects=second) == 10
+    assert second == {"seen": [1, 2, 3, 4]}
 
 
 def test_d8_builtin_shadowed_in_enclosing_scope_is_not_rewritten() -> None:
