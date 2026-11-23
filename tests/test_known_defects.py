@@ -233,7 +233,6 @@ def test_d7_rewritten_any_short_circuits() -> None:
     assert any_reciprocal() is True
 
 
-@_defect(8, "a builtin shadowed in an enclosing function is still rewritten")
 def test_d8_builtin_shadowed_in_enclosing_scope_is_not_rewritten() -> None:
     engine = Engine()
     xs = CascadeList(engine, [1, 2])

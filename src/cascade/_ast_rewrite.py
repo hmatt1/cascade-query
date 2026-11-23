@@ -17,9 +17,9 @@ Boundaries are strict and fail toward normal execution:
   stream alignment across several diff queues, so neither can be made
   incremental safely.
 * Arbitrary ``for`` loops are never touched.
-* If any relevant builtin name is shadowed in the function or its module, or
-  the source cannot be parsed, or the function is async or a lambda, the
-  function is registered unmodified.
+* If any relevant builtin name is shadowed in the function, in a function
+  enclosing it, or in its module, or the source cannot be parsed, or the
+  function is async or a lambda, the function is registered unmodified.
 
 The rewritten function is compiled against the original filename with the
 original line numbers, and its closure cells are the original cell objects,
@@ -74,6 +74,11 @@ def _rewrite(
             builtins, name, None
         ):
             return None
+    # A name the function takes from an enclosing function (a closure free
+    # variable) is not the builtin either. Names used only by a function
+    # nested inside the query show up here too, since they pass through it.
+    if (_RELEVANT | _EXCLUDED_SOURCES).intersection(fn.__code__.co_freevars):
+        return None
 
     lines, start = inspect.getsourcelines(fn)
     tree = ast.parse(textwrap.dedent("".join(lines)))

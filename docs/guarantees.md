@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D3, D5–D8) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D1–D3, D5–D7) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Broken for fixed-point queries (D2) | Strong otherwise |
@@ -43,7 +43,7 @@ Every open defect has a failing regression test in
 | G19 | Equal values of the same type encode to the same bytes | Holds | Weak |
 | G20 | A corrupt or old-format cache entry is recomputed, not served | Holds for query results; broken for collections (D16) | Medium |
 | G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5) | Strong for mutators |
-| G22 | A rewritten query returns what the plain Python would | Broken (D1, D7, D8) | Weak on edge cases |
+| G22 | A rewritten query returns what the plain Python would | Broken (D1, D7) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Broken (D12) | Strong for one snapshot |
 | G25 | A transaction applies completely or not at all | Broken (D12, D17) | Strong for inputs only |
@@ -437,8 +437,9 @@ reducers `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`,
 
 Not rewritten, falling back to plain Python: comprehensions with more than one
 `for`, `enumerate`, `zip`, `min`/`max` with `key=` or `default=`, `sum` with a
-start value, lambdas, async queries, and any query that rebinds one of those
-builtin names locally or at module level.
+start value, lambdas, async queries, and any query for which one of those
+builtin names is rebound: in the query, in a function enclosing it, or at
+module level.
 
 By design, iterating a `CascadeSet` yields insertion order.
 
@@ -447,6 +448,7 @@ Enforced by: `test_incremental_pipeline.py::test_list_reducers_match_recompute_t
 `::test_property_dict_pipeline_equals_recompute` (Hypothesis),
 `::test_min_max_handle_removal_of_current_extreme`, `::test_empty_collection_reducers`,
 `test_ast_rewrite.py::test_shadowed_builtin_disables_rewriting`,
+`::test_builtin_shadowed_in_an_enclosing_function_disables_rewriting`,
 `::test_enumerate_and_zip_sources_untouched`.
 
 ### G23. Incrementality
@@ -534,7 +536,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D5 | Collection reads that are not tracked go stale inside queries: `set(s)`, `s \| x`, set and dict `==`, `s.issubset`, `xs + [...]`, `repr`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. | Reproduced |
 | D6 | Early bail-out treats dicts that differ only in insertion order as equal, so a dependent that iterates the dict keeps the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
-| D8 | A builtin shadowed in an enclosing function is still rewritten. With an outer `sum = lambda it: "shadowed"`, the query returns 3. | Reproduced |
 | D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
 
 ### Data loss and corruption
@@ -564,6 +565,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D14 | `CascadeSet.update` and `difference_update` kept the part applied before a failure in storage but not in the log, so queries never saw it. Also found and fixed: list `pop`, `insert`, `xs[i] = v` and `del xs[i]` with an `__index__` object changed the list and then raised before logging. | `fix: a failed set update left elements that queries never saw` |
 | D4 | `compute_many`, `compute_many_stream` or `submit` called inside a query recorded no dependency, so the parent never invalidated. The first two now record each requested query; `submit` inside a query raises `RuntimeError`. | `fix: queries run through compute_many inside a query were not tracked` |
 | D9 | Functions registered under one `module:qualname` shared a cache (`make(1)()` and `make(2)()` both returned 1), and a handle to a replaced function kept running old code into it. A different function now replaces the old one, whose handles raise `StaleHandleError`; `name=` on `engine.query` and `engine.input` gives factories and lambdas distinct identities. | `fix: two functions registered under one name shared cached results` |
+| D8 | A builtin shadowed in an enclosing function was still rewritten (an outer `sum = lambda it: "shadowed"` was ignored). The rewriter now declines when a relevant name is a closure variable. | `fix: a builtin shadowed in an enclosing function was still rewritten` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed

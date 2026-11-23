@@ -281,6 +281,145 @@ def test_shadowed_builtin_disables_rewriting(engine):
     assert q() == 99
 
 
+def _shadowing_sum(engine, xs):
+    def sum(it):  # noqa: A001
+        return "shadowed"
+
+    @engine.query
+    def q():
+        return sum([x for x in xs])
+
+    return q
+
+
+def _shadowing_len(engine, xs):
+    len = lambda it: "shadowed"  # noqa: E731, A001
+
+    @engine.query
+    def q():
+        return len([x for x in xs])
+
+    return q
+
+
+def _shadowing_sorted(engine, xs):
+    sorted = lambda it: "shadowed"  # noqa: E731, A001
+
+    @engine.query
+    def q():
+        return sorted(x for x in xs)
+
+    return q
+
+
+def _shadowing_map(engine, xs):
+    map = lambda fn, it: "shadowed"  # noqa: E731, A001
+
+    @engine.query
+    def q():
+        return map(str, xs)
+
+    return q
+
+
+def _shadowing_filter(engine, xs):
+    filter = lambda fn, it: ["shadowed"]  # noqa: E731, A001
+
+    @engine.query
+    def q():
+        return list(filter(None, xs))[0]
+
+    return q
+
+
+def _shadowing_list_as_parameter(engine, xs, list=lambda it: "shadowed"):  # noqa: A002
+    @engine.query
+    def q():
+        return list(x for x in xs)
+
+    return q
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        _shadowing_sum,
+        _shadowing_len,
+        _shadowing_sorted,
+        _shadowing_map,
+        _shadowing_filter,
+        _shadowing_list_as_parameter,
+    ],
+)
+def test_builtin_shadowed_in_an_enclosing_function_disables_rewriting(engine, make):
+    xs = CascadeList(engine, [3, 1, 2])
+    q = make(engine, xs)
+    assert not rewritten(q)
+    assert q() == "shadowed"
+    xs.append(4)
+    assert q() == "shadowed"
+
+
+def test_builtin_shadowed_two_scopes_out_disables_rewriting(engine):
+    xs = CascadeList(engine, [1, 2])
+
+    def outermost():
+        sum = lambda it: "shadowed"  # noqa: E731, A001
+
+        def middle():
+            @engine.query
+            def q():
+                return sum([x for x in xs])
+
+            return q
+
+        return middle()
+
+    q = outermost()
+    assert not rewritten(q)
+    assert q() == "shadowed"
+
+
+def test_builtin_shadowed_for_a_function_nested_in_the_query(engine):
+    xs = CascadeList(engine, [1, 2])
+
+    def outer():
+        len = lambda it: "shadowed"  # noqa: E731, A001
+
+        @engine.query
+        def q():
+            def inner():
+                return len([x for x in xs])
+
+            return inner()
+
+        return q
+
+    q = outer()
+    assert not rewritten(q)
+    assert q() == "shadowed"
+
+
+def test_unrelated_closure_variables_do_not_disable_rewriting(engine):
+    xs = CascadeList(engine, [1, 2])
+
+    def outer():
+        factor = 10
+        total = "not a builtin the rewriter cares about"
+
+        @engine.query
+        def q():
+            return sum(x * factor for x in xs), total
+
+        return q
+
+    q = outer()
+    assert rewritten(q)
+    assert q()[0] == 30
+    xs.append(3)
+    assert q()[0] == 60
+
+
 def test_lambda_and_async_queries_not_rewritten(engine):
     xs = CascadeList(engine, [1, 2])
     lam = engine.query(lambda: sum(x for x in xs))
