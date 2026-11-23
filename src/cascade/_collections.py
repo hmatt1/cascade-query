@@ -34,6 +34,7 @@ import threading
 import uuid
 from typing import Any, Callable, Iterable, Mapping
 
+from . import _canonical
 from ._errors import PersistentCacheError
 
 _KIND_LIST = "list"
@@ -258,14 +259,20 @@ class _CollectionCore:
         start = self.log.head
         for i, diff in enumerate(diffs):
             diff["rev"] = start + i + 1
+        tx = self.engine._active_transaction()
         if self.disk is not None:
-            # Persist before committing to the in-memory log so a failure
-            # (unserializable value, cache full) leaves no partial state:
-            # the owner collection is rolled back to the log's truth.
+            # Persist (or, inside a transaction, check the diffs can be
+            # persisted) before committing to the in-memory log, so a failure
+            # leaves no partial state: the owner collection is rolled back to
+            # the log's truth.
             try:
-                self.disk.collection_append_many(
-                    self.name, [(diff["rev"], diff) for diff in diffs]
-                )
+                if tx is None:
+                    self.disk.collection_append_many(
+                        self.name, [(diff["rev"], diff) for diff in diffs]
+                    )
+                else:
+                    for diff in diffs:
+                        _canonical.encode(diff)
             except PersistentCacheError:
                 self._rollback()
                 raise
@@ -274,16 +281,53 @@ class _CollectionCore:
                 raise PersistentCacheError(
                     f"collection {self.name!r} received a value that cannot be persisted: {exc}"
                 ) from exc
+        if tx is not None:
+            tx.collections.setdefault(self, start)
+            if self.disk is not None:
+                tx.pending_disk.setdefault(self, []).extend(
+                    (diff["rev"], diff) for diff in diffs
+                )
         for diff in diffs:
             self.log.append(diff)
         self.handle.set(self.log.head)
+        if tx is None:
+            self._maybe_compact_disk()
+        if len(self.log.entries) >= self._next_memory_check:
+            self.compact_memory()
+
+    def _maybe_compact_disk(self) -> None:
         if (
             self.disk is not None
             and self.log.head - self._compacted_base >= self.compact_every
         ):
             self.compact()
-        if len(self.log.entries) >= self._next_memory_check:
-            self.compact_memory()
+
+    def write_pending(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
+        """Write diffs a transaction held back; called when it commits."""
+        try:
+            self.disk.collection_append_many(self.name, batch)
+        except PersistentCacheError:
+            raise
+        except Exception as exc:
+            raise PersistentCacheError(
+                f"collection {self.name!r} could not persist its changes: {exc}"
+            ) from exc
+
+    def after_commit(self) -> None:
+        """Run the disk compaction a transaction deferred."""
+        self._maybe_compact_disk()
+
+    def roll_back_to(self, head: int) -> None:
+        """Undo every change after ``head`` (a failed transaction).
+
+        In-memory compaction never folds past the committed head, so the
+        diffs being dropped are still in the log.
+        """
+        log = self.log
+        with log.lock:
+            if log.head > head:
+                del log.entries[head - log.base_rev :]
+        self._rollback()
 
     def _live_len(self) -> int:
         # The owner's own __len__ records a dependency inside a query.

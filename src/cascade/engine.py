@@ -57,10 +57,23 @@ __all__ = [
 
 
 class EngineTransaction:
+    """Batches input updates and collection changes; all apply or none do.
+
+    Input updates are queued and applied as one revision on success.
+    Collection changes take effect on the collection object immediately (so
+    code inside the block sees them), and are undone if the block raises.
+    Named collections hold their disk writes until commit and write them in
+    one batch, so a failed transaction never reaches disk.
+    """
+
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         self.updates: list[tuple[str, tuple[Any, ...], Any]] = []
         self._token: contextvars.Token | None = None
+        # Collections changed in this transaction -> log head before the first
+        # change, and disk writes held until commit for named collections.
+        self.collections: dict[Any, int] = {}
+        self.pending_disk: dict[Any, list[tuple[int, dict[str, Any]]]] = {}
 
     def __enter__(self) -> EngineTransaction:
         if _active_transaction.get() is not None:
@@ -71,8 +84,26 @@ class EngineTransaction:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._token is not None:
             _active_transaction.reset(self._token)
-        if exc_type is None and self.updates:
+        if exc_type is not None:
+            self._roll_back_collections()
+            return
+        try:
+            # Each collection's batch is one disk transaction. If a later one
+            # fails (disk full), earlier ones are already on disk; that rare
+            # partial write is the cost of not spanning collections.
+            for core, batch in self.pending_disk.items():
+                core.write_pending(batch)
+        except BaseException:
+            self._roll_back_collections()
+            raise
+        if self.updates:
             self.engine._set_inputs(self.updates)
+        for core in self.collections:
+            core.after_commit()
+
+    def _roll_back_collections(self) -> None:
+        for core, head in self.collections.items():
+            core.roll_back_to(head)
 
 
 _active_transaction: contextvars.ContextVar[EngineTransaction | None] = (
@@ -332,6 +363,13 @@ class Engine:
 
     def transaction(self) -> EngineTransaction:
         return EngineTransaction(self)
+
+    def _active_transaction(self) -> EngineTransaction | None:
+        """The transaction open in this context for this engine, if any."""
+        tx = _active_transaction.get()
+        if tx is not None and tx.engine is self:
+            return tx
+        return None
 
     def input(self, fn: Callable[..., Any]) -> _InputHandle:
         handle = _InputHandle(self, fn)

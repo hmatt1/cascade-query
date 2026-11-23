@@ -82,7 +82,7 @@ The `Engine` manages caching, execution, and state tracking.
 ### Snapshots & Transactions (Input Debouncing)
 
 *   **`engine.snapshot()`**: Returns a `Snapshot` object pinning the current global revision. Use `query(snapshot=s)` to read data as it existed at that revision.
-*   **`engine.transaction()`**: When updating multiple inputs, intermediate read states ("flapping") can cause inconsistent evaluations. Use a transaction block to batch updates so they are committed atomically. Only the last value set for each input counts, inputs that end at their current value are skipped, and a transaction that changes nothing leaves the revision alone.
+*   **`engine.transaction()`**: When updating multiple inputs, intermediate read states ("flapping") can cause inconsistent evaluations. Use a transaction block to batch updates so they are committed atomically. Only the last value set for each input counts, inputs that end at their current value are skipped, and a transaction that changes nothing leaves the revision alone. Collection changes made inside the block are visible to the code in it right away, and are undone if the block raises.
 
 The engine keeps old input values only while something can still read them: a snapshot that has not been released, or a call that is still running. Release a snapshot when you are done with it, either with a `with` block or `release()`; dropping every reference to it also releases it. Reading through a released snapshot raises `SnapshotExpiredError` once its history has been trimmed.
 
@@ -316,6 +316,8 @@ for i in range(10000):
 # FAST (1 single disk sync)
 docs.update({f"doc_{i}": i for i in range(10000)})
 ```
+
+Inside `engine.transaction()`, named collections hold their disk writes until the block finishes and then write them in one batch per collection; if the block raises, nothing reaches disk. A value that cannot be persisted still raises at the mutating call.
 
 *(Note: `.update()` behaves exactly like a standard Python dictionary. If a key already exists, it will seamlessly overwrite the old value by batching an `"upsert"` event to the underlying log, ensuring downstream queries receive the correct diffs.)*
 
