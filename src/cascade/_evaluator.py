@@ -722,6 +722,38 @@ class Evaluator:
                 return False
         return True
 
+    def _shadow_entry(
+        self, key: QueryKey, fn: Callable[..., Any], *, need_value: bool
+    ) -> MemoEntry:
+        """Bring ``key`` up to date in the current shadow runtime; return its entry.
+
+        Equivalent to ``query_call`` from a runtime with an empty stack, except
+        that it returns the entry verified or computed at the runtime's
+        snapshot. Callers must use that entry instead of re-reading
+        ``memos[key]`` afterwards: the store keeps one row per key, and a
+        concurrent reader at another revision may already have replaced it.
+        """
+        runtime = self._runtime_var.get()
+        assert runtime is not None
+        self.check_cancelled(runtime.cancel_epoch)
+        entry, _ = self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
+        if entry.error is not None:
+            raise entry.error
+        return entry
+
+    async def _shadow_entry_async(
+        self, key: QueryKey, fn: Callable[..., Any], *, need_value: bool
+    ) -> MemoEntry:  # pragma: no cover
+        runtime = self._runtime_var.get()
+        assert runtime is not None
+        self.check_cancelled(runtime.cancel_epoch)
+        entry, _ = await self.compute_or_get_memo_async(
+            key, fn, runtime, need_value=need_value
+        )
+        if entry.error is not None:
+            raise entry.error
+        return entry
+
     def dependency_changed_at(self, key: QueryKey, snapshot: Snapshot) -> int:
         kind, fid, args = key
         if kind == "input":
@@ -744,7 +776,7 @@ class Evaluator:
 
         if runtime is None:
             self._store.pin_snapshot(snapshot)
-            self._run_in_runtime(
+            entry = self._run_in_runtime(
                 RuntimeState(
                     snapshot=snapshot,
                     stack=[],
@@ -754,15 +786,7 @@ class Evaluator:
                     snapshot_explicit=True,
                     pins=[snapshot.revision],
                 ),
-                lambda: self.query_call(
-                    fid,
-                    fn,
-                    args,
-                    snapshot=snapshot,
-                    effects=None,
-                    cancel_epoch=None,
-                    need_value=False,
-                ),
+                lambda: self._shadow_entry(key, fn, need_value=False),
             )
         else:
             # Dependency verification should not add edges to currently executing frame.
@@ -774,24 +798,15 @@ class Evaluator:
                 cancel_epoch=runtime.cancel_epoch,
                 snapshot_explicit=True,
             )
-            self._run_in_runtime(
+            entry = self._run_in_runtime(
                 shadow,
-                lambda: self.query_call(
-                    fid,
-                    fn,
-                    args,
-                    snapshot=snapshot,
-                    effects=None,
-                    cancel_epoch=runtime.cancel_epoch,
-                    need_value=False,
-                ),
+                lambda: self._shadow_entry(key, fn, need_value=False),
             )
 
-        with self._store.lock:
-            refreshed = self._store.memos.get(key)
-            if refreshed is None:  # pragma: no cover - safety belt
-                raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
-            return refreshed.changed_at
+        # The entry verified at ``snapshot``, not ``memos[key]``: a reader at
+        # another revision may already have replaced that row, and its
+        # changed_at says nothing about this revision.
+        return entry.changed_at
 
     async def dependency_changed_at_async(
         self, key: QueryKey, snapshot: Snapshot
@@ -817,7 +832,7 @@ class Evaluator:
 
         if runtime is None:
             self._store.pin_snapshot(snapshot)
-            await self._run_in_runtime_async(
+            entry = await self._run_in_runtime_async(
                 RuntimeState(
                     snapshot=snapshot,
                     stack=[],
@@ -828,15 +843,7 @@ class Evaluator:
                     is_async=True,
                     pins=[snapshot.revision],
                 ),
-                lambda: self.query_call_async(
-                    fid,
-                    fn,
-                    args,
-                    snapshot=snapshot,
-                    effects=None,
-                    cancel_epoch=None,
-                    need_value=False,
-                ),
+                lambda: self._shadow_entry_async(key, fn, need_value=False),
             )
         else:
             shadow = RuntimeState(
@@ -848,24 +855,12 @@ class Evaluator:
                 snapshot_explicit=True,
                 is_async=True,
             )
-            await self._run_in_runtime_async(
+            entry = await self._run_in_runtime_async(
                 shadow,
-                lambda: self.query_call_async(
-                    fid,
-                    fn,
-                    args,
-                    snapshot=snapshot,
-                    effects=None,
-                    cancel_epoch=runtime.cancel_epoch,
-                    need_value=False,
-                ),
+                lambda: self._shadow_entry_async(key, fn, need_value=False),
             )
 
-        with self._store.lock:
-            refreshed = self._store.memos.get(key)
-            if refreshed is None:  # pragma: no cover - safety belt
-                raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
-            return refreshed.changed_at
+        return entry.changed_at
 
     def _restart_cycle(
         self, runtime: RuntimeState, frame: RuntimeFrame, key: QueryKey
@@ -1393,22 +1388,13 @@ class Evaluator:
             cancel_epoch=runtime.cancel_epoch,
             snapshot_explicit=runtime.snapshot_explicit,
         )
-        self._run_in_runtime(
+        entry = self._run_in_runtime(
             shadow,
-            lambda: self.query_call(
-                query_id,
-                fn,
-                args,
-                snapshot=runtime.snapshot,
-                effects=None,
-                cancel_epoch=runtime.cancel_epoch,
-            ),
+            lambda: self._shadow_entry(dep_key, fn, need_value=True),
         )
-        with self._store.lock:
-            memo = self._store.memos.get(dep_key)
-            if memo is None:
-                return None
-            return memo.value_hash, memo.changed_at
+        # As in dependency_changed_at: use the entry valid at this revision,
+        # not whatever row is stored by now.
+        return entry.value_hash, entry.changed_at
 
     async def _try_hydrate_from_disk_async(
         self, key: QueryKey, runtime: RuntimeState
@@ -1615,22 +1601,11 @@ class Evaluator:
             snapshot_explicit=runtime.snapshot_explicit,
             is_async=True,
         )
-        await self._run_in_runtime_async(
+        entry = await self._run_in_runtime_async(
             shadow,
-            lambda: self.query_call_async(
-                query_id,
-                fn,
-                args,
-                snapshot=runtime.snapshot,
-                effects=None,
-                cancel_epoch=runtime.cancel_epoch,
-            ),
+            lambda: self._shadow_entry_async(dep_key, fn, need_value=True),
         )
-        with self._store.lock:
-            memo = self._store.memos.get(dep_key)
-            if memo is None:
-                return None  # pragma: no cover
-            return memo.value_hash, memo.changed_at
+        return entry.value_hash, entry.changed_at
 
     def _disk_worker(self) -> None:
         if self._disk is None or self._disk_queue is None:
