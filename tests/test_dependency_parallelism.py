@@ -206,3 +206,40 @@ def test_compute_many_layered_dependencies_run_once_per_key() -> None:
             ]
         )
     assert result == expected
+
+
+def test_result_stored_between_cache_miss_and_claim_is_reused() -> None:
+    """A caller that missed the cache must not re-run a query that finished
+    before it could register as in flight.
+
+    The window is forced deterministically: the first cache lookup for the
+    query completes a whole nested evaluation before returning, exactly as
+    another thread would between the lookup and the in-flight claim.
+    """
+    engine = Engine()
+    runs = 0
+
+    @engine.query
+    def answer() -> int:
+        nonlocal runs
+        runs += 1
+        return 42
+
+    store = engine._store
+    original = store.lookup_query_memoize
+    raced = False
+
+    def lookup_then_race(query_id: str) -> bool:
+        nonlocal raced
+        if not raced:
+            raced = True
+            assert answer() == 42
+        return original(query_id)
+
+    store.lookup_query_memoize = lookup_then_race  # type: ignore[method-assign]
+    try:
+        assert answer() == 42
+    finally:
+        store.lookup_query_memoize = original  # type: ignore[method-assign]
+    assert raced
+    assert runs == 1

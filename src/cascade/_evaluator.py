@@ -483,8 +483,15 @@ class Evaluator:
 
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
-            slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
+            finished = self._finished_meanwhile_locked(
+                in_flight_key, existing, is_memoized or not need_value
+            )
+            if finished is None:
+                slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
 
+        if finished is not None:
+            self._store.trace_event("cache_hit", key)
+            return finished, True
         if waiter_future is not None:
             self._store.trace_event("dedup_wait", key)
             result = waiter_future.result()
@@ -546,8 +553,15 @@ class Evaluator:
 
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
-            slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
+            finished = self._finished_meanwhile_locked(
+                in_flight_key, existing, is_memoized or not need_value
+            )
+            if finished is None:
+                slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
 
+        if finished is not None:
+            self._store.trace_event("cache_hit", key)
+            return finished, True
         if waiter_future is not None:
             self._store.trace_event("dedup_wait", key)
             result = await asyncio.wrap_future(waiter_future)
@@ -578,6 +592,29 @@ class Evaluator:
             if self._store.memos.get(key) is memo:
                 self._store.refresh_head_clean_locked(memo, revision, key[1])
                 self._store.touch_memo_locked(key)
+
+    def _finished_meanwhile_locked(
+        self,
+        in_flight_key: tuple[QueryKey, int],
+        seen: MemoEntry | None,
+        usable: bool,
+    ) -> MemoEntry | None:
+        """Result another thread stored since this caller looked, if any.
+
+        The caller read ``memos`` (finding ``seen``) and then dropped the
+        lock. An owner that stored its result and released its in-flight
+        slot in that gap leaves nothing to wait on, so without this check
+        the caller would claim a fresh slot and run the query a second time.
+        Caller must hold ``store.lock``.
+        """
+        key, revision = in_flight_key
+        if not usable or in_flight_key in self._store.in_flight:
+            return None
+        memo = self._store.memos.get(key)
+        if memo is None or memo is seen or memo.verified_at != revision:
+            return None
+        self._store.touch_memo_locked(key)
+        return memo
 
     def _claim_in_flight_locked(
         self, in_flight_key: tuple[QueryKey, int]
