@@ -255,15 +255,21 @@ class GraphStore:
         fn_hash = hash_bytecode(fn)
         slot = ("query", query_id)
         with self.lock:
+            known = query_id in self.queries
             fn, drop = self._replace_locked(
                 slot, self.queries.get(query_id), fn, fn_hash
             )
+            if known and self.query_ttl.get(query_id) != ttl:
+                # Cached results, and everything computed from them, carry
+                # an expiry worked out from the old TTL.
+                drop = True
             if drop:
                 drop_keys = [
                     k for k in self.memos if k[0] == "query" and k[1] == query_id
                 ]
                 for k in drop_keys:
                     self.drop_memo_locked(k)
+                self.reverify_all_locked()
             self.queries[query_id] = fn
             self.query_hashes[query_id] = self._stored_hash_locked(slot)
             self.query_memoize[query_id] = memoize
@@ -394,7 +400,17 @@ class GraphStore:
                 for k in drop_keys:
                     self.inputs.pop(k, None)
                     self._multi_version_keys.discard(k)
-                    self.mark_dependents_dirty_locked(("input", k[0], k[1]))
+                # Everything computed from the old default must be looked at
+                # again. Direct readers are dropped outright: one that read
+                # the default without storing it (a snapshot read) recorded
+                # "no stored version", which is also what it would find now.
+                read_keys = [
+                    k for k in self.dependents if k[0] == "input" and k[1] == input_id
+                ]
+                for read_key in read_keys:
+                    for reader in list(self.dependents.get(read_key, ())):
+                        self.drop_memo_locked(reader)
+                self.reverify_all_locked()
             self.input_fns[input_id] = fn
             self.input_hashes[input_id] = self._stored_hash_locked(slot)
             return fn
@@ -654,6 +670,25 @@ class GraphStore:
                 if memo is not None and memo.head_clean:
                     memo.head_clean = False
                     stack.append(parent)
+
+    def reverify_all_locked(self) -> None:
+        """Make every memo verify its dependencies again before it is used.
+
+        For a change that no revision records: new code registered under a
+        name. A memo verified at a revision is otherwise used at that
+        revision without another look (``is_current_locked``), so after such
+        a change it would keep serving what the old code produced.
+
+        All memos, not only those ``dependents`` reaches from the replaced
+        function: an evicted memo takes its edges with it, so a result two
+        levels above the function can be cut off from it. An input change
+        gets past such gaps by moving the revision; this does the same for
+        every revision, snapshots included, at the cost of one dependency
+        walk per memo after a re-registration.
+        """
+        for memo in self.memos.values():
+            memo.verified_at = -1
+            memo.head_clean = False
 
     def is_current_locked(self, memo: MemoEntry, revision: int) -> bool:
         """True when ``memo`` needs no dependency walk to be used at ``revision``."""

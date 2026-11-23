@@ -32,7 +32,7 @@ Every open defect has a failing regression test in
 | G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits (D20) | Strong |
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
-| G11 | Re-registering a query with changed code drops its cached results | Holds with limits | Positive cases only |
+| G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
 | G12 | Accumulator effects are replayed on cache hits, in a fixed order | Holds | Good |
 | G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Holds | Strong for eviction and prune |
 | G14 | Async queries behave like sync queries | Holds with limits (D21) | Weak |
@@ -265,10 +265,21 @@ Enforced by: `test_memoize_false.py::test_memoize_false`,
 ### G11. Code-aware invalidation
 
 Registering a query or input whose bytecode hash differs from the one cached
-drops its results, in memory and on disk, and marks dependents for
-re-verification. This happens at registration, not while the old function is
-still registered. Handles to the replaced function go stale and raise
-`StaleHandleError` when used (see G1, identity).
+drops its results, in memory and on disk, and makes every other cached result
+verify its dependencies again before it is used. A result computed from the
+old code is therefore re-run on its next use, at the newest revision or
+through a snapshot, whether or not an input changed in between; if it comes
+out equal, the results above it are kept. This happens at registration, not
+while the old function is still registered. Handles to the replaced function
+go stale and raise `StaleHandleError` when used (see G1, identity).
+
+Registering a query again with a different `ttl=` does the same, because
+cached results carry an expiry worked out from the old TTL (G9).
+
+Cost: after such a registration every cached result pays one dependency walk
+on its next use, as it does after an input change it does not depend on when
+the walk cannot be skipped. Results read directly from a replaced input are
+dropped and re-run.
 
 The hash covers the function's bytecode, constants, names and local variable
 names. It does not cover closure values, default arguments, globals, or any
@@ -285,6 +296,18 @@ Enforced by: `test_code_versioning.py::test_memory_cache_invalidation_on_code_ch
 `::test_disk_cache_invalidation_on_code_change`,
 `::test_input_cache_invalidation_on_code_change`,
 `test_dirty_propagation.py::test_reregistering_a_query_dirties_its_dependents`,
+`test_known_defects.py::test_d22_reregistered_query_reaches_dependents_at_the_same_revision`,
+`test_code_versioning.py::test_reregistered_query_reaches_a_chain_of_dependents_at_the_same_revision`,
+`::test_reregistered_query_with_an_equal_result_stops_at_its_first_dependent`,
+`::test_reregistered_query_reaches_dependents_read_through_a_snapshot`,
+`::test_reregistered_query_reaches_dependents_after_a_result_was_evicted`,
+`::test_reregistered_input_default_reaches_dependents_at_the_same_revision`,
+`::test_reregistered_input_default_reaches_dependents_that_never_stored_it`,
+`::test_reregistered_query_reaches_async_dependents`,
+`::test_reregistering_with_another_ttl_applies_it_to_cached_results`,
+`::test_reregistered_query_reaches_dependents_with_a_disk_cache` and
+`::test_reregistered_query_reaches_in_memory_dependents_with_a_disk_cache`
+(both backends),
 `test_query_identity.py::test_reload_with_changed_code_makes_old_handles_stale`,
 `::test_reload_with_unchanged_code_keeps_results_and_handles`,
 `::test_replacing_function_does_not_load_the_old_ones_results_from_disk`.
@@ -560,7 +583,8 @@ Enforced by: `test_incremental_persistence.py::test_named_collections_restore_ac
 ## Defects
 
 "Reproduced" means re-run independently for this audit on Python 3.12.9, and
-pinned by an expected-failure test in `tests/test_known_defects.py`.
+pinned by an expected-failure test in `tests/test_known_defects.py`. D22 was
+found after the audit, while fixing D9.
 "Reported" means found and probed during the audit but not re-run a second
 time; it now applies only to the two sub-items of D7 marked that way.
 
@@ -604,18 +628,11 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D8 | A builtin shadowed in an enclosing function was still rewritten (an outer `sum = lambda it: "shadowed"` was ignored). The rewriter now declines when a relevant name is a closure variable. | `fix: a builtin shadowed in an enclosing function was still rewritten` |
 | D11 | `clear_disk_cache()` wiped the disk log of live named collections, so `[1, 2, 3]`, cleared, then `append(4)`, restored as `[4]`. It now deletes cached results only and leaves collection logs alone. | `fix: clearing the disk cache deleted named collections' data` |
 | D3 | An expired TTL query was not refreshed when reached through a dependent already verified at the current revision (`parent()` returned 10 before and after expiry). Two causes: a result verified at a revision was trusted at that revision for ever, and a re-run that changed the value at an unchanged revision looked unchanged to dependents. Results now carry the expiry of the TTL results beneath them, and a query's change marker is a stamp instead of the revision. | `fix: an expired TTL result was still served through queries that depend on it` |
+| D22 | Re-registering a query with changed code while `engine.revision` had not moved since its dependents were computed left those dependents serving old results (`top()` stayed 2 where a fresh run gives 11). The dependents counted as verified at that revision and were not looked at again; an input change in between hid it. The same held for an input registered again with a changed default and read through a snapshot, and for dependents cut off from the function by an evicted result. Registration with changed code now makes every cached result verify again. | `fix: results computed from a query's old code survived its re-registration` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
 because the map was full.
-
-Found while fixing D9, not yet numbered or pinned by a test: re-registering a
-query with changed code while `engine.revision` has not moved since its
-dependents were computed leaves those dependents serving their old results
-(`top()` stayed 2 where a fresh run gives 11). The new result gets the same
-`changed_at` revision as the one it replaces, so re-verification sees no
-change. An input change in between hides it, which is why
-`test_reregistering_a_query_dirties_its_dependents` passes.
 
 ## Limits that restrict who can use the library
 
@@ -665,14 +682,14 @@ with a single sequential actor. TLC checks six invariants in CI.
   transactions, collections, compaction, errors, TTL, eviction. The model
   uses the revision as the change marker of a query result; the code uses a
   separate stamp (G1).
-- None of D1–D21 is reachable in the model.
+- None of D1–D22 is reachable in the model.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Regression tests for the open defects exist but are expected
-   failures.** `tests/test_known_defects.py` has one test per defect (D1-D21),
+   failures.** `tests/test_known_defects.py` has one test per defect (D1-D22),
    each asserting the correct behaviour; those for open defects run under
    `xfail(strict=True)`. A fix removes the marker. The two "Reported"
    sub-items of D7 have no test.

@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D21).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D22).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -303,6 +303,28 @@ def test_d10_two_engines_on_one_named_collection(tmp_path: Path, backend: str) -
     finally:
         for engine in engines:
             engine.shutdown()
+
+
+def test_d22_reregistered_query_reaches_dependents_at_the_same_revision() -> None:
+    engine = Engine()
+
+    def base_v1() -> int:
+        return 1
+
+    def base_v2() -> int:
+        return 10
+
+    base_v2.__qualname__ = base_v1.__qualname__
+    base = engine.query(base_v1)
+
+    @engine.query
+    def top() -> int:
+        return base() + 1
+
+    assert top() == 2
+    # Changed code, registered again; no input changes in between.
+    base = engine.query(base_v2)
+    assert top() == 11
 
 
 # --- Data loss and corruption -----------------------------------------------
