@@ -1,7 +1,9 @@
 """Incremental collections that emit diffs into an append-only log.
 
 ``CascadeList``, ``CascadeSet``, and ``CascadeDict`` subclass the built-in
-types, so every read path behaves exactly like the plain collection. Mutating
+types, so every read path behaves exactly like the plain collection (inside a
+query running at an older revision, reads return the contents as of that
+revision; see ``_CollectionCore.read_view``). Mutating
 methods are intercepted: they perform the native mutation first, then append a
 diff record to the collection's log and bump a hidden engine input whose value
 is the log head. That hidden input is how the rest of the engine sees the
@@ -29,6 +31,7 @@ history.
 
 from __future__ import annotations
 
+import functools
 import itertools
 import threading
 import uuid
@@ -53,6 +56,27 @@ _MEMORY_COMPACT_THRESHOLD = 1024
 ABSENT_HEAD = -1
 
 _BASE_LEN = {_KIND_LIST: list.__len__, _KIND_SET: set.__len__, _KIND_DICT: dict.__len__}
+
+
+def _mutator(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a mutating method so the reads it makes internally stay live.
+
+    Mutators are written with ordinary reads (``len(self)``, ``self[i]``,
+    ``key in self``). Called inside a query, a second mutation would otherwise
+    read through ``read_view`` at the query's revision, which is already
+    behind the first one, and emit diffs computed from stale contents.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        local = self._core.mutating
+        local.depth = getattr(local, "depth", 0) + 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            local.depth -= 1
+
+    return wrapper
 
 
 class _HistoryCompacted(RuntimeError):
@@ -200,6 +224,10 @@ class _CollectionCore:
         self.owner: Any = None
         self._compacted_base = 0
         self._next_memory_check = _MEMORY_COMPACT_THRESHOLD
+        # (head, contents) last materialized for a reader at an older revision.
+        self._snapshot_cache: tuple[int, Any] | None = None
+        # Per-thread depth of mutating methods in progress (see _mutator).
+        self.mutating = threading.local()
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -252,10 +280,42 @@ class _CollectionCore:
         self.handle = engine.input(_head)
         self.handle.set(self.log.head)
 
-    def touch_read(self) -> None:
-        """Record a dependency on this collection when read inside a query."""
-        if self.engine._evaluator.in_runtime():
-            self.handle()
+    def read_view(self) -> Any:
+        """Contents a direct read must use, or None for the live storage.
+
+        Outside a query this is always None. Inside one it records the
+        dependency on this collection and, when the query runs at a revision
+        older than the collection's newest change (a snapshot read, or a
+        writer that got ahead of a running query), returns the contents as of
+        that revision: a plain list, set, or dict that must not be mutated or
+        handed out. Without this, ``xs[0]``, ``len(xs)``, ``for x in xs`` and
+        every query the AST rewriter leaves alone would read live data.
+        """
+        if not self.engine._evaluator.in_runtime():
+            return None
+        head = self.handle()
+        if getattr(self.mutating, "depth", 0):
+            return None
+        log = self.log
+        with log.lock:
+            if head != ABSENT_HEAD and head >= log.head:
+                return None
+            cached = self._snapshot_cache
+            if cached is not None and cached[0] == head:
+                return cached[1]
+            if head == ABSENT_HEAD:
+                # A revision from before this collection was created.
+                raw: Any = [] if self.kind != _KIND_DICT else {}
+            else:
+                raw = log.contents_at(head)
+            if self.kind == _KIND_LIST:
+                view: Any = [value for _uid, value in raw]
+            elif self.kind == _KIND_SET:
+                view = set(raw)
+            else:
+                view = raw
+            self._snapshot_cache = (head, view)
+            return view
 
     def head_for_current_context(self) -> int:
         """Log head as seen by the active runtime (snapshot-aware dependency read)."""
@@ -335,6 +395,8 @@ class _CollectionCore:
         with log.lock:
             if log.head > head:
                 del log.entries[head - log.base_rev :]
+            # The same head number can now come to mean different contents.
+            self._snapshot_cache = None
         self._rollback()
 
     def _live_len(self) -> int:
@@ -447,27 +509,32 @@ class CascadeList(list):
         return {"action": "insert", "uid": uid, "value": value, "index": index}
 
     # --- mutators ---
+    @_mutator
     def append(self, value: Any) -> None:
         list.append(self, value)
         self._core.emit([self._insert_diff(len(self) - 1, value)])
 
+    @_mutator
     def extend(self, iterable: Iterable[Any]) -> None:
         values = list(iterable)
         list.extend(self, values)
         start = len(self) - len(values)
         self._core.emit([self._insert_diff(start + i, v) for i, v in enumerate(values)])
 
+    @_mutator
     def insert(self, index: int, value: Any) -> None:
         eff = _clamped_insert_index(index, len(self))
         list.insert(self, index, value)
         self._core.emit([self._insert_diff(eff, value)])
 
+    @_mutator
     def remove(self, value: Any) -> None:
         index = self.index(value)
         list.__delitem__(self, index)
         uid = self._uids.pop(index)
         self._core.emit([{"action": "remove", "uid": uid, "value": value}])
 
+    @_mutator
     def pop(self, index: int = -1) -> Any:
         value = list.pop(self, index)
         eff = index if index >= 0 else len(self._uids) + index
@@ -475,6 +542,7 @@ class CascadeList(list):
         self._core.emit([{"action": "remove", "uid": uid, "value": value}])
         return value
 
+    @_mutator
     def clear(self) -> None:
         diffs = [
             {"action": "remove", "uid": uid, "value": value}
@@ -484,6 +552,7 @@ class CascadeList(list):
         self._uids.clear()
         self._core.emit(diffs)
 
+    @_mutator
     def __setitem__(self, index: int | slice, value: Any) -> None:
         if isinstance(index, slice):
             self._set_slice(index, value)
@@ -516,6 +585,7 @@ class CascadeList(list):
         inserted = [self._insert_diff(start + i, v) for i, v in enumerate(values)]
         self._core.emit(removed + inserted)
 
+    @_mutator
     def __delitem__(self, index: int | slice) -> None:
         if isinstance(index, slice):
             positions = list(range(*index.indices(len(self))))
@@ -534,6 +604,7 @@ class CascadeList(list):
         uid = self._uids.pop(eff)
         self._core.emit([{"action": "remove", "uid": uid, "value": value}])
 
+    @_mutator
     def sort(
         self, *, key: Callable[[Any], Any] | None = None, reverse: bool = False
     ) -> None:
@@ -544,6 +615,7 @@ class CascadeList(list):
         )
         self._reorder(pairs)
 
+    @_mutator
     def reverse(self) -> None:
         self._reorder(list(zip(self._uids, self))[::-1])
 
@@ -560,10 +632,12 @@ class CascadeList(list):
             inserted.append({"action": "insert", "uid": uid, "value": v, "index": i})
         self._core.emit(removed + inserted)
 
+    @_mutator
     def __iadd__(self, other: Iterable[Any]) -> CascadeList:
         self.extend(other)
         return self
 
+    @_mutator
     def __imul__(self, n: int) -> CascadeList:
         if n <= 0:
             self.clear()
@@ -574,39 +648,44 @@ class CascadeList(list):
         return self
 
     # --- tracked reads ---
+    # Each read goes through ``read_view``: the live storage normally, the
+    # contents as of the reader's revision inside a query that runs behind
+    # the newest change (see ``_CollectionCore.read_view``).
+    def _view(self) -> list:
+        view = self._core.read_view()
+        return self if view is None else view
+
     def __iter__(self):
-        self._core.touch_read()
-        return list.__iter__(self)
+        return list.__iter__(self._view())
 
     def __reversed__(self):
-        self._core.touch_read()
-        return list.__reversed__(self)
+        return list.__reversed__(self._view())
 
     def __len__(self) -> int:
-        self._core.touch_read()
-        return list.__len__(self)
+        return list.__len__(self._view())
 
     def __getitem__(self, index: Any) -> Any:
-        self._core.touch_read()
-        return list.__getitem__(self, index)
+        return list.__getitem__(self._view(), index)
 
     def __contains__(self, item: Any) -> bool:
-        self._core.touch_read()
-        return list.__contains__(self, item)
+        return list.__contains__(self._view(), item)
 
     def __eq__(self, other: Any) -> bool:
-        self._core.touch_read()
-        return list.__eq__(self, other)
+        return list.__eq__(self._view(), other)
 
     def __ne__(self, other: Any) -> bool:
-        self._core.touch_read()
-        return list.__ne__(self, other)
+        return list.__ne__(self._view(), other)
 
     __hash__ = None
 
+    def index(self, value: Any, *args: Any) -> int:
+        return list.index(self._view(), value, *args)
+
+    def count(self, value: Any) -> int:
+        return list.count(self._view(), value)
+
     def copy(self) -> list:
-        self._core.touch_read()
-        return list(self)
+        return list(list.__iter__(self._view()))
 
 
 def _clamped_insert_index(index: int, length: int) -> int:
@@ -649,32 +728,38 @@ class CascadeSet(set):
         self._core.emit([{"action": "remove", "value": v} for v in values])
 
     # --- mutators ---
+    @_mutator
     def add(self, value: Any) -> None:
         if value in self:
             return
         set.add(self, value)
         self._emit_adds([value])
 
+    @_mutator
     def remove(self, value: Any) -> None:
         set.remove(self, value)
         self._emit_removes([value])
 
+    @_mutator
     def discard(self, value: Any) -> None:
         if value not in self:
             return
         set.discard(self, value)
         self._emit_removes([value])
 
+    @_mutator
     def pop(self) -> Any:
         value = set.pop(self)
         self._emit_removes([value])
         return value
 
+    @_mutator
     def clear(self) -> None:
         values = list(self)
         set.clear(self)
         self._emit_removes(values)
 
+    @_mutator
     def update(self, *others: Iterable[Any]) -> None:
         added = []
         for other in others:
@@ -684,6 +769,7 @@ class CascadeSet(set):
                     added.append(v)
         self._emit_adds(added)
 
+    @_mutator
     def difference_update(self, *others: Iterable[Any]) -> None:
         removed = []
         for other in others:
@@ -693,12 +779,14 @@ class CascadeSet(set):
                     removed.append(v)
         self._emit_removes(removed)
 
+    @_mutator
     def intersection_update(self, *others: Iterable[Any]) -> None:
         keep = set(self).intersection(*others) if others else set(self)
         removed = [v for v in self if v not in keep]
         set.difference_update(self, removed)
         self._emit_removes(removed)
 
+    @_mutator
     def symmetric_difference_update(self, other: Iterable[Any]) -> None:
         other = set(other)
         removed = [v for v in other if v in self]
@@ -709,34 +797,39 @@ class CascadeSet(set):
             + [{"action": "add", "value": v} for v in added]
         )
 
+    @_mutator
     def __ior__(self, other: Any) -> CascadeSet:
         self.update(other)
         return self
 
+    @_mutator
     def __isub__(self, other: Any) -> CascadeSet:
         self.difference_update(other)
         return self
 
+    @_mutator
     def __iand__(self, other: Any) -> CascadeSet:
         self.intersection_update(other)
         return self
 
+    @_mutator
     def __ixor__(self, other: Any) -> CascadeSet:
         self.symmetric_difference_update(other)
         return self
 
     # --- tracked reads ---
+    def _view(self) -> set:
+        view = self._core.read_view()
+        return self if view is None else view
+
     def __iter__(self):
-        self._core.touch_read()
-        return set.__iter__(self)
+        return set.__iter__(self._view())
 
     def __len__(self) -> int:
-        self._core.touch_read()
-        return set.__len__(self)
+        return set.__len__(self._view())
 
     def __contains__(self, item: Any) -> bool:
-        self._core.touch_read()
-        return set.__contains__(self, item)
+        return set.__contains__(self._view(), item)
 
 
 class _CascadeDictView:
@@ -751,26 +844,24 @@ class _CascadeDictView:
         self.which = which
 
     def _raw(self):
-        return getattr(dict, self.which)(self.parent)
+        # Records the dependency and honours the reader's revision.
+        return getattr(dict, self.which)(self.parent._view())
 
     def __iter__(self):
-        self.parent._core.touch_read()
         return iter(self._raw())
 
     def __reversed__(self):
-        self.parent._core.touch_read()
         return reversed(self._raw())
 
     def __len__(self) -> int:
-        self.parent._core.touch_read()
         return len(self._raw())
 
     def __contains__(self, item: Any) -> bool:
-        self.parent._core.touch_read()
         return item in self._raw()
 
     def __repr__(self) -> str:
-        return f"cascade_{self.which}({list(self._raw())!r})"
+        live = getattr(dict, self.which)(self.parent)
+        return f"cascade_{self.which}({list(live)!r})"
 
 
 class CascadeDict(dict):
@@ -808,15 +899,18 @@ class CascadeDict(dict):
         self._core.compact()
 
     # --- mutators ---
+    @_mutator
     def __setitem__(self, key: Any, value: Any) -> None:
         dict.__setitem__(self, key, value)
         self._core.emit([{"action": "upsert", "key": key, "value": value}])
 
+    @_mutator
     def __delitem__(self, key: Any) -> None:
         value = dict.__getitem__(self, key)
         dict.__delitem__(self, key)
         self._core.emit([{"action": "remove", "key": key, "value": value}])
 
+    @_mutator
     def update(self, *args: Any, **kwargs: Any) -> None:
         incoming = dict(*args, **kwargs)
         dict.update(self, incoming)
@@ -824,6 +918,7 @@ class CascadeDict(dict):
             [{"action": "upsert", "key": k, "value": v} for k, v in incoming.items()]
         )
 
+    @_mutator
     def pop(self, key: Any, default: Any = _MISSING) -> Any:
         if key not in self:
             if default is self._MISSING:
@@ -833,22 +928,26 @@ class CascadeDict(dict):
         self._core.emit([{"action": "remove", "key": key, "value": value}])
         return value
 
+    @_mutator
     def popitem(self) -> tuple[Any, Any]:
         key, value = dict.popitem(self)
         self._core.emit([{"action": "remove", "key": key, "value": value}])
         return key, value
 
+    @_mutator
     def clear(self) -> None:
         diffs = [{"action": "remove", "key": k, "value": v} for k, v in self.items()]
         dict.clear(self)
         self._core.emit(diffs)
 
+    @_mutator
     def setdefault(self, key: Any, default: Any = None) -> Any:
         if key in self:
             return dict.__getitem__(self, key)
         self[key] = default
         return default
 
+    @_mutator
     def __ior__(self, other: Any) -> CascadeDict:
         self.update(other)
         return self
@@ -864,29 +963,27 @@ class CascadeDict(dict):
         return _CascadeDictView(self, "items")
 
     # --- tracked reads ---
+    def _view(self) -> dict:
+        view = self._core.read_view()
+        return self if view is None else view
+
     def __iter__(self):
-        self._core.touch_read()
-        return dict.__iter__(self)
+        return dict.__iter__(self._view())
 
     def __reversed__(self):
-        self._core.touch_read()
-        return dict.__reversed__(self)
+        return dict.__reversed__(self._view())
 
     def __len__(self) -> int:
-        self._core.touch_read()
-        return dict.__len__(self)
+        return dict.__len__(self._view())
 
     def __getitem__(self, key: Any) -> Any:
-        self._core.touch_read()
-        return dict.__getitem__(self, key)
+        return dict.__getitem__(self._view(), key)
 
     def __contains__(self, key: Any) -> bool:
-        self._core.touch_read()
-        return dict.__contains__(self, key)
+        return dict.__contains__(self._view(), key)
 
     def get(self, key: Any, default: Any = None) -> Any:
-        self._core.touch_read()
-        return dict.get(self, key, default)
+        return dict.get(self._view(), key, default)
 
 
 CASCADE_COLLECTION_TYPES = (CascadeList, CascadeSet, CascadeDict)
