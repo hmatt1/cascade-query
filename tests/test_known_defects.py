@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D26).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D27).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -549,7 +549,6 @@ def test_d16_format_change_does_not_silently_drop_collections(
         reopened.shutdown()
 
 
-@_defect(17, "an open transaction's rollback deletes another thread's change")
 def test_d17_rollback_keeps_another_threads_collection_change() -> None:
     engine = Engine()
     xs = CascadeList(engine, ["base"])
@@ -578,7 +577,6 @@ def test_d17_rollback_keeps_another_threads_collection_change() -> None:
         assert list(xs) == ["base", "other"]
 
 
-@_defect(17, "a task created in a transaction has its later set() dropped")
 def test_d17_task_created_in_a_transaction_can_set_after_it_commits() -> None:
     engine = Engine()
 
@@ -605,6 +603,30 @@ def test_d17_task_created_in_a_transaction_can_set_after_it_commits() -> None:
         return x()
 
     assert asyncio.run(main()) == 5
+
+
+@_defect(27, "a commit that fails on an input value keeps collection changes")
+def test_d27_commit_that_fails_on_an_input_applies_nothing() -> None:
+    engine = Engine()
+
+    @engine.input
+    def x() -> int:
+        return 1
+
+    xs = CascadeList(engine, [1])
+
+    @engine.query
+    def n() -> int:
+        return len(xs)
+
+    assert (x(), n()) == (1, 1)
+    with pytest.raises(TypeError):
+        with engine.transaction():
+            xs.append(2)
+            x.set(object())  # cannot be hashed, so the commit fails
+    # Nothing applied: the collection is back, and queries agree with it.
+    assert list(xs) == [1]
+    assert (x(), n()) == (1, 1)
 
 
 # --- Hangs and misleading errors --------------------------------------------

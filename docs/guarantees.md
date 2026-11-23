@@ -46,7 +46,7 @@ Every open defect has a failing regression test in
 | G22 | A rewritten query returns what the plain Python would | Broken (D1, D7) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
-| G25 | A transaction applies completely or not at all | Broken (D17) | Good on one thread |
+| G25 | A transaction applies completely or not at all | Broken for a commit that fails on an input value (D27) | Good, threads and tasks included |
 | G26 | A named collection is restored with the same contents after a restart | Broken (D10, D16) | Good on the happy path |
 
 ## Core evaluation
@@ -419,12 +419,12 @@ Enforced by: `test_async.py::test_async_query_basic`, `::test_mixed_graph_sync_a
 
 Safe from any thread: calling queries, reading inputs, `input.set`,
 transactions, registering queries and inputs, `prune`, `sweep_unaccessed`,
-traces and stats. All of these take the store lock.
+traces and stats. All of these take the store lock. Mutating a collection is
+safe from any thread; while a transaction that changed it is open, a
+mutation from outside that transaction raises `RuntimeError` (G25).
 
-Not safe: mutating one collection from another thread while a transaction that
-touched it is open (D17), two engines writing the same named collection
-(D10), and two threads calling into one dependency cycle through different
-queries (D24).
+Not safe: two engines writing the same named collection (D10), and two
+threads calling into one dependency cycle through different queries (D24).
 
 ## Persistence
 
@@ -628,18 +628,47 @@ Inside `with engine.transaction():`
 - queries run inside the block see the engine as it was before the block;
 - named collections write to disk once per collection at commit, and not at
   all if the block raises;
-- opening a second transaction in the same context raises `RuntimeError`, even
+- opening a second transaction inside an open one raises `RuntimeError`, even
   for a different engine;
 - a transaction object is single-use: entering it a second time raises
   `RuntimeError` and changes nothing.
 
+**Who is inside.** A transaction belongs to whoever entered it: the asyncio
+task, or the thread when it was entered outside any task. Only work done
+there while the block is open is part of it; a coroutine awaited directly is,
+and so is an event loop the block itself runs (`asyncio.run` inside a block
+entered outside any task). Everything else is outside, on every Python build
+and whether or not it inherited a copy of the block's context: a thread or
+task started in the block, `asyncio.to_thread`, `asyncio.gather`, anything
+that runs after the block has ended. For code outside:
+
+- `input.set` applies at once, as with no transaction. It is not queued, and
+  never dropped;
+- it can open a transaction of its own;
+- changing a collection that an open transaction has changed raises
+  `RuntimeError` and changes nothing. The collection is reserved from the
+  transaction's first change to it until the transaction has committed or
+  rolled back. Two writers' diffs in one log could not be told apart on
+  rollback, and the outside write would publish the uncommitted ones to
+  queries. Collections the transaction has not changed are free.
+
 Limits: if the disk write for a later collection fails at commit, earlier
-collections are already on disk.
+collections are already on disk. If applying the input updates fails at
+commit (a value that cannot be encoded), collection changes are kept but not
+shown to queries (D27). Reads of a collection object from outside a query
+see uncommitted changes from any thread. `asyncio.gather` inside a block does
+not batch the updates its coroutines make: they run as separate tasks.
 
 Enforced by: `test_engine.py::test_engine_transaction`, `test_transaction_collections.py`
 (including `::test_transaction_object_cannot_be_entered_twice`),
 `test_history_retention.py::test_collection_mutations_in_one_transaction_store_one_version`,
 `test_incremental_collections.py::test_mutations_inside_transaction_batch_invalidation`,
+`test_known_defects.py::test_d17_rollback_keeps_another_threads_collection_change`,
+`::test_d17_task_created_in_a_transaction_can_set_after_it_commits`,
+`test_transaction_ownership.py` (plain threads and threads that inherit the
+context, tasks during and after the block, `asyncio.to_thread`, two
+transactions on one collection, a four-thread run of transactions over a
+shared collection),
 `test_known_defects.py::test_d12_rollback_undoes_everything_after_compaction_in_the_block`,
 `test_collection_compaction_pins.py::test_rollback_of_a_collection_created_in_the_block`,
 `::test_rollback_restores_an_existing_collection_under_an_older_pin`,
@@ -676,8 +705,8 @@ Enforced by: `test_incremental_persistence.py::test_named_collections_restore_ac
 
 "Reproduced" means re-run independently for this audit on Python 3.12.9, and
 pinned by an expected-failure test in `tests/test_known_defects.py`. D22 was
-found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2.
-All four were already present at the audit commit.
+found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2;
+D27 while fixing D17. All were already present at the audit commit.
 "Reported" means found and probed during the audit but not re-run a second
 time; it now applies only to the two sub-items of D7 marked that way.
 
@@ -697,7 +726,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | ID | Defect | Evidence |
 |---|---|---|
 | D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
-| D17 | The open transaction leaks across concurrency boundaries. Another thread mutating the same collection during the block has its change deleted on rollback while queries keep the uncommitted value. A task created in the block that calls `set()` after the block exits has the update dropped. | Reproduced: the other thread's append was gone after rollback, and the task's `set(5)` left the input at 1. The "queries keep the uncommitted value" part was not re-run. |
+| D27 | A commit that fails while applying its input updates is applied in part. With `xs.append(2)` and `x.set(object())` in one block, the exit raises `TypeError` (the value cannot be hashed), `list(xs)` is `[1, 2]`, and a query still reads `len(xs) == 1`: the collection change is kept (for a named collection, also on disk) but its new head is never published. Found while fixing D17; present at the audit commit. | Reproduced |
 
 ### Hangs and misleading errors
 
@@ -726,6 +755,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D2 | A `fixed_point=` query ignored `snapshot=` and returned the head value (7 where the snapshot value is 1), and one read moved `engine.revision` from 3 to 6: every iteration ran at a new revision. The cycle is now iterated at the caller's revision, with intermediate results kept out of the shared cache. Found and fixed with it: a change to an input read only by another member of the cycle did not reach the head (`a` stayed 1 where a fresh run gives 21); a stale result read before the cycle was entered ended in `RecursionError`; a cycle that never converges looped for ever and now raises `CycleError` after `max_iterations` runs (default 1000). | `fix: a fixed-point query ignored snapshots and moved the revision` |
 | D22 | Re-registering a query with changed code while `engine.revision` had not moved since its dependents were computed left those dependents serving old results (`top()` stayed 2 where a fresh run gives 11). The dependents counted as verified at that revision and were not looked at again; an input change in between hid it. The same held for an input registered again with a changed default and read through a snapshot, and for dependents cut off from the function by an evicted result. Registration with changed code now makes every cached result verify again. | `fix: results computed from a query's old code survived its re-registration` |
 | D12 | When a pinned snapshot predated a collection, in-memory compaction ignored later snapshots and open transactions: a snapshot read raised the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction left 2048 of its 3000 appended items in place. With no head recorded at the oldest pinned revision, compaction took the newest head as its limit. The limit is now the first head the collection reported, and never past the head an open transaction started at. A reader nothing pins gets `SnapshotExpiredError`. | `fix: collection log compaction dropped diffs that snapshots and transactions needed` |
+| D17 | The open transaction leaked across concurrency boundaries. Another thread appending to a collection during the block had its change deleted on rollback, and published the block's uncommitted changes to queries. A task created in the block that called `set()` after the block had ended put the update on the dead transaction's queue, where it was dropped (`set(5)` left the input at 1); a task or inheriting thread running during the block had its updates queued into a transaction it knew nothing about. A transaction now belongs to the task, or else the thread, that entered it. Other code is outside it: its `set` applies at once, and changing a collection the transaction has changed raises `RuntimeError`. | `fix: a transaction leaked into other threads and tasks` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -784,14 +814,14 @@ with a single sequential actor. TLC checks six invariants in CI.
   transactions, collections, compaction, errors, TTL, eviction. The model
   uses the revision as the change marker of a query result; the code uses a
   separate stamp (G1).
-- None of D1–D26 is reachable in the model.
+- None of D1–D27 is reachable in the model.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Regression tests for the open defects exist but are expected
-   failures.** `tests/test_known_defects.py` has one test per defect (D1-D26),
+   failures.** `tests/test_known_defects.py` has one test per defect (D1-D27),
    each asserting the correct behaviour; those for open defects run under
    `xfail(strict=True)`. A fix removes the marker. The two "Reported"
    sub-items of D7 have no test.
@@ -820,8 +850,8 @@ Ordered by the risk they leave open.
 8. **Collection concurrency has one deterministic test.** No multi-writer or
    writer-against-pipeline stress, and none on free-threaded builds.
 9. **Transactions inside the block are untested** for queries reading a
-   mutated or newly created collection, `submit`, threads, async tasks and two
-   engines.
+   mutated or newly created collection, `submit` and two engines. Threads and
+   async tasks are covered by `test_transaction_ownership.py`.
 10. **One test does not test what it claims.**
     `test_disk_cache.py::test_format_bump_sqlite` registers a different query
     in its second session, so it would recompute regardless.

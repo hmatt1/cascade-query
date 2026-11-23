@@ -86,6 +86,13 @@ def _mutator(method: Callable[..., Any]) -> Callable[..., Any]:
         local = core.mutating
         try:
             with core.rw:
+                owner = core._tx
+                if owner is not None and owner is not core.engine._active_transaction():
+                    raise RuntimeError(
+                        f"collection {core.name!r} has uncommitted changes from "
+                        "a transaction that belongs to another thread or task; "
+                        "change it inside that transaction, or after it ends"
+                    )
                 local.depth = getattr(local, "depth", 0) + 1
                 try:
                     return method(self, *args, **kwargs)
@@ -274,6 +281,9 @@ class _CollectionCore:
         # on this collection, or None. Rolling back returns to it, so the
         # log must keep every diff after it.
         self._tx_start: int | None = None
+        # That transaction. Until it ends, only its owner may change this
+        # collection (see ``_mutator``). Guarded by ``rw``.
+        self._tx: Any = None
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -436,7 +446,8 @@ class _CollectionCore:
                 ) from exc
         if tx is not None:
             tx.collections.setdefault(self, start)
-            if self._tx_start is None:
+            if self._tx is None:
+                self._tx = tx
                 self._tx_start = start
             if self.disk is not None:
                 tx.pending_disk.setdefault(self, []).extend(
@@ -473,8 +484,17 @@ class _CollectionCore:
 
     def after_commit(self) -> None:
         """Run the disk compaction a transaction deferred."""
-        self._tx_start = None
+        with self.rw:
+            self._tx = None
+            self._tx_start = None
         self._maybe_compact_disk()
+
+    def release_transaction(self, tx: Any) -> None:
+        """``tx`` has ended, however it ended: other writers may come in."""
+        with self.rw:
+            if self._tx is tx:
+                self._tx = None
+                self._tx_start = None
 
     def roll_back_to(self, head: int) -> None:
         """Undo every change after ``head`` (a failed transaction).
@@ -495,8 +515,9 @@ class _CollectionCore:
                     del log.entries[head - log.base_rev :]
                 # The same head number can now come to mean other contents.
                 self._snapshot_cache = None
-                self._tx_start = None
             self._rollback()
+            self._tx = None
+            self._tx_start = None
 
     def _live_len(self) -> int:
         # The owner's own __len__ records a dependency inside a query.

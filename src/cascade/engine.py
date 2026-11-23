@@ -70,6 +70,16 @@ class EngineTransaction:
 
     A transaction object is single-use: entering it a second time raises
     ``RuntimeError``. Call ``engine.transaction()`` again for a new one.
+
+    A transaction belongs to whoever entered it: the asyncio task, or, when
+    it was entered outside any task, the thread. Only work done there, while
+    the block is open, is part of it. Anything else is outside it, including
+    threads and tasks started inside the block (which may inherit a copy of
+    the block's context): their input updates apply at once, as with no
+    transaction. The one thing they may not do is change a collection the
+    transaction has changed and not yet committed: that raises
+    ``RuntimeError``, because the two sets of changes could not be told apart
+    on rollback.
     """
 
     def __init__(self, engine: Engine) -> None:
@@ -77,13 +87,17 @@ class EngineTransaction:
         self.updates: list[tuple[str, tuple[Any, ...], Any]] = []
         self._token: contextvars.Token | None = None
         self._used = False
+        # Owner, valid while ``_open``: see ``_current_transaction``.
+        self._open = False
+        self._thread = 0
+        self._task: Any = None
         # Collections changed in this transaction -> log head before the first
         # change, and disk writes held until commit for named collections.
         self.collections: dict[Any, int] = {}
         self.pending_disk: dict[Any, list[tuple[int, dict[str, Any]]]] = {}
 
     def __enter__(self) -> EngineTransaction:
-        if _active_transaction.get() is not None:
+        if _current_transaction() is not None:
             raise RuntimeError("Nested transactions are not supported")
         if self._used:
             # The object still holds the first block's updates and rollback
@@ -93,37 +107,80 @@ class EngineTransaction:
                 "is single-use, call engine.transaction() again for a new one"
             )
         self._used = True
+        self._thread = threading.get_ident()
+        self._task = _running_task()
+        self._open = True
         self._token = _active_transaction.set(self)
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # Closed first: from here on nothing joins this transaction, while
+        # its collections stay reserved until their new heads are published.
+        self._open = False
+        self._task = None
         if self._token is not None:
             _active_transaction.reset(self._token)
-        if exc_type is not None:
-            self._roll_back_collections()
-            return
         try:
-            # Each collection's batch is one disk transaction. If a later one
-            # fails (disk full), earlier ones are already on disk; that rare
-            # partial write is the cost of not spanning collections.
-            for core, batch in self.pending_disk.items():
-                core.write_pending(batch)
-        except BaseException:
-            self._roll_back_collections()
-            raise
-        if self.updates:
-            self.engine._set_inputs(self.updates)
-        for core in self.collections:
-            core.after_commit()
+            if exc_type is not None:
+                self._roll_back_collections()
+                return
+            try:
+                # Each collection's batch is one disk transaction. If a later
+                # one fails (disk full), earlier ones are already on disk;
+                # that rare partial write is the cost of not spanning
+                # collections.
+                for core, batch in self.pending_disk.items():
+                    core.write_pending(batch)
+            except BaseException:
+                self._roll_back_collections()
+                raise
+            if self.updates:
+                self.engine._set_inputs(self.updates)
+            for core in self.collections:
+                core.after_commit()
+        finally:
+            for core in self.collections:
+                core.release_transaction(self)
 
     def _roll_back_collections(self) -> None:
         for core, head in self.collections.items():
             core.roll_back_to(head)
 
 
+# The transaction entered in this context. A context is copied into every
+# asyncio task, into ``asyncio.to_thread`` and ``Context.run`` calls, and on
+# free-threaded builds into every new thread, so the marker also shows up in
+# places that are not the transaction's owner, and stays there after the
+# block has ended. Read it through ``_current_transaction`` only.
 _active_transaction: contextvars.ContextVar[EngineTransaction | None] = (
     contextvars.ContextVar("active_transaction", default=None)
 )
+
+
+def _running_task() -> Any:
+    """The asyncio task running on this thread, or None."""
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _current_transaction() -> EngineTransaction | None:
+    """The open transaction that the caller owns, if any.
+
+    The owner is the task that entered the block. A block entered outside
+    any task is owned by its thread: a task can then only run there while
+    the block is open if the block itself runs the event loop.
+    """
+    tx = _active_transaction.get()
+    if tx is None:
+        return None
+    if not tx._open or tx._thread != threading.get_ident():
+        return None
+    task = tx._task
+    if task is not None and task is not _running_task():
+        return None
+    return tx
 
 
 def _stale_handle_error(kind: str, handle_id: str) -> StaleHandleError:
@@ -176,10 +233,11 @@ class _InputHandle:
             args = tuple(input_args)
             value = resolved_value
 
-        tx = _active_transaction.get()
-        if tx is not None and tx.engine is self._engine:
-            tx.updates.append((self._id, tuple(args), value))
-            return None
+        if _active_transaction.get() is not None:
+            tx = _current_transaction()
+            if tx is not None and tx.engine is self._engine:
+                tx.updates.append((self._id, tuple(args), value))
+                return None
 
         return self._engine._set_input(self._id, tuple(args), value)
 
@@ -439,8 +497,8 @@ class Engine:
         return EngineTransaction(self)
 
     def _active_transaction(self) -> EngineTransaction | None:
-        """The transaction open in this context for this engine, if any."""
-        tx = _active_transaction.get()
+        """The open transaction on this engine that the caller owns, if any."""
+        tx = _current_transaction()
         if tx is not None and tx.engine is self:
             return tx
         return None
