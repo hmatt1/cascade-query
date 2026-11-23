@@ -225,18 +225,21 @@ def test_input_version_at_returns_historical_versions() -> None:
     def source() -> int:
         return 0
 
-    revisions: list[int] = []
-    for value in (10, 20, 30):
-        source.set(value)
-        revisions.append(engine.revision)
-    store = engine._internals._store  # noqa: SLF001
-    input_key = (source.id, ())
-    assert store.input_version_at(input_key, revisions[0] - 1) is None
-    for revision, value in zip(revisions, (10, 20, 30)):
-        version = store.input_version_at(input_key, revision)
-        assert version is not None and version.value == value
-    latest = store.input_version_at(input_key, revisions[-1] + 100)
-    assert latest is not None and latest.value == 30
+    # History is only kept for revisions still in use, so hold a snapshot
+    # from before the first set.
+    with engine.snapshot() as held:
+        revisions: list[int] = []
+        for value in (10, 20, 30):
+            source.set(value)
+            revisions.append(engine.revision)
+        store = engine._internals._store  # noqa: SLF001
+        input_key = (source.id, ())
+        assert store.input_version_at(input_key, held.revision) is None
+        for revision, value in zip(revisions, (10, 20, 30)):
+            version = store.input_version_at(input_key, revision)
+            assert version is not None and version.value == value
+        latest = store.input_version_at(input_key, revisions[-1] + 100)
+        assert latest is not None and latest.value == 30
 
 
 @pytest.mark.parametrize("stats", [False, True])

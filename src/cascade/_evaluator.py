@@ -12,7 +12,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import _canonical, _disk_cache
 from ._disk_cache import DiskCacheProtocol
-from ._errors import CycleError, PersistentCacheError, QueryCancelled
+from ._errors import (
+    CycleError,
+    PersistentCacheError,
+    QueryCancelled,
+    SnapshotExpiredError,
+)
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
 from ._state import InFlight, InputVersion, MemoEntry, QueryKey, Snapshot
 from ._store import GraphStore
@@ -77,6 +82,10 @@ class Evaluator:
             return result
         finally:
             self._runtime_var.reset(token)
+            pins = runtime.pins
+            if pins:
+                runtime.pins = None
+                self._store.unpin_all(pins)
 
     async def _run_in_runtime_async(
         self, runtime: RuntimeState, fn: Callable[[], Any]
@@ -90,6 +99,10 @@ class Evaluator:
             return result
         finally:
             self._runtime_var.reset(token)
+            pins = runtime.pins
+            if pins:
+                runtime.pins = None
+                self._store.unpin_all(pins)
 
     def check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         if runtime_cancel_epoch is None:
@@ -156,26 +169,37 @@ class Evaluator:
         snapshot: Snapshot | None,
     ) -> Any:
         runtime = self._runtime_var.get()
-        use_snapshot = snapshot or (
-            runtime.snapshot if runtime is not None else self._store.snapshot()
-        )
-        snapshot_pinned = snapshot is not None or (
-            runtime.snapshot_pinned if runtime is not None else False
-        )
+        if snapshot is not None:
+            revision = snapshot.revision
+            snapshot_explicit = True
+        elif runtime is not None:
+            revision = runtime.snapshot.revision
+            snapshot_explicit = runtime.snapshot_explicit
+        else:
+            revision = -1
+            snapshot_explicit = False
         if runtime is not None:
             self.check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
-        version = self._store.input_version_at((input_id, args), use_snapshot.revision)
+        if revision < 0:
+            # No runtime and no snapshot: read the newest version. Doing it
+            # under the lock keeps the revision and the version consistent
+            # without pinning.
+            with self._store.lock:
+                revision = self._store.revision
+                version = self._store.latest_input_version((input_id, args))
+        else:
+            version = self._store.input_version_at((input_id, args), revision)
         if version is None:
             default = fn(*args)
             if isinstance(default, types.CoroutineType):
                 default = asyncio.run(default)
             should_materialize = False
-            if not snapshot_pinned:
+            if not snapshot_explicit:
                 with self._store.lock:
                     latest = self._store.latest_input_version((input_id, args))
                     should_materialize = (
-                        latest is None and use_snapshot.revision == self._store.revision
+                        latest is None and revision == self._store.revision
                     )
             if should_materialize:
                 self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
@@ -184,7 +208,7 @@ class Evaluator:
                     raise RuntimeError("input version missing after initialization")
             else:
                 version = InputVersion(
-                    revision=use_snapshot.revision,
+                    revision=revision,
                     changed_at=-1,
                     value_hash=self._store.stable_hash(default),
                     value=default,
@@ -202,16 +226,27 @@ class Evaluator:
         snapshot: Snapshot | None,
     ) -> Any:
         runtime = self._runtime_var.get()
-        use_snapshot = snapshot or (
-            runtime.snapshot if runtime is not None else self._store.snapshot()
-        )
-        snapshot_pinned = snapshot is not None or (
-            runtime.snapshot_pinned if runtime is not None else False
-        )
+        if snapshot is not None:
+            revision = snapshot.revision
+            snapshot_explicit = True
+        elif runtime is not None:
+            revision = runtime.snapshot.revision
+            snapshot_explicit = runtime.snapshot_explicit
+        else:
+            revision = -1
+            snapshot_explicit = False
         if runtime is not None:
             self.check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
-        version = self._store.input_version_at((input_id, args), use_snapshot.revision)
+        if revision < 0:
+            # No runtime and no snapshot: read the newest version. Doing it
+            # under the lock keeps the revision and the version consistent
+            # without pinning.
+            with self._store.lock:
+                revision = self._store.revision
+                version = self._store.latest_input_version((input_id, args))
+        else:
+            version = self._store.input_version_at((input_id, args), revision)
         if version is None:
             if inspect.iscoroutinefunction(fn):
                 default = await fn(*args)
@@ -220,11 +255,11 @@ class Evaluator:
                 executor = self._get_executor() if self._get_executor else None
                 default = await loop.run_in_executor(executor, fn, *args)
             should_materialize = False
-            if not snapshot_pinned:
+            if not snapshot_explicit:
                 with self._store.lock:
                     latest = self._store.latest_input_version((input_id, args))
                     should_materialize = (
-                        latest is None and use_snapshot.revision == self._store.revision
+                        latest is None and revision == self._store.revision
                     )
             if should_materialize:
                 self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
@@ -233,7 +268,7 @@ class Evaluator:
                     raise RuntimeError("input version missing after initialization")
             else:
                 version = InputVersion(
-                    revision=use_snapshot.revision,
+                    revision=revision,
                     changed_at=-1,
                     value_hash=self._store.stable_hash(default),
                     value=default,
@@ -255,13 +290,15 @@ class Evaluator:
     ) -> Any:
         runtime = self._runtime_var.get()
         if runtime is None:
+            pinned = self._store.pin_snapshot(snapshot)
             root_runtime = RuntimeState(
-                snapshot=snapshot or self._store.snapshot(),
+                snapshot=pinned,
                 stack=[],
                 root_effects=effects,
                 staged_root_effects={},
                 cancel_epoch=cancel_epoch,
-                snapshot_pinned=snapshot is not None,
+                snapshot_explicit=snapshot is not None,
+                pins=[pinned.revision],
             )
             return self._run_in_runtime(
                 root_runtime,
@@ -321,14 +358,16 @@ class Evaluator:
     ) -> Any:
         runtime = self._runtime_var.get()
         if runtime is None:
+            pinned = self._store.pin_snapshot(snapshot)
             root_runtime = RuntimeState(
-                snapshot=snapshot or self._store.snapshot(),
+                snapshot=pinned,
                 stack=[],
                 root_effects=effects,
                 staged_root_effects={},
                 cancel_epoch=cancel_epoch,
-                snapshot_pinned=snapshot is not None,
+                snapshot_explicit=snapshot is not None,
                 is_async=True,
+                pins=[pinned.revision],
             )
             return await self._run_in_runtime_async(
                 root_runtime,
@@ -691,6 +730,7 @@ class Evaluator:
                     return snapshot.revision
 
         if runtime is None:
+            self._store.pin_snapshot(snapshot)
             self._run_in_runtime(
                 RuntimeState(
                     snapshot=snapshot,
@@ -698,7 +738,8 @@ class Evaluator:
                     root_effects=None,
                     staged_root_effects={},
                     cancel_epoch=None,
-                    snapshot_pinned=True,
+                    snapshot_explicit=True,
+                    pins=[snapshot.revision],
                 ),
                 lambda: self.query_call(
                     fid,
@@ -718,7 +759,7 @@ class Evaluator:
                 root_effects=None,
                 staged_root_effects={},
                 cancel_epoch=runtime.cancel_epoch,
-                snapshot_pinned=True,
+                snapshot_explicit=True,
             )
             self._run_in_runtime(
                 shadow,
@@ -762,6 +803,7 @@ class Evaluator:
                     return snapshot.revision
 
         if runtime is None:
+            self._store.pin_snapshot(snapshot)
             await self._run_in_runtime_async(
                 RuntimeState(
                     snapshot=snapshot,
@@ -769,8 +811,9 @@ class Evaluator:
                     root_effects=None,
                     staged_root_effects={},
                     cancel_epoch=None,
-                    snapshot_pinned=True,
+                    snapshot_explicit=True,
                     is_async=True,
+                    pins=[snapshot.revision],
                 ),
                 lambda: self.query_call_async(
                     fid,
@@ -789,7 +832,7 @@ class Evaluator:
                 root_effects=None,
                 staged_root_effects={},
                 cancel_epoch=runtime.cancel_epoch,
-                snapshot_pinned=True,
+                snapshot_explicit=True,
                 is_async=True,
             )
             await self._run_in_runtime_async(
@@ -810,6 +853,22 @@ class Evaluator:
             if refreshed is None:  # pragma: no cover - safety belt
                 raise RuntimeError(f"missing memo for {self._store.key_to_str(key)}")
             return refreshed.changed_at
+
+    def _restart_cycle(
+        self, runtime: RuntimeState, frame: RuntimeFrame, key: QueryKey
+    ) -> None:
+        """Move a fixed-point cycle to a fresh revision for its next iteration."""
+        store = self._store
+        with store.lock:
+            store.revision += 1
+            rev = store.pin_current_locked()
+            if runtime.pins is None:
+                runtime.pins = []
+            runtime.pins.append(rev)
+            runtime.snapshot = Snapshot(rev)
+            for k in frame.cycle_nodes:
+                if k != key:
+                    store.drop_memo_locked(k)
 
     def recompute(
         self,
@@ -841,7 +900,15 @@ class Evaluator:
             except BaseException as exc:
                 cache_ex = self._store.lookup_query_cache_exceptions(key[1])
                 should_cache = False
-                if isinstance(exc, (QueryCancelled, CycleError, PersistentCacheError)):
+                if isinstance(
+                    exc,
+                    (
+                        QueryCancelled,
+                        CycleError,
+                        PersistentCacheError,
+                        SnapshotExpiredError,
+                    ),
+                ):
                     pass
                 elif cache_ex is True:
                     should_cache = isinstance(exc, Exception)
@@ -861,12 +928,7 @@ class Evaluator:
                 ) != self._store.stable_hash(frame.cycle_guess):
                     frame.cycle_guess = result
                     frame.is_cycle_root = False
-                    with self._store.lock:
-                        self._store.revision += 1
-                        runtime.snapshot = Snapshot(revision=self._store.revision)
-                        for k in frame.cycle_nodes:
-                            if k != key:
-                                self._store.drop_memo_locked(k)
+                    self._restart_cycle(runtime, frame, key)
                     frame.deps.clear()
                     frame.effects.clear()
                     continue
@@ -952,8 +1014,9 @@ class Evaluator:
             root_effects=runtime.root_effects,
             staged_root_effects=runtime.staged_root_effects,
             cancel_epoch=runtime.cancel_epoch,
-            snapshot_pinned=runtime.snapshot_pinned,
+            snapshot_explicit=runtime.snapshot_explicit,
             is_async=True,
+            pins=runtime.pins,
         )
         token = self._runtime_var.set(new_runtime)
         try:
@@ -983,7 +1046,13 @@ class Evaluator:
                     cache_ex = self._store.lookup_query_cache_exceptions(key[1])
                     should_cache = False
                     if isinstance(
-                        exc, (QueryCancelled, CycleError, PersistentCacheError)
+                        exc,
+                        (
+                            QueryCancelled,
+                            CycleError,
+                            PersistentCacheError,
+                            SnapshotExpiredError,
+                        ),
                     ):
                         pass
                     elif cache_ex is True:
@@ -1003,14 +1072,7 @@ class Evaluator:
                     ) != self._store.stable_hash(frame.cycle_guess):
                         frame.cycle_guess = result
                         frame.is_cycle_root = False
-                        with self._store.lock:
-                            self._store.revision += 1
-                            new_runtime.snapshot = Snapshot(
-                                revision=self._store.revision
-                            )
-                            for k in frame.cycle_nodes:
-                                if k != key:
-                                    self._store.drop_memo_locked(k)
+                        self._restart_cycle(new_runtime, frame, key)
                         frame.deps.clear()
                         frame.effects.clear()
                         continue
@@ -1087,6 +1149,7 @@ class Evaluator:
             return full_memo
         finally:
             runtime.snapshot = new_runtime.snapshot
+            runtime.pins = new_runtime.pins
             self._runtime_var.reset(token)
 
     # --- persistent disk cache ---
@@ -1317,7 +1380,7 @@ class Evaluator:
             root_effects=None,
             staged_root_effects={},
             cancel_epoch=runtime.cancel_epoch,
-            snapshot_pinned=runtime.snapshot_pinned,
+            snapshot_explicit=runtime.snapshot_explicit,
         )
         self._run_in_runtime(
             shadow,
@@ -1542,7 +1605,7 @@ class Evaluator:
             root_effects=None,
             staged_root_effects={},
             cancel_epoch=runtime.cancel_epoch,
-            snapshot_pinned=runtime.snapshot_pinned,
+            snapshot_explicit=runtime.snapshot_explicit,
             is_async=True,
         )
         await self._run_in_runtime_async(
@@ -1724,7 +1787,10 @@ class Evaluator:
             return dep_memo.value_hash
         input_key = (dep_fid, dep_args)
         with self._store.lock:
-            version = self._store.input_version_at(input_key, verified_at)
+            try:
+                version = self._store.input_version_at(input_key, verified_at)
+            except SnapshotExpiredError:
+                version = None
             if version is None:
                 # Materialized mid-run at a revision above verified_at, or never
                 # materialized at all (pull-based default read).

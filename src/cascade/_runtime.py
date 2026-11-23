@@ -27,5 +27,9 @@ class RuntimeState:
     root_effects: dict[str, list[Any]] | None
     staged_root_effects: dict[str, list[Any]]
     cancel_epoch: int | None
-    snapshot_pinned: bool
+    # True when the caller chose the snapshot; such reads never materialize
+    # an input default into the store.
+    snapshot_explicit: bool
     is_async: bool = False
+    # Revisions this runtime pinned in the store; released when it ends.
+    pins: list[int] | None = None

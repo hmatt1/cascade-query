@@ -42,7 +42,7 @@ def test_engine_private_wrappers() -> None:
         root_effects=None,
         staged_root_effects={},
         cancel_epoch=0,
-        snapshot_pinned=False,
+        snapshot_explicit=False,
     )
     try:
         engine._compute_or_get_memo(("query", "test", ()), lambda: 1, runtime)

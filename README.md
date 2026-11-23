@@ -75,14 +75,25 @@ The `Engine` manages caching, execution, and state tracking.
 ### Defining Nodes: `@engine.input` and `@engine.query`
 
 *   **`@engine.input`**: Decorator for mutable data roots.
-    *   `input.set(value)`: Updates the value and increments the global revision.
+    *   `input.set(value)`: Updates the value and increments the global revision. Setting the value the input already holds is a no-op: the revision does not change and nothing is invalidated or cancelled.
     *   `input.set(*args, value=value)`: Updates a keyed input.
 *   **`@engine.query`**: Decorator for cached computations. Re-evaluates only if upstream data changes.
 
 ### Snapshots & Transactions (Input Debouncing)
 
 *   **`engine.snapshot()`**: Returns a `Snapshot` object pinning the current global revision. Use `query(snapshot=s)` to read data as it existed at that revision.
-*   **`engine.transaction()`**: When updating multiple inputs, intermediate read states ("flapping") can cause inconsistent evaluations. Use a transaction block to batch updates so they are committed atomically.
+*   **`engine.transaction()`**: When updating multiple inputs, intermediate read states ("flapping") can cause inconsistent evaluations. Use a transaction block to batch updates so they are committed atomically. Only the last value set for each input counts, inputs that end at their current value are skipped, and a transaction that changes nothing leaves the revision alone.
+
+The engine keeps old input values only while something can still read them: a snapshot that has not been released, or a call that is still running. Release a snapshot when you are done with it, either with a `with` block or `release()`; dropping every reference to it also releases it. Reading through a released snapshot raises `SnapshotExpiredError` once its history has been trimmed.
+
+```python
+with engine.snapshot() as before:
+    price.set(12)
+    assert total(snapshot=before) != total()
+# History older than the current revision can now be dropped.
+```
+
+Collections trim their in-memory diff logs the same way: diffs no snapshot or pipeline still needs are folded into the collection's base, so long-running ingest keeps memory proportional to the collection's size.
 
 ```python
 with engine.transaction():

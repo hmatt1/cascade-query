@@ -9,6 +9,7 @@ from .engine import (
     PersistentCacheError,
     QueryCancelled,
     Snapshot,
+    SnapshotExpiredError,
     TraceEvent,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "QueryCancelled",
     "QueryKey",
     "Snapshot",
+    "SnapshotExpiredError",
     "TraceEvent",
     "condense_graph",
     "export_dot",

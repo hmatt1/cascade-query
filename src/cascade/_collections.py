@@ -42,6 +42,17 @@ _KIND_DICT = "dict"
 
 _auto_ids = itertools.count()
 
+# Entries a collection's in-memory log may hold before it tries to fold the
+# oldest ones into its base. The bar rises with the collection's size, so
+# compaction (which replays the folded diffs) stays amortized O(1) per diff.
+_MEMORY_COMPACT_THRESHOLD = 1024
+
+_BASE_LEN = {_KIND_LIST: list.__len__, _KIND_SET: set.__len__, _KIND_DICT: dict.__len__}
+
+
+class _HistoryCompacted(RuntimeError):
+    """Diffs older than the in-memory log's base were folded into it."""
+
 
 class DiffLog:
     """Append-only, revision-tagged diff log with replay support.
@@ -49,7 +60,9 @@ class DiffLog:
     ``base_items`` is the materialized contents at ``base_rev`` (empty for a
     fresh collection, the loaded snapshot for a restored one). ``entries``
     holds every diff after ``base_rev``, so ``contents_at(rev)`` can rebuild
-    the collection at any in-session revision by replaying from the base.
+    the collection at any revision from ``base_rev`` on by replaying from the
+    base. ``compact_to`` moves the base forward once older diffs are no
+    longer needed.
     """
 
     def __init__(self, kind: str, *, base_rev: int = 0, base_items: Any = None) -> None:
@@ -81,13 +94,12 @@ class DiffLog:
     def since(self, after_rev: int, up_to: int) -> list[dict[str, Any]]:
         """All diffs with ``after_rev < rev <= up_to``.
 
-        Raises if ``after_rev`` predates the in-memory base; that can only
-        happen for a snapshot taken before the collection was restored, which
-        the engine never produces.
+        Raises ``_HistoryCompacted`` if ``after_rev`` predates the in-memory
+        base: those diffs were folded into the base (or never loaded).
         """
         with self.lock:
             if after_rev < self.base_rev:
-                raise RuntimeError(
+                raise _HistoryCompacted(
                     f"diff history before revision {self.base_rev} is not available"
                 )
             lo = after_rev - self.base_rev
@@ -101,6 +113,10 @@ class DiffLog:
         sets a list of values in insertion order; for dicts a plain dict.
         """
         with self.lock:
+            if rev < self.base_rev:
+                raise _HistoryCompacted(
+                    f"contents before revision {self.base_rev} are not available"
+                )
             diffs = self.since(self.base_rev, rev)
             if self.kind == _KIND_LIST:
                 pairs: list[tuple[Any, Any]] = [tuple(p) for p in self.base_items]
@@ -129,6 +145,18 @@ class DiffLog:
                 else:
                     data.pop(d["key"], None)
             return data
+
+    def compact_to(self, target: int) -> bool:
+        """Fold every diff up to ``target`` into the base. Returns True if any were."""
+        with self.lock:
+            target = min(target, self.base_rev + len(self.entries))
+            if target <= self.base_rev:
+                return False
+            base = self.contents_at(target)
+            del self.entries[: target - self.base_rev]
+            self.base_items = base
+            self.base_rev = target
+            return True
 
 
 def _uid_index(pairs: list[tuple[Any, Any]], uid: Any) -> int:
@@ -166,6 +194,7 @@ class _CollectionCore:
         self.loaded: Any = None
         self.owner: Any = None
         self._compacted_base = 0
+        self._next_memory_check = _MEMORY_COMPACT_THRESHOLD
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -253,6 +282,43 @@ class _CollectionCore:
             and self.log.head - self._compacted_base >= self.compact_every
         ):
             self.compact()
+        if len(self.log.entries) >= self._next_memory_check:
+            self.compact_memory()
+
+    def _live_len(self) -> int:
+        # The owner's own __len__ records a dependency inside a query.
+        if self.owner is None:
+            return 0
+        return _BASE_LEN[self.kind](self.owner)
+
+    def compact_memory(self) -> None:
+        """Fold in-memory diffs that no reader can still ask for into the base.
+
+        Readers at a pinned engine revision need the log from the head that
+        revision saw (a hard limit). Pipelines need it from their last ingested
+        head, but one lagging by more than the collection's size is cheaper to
+        rebuild than to replay, so that limit is soft.
+        """
+        log = self.log
+        live_len = self._live_len()
+        store = self.engine._store
+        with store.lock:
+            floor = store.history_floor_locked()
+            version = store.input_version_at((self.handle.id, ()), floor)
+        head = log.head
+        # No version at the floor means the collection did not exist yet at
+        # any revision still in use.
+        hard = version.value if version is not None else head
+        min_last_rev = self.engine._incremental_rt.min_last_rev(self.input_qualname)
+        if min_last_rev is None:
+            soft = head
+        else:
+            lag_allowed = max(_MEMORY_COMPACT_THRESHOLD, live_len)
+            soft = max(min_last_rev, head - lag_allowed)
+        log.compact_to(min(hard, soft))
+        self._next_memory_check = max(
+            _MEMORY_COMPACT_THRESHOLD, live_len, 2 * len(log.entries)
+        )
 
     def _rollback(self) -> None:
         """Reset the owner's python-level storage to the committed log state."""

@@ -25,7 +25,13 @@ from bisect import bisect_left, bisect_right, insort
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ._collections import CascadeDict, CascadeList, CascadeSet, _CascadeDictView
+from ._collections import (
+    CascadeDict,
+    CascadeList,
+    CascadeSet,
+    _CascadeDictView,
+    _HistoryCompacted,
+)
 from ._serde import hash_bytecode
 
 _VOLATILE = object()
@@ -355,6 +361,7 @@ class IncrementalRuntime:
                 or fingerprint is _VOLATILE
                 or state.env_fp != fingerprint
                 or state.last_rev > head
+                or state.last_rev < core.log.base_rev
             )
             dep_base = evaluator.current_frame_dep_count()
             try:
@@ -364,10 +371,23 @@ class IncrementalRuntime:
                     )
                     self._states[state_key] = state
                 else:
-                    self._ingest(
-                        state, core, view, fused, core.log.since(state.last_rev, head)
-                    )
-                    state.last_rev = head
+                    try:
+                        diffs = core.log.since(state.last_rev, head)
+                    except _HistoryCompacted:
+                        # Folded into the base since the check above.
+                        state = self._build_state(
+                            reducer_name,
+                            reducer_args,
+                            fingerprint,
+                            core,
+                            view,
+                            fused,
+                            head,
+                        )
+                        self._states[state_key] = state
+                    else:
+                        self._ingest(state, core, view, fused, diffs)
+                        state.last_rev = head
             except BaseException:
                 self._states.pop(state_key, None)
                 raise
@@ -381,6 +401,16 @@ class IncrementalRuntime:
             self._record_info(state_key, site, reducer_name, core, view, stages, state)
             ctx = _FinalizeCtx(seq=state.seq, reverse=reverse, args=reducer_args)
             return state.reducer.result(ctx)
+
+    def min_last_rev(self, input_qualname: str) -> int | None:
+        """Oldest log head any pipeline over this collection has ingested up to."""
+        with self._lock:
+            revs = [
+                state.last_rev
+                for key, state in self._states.items()
+                if key[1] == input_qualname and not state.impure
+            ]
+        return min(revs) if revs else None
 
     # --- state construction and diff consumption ---
     def _build_state(

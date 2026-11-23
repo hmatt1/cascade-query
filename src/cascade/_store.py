@@ -3,10 +3,12 @@ from __future__ import annotations
 import bisect
 import threading
 import time
+import weakref
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Sequence
 from typing import Any, Callable
 
+from ._errors import SnapshotExpiredError
 from ._serde import hash_bytecode, stable_value_digest
 from ._state import (
     Dependency,
@@ -66,6 +68,20 @@ class GraphStore:
         self._stats_disk_stores = 0
 
         self.inputs: dict[InputKey, list[InputVersion]] = {}
+        # Input history retention. A revision is pinned while something may
+        # still read inputs at it: a snapshot from Engine.snapshot() that has
+        # not been released, or a call that is still running. Versions no
+        # pinned revision can reach are trimmed, and ``history_floor`` is the
+        # oldest revision whose history is still complete.
+        self._pins: dict[int, int] = {}
+        self.history_floor = 0
+        # Unpins that arrived while this thread held ``lock`` (a finalizer or
+        # a generator/coroutine closed by GC mid critical section). Applied
+        # the next time the registry is touched under the lock.
+        self._deferred_unpins: deque[int] = deque()
+        # Keys holding more than one version, and appends since the last sweep.
+        self._multi_version_keys: set[InputKey] = set()
+        self._trim_debt = 0
         self.input_hashes: dict[str, str] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
         self.query_hashes: dict[str, str] = {}
@@ -226,6 +242,7 @@ class GraphStore:
                 drop_keys = [k for k in self.inputs if k[0] == input_id]
                 for k in drop_keys:
                     self.inputs.pop(k, None)
+                    self._multi_version_keys.discard(k)
                     self.mark_dependents_dirty_locked(("input", k[0], k[1]))
             self.input_fns[input_id] = fn
             self.input_hashes[input_id] = fn_hash
@@ -234,8 +251,153 @@ class GraphStore:
         return self.input_fns.get(input_id)
 
     def snapshot(self) -> Snapshot:
+        """An owned snapshot of the current revision (``Engine.snapshot()``).
+
+        Its revision stays pinned until ``release()``, the end of a ``with``
+        block, or garbage collection.
+        """
         with self.lock:
-            return Snapshot(revision=self.revision)
+            rev = self._pin_locked(None)
+        snap = Snapshot(rev)
+        finalizer = weakref.finalize(snap, self._defer_unpin, rev)
+        finalizer.atexit = False
+        snap._finalizer = finalizer  # noqa: SLF001
+        return snap
+
+    def pin_snapshot(self, snapshot: Snapshot | None) -> Snapshot:
+        """Pin ``snapshot`` (or the current revision) for a call about to start.
+
+        Raises ``SnapshotExpiredError`` if the snapshot's history was trimmed.
+        The caller must ``unpin`` the returned revision when the call ends.
+        """
+        # Runs once per top-level call, so the common path is inlined.
+        with self.lock:
+            if self._deferred_unpins:
+                self._drain_unpins_locked()
+            if snapshot is None:
+                rev = self.revision
+            else:
+                rev = snapshot.revision
+                if rev < self.history_floor:
+                    self._raise_expired(rev)
+            pins = self._pins
+            pins[rev] = pins.get(rev, 0) + 1
+        if snapshot is None:
+            return Snapshot(rev)
+        return snapshot
+
+    def pin_current_locked(self) -> int:
+        """Pin the current revision; the caller holds ``lock``."""
+        return self._pin_locked(None)
+
+    def _pin_locked(self, snapshot: Snapshot | None) -> int:
+        if self._deferred_unpins:
+            self._drain_unpins_locked()
+        if snapshot is None:
+            rev = self.revision
+        else:
+            rev = snapshot.revision
+            if rev < self.history_floor:
+                self._raise_expired(rev)
+        pins = self._pins
+        pins[rev] = pins.get(rev, 0) + 1
+        return rev
+
+    def _raise_expired(self, rev: int) -> None:
+        raise SnapshotExpiredError(
+            f"input history for revision {rev} was trimmed (history now "
+            f"starts at revision {self.history_floor}); keep the snapshot "
+            "from Engine.snapshot() unreleased while it is in use"
+        )
+
+    def unpin(self, rev: int) -> None:
+        """Release one pin on ``rev``. Safe to call from finalizers."""
+        if self.lock._is_owned():  # type: ignore[attr-defined]
+            self._deferred_unpins.append(rev)
+            return
+        with self.lock:
+            self._unpin_locked(rev)
+            if self._deferred_unpins:
+                self._drain_unpins_locked()
+
+    def unpin_all(self, revs: list[int]) -> None:
+        """Release one pin on each revision in ``revs``."""
+        lock = self.lock
+        if lock._is_owned():  # type: ignore[attr-defined]
+            self._deferred_unpins.extend(revs)
+            return
+        # Runs once per top-level call, so the common path is inlined.
+        with lock:
+            pins = self._pins
+            for rev in revs:
+                count = pins.get(rev, 0)
+                if count > 1:
+                    pins[rev] = count - 1
+                elif count:
+                    del pins[rev]
+                    if self._multi_version_keys:
+                        self._after_last_unpin_locked(rev)
+            if self._deferred_unpins:
+                self._drain_unpins_locked()
+
+    def _defer_unpin(self, rev: int) -> None:
+        # Finalizer callback: may run on any thread at any bytecode boundary,
+        # including inside one of this store's critical sections, so it must
+        # never take the lock.
+        self._deferred_unpins.append(rev)
+
+    def _drain_unpins_locked(self) -> None:
+        deferred = self._deferred_unpins
+        while deferred:
+            self._unpin_locked(deferred.popleft())
+
+    def _unpin_locked(self, rev: int) -> None:
+        pins = self._pins
+        count = pins.get(rev, 0)
+        if count > 1:
+            pins[rev] = count - 1
+            return
+        if count == 0:  # pragma: no cover - unbalanced unpin
+            return
+        del pins[rev]
+        if self._multi_version_keys:
+            self._after_last_unpin_locked(rev)
+
+    def _after_last_unpin_locked(self, rev: int) -> None:
+        """``rev`` lost its last pin: sweep if that advanced the floor."""
+        pins = self._pins
+        if pins and rev > min(pins):
+            return
+        if self._trim_debt >= max(1, len(self._multi_version_keys) // 2):
+            self._sweep_locked()
+
+    def history_floor_locked(self) -> int:
+        """Oldest revision any reader may still use."""
+        pins = self._pins
+        return min(pins) if pins else self.revision
+
+    def _sweep_locked(self) -> None:
+        floor = self.history_floor_locked()
+        if floor > self.history_floor:
+            self.history_floor = floor
+        inputs = self.inputs
+        remaining = 0
+        for key in list(self._multi_version_keys):
+            versions = inputs.get(key)
+            if versions is None:
+                self._multi_version_keys.discard(key)
+                continue
+            cut = bisect.bisect_right(versions, floor, key=_version_revision) - 1
+            if cut > 0:
+                versions = versions[cut:]
+                inputs[key] = versions
+            if len(versions) <= 1:
+                self._multi_version_keys.discard(key)
+            else:
+                remaining += len(versions) - 1
+        # Versions an older pin still protected stay owed, so the next floor
+        # advance sweeps them even if nothing is set in between.
+        self._trim_debt = remaining
 
     def traces(self) -> list[TraceEvent]:
         with self.lock:
@@ -456,6 +618,13 @@ class GraphStore:
             return latest
         idx = bisect.bisect_right(versions, revision, key=_version_revision) - 1
         if idx < 0:
+            # Trimming only removes a prefix, so the answers above stay exact.
+            # Below the floor, "no version" may mean "trimmed".
+            if revision < self.history_floor:
+                raise SnapshotExpiredError(
+                    f"input history for revision {revision} was trimmed "
+                    f"(history now starts at revision {self.history_floor})"
+                )
             return None
         return versions[idx]
 
@@ -532,11 +701,32 @@ class GraphStore:
         self.trace_event("input_set", trace_key, detail=f"changed_at={self.revision}")
 
     def _append_version_locked(self, key: InputKey, version: InputVersion) -> None:
+        """Add ``version`` and drop history no pinned revision can reach.
+
+        Readers bisect without the lock, so trimmed lists are published as new
+        lists (copy-on-write), after ``history_floor`` is raised.
+        """
+        if self._deferred_unpins:
+            self._drain_unpins_locked()
         versions = self.inputs.get(key)
-        if versions is None:
+        floor = self.history_floor_locked()
+        if not versions or floor >= version.revision:
+            if versions and version.revision > self.history_floor:
+                self.history_floor = version.revision
             self.inputs[key] = [version]
+            self._multi_version_keys.discard(key)
+            return
+        cut = bisect.bisect_right(versions, floor, key=_version_revision) - 1
+        if cut > 0:
+            if floor > self.history_floor:
+                self.history_floor = floor
+            kept = versions[cut:]
+            kept.append(version)
+            self.inputs[key] = kept
         else:
             versions.append(version)
+            self._trim_debt += 1
+        self._multi_version_keys.add(key)
 
     def inspect_graph(self, *, condense: bool = False) -> dict[str, Any]:
         from ._graph_export import condense_graph

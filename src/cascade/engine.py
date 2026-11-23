@@ -12,7 +12,13 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 from . import _canonical
 from ._ast_rewrite import rewrite_query
 from ._disk_cache import DiskCache, DiskCacheProtocol
-from ._errors import CancellationError, CycleError, PersistentCacheError, QueryCancelled
+from ._errors import (
+    CancellationError,
+    CycleError,
+    PersistentCacheError,
+    QueryCancelled,
+    SnapshotExpiredError,
+)
 from ._evaluator import Evaluator
 from ._incremental import IncrementalRuntime
 from ._runtime import RuntimeState
@@ -45,6 +51,7 @@ __all__ = [
     "PersistentCacheError",
     "QueryCancelled",
     "Snapshot",
+    "SnapshotExpiredError",
     "TraceEvent",
 ]
 
@@ -301,6 +308,13 @@ class Engine:
         return self._store.revision
 
     def snapshot(self) -> Snapshot:
+        """Capture the current revision for consistent reads while inputs change.
+
+        The engine keeps the input history this snapshot needs until it is
+        released: call ``release()``, use it as ``with engine.snapshot() as s:``,
+        or drop every reference to it. Reading through a released snapshot can
+        raise ``SnapshotExpiredError``.
+        """
         return self._store.snapshot()
 
     @property
@@ -405,9 +419,11 @@ class Engine:
         other tasks. Call :meth:`shutdown` when dropping the engine if you
         require the default pool to release threads promptly.
         """
-        run_snapshot = snapshot or self.snapshot()
-        with self._store.lock:
-            cancel_epoch = self._store.cancel_epoch
+        store = self._store
+        run_snapshot = store.pin_snapshot(snapshot)
+        rev = run_snapshot.revision
+        with store.lock:
+            cancel_epoch = store.cancel_epoch
 
         def run() -> Any:
             return self._query_call(
@@ -419,9 +435,14 @@ class Engine:
                 cancel_epoch=cancel_epoch,
             )
 
-        if executor is None:
-            return self._ensure_submit_executor().submit(run)
-        return executor.submit(run)
+        try:
+            pool = executor if executor is not None else self._ensure_submit_executor()
+            future = pool.submit(run)
+        except BaseException:
+            store.unpin(rev)
+            raise
+        future.add_done_callback(lambda _: store.unpin(rev))
+        return future
 
     def compute_many(
         self,
@@ -433,7 +454,19 @@ class Engine:
     ) -> list[Any]:
         if not calls:
             return []
-        run_snapshot = snapshot or self.snapshot()
+        run_snapshot = self._store.pin_snapshot(snapshot)
+        try:
+            return self._compute_many_pinned(calls, workers, run_snapshot, effects)
+        finally:
+            self._store.unpin(run_snapshot.revision)
+
+    def _compute_many_pinned(
+        self,
+        calls: Sequence[tuple[_QueryHandle, tuple[Any, ...]]],
+        workers: int | None,
+        run_snapshot: Snapshot,
+        effects: dict[str, list[Any]] | None,
+    ) -> list[Any]:
         worker_count = workers or min(32, max(1, len(calls)))
         scheduler = WorkStealingExecutor(worker_count)
         per_call_effects: list[dict[str, list[Any]] | None]
@@ -484,7 +517,21 @@ class Engine:
         if not calls:
             return
 
-        run_snapshot = snapshot or self.snapshot()
+        run_snapshot = self._store.pin_snapshot(snapshot)
+        try:
+            yield from self._compute_many_stream_pinned(
+                calls, workers, run_snapshot, effects
+            )
+        finally:
+            self._store.unpin(run_snapshot.revision)
+
+    def _compute_many_stream_pinned(
+        self,
+        calls: Sequence[tuple[_QueryHandle, tuple[Any, ...]]],
+        workers: int | None,
+        run_snapshot: Snapshot,
+        effects: dict[str, list[Any]] | None,
+    ) -> Iterator[tuple[int, Any, dict[str, list[Any]]]]:
         worker_count = workers or min(32, max(1, len(calls)))
 
         per_call_effects: list[dict[str, list[Any]]]
