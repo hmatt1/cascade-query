@@ -991,15 +991,29 @@ def test_format_bump_sqlite(tmp_path: Path) -> None:
 
     from cascade import Engine
 
-    engine_a = Engine(cache_dir=cache, cache_backend="sqlite")
+    def session() -> tuple[Engine, Any]:
+        # Every session registers the same query, so only the format stamp
+        # decides whether the stored result is reused.
+        engine = Engine(cache_dir=cache, cache_backend="sqlite")
 
-    @engine_a.query
-    def word_count(p: str) -> int:
-        runs["word_count"] = runs.get("word_count", 0) + 1
-        return len(Path(p).read_text().split())
+        @engine.query(name="word_count")
+        def word_count(p: str) -> int:
+            runs["word_count"] = runs.get("word_count", 0) + 1
+            return len(Path(p).read_text().split())
 
+        return engine, word_count
+
+    engine_a, word_count = session()
     assert word_count(str(data)) == 2
+    assert runs == {"word_count": 1}
     engine_a.shutdown()
+
+    # Same format: the stored result is served and the body does not run.
+    runs.clear()
+    engine_same, word_count_same = session()
+    assert word_count_same(str(data)) == 2
+    assert runs == {}
+    engine_same.shutdown()
 
     # Manually bump sqlite format
     import sqlite3
@@ -1014,13 +1028,7 @@ def test_format_bump_sqlite(tmp_path: Path) -> None:
     conn.close()
 
     runs.clear()
-    engine_b = Engine(cache_dir=cache, cache_backend="sqlite")
-
-    @engine_b.query
-    def word_count_b(p: str) -> int:
-        runs["word_count"] = runs.get("word_count", 0) + 1
-        return len(Path(p).read_text().split())
-
+    engine_b, word_count_b = session()
     assert word_count_b(str(data)) == 2
     assert runs == {"word_count": 1}
 

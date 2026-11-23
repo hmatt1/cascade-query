@@ -304,7 +304,7 @@ def test_key_and_args_caches_are_bounded(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "mdbx"])
-def test_format_change_wipes_collection_logs(tmp_path: Path, backend: str) -> None:
+def test_format_change_keeps_collection_logs(tmp_path: Path, backend: str) -> None:
     cache = tmp_path / "cache"
 
     def open_disk() -> Any:
@@ -315,12 +315,13 @@ def test_format_change_wipes_collection_logs(tmp_path: Path, backend: str) -> No
     assert disk.collection_load("col") == (None, [(1, {"diff": (1, 2)})])
     disk.close()
 
-    # Reopening under a different format number must not try to decode it.
+    # The result-cache format number does not cover collection logs: they
+    # are data nothing can recompute, with a format number of their own.
     old_format = disk_cache_mod.DISK_FORMAT
     disk_cache_mod.DISK_FORMAT = old_format + 1
     try:
         disk = open_disk()
-        assert disk.collection_load("col") == (None, [])
+        assert disk.collection_load("col") == (None, [(1, {"diff": (1, 2)})])
         disk.close()
     finally:
         disk_cache_mod.DISK_FORMAT = old_format

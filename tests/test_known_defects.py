@@ -519,7 +519,6 @@ def test_d15_results_survive_a_normal_exit_without_shutdown(tmp_path: Path) -> N
     assert rerun == 0, f"{rerun} of {count} results were not on disk"
 
 
-@_defect(16, "a format-version change wipes collection logs")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_d16_format_change_does_not_silently_drop_collections(
     tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch

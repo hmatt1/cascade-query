@@ -1,11 +1,22 @@
 """MDBX-backed persistent store for query metadata and value blobs.
 
-Layout: one MDBX environment per ``cache_dir`` with three named databases.
+Layout: one MDBX environment per ``cache_dir`` with four named databases.
 ``meta`` maps a deterministic entry key to a packed record describing a query
 result (value fingerprint, dependency fingerprints, accumulator effects).
 ``blobs`` is content-addressed: value fingerprint -> canonical value bytes.
-``sys`` holds the on-disk format stamp; a mismatched stamp wipes the cache,
-which is always safe because everything here can be recomputed.
+``collections`` holds the logs of named collections.
+``sys`` holds two format stamps, because the two kinds of data age
+differently:
+
+* ``DISK_FORMAT`` covers ``meta`` and ``blobs``. They are a cache: a
+  mismatched stamp empties them, which is always safe because every result
+  can be recomputed.
+* ``COLLECTION_FORMAT`` covers ``collections``. A collection's log is the
+  only copy of its contents, so it is never emptied. A directory whose
+  collection data this version cannot read is refused with
+  ``PersistentCacheError`` and left as it is.
+
+The sqlite backend keeps the same four tables in one database file.
 """
 
 from __future__ import annotations
@@ -70,6 +81,55 @@ DISK_FORMAT = 2
 # blobs, where identical results are deduplicated.
 INLINE_VALUE_MAX_BYTES = 1024
 _FORMAT_KEY = b"format"
+
+# Format of named collections' logs, versioned apart from the result cache
+# so that a ``DISK_FORMAT`` bump keeps them. Bump it only together with code
+# that migrates the older formats: collection data must never be dropped.
+# 1: snapshot record and one diff per revision, each a canonical msgpack map.
+COLLECTION_FORMAT = 1
+_COLLECTION_FORMAT_KEY = b"collections_format"
+# Directories written before collections had a stamp of their own carry only
+# the result-cache stamp. This maps that stamp to the collection format the
+# same code wrote.
+_UNSTAMPED_COLLECTION_FORMATS = {2: 1}
+
+
+def _check_collection_format(
+    path: str,
+    result_stamp: bytes | None,
+    collection_stamp: bytes | None,
+    has_collection_data: Any,
+) -> None:
+    """Raise unless the stored collection data is in ``COLLECTION_FORMAT``.
+
+    Called before anything in the directory is changed.
+    """
+    if collection_stamp is not None:
+        stored: int | None = int.from_bytes(bytes(collection_stamp), "big")
+    elif result_stamp is None:
+        return  # a new directory
+    else:
+        written_by = int.from_bytes(bytes(result_stamp), "big")
+        stored = _UNSTAMPED_COLLECTION_FORMATS.get(written_by)
+        if stored is None:
+            if not has_collection_data():
+                return
+            raise PersistentCacheError(
+                f"the cache at {path!r} holds named collections written in "
+                f"disk format {written_by}, which this version of cascade "
+                "cannot read. Nothing was changed. Collection data cannot be "
+                "recomputed: open the directory with the version that wrote "
+                "it, or delete the directory if the data is not needed."
+            )
+    if stored != COLLECTION_FORMAT:
+        raise PersistentCacheError(
+            f"the cache at {path!r} holds named collections in collection "
+            f"format {stored}; this version of cascade reads format "
+            f"{COLLECTION_FORMAT}. Nothing was changed. Collection data "
+            "cannot be recomputed: open the directory with a version of "
+            "cascade that reads it, or delete the directory if the data is "
+            "not needed."
+        )
 
 
 class _SharedEnv:
@@ -167,7 +227,11 @@ class MdbxDiskCache:
             if _FREE_THREADED:  # pragma: no cover
                 _FT_LOCK.release()
         self._closed = False
-        self._ensure_format()
+        try:
+            self._ensure_format()
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def path(self) -> str:
@@ -178,17 +242,29 @@ class MdbxDiskCache:
 
     def _ensure_format(self) -> None:
         stamp = DISK_FORMAT.to_bytes(4, "big")
+        collection_stamp = COLLECTION_FORMAT.to_bytes(4, "big")
         with self._begin(write=True) as txn:
             current = self._sys.get(txn, _FORMAT_KEY)
-            if current == stamp:
+            current_collections = self._sys.get(txn, _COLLECTION_FORMAT_KEY)
+            if current == stamp and current_collections == collection_stamp:
                 return
-            if current is not None:
-                # Nothing written by another format is decodable, including
-                # collection logs, so start from an empty store.
+
+            def has_collection_data() -> bool:
+                with mdbx.Cursor(self._collections, txn) as curs:
+                    for _ in curs.iter():
+                        return True
+                return False
+
+            _check_collection_format(
+                self.path, current, current_collections, has_collection_data
+            )
+            if current is not None and current != stamp:
+                # Results written by another format are not decodable. They
+                # can be recomputed, so drop them. Collection logs stay.
                 self._meta.drop(txn, delete=False)
                 self._blobs.drop(txn, delete=False)
-                self._collections.drop(txn, delete=False)
             self._sys.put(txn, _FORMAT_KEY, stamp)
+            self._sys.put(txn, _COLLECTION_FORMAT_KEY, collection_stamp)
 
     def load_entry(self, key: bytes) -> dict[str, Any] | None:
         with self._begin() as txn:
@@ -379,7 +455,11 @@ class SqliteDiskCache:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
 
-        self._ensure_format()
+        try:
+            self._ensure_format()
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def path(self) -> str:
@@ -387,6 +467,7 @@ class SqliteDiskCache:
 
     def _ensure_format(self) -> None:
         stamp = DISK_FORMAT.to_bytes(4, "big")
+        collection_stamp = COLLECTION_FORMAT.to_bytes(4, "big")
         with self._lock:
             self._conn.execute("begin")
             try:
@@ -407,24 +488,42 @@ class SqliteDiskCache:
                     "select v from sys where k = ?", (_FORMAT_KEY,)
                 ).fetchone()
                 current = row[0] if row else None
+                row = self._conn.execute(
+                    "select v from sys where k = ?", (_COLLECTION_FORMAT_KEY,)
+                ).fetchone()
+                current_collections = row[0] if row else None
 
-                if current == stamp:
+                if current == stamp and current_collections == collection_stamp:
                     self._conn.execute("commit")
                     return
 
-                if current is not None:
-                    # Nothing written by another format is decodable, including
-                    # collection logs, so start from an empty store.
+                def has_collection_data() -> bool:
+                    return (
+                        self._conn.execute(
+                            "select 1 from collections limit 1"
+                        ).fetchone()
+                        is not None
+                    )
+
+                _check_collection_format(
+                    self._path, current, current_collections, has_collection_data
+                )
+                if current is not None and current != stamp:
+                    # Results written by another format are not decodable.
+                    # They can be recomputed, so drop them. Collection logs
+                    # stay.
                     self._conn.execute("delete from meta")
                     self._conn.execute("delete from blobs")
-                    self._conn.execute("delete from collections")
 
-                self._conn.execute(
+                self._conn.executemany(
                     "insert or replace into sys (k, v) values (?, ?)",
-                    (_FORMAT_KEY, stamp),
+                    [
+                        (_FORMAT_KEY, stamp),
+                        (_COLLECTION_FORMAT_KEY, collection_stamp),
+                    ],
                 )
                 self._conn.execute("commit")
-            except Exception:  # pragma: no cover
+            except BaseException:
                 self._conn.execute("rollback")
                 raise
 

@@ -41,13 +41,13 @@ Every open defect has a failing regression test in
 | G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
 | G19 | Equal values of the same type encode to the same bytes | Holds | Weak |
-| G20 | A corrupt or old-format cache entry is recomputed, not served | Holds for query results; broken for collections (D16) | Medium |
+| G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
 | G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5) | Strong for mutators |
 | G22 | A rewritten query returns what the plain Python would | Broken (D1, D7) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
 | G25 | A transaction applies completely or not at all | Broken for a commit that fails on an input value (D27) | Good, threads and tasks included |
-| G26 | A named collection is restored with the same contents after a restart | Broken (D10, D16) | Good on the happy path |
+| G26 | A named collection is restored with the same contents after a restart | Broken for two engines on one directory (D10) | Good on the happy path |
 
 ## Core evaluation
 
@@ -512,12 +512,32 @@ Enforced by: `test_disk_cache.py::test_encode_is_deterministic_for_dict_and_set_
 ### G20. Corruption and format changes
 
 An undecodable query entry, a missing blob or a digest mismatch is treated as a
-miss and recomputed. A cache written by a different on-disk format version is
-wiped on open. Opening a directory with the other backend sees an empty cache,
-because each backend uses its own files.
+miss and recomputed. Opening a directory with the other backend sees an empty
+cache, because each backend uses its own files.
+
+A cache directory carries two format numbers. `DISK_FORMAT` covers cached
+query results: results written under another number are deleted on open and
+recomputed. `COLLECTION_FORMAT` covers the logs of named collections, which
+are data and are never deleted: a change of `DISK_FORMAT` leaves them as they
+are, in both directions. A directory whose collection data this version
+cannot read (a newer `COLLECTION_FORMAT`, or collections left by a release
+older than the ones known) is refused with `PersistentCacheError` at
+`Engine(cache_dir=...)`, and nothing in it is changed. A directory written
+before collections had a number of their own (result format 2) is read as
+collection format 1.
+
+Limits: a release from before this split still wipes collections when it
+opens a directory with a result format it does not know, so do not open a
+directory with an older release than the one that wrote it.
 
 Enforced by: `test_disk_cache.py::test_corrupt_blob_falls_back_to_recompute`,
-`::test_format_bump_wipes_stale_cache`,
+`::test_format_bump_wipes_stale_cache`, `::test_format_bump_sqlite`,
+`test_format_bump.py` (both backends: results recomputed and collections
+kept across a bump and back, a compacted log with its tail, a directory
+without a collection stamp, unreadable collection formats refused with
+nothing dropped),
+`test_disk_format2.py::test_format_change_keeps_collection_logs`,
+`test_known_defects.py::test_d16_format_change_does_not_silently_drop_collections`,
 `test_disk_format2.py::test_corrupt_inline_value_falls_back_to_recompute`,
 `::test_foreign_extension_payload_is_rejected`.
 
@@ -685,7 +705,8 @@ compaction preserves them. A value that cannot be encoded raises
 `clear_disk_cache()` deletes cached query results only. Collection logs are
 data that nothing can recompute, so they stay, and a restart after a clear
 restores exactly what each collection held at shutdown. To empty a
-collection, call its `clear()`.
+collection, call its `clear()`. A change of the result cache's format
+keeps them too (G20).
 
 Limits: writes are committed but not fsynced, so they survive a process kill
 but not necessarily a power loss.
@@ -725,7 +746,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
 | D27 | A commit that fails while applying its input updates is applied in part. With `xs.append(2)` and `x.set(object())` in one block, the exit raises `TypeError` (the value cannot be hashed), `list(xs)` is `[1, 2]`, and a query still reads `len(xs) == 1`: the collection change is kept (for a named collection, also on disk) but its new head is never published. Found while fixing D17; present at the audit commit. | Reproduced |
 
 ### Hangs and misleading errors
@@ -756,6 +776,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D22 | Re-registering a query with changed code while `engine.revision` had not moved since its dependents were computed left those dependents serving old results (`top()` stayed 2 where a fresh run gives 11). The dependents counted as verified at that revision and were not looked at again; an input change in between hid it. The same held for an input registered again with a changed default and read through a snapshot, and for dependents cut off from the function by an evicted result. Registration with changed code now makes every cached result verify again. | `fix: results computed from a query's old code survived its re-registration` |
 | D12 | When a pinned snapshot predated a collection, in-memory compaction ignored later snapshots and open transactions: a snapshot read raised the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction left 2048 of its 3000 appended items in place. With no head recorded at the oldest pinned revision, compaction took the newest head as its limit. The limit is now the first head the collection reported, and never past the head an open transaction started at. A reader nothing pins gets `SnapshotExpiredError`. | `fix: collection log compaction dropped diffs that snapshots and transactions needed` |
 | D17 | The open transaction leaked across concurrency boundaries. Another thread appending to a collection during the block had its change deleted on rollback, and published the block's uncommitted changes to queries. A task created in the block that called `set()` after the block had ended put the update on the dead transaction's queue, where it was dropped (`set(5)` left the input at 1); a task or inheriting thread running during the block had its updates queued into a transaction it knew nothing about. A transaction now belongs to the task, or else the thread, that entered it. Other code is outside it: its `set` applies at once, and changing a collection the transaction has changed raises `RuntimeError`. | `fix: a transaction leaked into other threads and tasks` |
+| D16 | A format-version change wiped collection logs along with cached results (`[1, 2, 3]` restored as `[]`, with no error, on both backends). Collection logs now have a format number of their own, `COLLECTION_FORMAT`; a `DISK_FORMAT` change deletes cached results only. Collection data that cannot be read is refused with `PersistentCacheError` instead of deleted. | `fix: a disk format change deleted named collections' data` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -852,9 +873,6 @@ Ordered by the risk they leave open.
 9. **Transactions inside the block are untested** for queries reading a
    mutated or newly created collection, `submit` and two engines. Threads and
    async tasks are covered by `test_transaction_ownership.py`.
-10. **One test does not test what it claims.**
-    `test_disk_cache.py::test_format_bump_sqlite` registers a different query
-    in its second session, so it would recompute regardless.
-11. **Mutation testing is configured but never run in CI**, so the 95% line
+10. **Mutation testing is configured but never run in CI**, so the 95% line
     coverage figure says nothing about whether the assertions would catch a
     bug.
