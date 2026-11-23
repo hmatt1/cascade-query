@@ -10,8 +10,8 @@ implementation model), but it tracks the state transitions that matter for:
 
 ## Files
 
-- `cascade_core.tla` - state machine model and invariants
-- `cascade_core.cfg` - TLC constants and invariant check configuration
+- `CascadeCore.tla` - state machine model and invariants
+- `CascadeCore.cfg` - TLC constants and invariant check configuration
 
 ## What the model covers
 
@@ -42,20 +42,20 @@ implementation model), but it tracks the state transitions that matter for:
 Install any TLA+ runtime you prefer (Toolbox or `tla2tools.jar`), then run:
 
 ```bash
-java -cp tla2tools.jar tlc2.TLC docs/formal/cascade_core.tla -config docs/formal/cascade_core.cfg
+java -cp tla2tools.jar tlc2.TLC docs/formal/CascadeCore.tla -config docs/formal/CascadeCore.cfg
 ```
 
 Optional flags for faster local iteration:
 
 ```bash
-java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock docs/formal/cascade_core.tla -config docs/formal/cascade_core.cfg
+java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock docs/formal/CascadeCore.tla -config docs/formal/CascadeCore.cfg
 ```
 
 ## Notes
 
-- `MaxRev` and `ValueSet` are bounded in `cascade_core.cfg` to keep model
+- `MaxRev` and `ValueSet` are bounded in `CascadeCore.cfg` to keep model
   checking fast.
-- `cascade_core.cfg` enables `ChangedAtBoundedByRevision` in addition to the
+- `CascadeCore.cfg` enables `ChangedAtBoundedByRevision` in addition to the
   original snapshot/dependency/cancellation invariants.
 - This model is a safety net for invariants, not a full proof of total engine
   behavior.

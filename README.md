@@ -79,6 +79,13 @@ The `Engine` manages caching, execution, and state tracking.
     *   `input.set(*args, value=value)`: Updates a keyed input.
 *   **`@engine.query`**: Decorator for cached computations. Re-evaluates only if upstream data changes.
 
+A few rules apply to every engine, with or without `cache_dir`:
+
+*   **Values must be encodable.** Results and input values are fingerprinted with the same encoder the disk cache uses, so they must be primitives, bytes, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions. Anything else (`Enum`, `Path`, `Decimal`, arbitrary class instances) raises `TypeError`.
+*   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache.
+*   **A query's identity is its `module:qualname`.** Two functions with the same module and qualified name (queries built by one factory function, lambdas in one module) are the same query and share cached results.
+*   **Arguments are positional and hashable.**
+
 ### Snapshots & Transactions (Input Debouncing)
 
 *   **`engine.snapshot()`**: Returns a `Snapshot` object pinning the current global revision. Use `query(snapshot=s)` to read data as it existed at that revision.
@@ -140,8 +147,8 @@ Synchronous queries can also be called directly from inside asynchronous nodes (
 *   **`engine.submit(query, *args, executor=None)`**: Schedules a query for background execution. Returns a `concurrent.futures.Future`.
 *   **`engine.compute_many(calls, workers=None)`**: Executes a list of queries in parallel using a thread pool. Blocks until all are complete and returns a list of results.
 *   **`engine.compute_many_stream(calls, workers=None)`**: Yields completed results as each call finishes. Yields `(index, value, call_effects)` in completion order.
-*   **`engine.shutdown(*, wait=True, cancel_futures=False)`**: Shuts down the default thread pool executor used by `submit`.
-*   **`QueryCancelled`**: Exception raised if a background query's dependencies change before it completes.
+*   **`engine.shutdown(*, wait=True, cancel_futures=False)`**: Shuts down the default thread pool executor used by `submit`. With `cache_dir`, it also writes any results still queued for the disk cache and closes it.
+*   **`QueryCancelled`**: Exception raised if a background query's dependencies change before it completes. Only queries started with `submit` are cancelled; direct calls, `compute_many` and `compute_many_stream` always run to completion. (Known defect: a direct call that joins a submitted run of the same query can currently receive its `QueryCancelled`; see D19 in `docs/guarantees.md`.)
 
 ---
 
@@ -151,10 +158,12 @@ Synchronous queries can also be called directly from inside asynchronous nodes (
 If a function's logic evaluates to a result identical to its previous run, early bail-out prevents re-computation of downstream queries.
 
 ### Code-Aware Auto-Invalidation
-Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic. If the logic has changed, Cascade immediately invalidates that function's memory and persistent disk caches.
+Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic when the function is registered again. If the logic has changed, Cascade invalidates that function's memory and persistent disk caches at that point.
+
+The hash covers only the function's own bytecode, constants and names. It does not cover helper functions the query calls, closure values, default arguments or globals, so editing those leaves cached results in place; clear the cache (`engine.clear_disk_cache()`) after such an edit.
 
 ### Time-To-Live (TTL) Caching
-Cascade supports expiring cache entries automatically based on wall-clock time. By passing the `ttl` flag to `@engine.query`, you can guarantee that a node will recompute its value if it is accessed after the specified number of seconds has elapsed.
+Cascade supports expiring cache entries automatically based on wall-clock time. By passing the `ttl` flag to `@engine.query`, you ask for a node to recompute its value if it is accessed after the specified number of seconds has elapsed. Today this holds when the TTL query is called directly; reached through a dependent that is already up to date, an expired result can still be served (known defect D3 in `docs/guarantees.md`).
 
 ```python
 @engine.query(ttl=5.0)
@@ -184,7 +193,7 @@ def mapped_data() -> list[int]:
 ```
 
 ### Garbage Collection & Pruning
-*   **`engine.prune(roots, vacuum_disk=False)`**: Removes cached query results from the in-memory LRU cache that are not reachable from the specified roots. Set `vacuum_disk=True` to deep vacuum the persistent MDBX disk cache.
+*   **`engine.prune(roots, vacuum_disk=False)`**: Removes cached query results from the in-memory LRU cache that are not reachable from the specified roots. Set `vacuum_disk=True` to also delete unreachable entries from the persistent disk cache (`docs/disk_cache_vacuuming.md` describes the limits, written for the MDBX backend).
 *   **`engine.access_id`**: Property returning a monotonically increasing sequence number for memo accesses.
 *   **`engine.sweep_unaccessed(since_access_id)`**: Evicts all memos that haven't been accessed since `since_access_id`. Useful for generational garbage collection.
 
@@ -223,9 +232,9 @@ engine = Engine(max_entries=10_000, cache_dir=".cascade_cache")
 sqlite_engine = Engine(max_entries=10_000, cache_dir=".cascade_cache", cache_backend="sqlite")
 ```
 *   `libmdbx` and `msgpack` are required for the default backend (`pip install query-cascade[disk]`). You can also use `sqlite` which has no external dependencies.
-*   Values and arguments must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.).
+*   Values must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.); this is required for every engine, not only with `cache_dir`. A query whose arguments cannot be serialized is computed but not persisted.
 *   **`engine.clear_disk_cache()`**: Deletes every entry in the persistent disk cache.
-*   **Reusing results across runs:** each result is written to the cache as soon as its query finishes. A new `Engine` with the same `cache_dir` reuses them once you set the same input values again, and recomputes only the queries whose inputs changed.
+*   **Reusing results across runs:** results are queued when their query finishes and written to the cache in batches by a background thread. They are guaranteed to be on disk only after `engine.flush_disk()` or `engine.shutdown()` returns, so call one of them before your process exits; without it, recent results can be missing in the next run. A new `Engine` with the same `cache_dir` reuses them once you set the same input values again, and recomputes only the queries whose inputs changed.
 
 ---
 
@@ -260,7 +269,7 @@ Set `stats=True` or use `engine.enable_stats()` to track execution timing.
 
 ## 7. Incremental Collections & Native Map/Reduce
 
-`CascadeList`, `CascadeSet`, and `CascadeDict` behave like their builtin counterparts, but every mutation appends a diff to an event log. Queries written with ordinary comprehensions and reducers are rewritten at registration time into incremental pipelines that consume only new diffs. Appending one element to a list of a million reruns your mapping function once.
+`CascadeList`, `CascadeSet`, and `CascadeDict` behave like their builtin counterparts, but every mutation appends a diff to an event log. Queries written with ordinary single-`for` comprehensions and reducers are rewritten at registration time into incremental pipelines that consume only new diffs. Appending one element to a list of a million reruns your mapping function once.
 
 ```python
 from cascade import Engine, CascadeList
@@ -286,7 +295,7 @@ long_doc_count()      # processes only "delta"
 
 ### What gets rewritten
 
-Rewriting covers comprehensions (`[...]`, `{...}`, `{k: v ...}`), `map`, `filter`, `reversed`, and reducers: `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`, `dict`, and string-literal `.join`.
+Rewriting covers comprehensions with a single `for` clause (`[...]`, `{...}`, `{k: v ...}`), `map`, `filter`, `reversed`, and reducers: `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`, `dict`, and string-literal `.join`.
 
 | Reducer | Ingest per diff | Finalize |
 |---------|-----------------|----------|
@@ -296,24 +305,25 @@ Rewriting covers comprehensions (`[...]`, `{...}`, `{k: v ...}`), `map`, `filter
 | `list`, `set`, `dict`, `.join` | O(1) | O(output) |
 | `reversed` | O(1) positional flip | inherited |
 
-*   Arbitrary `for` loops are never rewritten, but invalidate through read tracking.
+*   Arbitrary `for` loops and comprehensions with more than one `for` are never rewritten, but invalidate through read tracking.
+*   Iterating a `CascadeSet`, in a comprehension or a loop, yields its elements in insertion order.
 *   `enumerate()` and `zip()` sources are explicitly excluded.
 *   Opt out globally via `Engine(incremental=False)` or per-query `@engine.query(incremental=False)`.
 
 ### Batching Mutations for Disk Performance
 
-By design, Cascade collections use an immediate write-ahead pattern for crash-safety. Every time you mutate a collection (`__setitem__`, `append()`, `add()`), Cascade immediately opens a disk transaction, writes the diff to the MDBX event log, and forces an OS sync (`fsync`). 
+By design, Cascade collections use an immediate write-ahead pattern for crash-safety. Every time you mutate a collection (`__setitem__`, `append()`, `add()`), Cascade immediately opens a disk transaction and commits the diff to the collection's event log on disk. The commit is not followed by an OS sync (`fsync`) on either backend, so a mutation survives a process crash but not necessarily a power loss.
 
-If you iterate through a loop inserting thousands of records one by one, you will trigger thousands of physical disk syncs, resulting in extremely slow performance (e.g., waiting on disk I/O).
+If you iterate through a loop inserting thousands of records one by one, you will trigger thousands of separate disk transactions, resulting in slow performance (e.g., waiting on disk I/O).
 
-To avoid this, always align disk syncs with your **logical units of work** by batching bulk-inserts using `.update()` or `extend()`. This allows Cascade to group all changes into a single disk transaction:
+To avoid this, always align disk transactions with your **logical units of work** by batching bulk-inserts using `.update()` or `extend()`. This allows Cascade to group all changes into a single disk transaction:
 
 ```python
-# SLOW (10,000 separate disk syncs)
+# SLOW (10,000 separate disk transactions)
 for i in range(10000):
     docs[f"doc_{i}"] = i
 
-# FAST (1 single disk sync)
+# FAST (1 single disk transaction)
 docs.update({f"doc_{i}": i for i in range(10000)})
 ```
 
@@ -339,8 +349,8 @@ items = CascadeList(engine, name="items", compact_every=1024)
 ### Limitations
 
 1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`.
-2. **Thread Safety:** While Cascade supports parallel query execution, the `Engine` object itself should be modified (`.set()`, `@engine.query`) from a single thread or with external synchronization.
-3. **Persistence Security:** The persistent disk cache resolves `@dataclass` and `NamedTuple` types via `importlib`. Only open cache directories from trusted sources.
+2. **Thread Safety:** Calling queries, reading inputs, `.set()`, transactions and registering queries or inputs are safe from any thread. Use one process per `cache_dir`, and do not mutate a collection from another thread while a transaction that touched it is open (see `docs/guarantees.md`).
+3. **Persistence Security:** The persistent disk cache resolves `@dataclass`, `NamedTuple` and exception types via `importlib`. Only open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.
 
 ### Examples (in `examples/`)
@@ -371,5 +381,6 @@ python3.14t -m pytest -q --cov=src/cascade --cov-branch --cov-report=term-missin
 ```
 
 *   **Stateful fuzz**: `PYTHON_GIL=0 python3.14t -m pytest -q tests/test_stateful_engine_invariants.py`
+*   **Guarantees**: `docs/guarantees.md` lists what the engine promises, the tests behind each promise, and known defects.
 *   **Formal model**: TLA+ specs live under `docs/formal/`.
 *   **Performance suite**: `python -m benchmarks.performance_suite --report-dir artifacts/performance --assert-thresholds`
