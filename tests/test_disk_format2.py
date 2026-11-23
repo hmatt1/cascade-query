@@ -63,7 +63,13 @@ def _same(a: Any, b: Any) -> bool:
     return a == b
 
 
-@pytest.mark.parametrize("value", ROUND_TRIP_VALUES, ids=repr)
+# Ids are positional: ``repr`` of a set of strings changes with the hash seed,
+# so pytest-xdist workers collected different ids and refused to run.
+@pytest.mark.parametrize(
+    "value",
+    ROUND_TRIP_VALUES,
+    ids=[f"{i}-{type(v).__name__}" for i, v in enumerate(ROUND_TRIP_VALUES)],
+)
 def test_round_trip_preserves_value_and_type(value: Any) -> None:
     assert _same(value, canonical.decode(canonical.encode(value)))
 
