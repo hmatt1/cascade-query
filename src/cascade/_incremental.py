@@ -28,6 +28,7 @@ from typing import Any, Callable
 from ._collections import (
     CascadeDict,
     CascadeList,
+    ABSENT_HEAD,
     CascadeSet,
     _CascadeDictView,
     _HistoryCompacted,
@@ -342,6 +343,9 @@ class IncrementalRuntime:
 
         core = collection._core
         head = core.head_for_current_context()
+        if head == ABSENT_HEAD:
+            # Read at a revision from before this collection was created.
+            return _fallback(reducer_name, [], stages, reducer_args)
         # If the recorded head outruns the live log, trust the log.
         head = min(head, core.log.head)
         fused = _fuse(stages)

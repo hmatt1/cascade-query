@@ -48,6 +48,10 @@ _auto_ids = itertools.count()
 # compaction (which replays the folded diffs) stays amortized O(1) per diff.
 _MEMORY_COMPACT_THRESHOLD = 1024
 
+# Head value the hidden input reports at revisions from before the collection
+# was created in this engine. Pipelines treat it as an empty collection.
+ABSENT_HEAD = -1
+
 _BASE_LEN = {_KIND_LIST: list.__len__, _KIND_SET: set.__len__, _KIND_DICT: dict.__len__}
 
 
@@ -237,7 +241,11 @@ class _CollectionCore:
             self.log = DiffLog(kind)
 
         def _head() -> int:
-            return self.log.head
+            # Only reached at revisions with no recorded head, which are the
+            # ones from before this collection was created (it records its
+            # head right below). Reporting the live head there let an older
+            # snapshot freeze whatever the collection held when first read.
+            return ABSENT_HEAD
 
         _head.__module__ = "cascade"
         _head.__qualname__ = self.input_qualname
