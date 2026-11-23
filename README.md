@@ -113,7 +113,7 @@ with engine.snapshot() as before:
 # History older than the current revision can now be dropped.
 ```
 
-Collections trim their in-memory diff logs the same way: diffs no snapshot or pipeline still needs are folded into the collection's base, so long-running ingest keeps memory proportional to the collection's size.
+Collections trim their in-memory diff logs the same way: diffs no live snapshot, open transaction or pipeline still needs are folded into the collection's base, so long-running ingest keeps memory proportional to the collection's size.
 
 ```python
 with engine.transaction():

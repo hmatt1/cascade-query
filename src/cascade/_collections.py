@@ -39,7 +39,7 @@ import uuid
 from typing import Any, Callable, Iterable, Mapping
 
 from . import _canonical
-from ._errors import PersistentCacheError
+from ._errors import PersistentCacheError, SnapshotExpiredError
 
 _KIND_LIST = "list"
 _KIND_SET = "set"
@@ -270,6 +270,10 @@ class _CollectionCore:
         self.rw = threading.RLock()
         # In-memory compaction a mutation asked for; runs once it lets go.
         self.compact_due = False
+        # Log head before the first change of the transaction that is open
+        # on this collection, or None. Rolling back returns to it, so the
+        # log must keep every diff after it.
+        self._tx_start: int | None = None
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -309,6 +313,8 @@ class _CollectionCore:
                 self.loaded = self.log.contents_at(self.log.head)
         if self.log is None:
             self.log = DiffLog(kind)
+        # The smallest head any reader of this collection can be handed.
+        self._created_head = self.log.head
 
         def _head() -> int:
             # Only reached at revisions with no recorded head, which are the
@@ -370,7 +376,7 @@ class _CollectionCore:
                 # A revision from before this collection was created.
                 raw: Any = [] if self.kind != _KIND_DICT else {}
             else:
-                raw = log.contents_at(head)
+                raw = self.contents_at(head)
             if self.kind == _KIND_LIST:
                 view: Any = [value for _uid, value in raw]
             elif self.kind == _KIND_SET:
@@ -379,6 +385,22 @@ class _CollectionCore:
                 view = raw
             self._snapshot_cache = (head, view)
             return view
+
+    def contents_at(self, head: int) -> Any:
+        """Log contents at ``head`` for a reader at an older revision.
+
+        Compaction keeps what every pinned revision and open transaction
+        needs, so this only fails for a reader whose revision nothing pins (a
+        hand-built or released snapshot). That reader gets the public error.
+        """
+        try:
+            return self.log.contents_at(head)
+        except _HistoryCompacted as exc:
+            raise SnapshotExpiredError(
+                f"collection {self.name!r} no longer holds its contents as of "
+                f"the revision being read ({exc}); keep the snapshot from "
+                "Engine.snapshot() unreleased while it is in use"
+            ) from None
 
     def head_for_current_context(self) -> int:
         """Log head as seen by the active runtime (snapshot-aware dependency read)."""
@@ -414,6 +436,8 @@ class _CollectionCore:
                 ) from exc
         if tx is not None:
             tx.collections.setdefault(self, start)
+            if self._tx_start is None:
+                self._tx_start = start
             if self.disk is not None:
                 tx.pending_disk.setdefault(self, []).extend(
                     (diff["rev"], diff) for diff in diffs
@@ -449,21 +473,29 @@ class _CollectionCore:
 
     def after_commit(self) -> None:
         """Run the disk compaction a transaction deferred."""
+        self._tx_start = None
         self._maybe_compact_disk()
 
     def roll_back_to(self, head: int) -> None:
         """Undo every change after ``head`` (a failed transaction).
 
-        In-memory compaction never folds past the committed head, so the
-        diffs being dropped are still in the log.
+        In-memory compaction never folds past the head a transaction
+        started from (``compact_memory``), so the diffs being dropped are
+        still in the log.
         """
         log = self.log
         with self.rw:
             with log.lock:
+                if head < log.base_rev:  # pragma: no cover - compaction bug
+                    raise RuntimeError(
+                        f"collection {self.name!r} cannot be rolled back: its "
+                        f"log was compacted past the transaction's start"
+                    )
                 if log.head > head:
                     del log.entries[head - log.base_rev :]
                 # The same head number can now come to mean other contents.
                 self._snapshot_cache = None
+                self._tx_start = None
             self._rollback()
 
     def _live_len(self) -> int:
@@ -475,21 +507,33 @@ class _CollectionCore:
     def compact_memory(self) -> None:
         """Fold in-memory diffs that no reader can still ask for into the base.
 
-        Readers at a pinned engine revision need the log from the head that
-        revision saw (a hard limit). Pipelines need it from their last ingested
-        head, but one lagging by more than the collection's size is cheaper to
-        rebuild than to replay, so that limit is soft.
+        Two hard limits. Readers at a pinned engine revision need the log
+        from the oldest head any of them saw. That is the head at the oldest
+        revision in use, or, when the collection did not exist yet at that
+        revision, the first head it ever reported: a later pinned revision
+        sees that one or a newer one. An open transaction needs the log from
+        the head it started at, to roll back to.
+
+        Pipelines need the log from their last ingested head, but one lagging
+        by more than the collection's size is cheaper to rebuild than to
+        replay, so that limit is soft.
         """
         log = self.log
         live_len = self._live_len()
         store = self.engine._store
+        key = (self.handle.id, ())
         with store.lock:
             floor = store.history_floor_locked()
-            version = store.input_version_at((self.handle.id, ()), floor)
+            version = store.input_version_at(key, floor)
+            if version is None:
+                version = store.first_version_after(key, floor)
         head = log.head
-        # No version at the floor means the collection did not exist yet at
-        # any revision still in use.
-        hard = version.value if version is not None else head
+        # No version at all: the head was never published (the collection was
+        # created inside a transaction that is still open).
+        hard = version.value if version is not None else self._created_head
+        tx_start = self._tx_start
+        if tx_start is not None:
+            hard = min(hard, tx_start)
         min_last_rev = self.engine._incremental_rt.min_last_rev(self.input_qualname)
         if min_last_rev is None:
             soft = head

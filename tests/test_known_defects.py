@@ -409,7 +409,6 @@ def test_d11_clear_disk_cache_keeps_live_named_collections(
         reopened.shutdown()
 
 
-@_defect(12, "compaction ignores later snapshots when one predates the collection")
 def test_d12_snapshot_read_survives_compaction_with_an_older_pin() -> None:
     engine = Engine()
     before_collection = engine.snapshot()
@@ -426,7 +425,6 @@ def test_d12_snapshot_read_survives_compaction_with_an_older_pin() -> None:
     before_collection.release()
 
 
-@_defect(12, "compaction inside a transaction keeps rolled-back items")
 def test_d12_rollback_undoes_everything_after_compaction_in_the_block() -> None:
     engine = Engine()
     xs: CascadeList | None = None

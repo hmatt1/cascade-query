@@ -431,7 +431,7 @@ class IncrementalRuntime:
         state = _PipelineState(reducer=reducer, env_fp=fingerprint)
         if reducer.needs_seq:
             state.seq = []
-        contents = core.log.contents_at(head)
+        contents = core.contents_at(head)
         self._ingest(state, core, view, fused, _synthetic_inserts(core.kind, contents))
         state.last_rev = head
         return state

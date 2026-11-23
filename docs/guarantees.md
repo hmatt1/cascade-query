@@ -45,8 +45,8 @@ Every open defect has a failing regression test in
 | G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5) | Strong for mutators |
 | G22 | A rewritten query returns what the plain Python would | Broken (D1, D7) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
-| G24 | A snapshot read sees collection contents as of the snapshot | Broken (D12) | Strong for one snapshot |
-| G25 | A transaction applies completely or not at all | Broken (D12, D17) | Strong for inputs only |
+| G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
+| G25 | A transaction applies completely or not at all | Broken (D17) | Good on one thread |
 | G26 | A named collection is restored with the same contents after a restart | Broken (D10, D16) | Good on the happy path |
 
 ## Core evaluation
@@ -593,11 +593,25 @@ Enforced by: `test_incremental_pipeline.py::test_single_append_runs_map_and_filt
 ### G24. Snapshot semantics for collections
 
 A query run with `snapshot=s` sees each collection's contents as of
-`s.revision`. A collection created after the snapshot reads as empty. Diff logs
-are trimmed only below what live snapshots and pipelines need.
+`s.revision`. A collection created after the snapshot reads as empty.
+
+A collection keeps its diffs in memory and folds old ones into a base from
+time to time. It never folds a diff that a live snapshot, a running call or
+an open transaction can still ask for: the log is kept from the oldest head
+any pinned revision saw (for a pinned revision from before the collection
+existed, from the collection's first head) and from the head an open
+transaction started at. Pipelines that lag far behind are rebuilt instead.
+
+Limits: a `Snapshot` built by hand, or one already released, pins nothing.
+Reading a collection through it raises `SnapshotExpiredError` once the diffs
+it needs are folded, as for inputs (G4).
 
 Enforced by: `test_collection_snapshot_direct_reads.py`,
 `test_collection_snapshot_before_creation.py`,
+`test_collection_compaction_pins.py` (several snapshots under an older pin,
+all three kinds, the public error for an unpinned reader, snapshot readers
+against a writer thread),
+`test_known_defects.py::test_d12_snapshot_read_survives_compaction_with_an_older_pin`,
 `test_history_retention.py::test_collection_snapshot_reads_survive_compaction`,
 `::test_collection_log_stays_bounded_under_churn`.
 
@@ -609,7 +623,8 @@ Inside `with engine.transaction():`
 - the last value set for each input wins, inputs ending at their current value
   are skipped, and a block that changes nothing leaves the revision alone;
 - collection changes are visible on the collection object at once and are
-  undone if the block raises;
+  undone if the block raises, however many there were and also for a
+  collection created in the block;
 - queries run inside the block see the engine as it was before the block;
 - named collections write to disk once per collection at commit, and not at
   all if the block raises;
@@ -624,7 +639,12 @@ collections are already on disk.
 Enforced by: `test_engine.py::test_engine_transaction`, `test_transaction_collections.py`
 (including `::test_transaction_object_cannot_be_entered_twice`),
 `test_history_retention.py::test_collection_mutations_in_one_transaction_store_one_version`,
-`test_incremental_collections.py::test_mutations_inside_transaction_batch_invalidation`.
+`test_incremental_collections.py::test_mutations_inside_transaction_batch_invalidation`,
+`test_known_defects.py::test_d12_rollback_undoes_everything_after_compaction_in_the_block`,
+`test_collection_compaction_pins.py::test_rollback_of_a_collection_created_in_the_block`,
+`::test_rollback_restores_an_existing_collection_under_an_older_pin`,
+`::test_rolled_back_named_collection_is_unchanged_in_memory_and_on_disk` (both
+backends).
 
 ### G26. Named collection persistence
 
@@ -676,7 +696,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D12 | When a pinned snapshot predates a collection, compaction ignores later snapshots and open transactions. A snapshot read raises the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction leaves 2048 of its 3000 appended items in place. | Reproduced |
 | D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
 | D17 | The open transaction leaks across concurrency boundaries. Another thread mutating the same collection during the block has its change deleted on rollback while queries keep the uncommitted value. A task created in the block that calls `set()` after the block exits has the update dropped. | Reproduced: the other thread's append was gone after rollback, and the task's `set(5)` left the input at 1. The "queries keep the uncommitted value" part was not re-run. |
 
@@ -706,6 +725,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D3 | An expired TTL query was not refreshed when reached through a dependent already verified at the current revision (`parent()` returned 10 before and after expiry). Two causes: a result verified at a revision was trusted at that revision for ever, and a re-run that changed the value at an unchanged revision looked unchanged to dependents. Results now carry the expiry of the TTL results beneath them, and a query's change marker is a stamp instead of the revision. | `fix: an expired TTL result was still served through queries that depend on it` |
 | D2 | A `fixed_point=` query ignored `snapshot=` and returned the head value (7 where the snapshot value is 1), and one read moved `engine.revision` from 3 to 6: every iteration ran at a new revision. The cycle is now iterated at the caller's revision, with intermediate results kept out of the shared cache. Found and fixed with it: a change to an input read only by another member of the cycle did not reach the head (`a` stayed 1 where a fresh run gives 21); a stale result read before the cycle was entered ended in `RecursionError`; a cycle that never converges looped for ever and now raises `CycleError` after `max_iterations` runs (default 1000). | `fix: a fixed-point query ignored snapshots and moved the revision` |
 | D22 | Re-registering a query with changed code while `engine.revision` had not moved since its dependents were computed left those dependents serving old results (`top()` stayed 2 where a fresh run gives 11). The dependents counted as verified at that revision and were not looked at again; an input change in between hid it. The same held for an input registered again with a changed default and read through a snapshot, and for dependents cut off from the function by an evicted result. Registration with changed code now makes every cached result verify again. | `fix: results computed from a query's old code survived its re-registration` |
+| D12 | When a pinned snapshot predated a collection, in-memory compaction ignored later snapshots and open transactions: a snapshot read raised the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction left 2048 of its 3000 appended items in place. With no head recorded at the oldest pinned revision, compaction took the newest head as its limit. The limit is now the first head the collection reported, and never past the head an open transaction started at. A reader nothing pins gets `SnapshotExpiredError`. | `fix: collection log compaction dropped diffs that snapshots and transactions needed` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
