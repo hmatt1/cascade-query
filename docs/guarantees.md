@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D1, D5–D7) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D1, D5, D7) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
@@ -40,7 +40,7 @@ Every open defect has a failing regression test in
 | G16 | A stale persisted result is never served | Holds with limits (G11's blind spots) | Medium |
 | G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
-| G19 | Equal values of the same type encode to the same bytes | Holds | Weak |
+| G19 | Values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Good by example |
 | G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
 | G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5) | Strong for mutators |
 | G22 | A rewritten query returns what the plain Python would | Broken (D1, D7) | Weak on edge cases |
@@ -98,7 +98,11 @@ Limits, by design:
   `TypeError`. G18 lists the supported types.
 - **Arguments are positional and hashable.** Keyword arguments raise
   `TypeError`. Arguments that compare equal are one cache key, so `q(1)`,
-  `q(True)` and `q(1.0)` share a result.
+  `q(True)` and `q(1.0)` share a result. A dict is not hashable and cannot be
+  an argument. A hashable object that holds a dict (a frozen dataclass with
+  the field left out of its hash) follows the same rule: two that compare
+  equal share one result, the first call's, whatever the order of their
+  dicts. Results and input values are compared more strictly (G2).
 
 Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_recomputation`
 (seeded differential test against an independent model, 16 parametrisations),
@@ -114,14 +118,28 @@ handles, `name=`).
 If no dependency changed, the body does not run. If a body re-runs and
 produces an equal result, its dependents do not re-run.
 
-"Equal" means equal content digest, not `==`. The digest is type-sensitive
-(`1`, `1.0` and `True` differ) and ignores dict and set ordering (see D6).
+"Equal" means equal content digest, not `==`. Two values have the same
+digest when a query could not tell them apart by their contents. The digest
+is type-sensitive (`1`, `1.0` and `True` differ) and includes the insertion
+order of dicts, at any depth: `{"a": 1, "b": 1}` and `{"b": 1, "a": 1}` are
+`==` but iterate differently, so a result that changes from one to the other
+re-runs its dependents. Sets have no order; two equal sets have the same
+digest however they were built.
+
+Cost of the stricter comparison: a query that returns a dict whose order
+varies without meaning (keys taken from iterating a set of strings, for
+example, whose order changes from one process to the next) no longer stops
+propagation and is not reused across runs when the order differs. Return
+`dict(sorted(d.items()))` where the order means nothing.
 
 Enforced by: `test_dirty_propagation.py::test_backdated_middle_result_stops_recompute_but_stays_correct`,
 `::test_unrelated_input_change_needs_no_walk_or_recompute`,
 `test_engine.py::test_smart_recalculation_and_selective_updates`,
 `test_scale_behavior.py::test_giant_graph_selective_invalidation_counts`,
-`test_iterative_verification.py::test_verification_stops_at_first_changed_dependency`.
+`test_iterative_verification.py::test_verification_stops_at_first_changed_dependency`,
+`test_known_defects.py::test_d6_dict_order_change_reaches_dependents`,
+`test_dict_order.py` (both digests, nested and non-string-keyed dicts, sets
+unaffected; in memory and on both backends).
 
 ### G3. Same-value `set` is a no-op
 
@@ -129,7 +147,8 @@ Enforced by: `test_dirty_propagation.py::test_backdated_middle_result_stops_reco
 revision alone, invalidates nothing and cancels nothing. Inside a transaction
 the same rule applies per input after last-write-wins.
 
-Limits: "same" is digest equality, so `set(1)` then `set(1.0)` is a change.
+Limits: "same" is digest equality (G2), so `set(1)` then `set(1.0)` is a
+change, and so is setting a dict with the same items in another order.
 The first read of an input that was never set stores its default and bumps
 the revision.
 
@@ -486,8 +505,10 @@ Supported: `None`, `bool`, `int` of any size, `float`, `str`, `bytes`, `list`,
 `timezone`, dataclasses, `NamedTuple`s and exceptions. These decode to an equal
 value of the same type.
 
+A dict comes back in the insertion order it was stored with.
+
 Known losses: `bytearray` becomes `bytes`; subclasses of containers become the
-base type; dict order comes back sorted; `zoneinfo` zones become fixed offsets;
+base type; `zoneinfo` zones become fixed offsets;
 exceptions keep only type and `args`. Dataclasses with `init=False` fields and
 classes defined inside functions cannot be decoded, so their results recompute
 every session.
@@ -499,15 +520,28 @@ Enforced by: `test_disk_cache.py::test_round_trip`,
 `::test_round_trip_preserves_container_types`,
 `::test_bytearray_collapses_to_bytes_and_nan_round_trips`,
 `test_disk_format2.py::test_round_trip_preserves_value_and_type`,
-`::test_container_subclasses_encode_as_their_base_type`.
+`::test_container_subclasses_encode_as_their_base_type`,
+`test_dict_order.py::test_decoded_dict_keeps_its_order`,
+`::test_stored_dict_comes_back_in_the_order_it_was_returned` and
+`::test_compacted_named_dict_restores_its_insertion_order` (both backends).
 
 ### G19. Deterministic encoding
 
-Two equal values of the same type encode to the same bytes regardless of dict
-or set insertion order.
+Two values of the same type with the same contents encode to the same bytes,
+and so have the same digest. For sets "the same contents" ignores the order
+in which elements were added. For dicts it includes the insertion order,
+because code can observe it (G2): the same items in another order are other
+bytes. This changed with disk format 3; format 2 sorted dict keys, so its
+results held dicts in an order the query had not returned, and they are
+dropped on open (G20). Collection logs written under format 2 are read
+unchanged.
 
 Enforced by: `test_disk_cache.py::test_encode_is_deterministic_for_dict_and_set_ordering`,
-`test_disk_format2.py::test_encoding_is_independent_of_insertion_order`.
+`test_disk_format2.py::test_encoding_is_independent_of_insertion_order`,
+`test_dict_order.py::test_digest_tells_dict_orders_apart_at_any_depth`,
+`::test_digest_of_sets_ignores_how_they_were_built`,
+`::test_results_stored_with_sorted_dicts_are_dropped_and_collections_kept`
+(both backends).
 
 ### G20. Corruption and format changes
 
@@ -737,7 +771,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 |---|---|---|
 | D1 | A rewritten stage that reads an input the query has already read is not detected as impure. `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` still returns 12 after `factor.set(10)`; correct is 60. | Reproduced |
 | D5 | Collection reads that are not tracked go stale inside queries: `set(s)`, `s \| x`, set and dict `==`, `s.issubset`, `xs + [...]`, `repr`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. | Reproduced |
-| D6 | Early bail-out treats dicts that differ only in insertion order as equal, so a dependent that iterates the dict keeps the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
 | D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
 | D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
@@ -777,6 +810,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D12 | When a pinned snapshot predated a collection, in-memory compaction ignored later snapshots and open transactions: a snapshot read raised the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction left 2048 of its 3000 appended items in place. With no head recorded at the oldest pinned revision, compaction took the newest head as its limit. The limit is now the first head the collection reported, and never past the head an open transaction started at. A reader nothing pins gets `SnapshotExpiredError`. | `fix: collection log compaction dropped diffs that snapshots and transactions needed` |
 | D17 | The open transaction leaked across concurrency boundaries. Another thread appending to a collection during the block had its change deleted on rollback, and published the block's uncommitted changes to queries. A task created in the block that called `set()` after the block had ended put the update on the dead transaction's queue, where it was dropped (`set(5)` left the input at 1); a task or inheriting thread running during the block had its updates queued into a transaction it knew nothing about. A transaction now belongs to the task, or else the thread, that entered it. Other code is outside it: its `set` applies at once, and changing a collection the transaction has changed raises `RuntimeError`. | `fix: a transaction leaked into other threads and tasks` |
 | D16 | A format-version change wiped collection logs along with cached results (`[1, 2, 3]` restored as `[]`, with no error, on both backends). Collection logs now have a format number of their own, `COLLECTION_FORMAT`; a `DISK_FORMAT` change deletes cached results only. Collection data that cannot be read is refused with `PersistentCacheError` instead of deleted. | `fix: a disk format change deleted named collections' data` |
+| D6 | Early bail-out treated dicts that differ only in insertion order as equal, so a dependent that iterated the dict kept the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). The same digest made `input.set` of a reordered dict a no-op, and the disk encoding sorted dict keys, so a stored dict came back in sorted order. Both digests and the disk encoding now keep insertion order; sets are unchanged. `DISK_FORMAT` went from 2 to 3: results stored under 2 are dropped on open, collections are kept. | `fix: a result that only changed a dict's order did not reach its dependents` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -814,6 +848,8 @@ Limits that narrow use without stopping it:
   can be reached again, so a cycle has to be entered through it, and from one
   thread at a time (G7, D24, D25).
 - **Positional, hashable arguments only**, with equal arguments sharing a key.
+- **Dict order counts.** A result or input value whose dict order varies
+  without meaning defeats early bail-out and reuse across runs (G2).
 - **Returned values are shared with the cache.**
 - **Alternating snapshot and head reads of one query recompute each time**,
   because one result is kept per query and arguments.

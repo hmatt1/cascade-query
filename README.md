@@ -97,7 +97,7 @@ A few rules apply to every engine, with or without `cache_dir`:
     ```
 
     The name is also the identity in the disk cache, so keep it stable across runs.
-*   **Arguments are positional and hashable.**
+*   **Arguments are positional and hashable.** Arguments that compare equal share one cached result (`q(1)` and `q(1.0)`); a dict cannot be an argument.
 
 ### Snapshots & Transactions (Input Debouncing)
 
@@ -169,6 +169,8 @@ Synchronous queries can also be called directly from inside asynchronous nodes (
 
 ### Targeted Updates & Early Bail-out
 If a function's logic evaluates to a result identical to its previous run, early bail-out prevents re-computation of downstream queries.
+
+"Identical" is stricter than `==`: `1`, `1.0` and `True` are different results, and so are two dicts with the same items in a different insertion order, because a query that iterates the dict can tell them apart. Sets have no order and compare by their elements. The same rule decides whether `input.set(value)` is a no-op. If a query builds a dict whose order carries no meaning (for example from iterating a set), return `dict(sorted(d.items()))` so that equal contents stop propagation and are reused across runs.
 
 ### Code-Aware Auto-Invalidation
 Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic when the function is registered again. If the logic has changed, Cascade invalidates that function's memory and persistent disk caches at that point, and results that other queries computed from the old function are re-run the next time they are used, whether or not an input changed in between. Handles to the old function become stale: calling one raises `StaleHandleError` rather than running the old code, so modules that imported the handle need to import it again after the reload.
@@ -262,7 +264,7 @@ sqlite_engine = Engine(max_entries=10_000, cache_dir=".cascade_cache", cache_bac
 *   `libmdbx` and `msgpack` are required for the default backend (`pip install query-cascade[disk]`). You can also use `sqlite` which has no external dependencies.
 *   Values must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.); this is required for every engine, not only with `cache_dir`. A query whose arguments cannot be serialized is computed but not persisted.
 *   **`engine.clear_disk_cache()`**: Deletes every cached query result in the persistent disk cache. Named collections are kept: their contents are data, not cache, and are restored as usual on the next run. To empty a collection, call its `clear()`.
-*   **Upgrades:** when a new version of Cascade changes how results are stored, the cached results in an existing `cache_dir` are dropped on open and recomputed. Named collections are kept across such a change. If a directory holds collection data the running version cannot read, `Engine(cache_dir=...)` raises `PersistentCacheError` and leaves the directory untouched.
+*   **Upgrades:** when a new version of Cascade changes how results are stored, the cached results in an existing `cache_dir` are dropped on open and recomputed (this version does: dicts are now stored in insertion order instead of sorted). Named collections are kept across such a change. If a directory holds collection data the running version cannot read, `Engine(cache_dir=...)` raises `PersistentCacheError` and leaves the directory untouched.
 *   **Reusing results across runs:** results are queued when their query finishes and written to the cache in batches by a background thread. They are on disk once `engine.flush_disk()` or `engine.shutdown()` returns, and a normal interpreter exit (end of script, `sys.exit()`, an unhandled exception) writes whatever is still queued. A process that is killed (`os._exit`, SIGKILL, a crash) loses the results still in the queue, so call `flush_disk()` at the points where that matters. A new `Engine` with the same `cache_dir` reuses them once you set the same input values again, and recomputes only the queries whose inputs changed.
 
 ---

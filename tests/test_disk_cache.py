@@ -49,7 +49,10 @@ class _Point(NamedTuple):
 
 
 def test_encode_is_deterministic_for_dict_and_set_ordering() -> None:
-    assert canonical.encode({"z": 1, "a": 2}) == canonical.encode({"a": 2, "z": 1})
+    # A dict's insertion order is part of its value (a reader can iterate
+    # it), so it is part of the encoding. Sets have no order.
+    assert canonical.encode({"z": 1, "a": 2}) == canonical.encode({"z": 1, "a": 2})
+    assert canonical.encode({"z": 1, "a": 2}) != canonical.encode({"a": 2, "z": 1})
     assert canonical.encode({3, 1, 2}) == canonical.encode({2, 3, 1})
     assert canonical.encode(frozenset(("b", "a"))) == canonical.encode(
         frozenset(("a", "b"))
@@ -308,10 +311,19 @@ def test_set_based_inputs_hit_across_sessions_when_values_match(tmp_path: Path) 
 
     runs.clear()
     engine_b, config_b, strictness_b = build()
-    config_b.set({"version": 1, "strict": True})  # same value, different key order
+    config_b.set({"strict": True, "version": 1})  # same value, same key order
     assert strictness_b() is True
     assert runs == {}
     engine_b.shutdown()
+
+    # Another key order is another value: a query can iterate the dict.
+    runs.clear()
+    engine_o, config_o, strictness_o = build()
+    config_o.set({"version": 1, "strict": True})
+    assert strictness_o() is True
+    assert runs == {"strictness": 1}
+    config_o.set({"strict": True, "version": 1})
+    engine_o.shutdown()
 
     runs.clear()
     engine_c, config_c, strictness_c = build()

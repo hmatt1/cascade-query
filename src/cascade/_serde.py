@@ -1,4 +1,9 @@
-"""Canonical JSON encoding used for stable value hashing, plus bytecode hashing."""
+"""Canonical JSON encoding used for stable value hashing, plus bytecode hashing.
+
+The digest tells apart everything a query could observe in a value: types,
+items, and the insertion order of dicts. Sets have no order and are hashed
+in a canonical one. ``_canonical`` follows the same rule for the disk cache.
+"""
 
 from __future__ import annotations
 
@@ -57,9 +62,10 @@ def stable_value_digest(value: Any) -> str:
     text = _scalar_json_text(value)
     if text is not None:
         return hashlib.blake2b(text.encode("utf-8"), digest_size=20).hexdigest()
+    # No sort_keys: the dicts _to_jsonable builds have a fixed key order,
+    # and a user's dict is a ``__map__`` list of pairs in insertion order.
     blob = json.dumps(
         _to_jsonable(value),
-        sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
@@ -69,7 +75,6 @@ def stable_value_digest(value: Any) -> str:
 def _sort_key(obj: Any) -> str:
     return json.dumps(
         _to_jsonable(obj),
-        sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
@@ -136,10 +141,8 @@ def _to_jsonable(obj: Any) -> Any:
         items = sorted((_sort_key(x), _to_jsonable(x)) for x in obj)
         return {"__set__": [v for _, v in items]}
     if isinstance(obj, dict):
-        pairs: list[list[Any]] = []
-        for k in sorted(obj.keys(), key=_sort_key):
-            pairs.append([_to_jsonable(k), _to_jsonable(obj[k])])
-        return {"__map__": pairs}
+        # In insertion order: a dependent that iterates the dict sees it.
+        return {"__map__": [[_to_jsonable(k), _to_jsonable(v)] for k, v in obj.items()]}
 
     if isinstance(obj, BaseException):
         return {

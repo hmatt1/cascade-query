@@ -23,7 +23,11 @@ class _SampleNT(NamedTuple):
 
 
 def test_stable_digest_deterministic_for_collections_and_dataclass() -> None:
+    # A dict's insertion order is part of its value; a set has no order.
     assert stable_value_digest({"z": 1, "a": 2}) == stable_value_digest(
+        {"z": 1, "a": 2}
+    )
+    assert stable_value_digest({"z": 1, "a": 2}) != stable_value_digest(
         {"a": 2, "z": 1}
     )
     assert stable_value_digest(_SampleDC(1, "x")) == stable_value_digest(

@@ -96,9 +96,14 @@ def test_exception_round_trip() -> None:
 
 
 def test_encoding_is_independent_of_insertion_order() -> None:
+    # Of sets, that is. Dict order is part of the value and of the encoding.
     a = {"x": {3, 1, 2}, "y": {(1, 2): "p", "k": "q"}, "z": frozenset({"b", "a"})}
-    b = {"z": frozenset({"a", "b"}), "y": {"k": "q", (1, 2): "p"}, "x": {2, 3, 1}}
+    b = {"x": {2, 3, 1}, "y": {(1, 2): "p", "k": "q"}, "z": frozenset({"a", "b"})}
     assert canonical.encode(a) == canonical.encode(b)
+    reordered = {"z": a["z"], "y": a["y"], "x": a["x"]}
+    assert canonical.encode(a) != canonical.encode(reordered)
+    inner = {"x": a["x"], "y": {"k": "q", (1, 2): "p"}, "z": a["z"]}
+    assert canonical.encode(a) != canonical.encode(inner)
     mixed_a = {1, "a", (2, 3), None, 1.5}
     mixed_b = {None, 1.5, (2, 3), "a", 1}
     assert canonical.encode(mixed_a) == canonical.encode(mixed_b)

@@ -1,12 +1,19 @@
 """Deterministic msgpack encoding and hashing for the persistent disk cache.
 
-Equal values must always produce identical byte streams, so dict keys and set
-elements are emitted in a canonical order. Fingerprints are blake2b digests of
-those byte streams. msgpack is imported lazily so the in-memory engine keeps
-working without it; enabling ``cache_dir`` requires it.
+Two values produce identical byte streams exactly when no Python code could
+tell them apart by their contents: same types, same items, and for dicts the
+same insertion order. Set elements have no order to observe and are emitted
+in a canonical one. A dict's insertion order is part of its value: a query
+that iterates the dict sees it, so ``{"a": 1, "b": 2}`` and
+``{"b": 2, "a": 1}``, though ``==``, are different results with different
+fingerprints, and a decoded dict has the order it was encoded with.
 
-Wire format (disk format 2)
----------------------------
+Fingerprints are blake2b digests of those byte streams. msgpack is imported
+lazily so the in-memory engine keeps working without it; enabling
+``cache_dir`` requires it.
+
+Wire format (disk format 3; format 2 differed only in sorting dict keys)
+------------------------------------------------------------------------
 Values msgpack cannot represent natively (tuples, sets, dataclasses, ...) are
 written as an ordinary msgpack array whose first element is a zero-length
 extension marker carrying the type code::
@@ -88,7 +95,7 @@ def _marker(code: int) -> Any:
 
 
 def encode(value: Any) -> bytes:
-    """Canonical msgpack bytes for ``value``. Equal values yield equal bytes."""
+    """Canonical msgpack bytes for ``value``; see the module docstring."""
     mp = require_msgpack()
     return mp.packb(_encode_node(value), use_bin_type=True)
 
@@ -216,14 +223,14 @@ def _sorted_nodes(items: Any) -> list[Any]:
 
 
 def _encode_dict(obj: dict[Any, Any]) -> Any:
+    # Insertion order is kept on purpose (module docstring). msgpack writes a
+    # map in the dict's own order and reads it back in stream order.
     if all(type(k) is str for k in obj):
-        return {k: _encode_node(obj[k]) for k in sorted(obj)}
-    pairs = [(_encode_node(k), _encode_node(v)) for k, v in obj.items()]
-    pairs.sort(key=lambda kv: _packed(kv[0]))
+        return {k: _encode_node(v) for k, v in obj.items()}
     node: list[Any] = [_marker(_EXT_MAP)]
-    for k, v in pairs:
-        node.append(k)
-        node.append(v)
+    for k, v in obj.items():
+        node.append(_encode_node(k))
+        node.append(_encode_node(v))
     return node
 
 

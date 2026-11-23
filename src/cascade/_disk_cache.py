@@ -73,7 +73,10 @@ class TxnContext:
 
 
 # 2: single-pass canonical encoding (see _canonical) and inline small values.
-DISK_FORMAT = 2
+# 3: dicts are encoded in insertion order, and value fingerprints depend on
+#    it. A format 2 result holds its dicts in sorted key order, which is not
+#    the order the query returned, so format 2 results are not served.
+DISK_FORMAT = 3
 
 # Values whose canonical encoding is at most this many bytes are stored
 # inside their meta record instead of the content-addressed blob store, so
@@ -90,7 +93,9 @@ COLLECTION_FORMAT = 1
 _COLLECTION_FORMAT_KEY = b"collections_format"
 # Directories written before collections had a stamp of their own carry only
 # the result-cache stamp. This maps that stamp to the collection format the
-# same code wrote.
+# same code wrote. (Format 2 sorted the keys of the maps in a collection
+# log; the format 3 decoder reads those unchanged, so both are collection
+# format 1.)
 _UNSTAMPED_COLLECTION_FORMATS = {2: 1}
 
 

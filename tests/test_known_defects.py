@@ -173,7 +173,6 @@ def test_d5_set_union_inside_a_query_sees_later_mutations() -> None:
     assert q() == [1, 2, 99]
 
 
-@_defect(6, "early bail-out treats dicts differing only in order as equal")
 def test_d6_dict_order_change_reaches_dependents() -> None:
     engine = Engine()
 
