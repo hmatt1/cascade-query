@@ -112,5 +112,28 @@ async def test_async_query_cancelled():
 
 
 def test_sync_cycle_fixed_point():
-    # just in case coverage for cycle nodes missing
-    pass
+    # A sync fixed-point query whose cycle runs through an async member,
+    # driven from sync code: both recompute paths take part in one cycle.
+    engine = Engine()
+
+    @engine.input
+    def step() -> int:
+        return 1
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        return min(member() + step(), 9)
+
+    @engine.query
+    async def member() -> int:
+        return head()
+
+    step.set(2)
+    revision = engine.revision
+    assert head() == 9
+    assert member() == 9
+    assert engine.revision == revision
+    key = ("query", head.id, ())
+    memo = engine._internals.memos[key]  # noqa: SLF001
+    assert set(memo.cycle_nodes) == {key, ("query", member.id, ())}
+    assert [dep.key for dep in memo.deps] == [("input", step.id, ())]

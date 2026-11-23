@@ -184,6 +184,21 @@ def fetch_external_data():
     return request.get("https://api.example.com/data")
 ```
 
+### Fixed-Point Cycles
+A query that calls itself, directly or through other queries, raises `CycleError`. Passing `fixed_point=<initial guess>` to `@engine.query` turns it into the head of the cycle instead: the call that reaches it again gets the current guess, and the query is re-run until a run returns the value it was given as the guess.
+
+```python
+@engine.query(fixed_point=0.0)
+def bonus_pool() -> float:
+    return round(net_profit() * 0.10, 2)
+
+@engine.query
+def net_profit() -> float:
+    return base_profit() - bonus_pool()
+```
+
+The iteration happens at the caller's revision: `bonus_pool(snapshot=s)` is the fixed point for the inputs as of `s`, and evaluating a fixed point never moves `engine.revision`. A cycle that has not converged after 1000 runs raises `CycleError`; pass `max_iterations=` to change the limit. Enter a cycle through the query that has `fixed_point=`, and from one thread at a time (see G7 in `docs/guarantees.md`).
+
 ### Error Caching
 By default, queries intercept and cache exceptions (excluding control flow exceptions like `QueryCancelled`).
 
@@ -363,7 +378,7 @@ items = CascadeList(engine, name="items", compact_every=1024)
 
 ### Limitations
 
-1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`.
+1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`, unless the query reached again has `fixed_point=`. A fixed-point cycle must be entered through that query, and stops with a `CycleError` if it has not converged after `max_iterations` runs (default 1000).
 2. **Thread Safety:** Calling queries, reading inputs, `.set()`, transactions and registering queries or inputs are safe from any thread. Use one process per `cache_dir`, and do not mutate a collection from another thread while a transaction that touched it is open (see `docs/guarantees.md`).
 3. **Persistence Security:** The persistent disk cache resolves `@dataclass`, `NamedTuple` and exception types via `importlib`. Only open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.

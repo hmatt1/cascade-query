@@ -22,21 +22,21 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D1, D2, D5–D7) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D1, D5–D7) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
-| G4 | A snapshot read sees inputs as of the snapshot's revision | Broken for fixed-point queries (D2) | Strong otherwise |
+| G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
 | G5 | Concurrent requests for one query at one revision run the body once | Holds with limits | Strong |
 | G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits (D19) | Medium |
-| G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value | Broken with snapshots (D2) | Weak for fixed point |
+| G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits (D24–D26) | Good on one thread |
 | G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits (D20) | Strong |
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
-| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Holds | Good |
-| G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Holds | Strong for eviction and prune |
-| G14 | Async queries behave like sync queries | Holds with limits (D21) | Weak |
-| G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path |
+| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Holds with limits (D26) | Good |
+| G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Broken for fixed-point cycles (D25) | Strong for eviction and prune |
+| G14 | Async queries behave like sync queries | Holds with limits (D21, D23) | Weak |
+| G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Broken for async queries (D23) | Strong on the sync path |
 | G16 | A stale persisted result is never served | Holds with limits (G11's blind spots) | Medium |
 | G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
@@ -146,9 +146,12 @@ afterwards. Input history is kept while any snapshot or running call needs it.
 Reading through a released snapshot raises `SnapshotExpiredError` once the
 history has been trimmed.
 
+This includes `fixed_point=` queries: the cycle is iterated at the snapshot's
+revision and gives the fixed point for the snapshot's inputs (G7).
+
 Limits: a `Snapshot` built by hand from a revision number pins nothing. An old
 snapshot read replaces the head's cached row, which is correct but costs a
-recompute on the next head read.
+recompute on the next head read. TTL results are not part of a snapshot (G9).
 
 Enforced by: `test_engine.py::test_snapshot_isolation_mvcc`,
 `test_history_retention.py::test_held_snapshot_keeps_history_until_released`,
@@ -156,7 +159,9 @@ Enforced by: `test_engine.py::test_snapshot_isolation_mvcc`,
 `::test_concurrent_snapshots_and_writers_never_expire_live_reads`,
 `test_dirty_propagation.py::test_pinned_snapshot_and_head_reads_interleave_correctly`,
 `test_snapshot_verification_race.py::test_old_snapshot_read_ignores_rows_replaced_during_verification`,
-`test_engine_concurrency.py::test_snapshot_reads_stable_during_concurrent_writes`.
+`test_engine_concurrency.py::test_snapshot_reads_stable_during_concurrent_writes`,
+`test_fixed_point.py::test_fixed_point_read_through_a_snapshot_uses_the_snapshot_inputs`,
+`::test_threads_reading_a_fixed_point_at_different_revisions`.
 
 ### G5. Concurrent demand runs the body once
 
@@ -192,12 +197,68 @@ Enforced by: `test_engine_concurrency.py::test_safe_task_cancellation_after_inpu
 ### G7. Cycles and fixed points
 
 A query that reaches itself raises `CycleError` naming the path. With
-`fixed_point=v`, the re-entrant call returns the current guess and the cycle
-re-runs until the result stops changing. There is no iteration cap.
+`fixed_point=v` the query is a cycle head instead: the call that reaches it
+again returns the current guess (`v` at first, then the result of the run
+before), and the head re-runs until a run returns a result equal to the guess
+it was computed from. That result is the fixed point for the inputs at the
+caller's revision; read through a snapshot, for the snapshot's inputs.
+
+Evaluating a fixed point changes nothing another reader can see.
+`engine.revision` does not move, nothing is cancelled, and no input history
+is pinned or trimmed. Results computed from a guess stay private to the call
+that is iterating; the head and the queries in its cycle are stored together
+once the head has converged, and a thread that asks for the head in the
+meantime waits for that. The head's cached result depends on everything any
+query in the cycle read from outside the cycle, so a change to an input that
+only another member reads re-runs the cycle.
+
+Limits, by design:
+
+- **Iteration cap.** A head that has not converged after 1000 runs raises
+  `CycleError` saying so. `engine.query(fixed_point=..., max_iterations=n)`
+  sets another limit. The error is not cached, like every `CycleError`.
+  "Converged" means equal digests (G2), so a cycle over floats that keep
+  changing in the last digit runs into the cap.
+- **Enter through the head.** The query that is reached again must be the one
+  with `fixed_point=`. Calling another member of a cycle whose head has no
+  current result reaches that member again first and raises `CycleError`.
+  Once the head has a result, members can be called directly. (When a
+  dependency check runs into such a cycle the dependent is simply re-run;
+  D25 is the case this does not cover.)
+- **A cached error ends the iteration.** If a run of the head raises an error
+  that is cached, that error is the result and the other members are not
+  stored.
+- **Every run re-runs the whole cycle**, and a head nested in another head's
+  cycle starts again from its initial guess on each run of the outer one.
+- **One thread per cycle.** Any number of threads may ask for the head of a
+  cycle. A thread that asks for another member while the cycle is being
+  iterated, or two threads that enter one cycle through different queries,
+  can deadlock (D24).
 
 Enforced by: `test_engine.py::test_cycle_detection`,
-`::test_long_chain_cycle_detection_behavior`, `test_fixed_point.py::test_fixed_point_basic`,
-`::test_fixed_point_no_default_raises`, `test_async_coverage.py::test_async_cycle`.
+`::test_long_chain_cycle_detection_behavior`, `test_async_coverage.py::test_async_cycle`,
+`::test_sync_cycle_fixed_point`, and `test_fixed_point.py`:
+`::test_fixed_point_basic`, `::test_fixed_point_no_default_raises`,
+`::test_fixed_point_read_through_a_snapshot_uses_the_snapshot_inputs`,
+`::test_fixed_point_member_first_read_through_a_snapshot`,
+`::test_evaluating_a_fixed_point_leaves_the_revision_alone`,
+`::test_fixed_point_does_not_cancel_or_disturb_submitted_work`,
+`::test_fixed_point_follows_an_input_read_only_by_another_member`,
+`::test_fixed_point_with_a_stale_result_read_before_the_cycle_is_entered`,
+`::test_nested_fixed_points_match_a_fresh_engine_after_every_change`,
+`::test_intermediate_results_never_reach_the_store`,
+`::test_fixed_point_that_does_not_converge_raises_instead_of_hanging`,
+`::test_fixed_point_that_oscillates_between_members_raises`,
+`::test_max_iterations_bounds_the_number_of_runs`,
+`::test_fixed_point_head_that_raises_a_cached_error`,
+`::test_fixed_point_recovers_after_an_uncached_error`,
+`::test_caller_that_catches_a_failed_fixed_point_is_cached_normally`,
+`::test_cold_entry_through_a_member_without_fixed_point_raises`,
+`::test_threads_requesting_one_fixed_point_get_one_result`,
+`::test_threads_reading_a_fixed_point_at_different_revisions`,
+`::test_async_fixed_point_honours_snapshots_and_the_revision`,
+`::test_fixed_point_with_a_disk_cache` (both backends),
+`test_known_defects.py::test_d2_fixed_point_query_honours_snapshot`.
 
 ### G8. Error caching
 
@@ -319,6 +380,9 @@ cache hit, to every waiting caller, in execution order. A query that fails
 leaks no partial effects. `compute_many(effects=)` merges per-call effects in
 call order.
 
+Limits: effects pushed in the abandoned runs of a fixed-point cycle are not
+dropped for callers above the cycle head (D26).
+
 Enforced by: `test_engine.py::test_side_effect_replay_on_cache_hits`,
 `::test_nested_side_effect_replay_propagates_to_parent_effects`,
 `::test_failed_query_does_not_leak_partial_accumulator_effects`,
@@ -329,6 +393,9 @@ Enforced by: `test_engine.py::test_side_effect_replay_on_cache_hits`,
 
 Dropping a cached result (LRU at `max_entries`, `prune`, `sweep_unaccessed`)
 never changes what a later call returns; it only makes that call recompute.
+
+Broken for fixed-point cycles: dropping the result of a cycle member can turn
+a later call into a `CycleError` (D25).
 
 Enforced by: `test_dirty_propagation.py::test_lru_eviction_never_serves_stale_results`,
 `::test_dropping_a_middle_memo_dirties_its_dependents`,
@@ -355,8 +422,9 @@ transactions, registering queries and inputs, `prune`, `sweep_unaccessed`,
 traces and stats. All of these take the store lock.
 
 Not safe: mutating one collection from another thread while a transaction that
-touched it is open (D17), and two engines writing the same named collection
-(D10).
+touched it is open (D17), two engines writing the same named collection
+(D10), and two threads calling into one dependency cycle through different
+queries (D24).
 
 ## Persistence
 
@@ -367,8 +435,12 @@ the body when every recorded dependency matches: an input by the digest of its
 current value, a dependency query by the digest of its up-to-date result. An
 input never set in the new session is matched by the digest of its default.
 
+Broken for `async def` queries: loading a stored result raises `TypeError`
+(D23).
+
 Limits: a query whose arguments cannot be encoded is computed but not
-persisted. Query identity on disk is `module:qualname` unless `name=` is
+persisted. When a fixed-point cycle converges only the head's result is
+written; the other members are recomputed from it in a new session. Query identity on disk is `module:qualname` unless `name=` is
 given, so two scripts run as `__main__` with same-named queries share entries.
 
 Enforced by: `test_disk_cache.py::test_cross_session_hit_skips_all_query_bodies`,
@@ -584,7 +656,8 @@ Enforced by: `test_incremental_persistence.py::test_named_collections_restore_ac
 
 "Reproduced" means re-run independently for this audit on Python 3.12.9, and
 pinned by an expected-failure test in `tests/test_known_defects.py`. D22 was
-found after the audit, while fixing D9.
+found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2.
+All four were already present at the audit commit.
 "Reported" means found and probed during the audit but not re-run a second
 time; it now applies only to the two sub-items of D7 marked that way.
 
@@ -593,10 +666,10 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | ID | Defect | Evidence |
 |---|---|---|
 | D1 | A rewritten stage that reads an input the query has already read is not detected as impure. `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` still returns 12 after `factor.set(10)`; correct is 60. | Reproduced |
-| D2 | A `fixed_point=` query ignores `snapshot=` and returns the head value (7 where the snapshot value is 1). One read also moved `engine.revision` from 3 to 6. | Reproduced |
 | D5 | Collection reads that are not tracked go stale inside queries: `set(s)`, `s \| x`, set and dict `==`, `s.issubset`, `xs + [...]`, `repr`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. | Reproduced |
 | D6 | Early bail-out treats dicts that differ only in insertion order as equal, so a dependent that iterates the dict keeps the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
+| D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
 | D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
 
 ### Data loss and corruption
@@ -614,6 +687,9 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D18 | If the disk writer thread hits an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread dies and `flush_disk()` and `shutdown()` block forever. | Reproduced on both backends by making the batch write raise `sqlite3.OperationalError` |
 | D19 | A direct caller that joins a `submit`-owned run of the same query receives the owner's `QueryCancelled`. | Reproduced |
 | D20 | A query result that cannot be encoded raises a bare `TypeError` even with no `cache_dir`. Its message names the unsupported type but not the query. An exception with unencodable `args` is replaced by that `TypeError`. | Reproduced |
+| D23 | A stored result of an `async def` query cannot be loaded by a new engine: the call raises `TypeError: entry_from_runtime() missing ... 'computed_at_time'` instead of returning the value. Sync queries are not affected. | Reproduced on both backends |
+| D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
+| D25 | After the cached result of a fixed-point cycle member is dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changes, a query that depends on that member raises `CycleError`. With the member's result still cached the same call returns the right value. The member is recomputed on its own, enters the cycle from the wrong end and reaches itself before the head. | Reproduced |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocks. Also reachable through the public API: a sync query that depends on an async query, called on the loop thread while that async query is running there, blocks the loop while re-verifying. | Reproduced, through the private entry point and through the public path |
 
 ### Fixed since the audit
@@ -628,9 +704,12 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D8 | A builtin shadowed in an enclosing function was still rewritten (an outer `sum = lambda it: "shadowed"` was ignored). The rewriter now declines when a relevant name is a closure variable. | `fix: a builtin shadowed in an enclosing function was still rewritten` |
 | D11 | `clear_disk_cache()` wiped the disk log of live named collections, so `[1, 2, 3]`, cleared, then `append(4)`, restored as `[4]`. It now deletes cached results only and leaves collection logs alone. | `fix: clearing the disk cache deleted named collections' data` |
 | D3 | An expired TTL query was not refreshed when reached through a dependent already verified at the current revision (`parent()` returned 10 before and after expiry). Two causes: a result verified at a revision was trusted at that revision for ever, and a re-run that changed the value at an unchanged revision looked unchanged to dependents. Results now carry the expiry of the TTL results beneath them, and a query's change marker is a stamp instead of the revision. | `fix: an expired TTL result was still served through queries that depend on it` |
+| D2 | A `fixed_point=` query ignored `snapshot=` and returned the head value (7 where the snapshot value is 1), and one read moved `engine.revision` from 3 to 6: every iteration ran at a new revision. The cycle is now iterated at the caller's revision, with intermediate results kept out of the shared cache. Found and fixed with it: a change to an input read only by another member of the cycle did not reach the head (`a` stayed 1 where a fresh run gives 21); a stale result read before the cycle was entered ended in `RecursionError`; a cycle that never converges looped for ever and now raises `CycleError` after `max_iterations` runs (default 1000). | `fix: a fixed-point query ignored snapshots and moved the revision` |
 | D22 | Re-registering a query with changed code while `engine.revision` had not moved since its dependents were computed left those dependents serving old results (`top()` stayed 2 where a fresh run gives 11). The dependents counted as verified at that revision and were not looked at again; an input change in between hid it. The same held for an input registered again with a changed default and read through a snapshot, and for dependents cut off from the function by an evicted result. Registration with changed code now makes every cached result verify again. | `fix: results computed from a query's old code survived its re-registration` |
 
-Smaller items: the first read of a never-set input bumps `engine.revision`;
+Smaller items: the first read of a never-set input bumps `engine.revision`
+(the call that did it keeps running at its own revision; its later reads of
+that input report the stored version, so its results stay valid afterwards);
 the `disk_store` counter and trace are recorded even when the write failed
 because the map was full.
 
@@ -660,6 +739,9 @@ Limits that narrow use without stopping it:
   `pytest-xdist` workers need separate directories.
 - **Only `submit` cancels.** An editor-style tool that calls queries directly
   or through `compute_many` cannot abandon stale work.
+- **A dependency cycle has one way in.** Only the query with `fixed_point=`
+  can be reached again, so a cycle has to be entered through it, and from one
+  thread at a time (G7, D24, D25).
 - **Positional, hashable arguments only**, with equal arguments sharing a key.
 - **Returned values are shared with the cache.**
 - **Alternating snapshot and head reads of one query recompute each time**,
@@ -682,14 +764,14 @@ with a single sequential actor. TLC checks six invariants in CI.
   transactions, collections, compaction, errors, TTL, eviction. The model
   uses the revision as the change marker of a query result; the code uses a
   separate stamp (G1).
-- None of D1–D22 is reachable in the model.
+- None of D1–D26 is reachable in the model.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Regression tests for the open defects exist but are expected
-   failures.** `tests/test_known_defects.py` has one test per defect (D1-D22),
+   failures.** `tests/test_known_defects.py` has one test per defect (D1-D26),
    each asserting the correct behaviour; those for open defects run under
    `xfail(strict=True)`. A fix removes the marker. The two "Reported"
    sub-items of D7 have no test.
@@ -712,17 +794,17 @@ Ordered by the risk they leave open.
    `test_error_caching_persistence.py` run mdbx only; `test_transaction_collections.py`
    runs sqlite only. The sqlite vacuum delete paths are excluded from coverage.
 7. **Async is thinly tested** and its internals are excluded from coverage:
-   no async tests for snapshots, effects, bail-out counts, fixed points or
-   eviction.
+   no async tests for effects, bail-out counts or eviction, and snapshots,
+   TTL and fixed points have one or two each. Loading an async result from
+   disk fails outright (D23).
 8. **Collection concurrency has one deterministic test.** No multi-writer or
    writer-against-pipeline stress, and none on free-threaded builds.
 9. **Transactions inside the block are untested** for queries reading a
    mutated or newly created collection, `submit`, threads, async tasks and two
    engines.
-10. **Two tests do not test what they claim.**
+10. **One test does not test what it claims.**
     `test_disk_cache.py::test_format_bump_sqlite` registers a different query
     in its second session, so it would recompute regardless.
-    `test_async_coverage.py::test_sync_cycle_fixed_point` is an empty `pass`.
 11. **Mutation testing is configured but never run in CI**, so the 95% line
     coverage figure says nothing about whether the assertions would catch a
     bug.

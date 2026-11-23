@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D22).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D26).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -86,7 +86,6 @@ def test_d1_stage_reading_an_already_read_input_is_invalidated() -> None:
     assert total() == 60
 
 
-@_defect(2, "a fixed_point query ignores snapshot= and returns the head value")
 def test_d2_fixed_point_query_honours_snapshot() -> None:
     engine = Engine()
 
@@ -325,6 +324,66 @@ def test_d22_reregistered_query_reaches_dependents_at_the_same_revision() -> Non
     # Changed code, registered again; no input changes in between.
     base = engine.query(base_v2)
     assert top() == 11
+
+
+@_defect(26, "effects of abandoned fixed-point runs reach the caller")
+def test_d26_fixed_point_effects_are_those_of_the_final_run() -> None:
+    engine = Engine()
+    log = engine.accumulator("log")
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        log.push("head")
+        return member() + inp()
+
+    @engine.query
+    def member() -> int:
+        return head() // 2
+
+    @engine.query
+    def top() -> int:
+        return head()
+
+    inp.set(4)
+    effects: dict[str, list[Any]] = {}
+    assert top(effects=effects) == 7  # four runs of the head
+    assert effects == {"log": ["head"]}
+
+
+@_defect(25, "a dependent of an evicted cycle member raises CycleError")
+def test_d25_evicting_a_cycle_member_does_not_change_the_outcome() -> None:
+    engine = Engine()
+
+    @engine.input
+    def inp() -> int:
+        return 1
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        return member() + inp()
+
+    @engine.query
+    def member() -> int:
+        return head() // 2
+
+    @engine.query
+    def top() -> int:
+        return member() * 10
+
+    inp.set(4)
+    assert head() == 7
+    assert top() == 30
+    # What LRU eviction, prune() or sweep_unaccessed() do to one result.
+    store = engine._internals._store  # noqa: SLF001
+    with store.lock:
+        store.drop_memo_locked(("query", member.id, ()))
+    inp.set(6)
+    # With the member's result still cached this returns 50.
+    assert top() == 50
 
 
 # --- Data loss and corruption -----------------------------------------------
@@ -637,6 +696,86 @@ def test_d19_direct_caller_is_not_cancelled_by_a_submitted_run() -> None:
     # Only submit() cancels. The direct caller started when x was 1 and must
     # get that revision's answer, not the submitted run's cancellation.
     assert direct == [1]
+
+
+@_defect(23, "an async query's stored result cannot be loaded: TypeError")
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_d23_async_query_result_is_reused_by_a_new_engine(
+    tmp_path: Path, backend: str
+) -> None:
+    runs = {"n": 0}
+
+    def session() -> int:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.input
+        def x() -> int:
+            return 3
+
+        @engine.query
+        async def double() -> int:
+            runs["n"] += 1
+            return x() * 2
+
+        async def main() -> int:
+            return await double()
+
+        try:
+            return asyncio.run(main())
+        finally:
+            engine.shutdown()
+
+    assert session() == 6
+    assert session() == 6
+    assert runs["n"] == 1
+
+
+@_defect(24, "two threads entering one cycle from different queries deadlock")
+def test_d24_threads_entering_a_cycle_from_both_ends_do_not_deadlock() -> None:
+    engine = Engine()
+    in_head = threading.Event()
+    in_member = threading.Event()
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        in_head.set()
+        in_member.wait(HANG_TIMEOUT)
+        return member() + inp()
+
+    @engine.query
+    def member() -> int:
+        in_member.set()
+        in_head.wait(HANG_TIMEOUT)
+        return head() // 2
+
+    inp.set(4)
+    outcomes: dict[str, Any] = {}
+
+    def call(name: str, query: Any) -> None:
+        try:
+            outcomes[name] = query()
+        except BaseException as exc:  # noqa: BLE001
+            outcomes[name] = exc
+
+    # Each thread now runs one of the two queries and asks for the other.
+    threads = [
+        threading.Thread(target=call, args=("head", head), daemon=True),
+        threading.Thread(target=call, args=("member", member), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(HANG_TIMEOUT)
+    # Design choice: both may get the fixed point, or the thread that entered
+    # through the member may get a CycleError, as it does on one thread.
+    # Waiting for each other for ever is not acceptable.
+    assert not any(thread.is_alive() for thread in threads), "threads deadlocked"
+    assert outcomes["head"] == 7
+    assert outcomes["member"] == 3 or isinstance(outcomes["member"], cascade.CycleError)
 
 
 def _plain_object() -> Any:

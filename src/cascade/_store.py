@@ -23,6 +23,10 @@ from ._state import (
 
 _TraceRow = tuple[str, "QueryKey", int, str, float]
 
+# Runs a ``fixed_point=`` query gets to converge before the engine gives up
+# with ``CycleError``. ``engine.query(max_iterations=...)`` overrides it.
+DEFAULT_FIXED_POINT_ITERATIONS = 1000
+
 
 def _version_revision(version: InputVersion) -> int:
     return version.revision
@@ -88,7 +92,7 @@ class GraphStore:
         self.cancel_epoch = 0
         self.next_access_id = 0
         # Source of ``MemoEntry.changed_at`` stamps; see ``new_change_stamp_locked``.
-        self._change_stamp = 0
+        self.change_stamp = 0
         self.max_entries = max_entries
         self.trace_limit = trace_limit
         # Raw rows (event, key, revision, detail, timestamp). ``key`` is the
@@ -132,6 +136,7 @@ class GraphStore:
         self.query_hashes: dict[str, str] = {}
         self.query_memoize: dict[str, bool] = {}
         self.query_fixed_points: dict[str, Any] = {}
+        self.query_fixed_point_limits: dict[str, int] = {}
         self.query_cache_exceptions: dict[
             str, bool | tuple[type[BaseException], ...]
         ] = {}
@@ -245,6 +250,7 @@ class GraphStore:
         has_fixed_point: bool = False,
         cache_exceptions: bool | tuple[type[BaseException], ...] = False,
         ttl: float | None = None,
+        max_iterations: int = DEFAULT_FIXED_POINT_ITERATIONS,
     ) -> Callable[..., Any]:
         """Register ``fn`` as ``query_id`` and return the function to run.
 
@@ -277,6 +283,7 @@ class GraphStore:
             self.query_ttl[query_id] = ttl
             if has_fixed_point:
                 self.query_fixed_points[query_id] = fixed_point
+                self.query_fixed_point_limits[query_id] = max_iterations
             return fn
 
     def _replace_locked(
@@ -380,6 +387,11 @@ class GraphStore:
             if query_id in self.query_fixed_points:
                 return True, self.query_fixed_points[query_id]
             return False, None
+
+    def lookup_fixed_point_limit(self, query_id: str) -> int:
+        return self.query_fixed_point_limits.get(
+            query_id, DEFAULT_FIXED_POINT_ITERATIONS
+        )
 
     def register_input(
         self, input_id: str, fn: Callable[..., Any]
@@ -612,8 +624,8 @@ class GraphStore:
         a dependent that saw the old value at this revision would find the
         same number and keep its result.
         """
-        self._change_stamp += 1
-        return self._change_stamp
+        self.change_stamp += 1
+        return self.change_stamp
 
     def touch_memo_locked(self, key: QueryKey) -> None:
         memo = self.memos[key]
@@ -806,6 +818,20 @@ class GraphStore:
         if not versions:
             return None
         return versions[-1]
+
+    def first_version_after(
+        self, input_key: InputKey, revision: int
+    ) -> InputVersion | None:
+        """The oldest stored version, if it is newer than ``revision``.
+
+        Only meaningful when ``input_version_at(input_key, revision)`` found
+        nothing: then no version was trimmed from below, and this is the
+        first value the input was given after ``revision``.
+        """
+        versions = self.inputs.get(input_key)
+        if versions and versions[0].revision > revision:
+            return versions[0]
+        return None
 
     def input_version_at(
         self, input_key: InputKey, revision: int

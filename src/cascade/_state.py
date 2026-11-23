@@ -48,6 +48,10 @@ class MemoEntry:
     # read, directly or through other queries, expires. None when nothing
     # beneath it has a TTL.
     expires_at: float | None = None
+    # Set while this is a provisional result inside a fixed-point cycle: the
+    # cycle heads whose guesses it was computed from. Such an entry lives in
+    # a runtime's overlay, never in the store. None for every stored memo.
+    cycle_heads: frozenset[QueryKey] | None = None
 
 
 @dataclass(frozen=True)

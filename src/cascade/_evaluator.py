@@ -6,6 +6,7 @@ import queue
 import threading
 import concurrent.futures
 import contextvars
+import dataclasses
 import inspect
 import time
 import types
@@ -22,7 +23,14 @@ from ._errors import (
     StaleHandleError,
 )
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
-from ._state import InFlight, InputVersion, MemoEntry, QueryKey, Snapshot
+from ._state import (
+    Dependency,
+    InFlight,
+    InputVersion,
+    MemoEntry,
+    QueryKey,
+    Snapshot,
+)
 from ._store import GraphStore
 
 
@@ -35,6 +43,41 @@ _CONTROL_FLOW_ERRORS = (
     SnapshotExpiredError,
     StaleHandleError,
 )
+
+
+class _ReenteredQuery(BaseException):
+    """A verification reached a query that is waiting for that verification.
+
+    Internal. Raised in a shadow runtime (see ``Evaluator._refuse_reentry``)
+    and caught by the verification that owns the running query, which then
+    recomputes instead. A ``BaseException`` so that neither query bodies nor
+    the engine's own ``except Exception`` clauses swallow it on the way.
+    """
+
+    def __init__(self, key: QueryKey) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+class _ProvisionalResult(Exception):
+    """Handed to callers that joined a run whose result is only provisional.
+
+    Internal. The run belonged to a fixed-point cycle that another thread is
+    still iterating; ``heads`` are the queries whose convergence the result
+    waits for. Travels through the in-flight future only.
+    """
+
+    def __init__(self, heads: frozenset[QueryKey]) -> None:
+        super().__init__(heads)
+        self.heads = heads
+
+
+_NEVER_CACHED_ERRORS = (*_CONTROL_FLOW_ERRORS, _ReenteredQuery)
+
+# Stands in for the ``changed_at`` of a query that has no result yet (it is
+# running, or its result is provisional). Equal to no real marker, so
+# whatever is compared against it counts as changed.
+_NEVER_CHANGED_AT = -2
 
 
 # Evaluators with a disk writer that has not been shut down. A normal
@@ -303,6 +346,29 @@ class Evaluator:
             return False
         return self._store.is_current_locked(memo, revision)
 
+    def _default_version(
+        self, input_key: tuple[str, tuple[Any, ...]], revision: int, default: Any
+    ) -> InputVersion:
+        """The version to report for an input read by default at ``revision``.
+
+        Normally a placeholder that says "no stored version". But a call that
+        reads a never-set input stores the default at a new revision while it
+        keeps running at its own, older one, and its later reads land here.
+        They report that stored version when it holds this same value, so
+        every read of the input in one call records the same marker, and the
+        results are still valid at the revision the default was stored at.
+        """
+        value_hash = self._store.stable_hash(default)
+        stored = self._store.first_version_after(input_key, revision)
+        if stored is not None and stored.value_hash == value_hash:
+            return stored
+        return InputVersion(
+            revision=revision,
+            changed_at=-1,
+            value_hash=value_hash,
+            value=default,
+        )
+
     def read_input(
         self,
         input_id: str,
@@ -350,12 +416,7 @@ class Evaluator:
                 if version is None:  # pragma: no cover - safety belt
                     raise RuntimeError("input version missing after initialization")
             else:
-                version = InputVersion(
-                    revision=revision,
-                    changed_at=-1,
-                    value_hash=self._store.stable_hash(default),
-                    value=default,
-                )
+                version = self._default_version((input_id, args), revision, default)
         self.record_dependency(key, version.changed_at)
         self._store.trace_event("input_read", key)
         return version.value
@@ -408,12 +469,7 @@ class Evaluator:
                 if version is None:  # pragma: no cover
                     raise RuntimeError("input version missing after initialization")
             else:
-                version = InputVersion(
-                    revision=revision,
-                    changed_at=-1,
-                    value_hash=self._store.stable_hash(default),
-                    value=default,
-                )
+                version = self._default_version((input_id, args), revision, default)
         self.record_dependency(key, version.changed_at)
         self._store.trace_event("input_read", key)
         return version.value
@@ -457,24 +513,7 @@ class Evaluator:
         key: QueryKey = ("query", query_id, args)
         for i, frame in enumerate(runtime.stack):
             if frame.key == key:
-                if frame.cycle_guess is UNSET:
-                    has_fp, fp_val = self._store.lookup_query_fixed_point(query_id)
-                    if not has_fp:
-                        cycle_start = [f.key for f in runtime.stack[i:]] + [key]
-                        cycle = " -> ".join(
-                            self._store.key_to_str(k) for k in cycle_start
-                        )
-                        raise CycleError(f"cycle detected: {cycle}")
-                    frame.cycle_guess = fp_val
-
-                frame.is_cycle_root = True
-                for f in runtime.stack[i:]:
-                    frame.cycle_nodes.add(f.key)
-
-                # Record the back-edge dependency so the calling node is properly invalidated later
-                if len(runtime.stack) > 0:
-                    runtime.stack[-1].deps[key] = runtime.snapshot.revision
-                return frame.cycle_guess
+                return self._read_cycle_guess(runtime, i, frame, key)
         self.check_cancelled(runtime.cancel_epoch)
         entry, replay_needed = self.compute_or_get_memo(
             key, fn, runtime, need_value=need_value
@@ -482,6 +521,8 @@ class Evaluator:
         self.record_dependency(key, entry.changed_at)
         if entry.expires_at is not None:
             self._note_expiry(runtime, entry.expires_at)
+        if entry.cycle_heads is not None:
+            self._note_cycle_heads(runtime, entry.cycle_heads)
         if replay_needed:
             self.replay_effects(entry.effects)
         if entry.error is not None:
@@ -528,23 +569,7 @@ class Evaluator:
         key: QueryKey = ("query", query_id, args)
         for i, frame in enumerate(runtime.stack):
             if frame.key == key:
-                if frame.cycle_guess is UNSET:
-                    has_fp, fp_val = self._store.lookup_query_fixed_point(query_id)
-                    if not has_fp:
-                        cycle_start = [f.key for f in runtime.stack[i:]] + [key]
-                        cycle = " -> ".join(
-                            self._store.key_to_str(k) for k in cycle_start
-                        )
-                        raise CycleError(f"cycle detected: {cycle}")
-                    frame.cycle_guess = fp_val
-
-                frame.is_cycle_root = True
-                for f in runtime.stack[i:]:
-                    frame.cycle_nodes.add(f.key)
-
-                if len(runtime.stack) > 0:
-                    runtime.stack[-1].deps[key] = runtime.snapshot.revision
-                return frame.cycle_guess
+                return self._read_cycle_guess(runtime, i, frame, key)
         self.check_cancelled(runtime.cancel_epoch)
         entry, replay_needed = await self.compute_or_get_memo_async(
             key, fn, runtime, need_value=need_value
@@ -552,6 +577,8 @@ class Evaluator:
         self.record_dependency(key, entry.changed_at)
         if entry.expires_at is not None:
             self._note_expiry(runtime, entry.expires_at)
+        if entry.cycle_heads is not None:
+            self._note_cycle_heads(runtime, entry.cycle_heads)
         if replay_needed:
             self.replay_effects(entry.effects)
         if entry.error is not None:
@@ -566,6 +593,14 @@ class Evaluator:
         *,
         need_value: bool = True,
     ) -> tuple[MemoEntry, bool]:
+        # Both are None outside fixed-point cycles and verification.
+        provisional = runtime.provisional
+        if provisional is not None:
+            pending = provisional.get(key)
+            if pending is not None:
+                return pending, True
+        if runtime.outer is not None:
+            self._refuse_reentry(runtime, key)
         with self._store.lock:
             existing = self._store.memos.get(key)
             is_memoized = self._store.lookup_query_memoize(key[1])
@@ -617,7 +652,11 @@ class Evaluator:
         if waiter_future is not None:
             self._refuse_wait_on_caller(key)
             self._store.trace_event("dedup_wait", key)
-            result = waiter_future.result()
+            try:
+                result = waiter_future.result()
+            except _ProvisionalResult as pending_cycle:
+                self._await_cycle_heads(pending_cycle.heads, runtime)
+                return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
             return result, True
 
         try:
@@ -631,6 +670,13 @@ class Evaluator:
         except BaseException as exc:
             self._release_in_flight(in_flight_key, slot, exc=exc)
             raise
+        if result.cycle_heads is not None:
+            # Provisional: good for this runtime only. Callers on other
+            # threads that joined this run must wait for the cycle instead.
+            self._release_in_flight(
+                in_flight_key, slot, exc=_ProvisionalResult(result.cycle_heads)
+            )
+            return result, False
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
 
@@ -642,6 +688,14 @@ class Evaluator:
         *,
         need_value: bool = True,
     ) -> tuple[MemoEntry, bool]:
+        # Both are None outside fixed-point cycles and verification.
+        provisional = runtime.provisional
+        if provisional is not None:
+            pending = provisional.get(key)
+            if pending is not None:
+                return pending, True
+        if runtime.outer is not None:
+            self._refuse_reentry(runtime, key)
         with self._store.lock:
             existing = self._store.memos.get(key)
             is_memoized = self._store.lookup_query_memoize(key[1])
@@ -688,7 +742,13 @@ class Evaluator:
         if waiter_future is not None:
             self._refuse_wait_on_caller(key)
             self._store.trace_event("dedup_wait", key)
-            result = await asyncio.wrap_future(waiter_future)
+            try:
+                result = await asyncio.wrap_future(waiter_future)
+            except _ProvisionalResult as pending_cycle:
+                await self._await_cycle_heads_async(pending_cycle.heads, runtime)
+                return await self.compute_or_get_memo_async(
+                    key, fn, runtime, need_value=need_value
+                )
             return result, True
 
         try:
@@ -702,6 +762,11 @@ class Evaluator:
         except BaseException as exc:
             self._release_in_flight(in_flight_key, slot, exc=exc)
             raise
+        if result.cycle_heads is not None:
+            self._release_in_flight(
+                in_flight_key, slot, exc=_ProvisionalResult(result.cycle_heads)
+            )
+            return result, False
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
 
@@ -803,7 +868,7 @@ class Evaluator:
                 else:
                     dep_entry = self._dependency_entry(dep_key, snapshot)
                     if dep_entry is None:
-                        dep_changed_at = snapshot.revision
+                        dep_changed_at = _NEVER_CHANGED_AT
                     else:
                         dep_changed_at = dep_entry.changed_at
                         dep_expires_at = dep_entry.expires_at
@@ -816,8 +881,24 @@ class Evaluator:
                         "cache_red", key, detail=self._store.key_to_str(dep_key)
                     )
                     return False
+        except CycleError:
+            # Bringing a dependency up to date ran into a cycle. The walk
+            # takes dependencies in recorded order, each from an empty
+            # stack, so it can enter a fixed-point cycle through a member
+            # where this query's own code enters it through the head (the
+            # member's result was dropped, or its cycle failed last time).
+            # Only a run of this query shows whether the cycle is an error.
+            self._store.trace_event("cache_red", key, detail="dependency cycle")
+            return False
         except _CONTROL_FLOW_ERRORS:
             raise
+        except _ReenteredQuery as reentry:
+            if not self._reentry_is_ours(reentry):
+                raise
+            # The walk reached a query that is running in this runtime, or
+            # whose result here is provisional. Only a real run can tell.
+            self._store.trace_event("cache_red", key, detail="dependency is running")
+            return False
         except Exception:
             # A dependency now raises an error that is not cached. That is a
             # change, and whether it propagates is up to this query's own
@@ -853,6 +934,8 @@ class Evaluator:
         executing = (
             {frame.key for frame in runtime.stack} if runtime is not None else set()
         )
+        # Provisional results cannot be verified against either. Usually None.
+        overlay = runtime.provisional if runtime is not None else None
         revision = snapshot.revision
         # Frames are [key, memo, index of the next dependency to examine].
         stack: list[list[Any]] = [[root, root_entry, 0]]
@@ -873,11 +956,18 @@ class Evaluator:
                         break
                     index += 1
                     continue
+                if overlay and dep_key in overlay:
+                    break
                 with store.lock:
                     dep_memo = store.memos.get(dep_key)
-                    current = dep_memo is not None and self._usable_locked(
-                        dep_memo, revision
-                    )
+                    if dep_memo is None:
+                        current = False
+                    else:
+                        # Inlined ``_usable_locked``: this loop is hot.
+                        dep_expires_at = dep_memo.expires_at
+                        current = (
+                            dep_expires_at is None or time.time() <= dep_expires_at
+                        ) and store.is_current_locked(dep_memo, revision)
                 if current:
                     if dep_memo.changed_at != dep.observed_changed_at:  # type: ignore[union-attr]
                         break
@@ -887,7 +977,7 @@ class Evaluator:
                     break
                 if dep_memo is None:
                     # Nothing to walk; computing it is the only way forward.
-                    self.dependency_changed_at(dep_key, snapshot)
+                    self._dependency_entry(dep_key, snapshot)
                     settled.add(dep_key)
                     continue
                 frame[2] = index
@@ -902,7 +992,7 @@ class Evaluator:
             if stack:
                 # All of this memo's examined dependencies are now verified,
                 # so verifying the memo itself does not recurse further.
-                self.dependency_changed_at(frame[0], snapshot)
+                self._dependency_entry(frame[0], snapshot)
                 settled.add(frame[0])
 
     async def try_mark_green_async(
@@ -923,7 +1013,7 @@ class Evaluator:
                 else:
                     dep_entry = await self._dependency_entry_async(dep_key, snapshot)
                     if dep_entry is None:
-                        dep_changed_at = snapshot.revision
+                        dep_changed_at = _NEVER_CHANGED_AT
                     else:
                         dep_changed_at = dep_entry.changed_at
                         dep_expires_at = dep_entry.expires_at
@@ -936,8 +1026,16 @@ class Evaluator:
                         "cache_red", key, detail=self._store.key_to_str(dep_key)
                     )
                     return False
+        except CycleError:
+            self._store.trace_event("cache_red", key, detail="dependency cycle")
+            return False
         except _CONTROL_FLOW_ERRORS:
             raise
+        except _ReenteredQuery as reentry:
+            if not self._reentry_is_ours(reentry):
+                raise
+            self._store.trace_event("cache_red", key, detail="dependency is running")
+            return False
         except Exception:
             # See try_mark_green.
             self._store.trace_event("cache_red", key, detail="dependency raised")
@@ -984,22 +1082,31 @@ class Evaluator:
             version = self._store.input_version_at((fid, args), snapshot.revision)
             return -1 if version is None else version.changed_at
         entry = self._dependency_entry(key, snapshot)
-        return snapshot.revision if entry is None else entry.changed_at
+        return _NEVER_CHANGED_AT if entry is None else entry.changed_at
 
     def _dependency_entry(self, key: QueryKey, snapshot: Snapshot) -> MemoEntry | None:
         """The memo of query ``key`` brought up to date at ``snapshot``.
 
-        None when the query is running further up this context's stack: it
-        has no result yet.
+        None when the query has no settled result to compare against: it is
+        running further up this context's stack, or its result here is
+        provisional (part of a fixed-point cycle still being iterated).
         """
         fid = key[1]
+        runtime = self._runtime_var.get()
+        if runtime is not None:
+            overlay = runtime.provisional
+            if overlay is not None and key in overlay:
+                return None
         with self._store.lock:
             memo = self._store.memos.get(key)
-            if memo is not None and self._usable_locked(memo, snapshot.revision):
-                return memo
+            if memo is not None:
+                # Inlined ``_usable_locked``: called once per dependency.
+                expires_at = memo.expires_at
+                if (
+                    expires_at is None or time.time() <= expires_at
+                ) and self._store.is_current_locked(memo, snapshot.revision):
+                    return memo
         fn = self._store.lookup_query(fid)
-
-        runtime = self._runtime_var.get()
         if runtime is not None:
             for frame in runtime.stack:
                 if frame.key == key:
@@ -1028,6 +1135,10 @@ class Evaluator:
                 staged_root_effects={},
                 cancel_epoch=runtime.cancel_epoch,
                 snapshot_explicit=True,
+                # Inlined ``_shadow_outer``.
+                outer=(
+                    runtime if runtime.stack or runtime.provisional else runtime.outer
+                ),
             )
             entry = self._run_in_runtime(
                 shadow,
@@ -1047,19 +1158,22 @@ class Evaluator:
             version = self._store.input_version_at((fid, args), snapshot.revision)
             return -1 if version is None else version.changed_at
         entry = await self._dependency_entry_async(key, snapshot)
-        return snapshot.revision if entry is None else entry.changed_at
+        return _NEVER_CHANGED_AT if entry is None else entry.changed_at
 
     async def _dependency_entry_async(
         self, key: QueryKey, snapshot: Snapshot
     ) -> MemoEntry | None:  # pragma: no cover
         fid = key[1]
+        runtime = self._runtime_var.get()
+        if runtime is not None:
+            overlay = runtime.provisional
+            if overlay is not None and key in overlay:
+                return None
         with self._store.lock:
             memo = self._store.memos.get(key)
             if memo is not None and self._usable_locked(memo, snapshot.revision):
                 return memo
         fn = self._store.lookup_query(fid)
-
-        runtime = self._runtime_var.get()
         if runtime is not None:
             for frame in runtime.stack:
                 if frame.key == key:
@@ -1089,6 +1203,7 @@ class Evaluator:
                 cancel_epoch=runtime.cancel_epoch,
                 snapshot_explicit=True,
                 is_async=True,
+                outer=self._shadow_outer(runtime),
             )
             entry = await self._run_in_runtime_async(
                 shadow,
@@ -1097,21 +1212,186 @@ class Evaluator:
 
         return entry
 
-    def _restart_cycle(
-        self, runtime: RuntimeState, frame: RuntimeFrame, key: QueryKey
+    # --- fixed points ---------------------------------------------------------
+    #
+    # A query registered with ``fixed_point=`` may reach itself. The call that
+    # closes the cycle returns the current guess; the query re-runs until its
+    # result equals the guess it was computed from. All of that happens at
+    # the caller's revision: nothing here moves ``store.revision``.
+    #
+    # Results computed from a guess are *provisional*. They are kept in an
+    # overlay on the runtime (``RuntimeState.provisional``), never in the
+    # store, so no other reader can pick up a value that only held for an
+    # intermediate guess. Each provisional entry lists the cycle heads it
+    # depends on (``MemoEntry.cycle_heads``). When a head re-runs with a new
+    # guess, its entries are thrown away; when it converges they move to the
+    # store together with the head's own result.
+
+    def _read_cycle_guess(
+        self, runtime: RuntimeState, index: int, frame: RuntimeFrame, key: QueryKey
+    ) -> Any:
+        """``key`` is running at ``runtime.stack[index]`` and was called again."""
+        stack = runtime.stack
+        if frame.cycle_guess is UNSET:
+            has_fp, fp_val = self._store.lookup_query_fixed_point(key[1])
+            if not has_fp:
+                cycle_start = [f.key for f in stack[index:]] + [key]
+                cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
+                raise CycleError(f"cycle detected: {cycle}")
+            frame.cycle_guess = fp_val
+        frame.is_cycle_root = True
+        overlay = runtime.provisional
+        if overlay is None:
+            overlay = {}
+        # Every query between the head and this call will hold a provisional
+        # result; make sure each of them can see the overlay.
+        for running in stack[index:]:
+            owner = running.runtime
+            if owner is not None and owner.provisional is None:
+                owner.provisional = overlay
+        if runtime.provisional is None:
+            runtime.provisional = overlay
+        top = stack[-1]
+        # The marker is replaced by the head's real one when the cycle
+        # converges; until then it must match nothing.
+        top.deps[key] = _NEVER_CHANGED_AT
+        if top.cycle_heads is None:
+            top.cycle_heads = {key}
+        else:
+            top.cycle_heads.add(key)
+        return frame.cycle_guess
+
+    @staticmethod
+    def _note_cycle_heads(runtime: RuntimeState, heads: frozenset[QueryKey]) -> None:
+        """The running query read a provisional result that depends on ``heads``."""
+        if runtime.stack:
+            frame = runtime.stack[-1]
+            if frame.cycle_heads is None:
+                frame.cycle_heads = set(heads)
+            else:
+                frame.cycle_heads.update(heads)
+
+    @staticmethod
+    def _discard_provisional(runtime: RuntimeState, head: QueryKey) -> None:
+        """Forget every provisional result computed from ``head``'s guess."""
+        overlay = runtime.provisional
+        if overlay:
+            for key in [k for k, e in overlay.items() if head in e.cycle_heads]:
+                del overlay[key]
+
+    def _next_iteration(
+        self,
+        runtime: RuntimeState,
+        frame: RuntimeFrame,
+        key: QueryKey,
+        result: Any,
+        error: BaseException | None,
+        iterations: int,
+    ) -> bool:
+        """Decide whether a cycle head must run again; prepare the frame if so.
+
+        The head is done when the run did not read its guess, raised an error
+        that is cached, or produced a result equal to the guess.
+        """
+        if not frame.is_cycle_root or error is not None:
+            return False
+        if self._store.stable_hash(result) == self._store.stable_hash(
+            frame.cycle_guess
+        ):
+            return False
+        self._discard_provisional(runtime, key)
+        limit = self._store.lookup_fixed_point_limit(key[1])
+        if iterations >= limit:
+            raise CycleError(
+                f"fixed point of {self._store.key_to_str(key)} did not converge "
+                f"after {limit} iterations: each run still returned a result "
+                "different from the one before. Make the query converge, or "
+                "raise the limit with max_iterations= if it only needs longer"
+            )
+        frame.cycle_guess = result
+        frame.is_cycle_root = False
+        frame.deps.clear()
+        frame.effects.clear()
+        frame.expires_at = None
+        frame.cycle_heads = None
+        return True
+
+    def _refuse_reentry(self, runtime: RuntimeState, key: QueryKey) -> None:
+        """Raise if ``key`` belongs to a query run that is waiting for this check.
+
+        ``runtime`` is a shadow runtime: it brings a dependency up to date
+        for a verification started by ``runtime.outer``. If the walk reaches
+        a query that is running there, or one whose result there is still
+        provisional, there is nothing to verify against yet. Running it
+        again from here would not see the frames above, so a cycle would go
+        undetected (or wait for itself). The verification is abandoned
+        instead, and the memo being verified is recomputed where the cycle
+        is visible.
+        """
+        outer = runtime.outer
+        while outer is not None:
+            if self._owns(outer, key):
+                raise _ReenteredQuery(key)
+            outer = outer.outer
+
+    @staticmethod
+    def _shadow_outer(runtime: RuntimeState) -> RuntimeState | None:
+        """What a shadow runtime started from ``runtime`` records as its outer.
+
+        ``runtime`` itself, unless it runs nothing and holds nothing
+        provisional: then it can own no query, and leaving it out keeps the
+        chain ``_refuse_reentry`` walks as short as the nesting of real runs.
+        Nothing is added to ``runtime`` while the shadow is alive.
+        """
+        if runtime.stack or runtime.provisional:
+            return runtime
+        return runtime.outer
+
+    @staticmethod
+    def _owns(runtime: RuntimeState, key: QueryKey) -> bool:
+        overlay = runtime.provisional
+        if overlay is not None and key in overlay:
+            return True
+        for frame in runtime.stack:
+            if frame.key == key:
+                return True
+        return False
+
+    def _reentry_is_ours(self, reentry: _ReenteredQuery) -> bool:
+        runtime = self._runtime_var.get()
+        return runtime is not None and self._owns(runtime, reentry.key)
+
+    def _await_cycle_heads(
+        self, heads: frozenset[QueryKey], runtime: RuntimeState
     ) -> None:
-        """Move a fixed-point cycle to a fresh revision for its next iteration."""
-        store = self._store
-        with store.lock:
-            store.revision += 1
-            rev = store.pin_current_locked()
-            if runtime.pins is None:
-                runtime.pins = []
-            runtime.pins.append(rev)
-            runtime.snapshot = Snapshot(rev)
-            for k in frame.cycle_nodes:
-                if k != key:
-                    store.drop_memo_locked(k)
+        """Wait for the fixed points another thread is still iterating.
+
+        The run this caller joined produced a provisional result. Its final
+        value exists once the cycle heads it depends on have converged, so
+        ask for those: that joins their runs, or finds them finished.
+        """
+        for head in heads:
+            try:
+                fn = self._store.lookup_query(head[1])
+                self.compute_or_get_memo(head, fn, runtime, need_value=False)
+            except _CONTROL_FLOW_ERRORS:
+                raise
+            except Exception:  # noqa: BLE001 - the caller's own run meets it again
+                pass
+
+    async def _await_cycle_heads_async(
+        self, heads: frozenset[QueryKey], runtime: RuntimeState
+    ) -> None:  # pragma: no cover
+        for head in heads:
+            try:
+                fn = self._store.lookup_query(head[1])
+                await self.compute_or_get_memo_async(
+                    head, fn, runtime, need_value=False
+                )
+            except _CONTROL_FLOW_ERRORS:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _inherit_failed_deps(
@@ -1137,6 +1417,38 @@ class Evaluator:
             caller.expires_at is None or frame.expires_at < caller.expires_at
         ):
             caller.expires_at = frame.expires_at
+        if frame.cycle_heads:
+            # What the failed query read still depends on the guesses of the
+            # cycle heads running beneath the caller. Its own cycle, if it
+            # was a head, ended with it.
+            heads = frame.cycle_heads
+            heads.discard(frame.key)
+            if heads:
+                if caller.cycle_heads is None:
+                    caller.cycle_heads = set(heads)
+                else:
+                    caller.cycle_heads.update(heads)
+
+    def _should_cache_error(self, key: QueryKey, exc: BaseException) -> bool:
+        if isinstance(exc, _NEVER_CACHED_ERRORS):
+            return False
+        cache_ex = self._store.lookup_query_cache_exceptions(key[1])
+        if cache_ex is True:
+            return isinstance(exc, Exception)
+        if isinstance(cache_ex, tuple):
+            return isinstance(exc, cache_ex)
+        return False
+
+    def _drop_previous_cycle_locked(self, key: QueryKey, old_memo: MemoEntry) -> None:
+        """Drop what the last fixed point of ``key`` left behind.
+
+        Those results were computed from the old fixed point and are about
+        to be computed again; dropping them saves verifying each one against
+        a head that is running.
+        """
+        for k in old_memo.cycle_nodes:
+            if k != key:
+                self._store.drop_memo_locked(k)
 
     def recompute(
         self,
@@ -1144,7 +1456,7 @@ class Evaluator:
         fn: Callable[..., Any],
         runtime: RuntimeState,
     ) -> MemoEntry:
-        frame = RuntimeFrame(key=key)
+        frame = RuntimeFrame(key=key, runtime=runtime)
         runtime.stack.append(frame)
         start = self._store.monotonic_seconds()
         self._store.trace_event("recompute_start", key)
@@ -1152,11 +1464,10 @@ class Evaluator:
         with self._store.lock:
             old_memo = self._store.memos.get(key)
             if old_memo is not None and old_memo.cycle_nodes:
-                for k in old_memo.cycle_nodes:
-                    if k != key:
-                        self._store.drop_memo_locked(k)
+                self._drop_previous_cycle_locked(key, old_memo)
 
         error: BaseException | None = None
+        iterations = 1
         while True:
             try:
                 self.check_cancelled(runtime.cancel_epoch)
@@ -1166,120 +1477,32 @@ class Evaluator:
                 self.check_cancelled(runtime.cancel_epoch)
                 error = None
             except BaseException as exc:
-                cache_ex = self._store.lookup_query_cache_exceptions(key[1])
-                should_cache = False
-                if isinstance(
-                    exc,
-                    (
-                        QueryCancelled,
-                        CycleError,
-                        PersistentCacheError,
-                        SnapshotExpiredError,
-                        StaleHandleError,
-                    ),
-                ):
-                    pass
-                elif cache_ex is True:
-                    should_cache = isinstance(exc, Exception)
-                elif isinstance(cache_ex, tuple):
-                    should_cache = isinstance(exc, cache_ex)
-
-                if should_cache:
+                if self._should_cache_error(key, exc):
                     error = exc
                     result = None
                 else:
                     runtime.stack.pop()
+                    if frame.cycle_guess is not UNSET:
+                        self._discard_provisional(runtime, key)
                     self._inherit_failed_deps(runtime.stack, frame, exc)
                     raise
 
             if frame.is_cycle_root:
-                if error is None and self._store.stable_hash(
-                    result
-                ) != self._store.stable_hash(frame.cycle_guess):
-                    frame.cycle_guess = result
-                    frame.is_cycle_root = False
-                    self._restart_cycle(runtime, frame, key)
-                    frame.deps.clear()
-                    frame.effects.clear()
-                    frame.expires_at = None
+                try:
+                    again = self._next_iteration(
+                        runtime, frame, key, result, error, iterations
+                    )
+                except CycleError:
+                    runtime.stack.pop()
+                    raise
+                if again:
+                    iterations += 1
                     continue
 
             runtime.stack.pop()
             break
 
-        elapsed = self._store.monotonic_seconds() - start
-        duration_ms = elapsed * 1000.0
-
-        frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
-        if error is not None:
-            value_hash = self._store.stable_hash(error)
-        else:
-            value_hash = self._store.stable_hash(result)
-
-        if frame.cycle_nodes:
-            for k in frame.cycle_nodes:
-                frame.deps.pop(k, None)
-
-        is_memoized = self._store.lookup_query_memoize(key[1])
-        computed_at_time = time.time()
-        expires_at = frame.expires_at
-        ttl = self._store.lookup_query_ttl(key[1])
-        if ttl is not None and (
-            expires_at is None or computed_at_time + ttl < expires_at
-        ):
-            expires_at = computed_at_time + ttl
-        with self._store.lock:
-            previous = self._store.memos.get(key)
-            if previous is not None and previous.value_hash == value_hash:
-                changed_at = previous.changed_at
-                self._store.trace_event("backdate", key)
-            else:
-                changed_at = self._store.new_change_stamp_locked()
-            self._store.next_access_id += 1
-            full_memo = self._store.entry_from_runtime(
-                value=result,
-                value_hash=value_hash,
-                changed_at=changed_at,
-                verified_at=runtime.snapshot.revision,
-                deps=frame.deps,
-                effects=frozen_effects,
-                last_access=self._store.next_access_id,
-                computed_at_time=computed_at_time,
-                cycle_nodes=tuple(frame.cycle_nodes),
-                error=error,
-                expires_at=expires_at,
-            )
-            if is_memoized:
-                stored_memo = full_memo
-            else:
-                stored_memo = self._store.entry_from_runtime(
-                    value=None,
-                    value_hash=value_hash,
-                    changed_at=changed_at,
-                    verified_at=runtime.snapshot.revision,
-                    deps=frame.deps,
-                    effects=frozen_effects,
-                    last_access=self._store.next_access_id,
-                    computed_at_time=computed_at_time,
-                    cycle_nodes=tuple(frame.cycle_nodes),
-                    error=error,
-                    expires_at=expires_at,
-                )
-            self._store.drop_memo_locked(key)
-            self._store.memos[key] = stored_memo
-            self._store.push_memo_lru_locked(key)
-            for dep_key in frame.deps.keys():
-                self._store.dependents[dep_key].add(key)
-            self._store.refresh_head_clean_locked(
-                stored_memo, runtime.snapshot.revision, key[1]
-            )
-            self._store.evict_if_needed_locked()
-        if self._disk is not None and is_memoized:
-            self._persist_entry(key, full_memo)
-        self._store.trace_event("recompute_done", key, detail=f"{duration_ms:.3f}ms")
-        if self._store.is_stats_enabled():
-            self._store.record_query_body_time(key, elapsed)
-        return full_memo
+        return self._finish_recompute(key, frame, runtime, result, error, start)
 
     async def recompute_async(  # pragma: no cover
         self,
@@ -1297,7 +1520,10 @@ class Evaluator:
             snapshot_explicit=runtime.snapshot_explicit,
             is_async=True,
             pins=runtime.pins,
+            provisional=runtime.provisional,
+            outer=runtime.outer,
         )
+        frame.runtime = new_runtime
         token = self._runtime_var.set(new_runtime)
         try:
             start = self._store.monotonic_seconds()
@@ -1306,11 +1532,10 @@ class Evaluator:
             with self._store.lock:
                 old_memo = self._store.memos.get(key)
                 if old_memo is not None and old_memo.cycle_nodes:
-                    for k in old_memo.cycle_nodes:
-                        if k != key:
-                            self._store.drop_memo_locked(k)
+                    self._drop_previous_cycle_locked(key, old_memo)
 
             error: BaseException | None = None
+            iterations = 1
             while True:
                 try:
                     self.check_cancelled(new_runtime.cancel_epoch)
@@ -1321,126 +1546,184 @@ class Evaluator:
                     self.check_cancelled(new_runtime.cancel_epoch)
                     error = None
                 except BaseException as exc:
-                    cache_ex = self._store.lookup_query_cache_exceptions(key[1])
-                    should_cache = False
-                    if isinstance(
-                        exc,
-                        (
-                            QueryCancelled,
-                            CycleError,
-                            PersistentCacheError,
-                            SnapshotExpiredError,
-                            StaleHandleError,
-                        ),
-                    ):
-                        pass
-                    elif cache_ex is True:
-                        should_cache = isinstance(exc, Exception)
-                    elif isinstance(cache_ex, tuple):
-                        should_cache = isinstance(exc, cache_ex)
-
-                    if should_cache:
+                    if self._should_cache_error(key, exc):
                         error = exc
                         result = None
                     else:
+                        if frame.cycle_guess is not UNSET:
+                            self._discard_provisional(new_runtime, key)
                         self._inherit_failed_deps(runtime.stack, frame, exc)
                         raise
 
-                if frame.is_cycle_root:
-                    if error is None and self._store.stable_hash(
-                        result
-                    ) != self._store.stable_hash(frame.cycle_guess):
-                        frame.cycle_guess = result
-                        frame.is_cycle_root = False
-                        self._restart_cycle(new_runtime, frame, key)
-                        frame.deps.clear()
-                        frame.effects.clear()
-                        frame.expires_at = None
-                        continue
+                if frame.is_cycle_root and self._next_iteration(
+                    new_runtime, frame, key, result, error, iterations
+                ):
+                    iterations += 1
+                    continue
 
                 break
 
-            elapsed = self._store.monotonic_seconds() - start
-            duration_ms = elapsed * 1000.0
+            return self._finish_recompute(key, frame, new_runtime, result, error, start)
+        finally:
+            self._runtime_var.reset(token)
+            frame.runtime = None  # break the frame <-> runtime reference cycle
 
-            frozen_effects = {
-                name: tuple(items) for name, items in frame.effects.items()
-            }
+    def _finish_recompute(
+        self,
+        key: QueryKey,
+        frame: RuntimeFrame,
+        runtime: RuntimeState,
+        result: Any,
+        error: BaseException | None,
+        start: float,
+    ) -> MemoEntry:
+        """Turn a finished run into a memo: stored, or provisional in a cycle."""
+        store = self._store
+        elapsed = store.monotonic_seconds() - start
+        revision = runtime.snapshot.revision
+
+        frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
+        if error is not None:
+            value_hash = store.stable_hash(error)
+        else:
+            value_hash = store.stable_hash(result)
+
+        is_memoized = store.lookup_query_memoize(key[1])
+        computed_at_time = time.time()
+        expires_at = frame.expires_at
+        ttl = store.lookup_query_ttl(key[1])
+        if ttl is not None and (
+            expires_at is None or computed_at_time + ttl < expires_at
+        ):
+            expires_at = computed_at_time + ttl
+
+        deps = frame.deps
+        heads = frame.cycle_heads
+        members: list[tuple[QueryKey, MemoEntry]] = []
+        cycle_nodes: tuple[QueryKey, ...] = ()
+        if frame.cycle_guess is not UNSET:
+            # This query was the head of a fixed-point cycle. Its result
+            # depends on everything the cycle read from outside, so it takes
+            # over the outside dependencies of every member, and drops the
+            # members themselves: they depend on the head, not the reverse.
+            deps.pop(key, None)
+            if heads:
+                heads.discard(key)
+            overlay = runtime.provisional
+            if overlay:
+                members = [(k, e) for k, e in overlay.items() if key in e.cycle_heads]
+            member_keys = {k for k, _ in members}
+            for k in member_keys:
+                deps.pop(k, None)
+            for _, entry in members:
+                for dep in entry.deps:
+                    dep_key = dep.key
+                    if dep_key == key or dep_key in member_keys:
+                        continue
+                    seen = deps.get(dep_key)
+                    if seen is None or dep.observed_changed_at > seen:
+                        deps[dep_key] = dep.observed_changed_at
+                if entry.expires_at is not None and (
+                    expires_at is None or entry.expires_at < expires_at
+                ):
+                    expires_at = entry.expires_at
+            cycle_nodes = (key, *member_keys)
             if error is not None:
-                value_hash = self._store.stable_hash(error)
+                # A cached error is final but it is not the guess the
+                # members were computed from: they cannot be kept.
+                for k in member_keys:
+                    del overlay[k]  # type: ignore[union-attr]
+                members = []
+        provisional = bool(heads)
+
+        with store.lock:
+            previous = None if provisional else store.memos.get(key)
+            if previous is not None and previous.value_hash == value_hash:
+                changed_at = previous.changed_at
+                store.trace_event("backdate", key)
             else:
-                value_hash = self._store.stable_hash(result)
-
-            if frame.cycle_nodes:
-                for k in frame.cycle_nodes:
-                    frame.deps.pop(k, None)
-
-            is_memoized = self._store.lookup_query_memoize(key[1])
-            computed_at_time = time.time()
-            expires_at = frame.expires_at
-            ttl = self._store.lookup_query_ttl(key[1])
-            if ttl is not None and (
-                expires_at is None or computed_at_time + ttl < expires_at
-            ):
-                expires_at = computed_at_time + ttl
-            with self._store.lock:
-                previous = self._store.memos.get(key)
-                if previous is not None and previous.value_hash == value_hash:
-                    changed_at = previous.changed_at
-                    self._store.trace_event("backdate", key)
-                else:
-                    changed_at = self._store.new_change_stamp_locked()
-                self._store.next_access_id += 1
-                full_memo = self._store.entry_from_runtime(
-                    value=result,
-                    value_hash=value_hash,
-                    changed_at=changed_at,
-                    verified_at=new_runtime.snapshot.revision,
-                    deps=frame.deps,
-                    effects=frozen_effects,
-                    last_access=self._store.next_access_id,
-                    computed_at_time=computed_at_time,
-                    cycle_nodes=tuple(frame.cycle_nodes),
-                    error=error,
-                    expires_at=expires_at,
+                # Inlined ``new_change_stamp_locked``.
+                changed_at = store.change_stamp = store.change_stamp + 1
+            store.next_access_id += 1
+            full_memo = store.entry_from_runtime(
+                value=result,
+                value_hash=value_hash,
+                changed_at=changed_at,
+                verified_at=revision,
+                deps=deps,
+                effects=frozen_effects,
+                last_access=store.next_access_id,
+                computed_at_time=computed_at_time,
+                cycle_nodes=cycle_nodes,
+                error=error,
+                expires_at=expires_at,
+            )
+            # Members recorded a placeholder for the head; give them the
+            # marker its result really has.
+            for _, entry in members:
+                entry.deps = tuple(
+                    Dependency(key, changed_at) if dep.key == key else dep
+                    for dep in entry.deps
                 )
+            if provisional:
+                # Depends on the guess of a cycle head further up the stack:
+                # visible to this runtime only, until that head converges.
+                outer_heads = frozenset(heads)  # type: ignore[arg-type]
+                full_memo.cycle_heads = outer_heads
+                overlay = runtime.provisional
+                if overlay is None:
+                    overlay = runtime.provisional = {}
+                overlay[key] = full_memo
+                for _, entry in members:
+                    entry.cycle_heads = (entry.cycle_heads - {key}) | outer_heads
+            else:
                 if is_memoized:
                     stored_memo = full_memo
                 else:
-                    stored_memo = self._store.entry_from_runtime(
+                    stored_memo = store.entry_from_runtime(
                         value=None,
                         value_hash=value_hash,
                         changed_at=changed_at,
-                        verified_at=new_runtime.snapshot.revision,
-                        deps=frame.deps,
+                        verified_at=revision,
+                        deps=deps,
                         effects=frozen_effects,
-                        last_access=self._store.next_access_id,
+                        last_access=store.next_access_id,
                         computed_at_time=computed_at_time,
-                        cycle_nodes=tuple(frame.cycle_nodes),
+                        cycle_nodes=cycle_nodes,
                         error=error,
                         expires_at=expires_at,
                     )
-                self._store.drop_memo_locked(key)
-                self._store.memos[key] = stored_memo
-                self._store.push_memo_lru_locked(key)
-                for dep_key in frame.deps.keys():
-                    self._store.dependents[dep_key].add(key)
-                self._store.refresh_head_clean_locked(
-                    stored_memo, new_runtime.snapshot.revision, key[1]
-                )
-                self._store.evict_if_needed_locked()
-            if self._disk is not None and is_memoized:
-                self._persist_entry(key, full_memo)
-            self._store.trace_event(
-                "recompute_done", key, detail=f"{duration_ms:.3f}ms"
-            )
-            if self._store.is_stats_enabled():
-                self._store.record_query_body_time(key, elapsed)
-            return full_memo
-        finally:
-            runtime.snapshot = new_runtime.snapshot
-            runtime.pins = new_runtime.pins
-            self._runtime_var.reset(token)
+                store.drop_memo_locked(key)
+                store.memos[key] = stored_memo
+                store.push_memo_lru_locked(key)
+                dependents = store.dependents
+                for dep_key in deps:
+                    dependents[dep_key].add(key)
+                store.refresh_head_clean_locked(stored_memo, revision, key[1])
+                for member_key, entry in members:
+                    del runtime.provisional[member_key]  # type: ignore[index]
+                    entry.cycle_heads = None
+                    entry.verified_at = revision
+                    if not store.lookup_query_memoize(member_key[1]):
+                        entry = dataclasses.replace(entry, value=None)
+                    self._store_memo_locked(member_key, entry, revision)
+                store.evict_if_needed_locked()
+        if not provisional and self._disk is not None and is_memoized:
+            self._persist_entry(key, full_memo)
+        store.trace_event("recompute_done", key, detail=f"{elapsed * 1000.0:.3f}ms")
+        if store.is_stats_enabled():
+            store.record_query_body_time(key, elapsed)
+        return full_memo
+
+    def _store_memo_locked(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
+        store = self._store
+        store.drop_memo_locked(key)
+        store.memos[key] = memo
+        store.push_memo_lru_locked(key)
+        dependents = store.dependents
+        for dep in memo.deps:
+            dependents[dep.key].add(key)
+        store.refresh_head_clean_locked(memo, revision, key[1])
 
     # --- persistent disk cache ---
 
@@ -1621,8 +1904,17 @@ class Evaluator:
             elif dep_kind == "query":
                 try:
                     state = self._current_query_state(dep_fid, dep_args, runtime)
+                except CycleError:
+                    # As in try_mark_green: only a real run can tell.
+                    state = None
                 except _CONTROL_FLOW_ERRORS:
                     raise
+                except _ReenteredQuery as reentry:
+                    if not self._owns(runtime, reentry.key):
+                        raise
+                    # The dependency is running in this runtime (a cycle):
+                    # nothing to compare with, so compute instead of loading.
+                    state = None
                 except Exception:
                     # The dependency raises an uncached error: not a match.
                     state = None
@@ -1694,6 +1986,8 @@ class Evaluator:
             staged_root_effects={},
             cancel_epoch=runtime.cancel_epoch,
             snapshot_explicit=runtime.snapshot_explicit,
+            # Inlined ``_shadow_outer``.
+            outer=(runtime if runtime.stack or runtime.provisional else runtime.outer),
         )
         entry = self._run_in_runtime(
             shadow,
@@ -1857,8 +2151,14 @@ class Evaluator:
                     state = await self._current_query_state_async(
                         dep_fid, dep_args, runtime
                     )
+                except CycleError:
+                    state = None
                 except _CONTROL_FLOW_ERRORS:
                     raise
+                except _ReenteredQuery as reentry:
+                    if not self._owns(runtime, reentry.key):
+                        raise
+                    state = None
                 except Exception:
                     state = None
                 if state is None or state[0] != fingerprint:
@@ -1923,6 +2223,7 @@ class Evaluator:
             cancel_epoch=runtime.cancel_epoch,
             snapshot_explicit=runtime.snapshot_explicit,
             is_async=True,
+            outer=self._shadow_outer(runtime),
         )
         entry = await self._run_in_runtime_async(
             shadow,

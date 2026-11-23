@@ -34,7 +34,7 @@ from ._state import (
     Snapshot,
     TraceEvent,
 )
-from ._store import GraphStore
+from ._store import DEFAULT_FIXED_POINT_ITERATIONS, GraphStore
 
 _get_loop = getattr(asyncio, "_get_running_loop", None)
 
@@ -476,7 +476,16 @@ class Engine:
         cache_exceptions: bool | tuple[type[BaseException], ...] = True,
         ttl: float | None = None,
         incremental: bool | None = None,
+        max_iterations: int | None = None,
     ) -> Any:
+        if max_iterations is not None:
+            if fixed_point is _UNSET:
+                raise TypeError("max_iterations= needs fixed_point=")
+            if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+                raise TypeError("max_iterations must be an int")
+            if max_iterations < 1:
+                raise ValueError("max_iterations must be at least 1")
+
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
             query_id = self._resolve_id(f, name)
             enabled = self._incremental_default if incremental is None else incremental
@@ -496,6 +505,11 @@ class Engine:
                 has_fixed_point=has_fixed_point,
                 cache_exceptions=cache_exceptions,
                 ttl=ttl,
+                max_iterations=(
+                    DEFAULT_FIXED_POINT_ITERATIONS
+                    if max_iterations is None
+                    else max_iterations
+                ),
             )
             handle = _QueryHandle(self, registered, query_id)
             self._store.track_handle("query", query_id, registered, handle)
