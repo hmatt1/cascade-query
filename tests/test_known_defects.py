@@ -1,10 +1,10 @@
 """Regression tests for the defects listed in docs/guarantees.md (D1-D21).
 
-Every test here asserts the CORRECT behaviour and is marked
-``xfail(strict=True)``: it fails today, so the suite stays green, and it
-starts failing the suite the moment the defect is fixed. Remove the marker
+Every test here asserts the CORRECT behaviour. A test for an open defect is
+marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
+it starts failing the suite the moment the defect is fixed. Remove the marker
 (and move the test next to the feature it covers, if you like) as part of
-the fix.
+the fix. Tests without the marker are for defects that have been fixed.
 
 Where the right behaviour is a design choice, the test accepts every outcome
 that would be correct and says so in a comment.
@@ -440,7 +440,6 @@ def _run_d15_child(mode: str, cache_dir: Path, count: int) -> str:
     return done.stdout.strip()
 
 
-@_defect(15, "results are lost when a process exits without shutdown()")
 def test_d15_results_survive_a_normal_exit_without_shutdown(tmp_path: Path) -> None:
     count = 500
     _run_d15_child("write", tmp_path, count)

@@ -6,7 +6,9 @@ README are checked against.
 
 The second half is an audit dated 2026-11-23 (commit `03c7ed7`): defects where
 the code does not keep a promise, and guarantees with no test behind them.
-Every defect has a failing regression test in `tests/test_known_defects.py`.
+Every open defect has a failing regression test in
+`tests/test_known_defects.py`; defects fixed since the audit are listed under
+"Fixed since the audit".
 
 **Status key**
 
@@ -36,7 +38,7 @@ Every defect has a failing regression test in `tests/test_known_defects.py`.
 | G14 | Async queries behave like sync queries | Holds with limits (D21) | Weak |
 | G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path |
 | G16 | A stale persisted result is never served | Holds with limits (G11's blind spots) | Medium |
-| G17 | A finished result is on disk | Broken (D15) | None |
+| G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
 | G19 | Equal values of the same type encode to the same bytes | Holds | Weak |
 | G20 | A corrupt or old-format cache entry is recomputed, not served | Holds for query results; broken for collections (D16) | Medium |
@@ -297,15 +299,23 @@ Enforced by: `test_code_versioning.py::test_disk_cache_invalidation_on_code_chan
 
 ### G17. Durability
 
-Intended: a result is on disk when its query finishes.
+Results are queued when their query finishes and written in batches by a
+background thread. They are on disk once `flush_disk()` or `shutdown()`
+returns, and also when the interpreter exits normally without either: an
+`atexit` hook writes whatever is still queued. "Normally" covers falling off
+the end of the script, `sys.exit()` and an unhandled exception.
 
-Actual: results are queued and written in batches by a background thread.
-They are guaranteed on disk only after `flush_disk()` or `shutdown()` returns.
-Neither backend fsyncs each commit, so a power loss can lose recent commits
-even then. See D15.
+Limits: a process that is killed (`os._exit`, SIGKILL, a crash in native
+code) runs no exit hook and loses the results still queued; the cache stays
+usable. Neither backend fsyncs each commit, so a power loss can lose recent
+commits even after a flush. The exit hook gives up if the writer thread has
+died, so the exit never hangs (`flush_disk()` itself still does, see D18).
 
-Enforced by: nothing yet. `test_known_defects.py::test_d15_results_survive_a_normal_exit_without_shutdown`
-asserts the intended behaviour and is an expected failure.
+Enforced by: `test_known_defects.py::test_d15_results_survive_a_normal_exit_without_shutdown`,
+`test_durability_at_exit.py::test_normal_exit_without_shutdown_keeps_every_result`
+(both backends; plain exit, `sys.exit`, unhandled exception, engine dropped),
+`::test_exit_does_not_hang_when_the_writer_thread_is_dead`,
+`::test_hard_kill_is_not_covered_but_leaves_a_usable_cache`.
 
 ### G18. Round-trip fidelity
 
@@ -491,7 +501,6 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D12 | When a pinned snapshot predates a collection, compaction ignores later snapshots and open transactions. A snapshot read raises the private `_HistoryCompacted` after 3000 appends, and a rolled-back transaction leaves 2048 of its 3000 appended items in place. | Reproduced |
 | D13 | Reusing an `EngineTransaction` object replays its old state. A failing second `with tx:` rolled the list back past data committed in between, leaving `[]`. | Reproduced |
 | D14 | `CascadeSet.update` and `difference_update` are not atomic. `s.update([1, [2]])` raises, leaves 1 in storage but not in the log, and queries never see it. | Reproduced |
-| D15 | Results are lost when a process ends without `shutdown()` or `flush_disk()`. Of 2000 results on mdbx, 1224 were missing after a normal exit and 1364 after a kill; sqlite lost 2 each way; `shutdown()` lost none. | Reproduced |
 | D16 | A format-version change wipes collection logs along with cached results. Collection logs are source data and cannot be recomputed. | Reproduced on both backends: `[1, 2, 3]` restored as `[]`, with no error |
 | D17 | The open transaction leaks across concurrency boundaries. Another thread mutating the same collection during the block has its change deleted on rollback while queries keep the uncommitted value. A task created in the block that calls `set()` after the block exits has the update dropped. | Reproduced: the other thread's append was gone after rollback, and the task's `set(5)` left the input at 1. The "queries keep the uncommitted value" part was not re-run. |
 
@@ -503,6 +512,12 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D19 | A direct caller that joins a `submit`-owned run of the same query receives the owner's `QueryCancelled`. | Reproduced |
 | D20 | A query result that cannot be encoded raises a bare `TypeError` even with no `cache_dir`. Its message names the unsupported type but not the query. An exception with unencodable `args` is replaced by that `TypeError`. | Reproduced |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocks. Also reachable through the public API: a sync query that depends on an async query, called on the loop thread while that async query is running there, blocks the loop while re-verifying. | Reproduced, through the private entry point and through the public path |
+
+### Fixed since the audit
+
+| ID | Defect | Fixed by |
+|---|---|---|
+| D15 | Results were lost when a process ended without `shutdown()` or `flush_disk()` (1224 of 2000 on mdbx after a normal exit). | `fix: results were lost when a script ended without shutdown()` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`;
 the `disk_store` counter and trace are recorded even when the write failed
@@ -520,7 +535,7 @@ running it.
 |---|---|---|
 | **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
 | **Query identity.** A query is its `module:qualname`. Factories, lambdas and methods either collide silently or do not work. After a reload, a caller still holding the old handle runs the old code and writes its result into the cache the new handle reads. | Libraries that generate queries, class-based designs, hot-reload workflows. | The failure is a silently wrong answer, which is the one thing G1 exists to rule out. |
-| **Persistence cannot be trusted across code edits or exits.** Code invalidation sees only the query's own bytecode, there is no manual version or salt to force invalidation, and results reach disk only after `shutdown()` or `flush_disk()` (D15). | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served; end a script normally and most results on the default backend are gone. | "Zero-config persistence" implies both work without the user knowing about them. |
+| **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
 | **Rewriting is on by default but not exact.** Rewritten reducers differ from the builtins (D7), stages can go stale (D1), and ordinary operations such as `set(s)` or `s \| x` are untracked (D5). | Anyone using collections for numeric work, ordering-sensitive output, or set algebra. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
 
 Limits that narrow use without stopping it:
@@ -559,14 +574,16 @@ with a single sequential actor. TLC checks six invariants in CI.
 
 Ordered by the risk they leave open.
 
-1. **Regression tests for the defects above exist but are expected
+1. **Regression tests for the open defects exist but are expected
    failures.** `tests/test_known_defects.py` has one test per defect (D1-D21),
-   each asserting the correct behaviour under `xfail(strict=True)`. A fix
-   removes the marker. The two "Reported" sub-items of D7 have no test.
-2. **Durability has no passing tests.** The only tests that exit a process
-   without `shutdown()`, inject a write failure, or put two engines on one
-   `cache_dir` are the expected failures for D15, D18 and D10. Nothing kills
-   a process or runs two processes on one `cache_dir`.
+   each asserting the correct behaviour; those for open defects run under
+   `xfail(strict=True)`. A fix removes the marker. The two "Reported"
+   sub-items of D7 have no test.
+2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
+   exits child processes without `shutdown()` and with `os._exit`. The only
+   tests that inject a write failure into a live engine or put two engines on
+   one `cache_dir` are the expected failures for D18 and D10. Nothing runs
+   two processes on one `cache_dir`.
 3. **The Hypothesis state machine is narrow.** It covers inputs, one dynamic
    query and snapshots. It copies input history and the revision from the
    engine rather than modelling them, runs 35 examples of 25 steps, and has no

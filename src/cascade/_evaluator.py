@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import queue
 import threading
 import concurrent.futures
@@ -8,6 +9,7 @@ import contextvars
 import inspect
 import time
 import types
+import weakref
 from typing import Any, Callable, Mapping, Sequence
 
 from . import _canonical, _disk_cache
@@ -31,6 +33,32 @@ _CONTROL_FLOW_ERRORS = (
     PersistentCacheError,
     SnapshotExpiredError,
 )
+
+
+# Evaluators with a disk writer that has not been shut down. A normal
+# interpreter exit drains their queues (see ``_flush_all_at_exit``). The set
+# holds weak references, and the single module-level hook holds none, so
+# registering here never keeps an engine alive.
+_live_disk_writers: weakref.WeakSet[Evaluator] = weakref.WeakSet()
+_live_disk_writers_lock = threading.Lock()
+
+
+def _flush_all_at_exit() -> None:
+    """Write every queued result before the interpreter exits.
+
+    Runs from ``atexit``, when the daemon writer threads are still alive. A
+    process that is killed (``os._exit``, SIGKILL, a crash) never gets here.
+    """
+    with _live_disk_writers_lock:
+        evaluators = list(_live_disk_writers)
+    for evaluator in evaluators:
+        try:
+            evaluator.flush_disk_at_exit()
+        except Exception:  # pragma: no cover - never block or fail the exit
+            pass
+
+
+atexit.register(_flush_all_at_exit)
 
 
 class Evaluator:
@@ -81,6 +109,8 @@ class Evaluator:
             self._disk_queue = queue.Queue()
             self._disk_thread = threading.Thread(target=self._disk_worker, daemon=True)
             self._disk_thread.start()
+            with _live_disk_writers_lock:
+                _live_disk_writers.add(self)
 
     def _run_in_runtime(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
         token = self._runtime_var.set(runtime)
@@ -1794,11 +1824,32 @@ class Evaluator:
         if self._disk_queue is not None:
             self._disk_queue.join()
 
+    def flush_disk_at_exit(self) -> None:
+        """Wait for queued writes, giving up if the writer thread is gone.
+
+        ``flush_disk`` waits for the queue unconditionally. At interpreter
+        exit that would turn a dead writer into a process that never ends,
+        so this variant also returns once nothing is left to drain the queue.
+        """
+        pending = self._disk_queue
+        thread = self._disk_thread
+        if pending is None:
+            return
+        with pending.all_tasks_done:
+            while pending.unfinished_tasks:
+                if thread is None or not thread.is_alive():
+                    return
+                pending.all_tasks_done.wait(0.05)
+
     def shutdown(self, wait: bool = True) -> None:
         if self._disk_queue is not None:
             self._disk_queue.put(None)
             if wait and self._disk_thread is not None:
                 self._disk_thread.join()
+                # Joined, so nothing is left to flush at exit. Without the
+                # join the queue may still hold results; stay registered.
+                with _live_disk_writers_lock:
+                    _live_disk_writers.discard(self)
 
     def _persist_entry(self, key: QueryKey, memo: MemoEntry) -> None:
         if self._disk_queue is None:
