@@ -31,6 +31,7 @@ history.
 
 from __future__ import annotations
 
+import copy as _copy
 import functools
 import itertools
 import operator
@@ -122,6 +123,53 @@ def _copy_set(owner: set) -> set:
 
 def _copy_dict(owner: dict) -> dict:
     return dict(dict.items(owner))
+
+
+_EXACT_CONTAINERS = (list, tuple, set, frozenset, dict, str, bytes, range)
+
+
+def _plain(other: Any) -> Any:
+    """``other`` as a builtin when it is a cascade collection.
+
+    The builtin operators and methods read the storage of an operand that is
+    a list, set or dict subclass directly, in C: no method of the subclass
+    runs, so nothing is recorded and the contents are the live ones whatever
+    revision the reader is at. Operands are therefore read here first, as a
+    tracked copy. Doing it before the receiver takes its own lock also keeps
+    two collections' locks from ever being held together.
+    """
+    if isinstance(other, CASCADE_COLLECTION_TYPES):
+        return other.copy()
+    return other
+
+
+def _plain_iterable(other: Any) -> Any:
+    """Like ``_plain`` for an argument that will be iterated under the lock.
+
+    Anything that is not a plain builtin container is drained first, so that
+    an iterator which reads another collection does not run while this
+    collection's lock is held.
+    """
+    if isinstance(other, CASCADE_COLLECTION_TYPES):
+        return other.copy()
+    if type(other) in _EXACT_CONTAINERS:
+        return other
+    return list(other)
+
+
+def _set_repr(data: set, name: str) -> str:
+    # Live storage is the subclass, which the builtin already names; the
+    # contents at an older revision are a plain set.
+    if type(data) is not set:
+        return set.__repr__(data)
+    return f"{name}({set.__repr__(data)})" if data else f"{name}()"
+
+
+def _refuse_pickle(self: Any, protocol: Any = None) -> Any:
+    raise TypeError(
+        f"{type(self).__name__} cannot be pickled: it is bound to an engine. "
+        "Pickle a plain copy (.copy()) instead"
+    )
 
 
 class _HistoryCompacted(RuntimeError):
@@ -802,12 +850,72 @@ class CascadeList(list):
         return self._core.read(self, list.__contains__, item)
 
     def __eq__(self, other: Any) -> bool:
-        return self._core.read(self, list.__eq__, other)
+        return self._core.read(self, list.__eq__, _plain(other))
 
     def __ne__(self, other: Any) -> bool:
-        return self._core.read(self, list.__ne__, other)
+        return self._core.read(self, list.__ne__, _plain(other))
+
+    def __lt__(self, other: Any) -> bool:
+        return self._core.read(self, list.__lt__, _plain(other))
+
+    def __le__(self, other: Any) -> bool:
+        return self._core.read(self, list.__le__, _plain(other))
+
+    def __gt__(self, other: Any) -> bool:
+        return self._core.read(self, list.__gt__, _plain(other))
+
+    def __ge__(self, other: Any) -> bool:
+        return self._core.read(self, list.__ge__, _plain(other))
 
     __hash__ = None
+
+    # ``+`` and ``*`` give plain lists, as slicing does. For an operand the
+    # builtin refuses, the other operand's reflected method gets its turn
+    # and then the builtin raises its own error, in the order a plain list
+    # goes through.
+    def __add__(self, other: Any) -> list:
+        if not isinstance(other, list):
+            reflected = getattr(type(other), "__radd__", None)
+            if reflected is not None:
+                result = reflected(other, self)
+                if result is not NotImplemented:
+                    return result
+            return list.__add__([], other)
+        return self._core.read(self, list.__add__, _plain(other))
+
+    def __radd__(self, other: Any) -> list:
+        if not isinstance(other, list):
+            return NotImplemented
+        other = _plain(other)
+        return self._core.read(self, lambda data: list.__add__(other, data))
+
+    def __mul__(self, n: Any) -> list:
+        try:
+            count = operator.index(n)
+        except TypeError:
+            # A builtin sequence's ``__rmul__`` is its own repeat, which the
+            # ``*`` operator never offers a list to.
+            reflected = getattr(type(n), "__rmul__", None)
+            if reflected is not None and not isinstance(
+                n, (str, bytes, bytearray, tuple, list)
+            ):
+                result = reflected(n, self)
+                if result is not NotImplemented:
+                    return result
+            raise TypeError(
+                f"can't multiply sequence by non-int of type '{type(n).__name__}'"
+            ) from None
+        return self._core.read(self, list.__mul__, count)
+
+    def __rmul__(self, n: Any) -> list:
+        try:
+            count = operator.index(n)
+        except TypeError:
+            return NotImplemented
+        return self._core.read(self, list.__mul__, count)
+
+    def __repr__(self) -> str:
+        return self._core.read(self, list.__repr__)
 
     def index(self, value: Any, *args: Any) -> int:
         return self._core.read(self, list.index, value, *args)
@@ -817,6 +925,14 @@ class CascadeList(list):
 
     def copy(self) -> list:
         return self._core.read(self, _copy_list)
+
+    def __copy__(self) -> list:
+        return self.copy()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> list:
+        return _copy.deepcopy(self.copy(), memo)
+
+    __reduce_ex__ = _refuse_pickle
 
 
 def _plain_index(index: Any) -> Any:
@@ -977,6 +1093,103 @@ class CascadeSet(set):
     def __contains__(self, item: Any) -> bool:
         return self._core.read(self, set.__contains__, item)
 
+    # Comparisons, the binary operators and the methods below all give what
+    # the builtin gives (plain sets for the ones that build a set), read at
+    # the reader's revision. ``__hash__`` stays None, as for ``set``.
+    def __eq__(self, other: Any) -> bool:
+        return self._core.read(self, set.__eq__, _plain(other))
+
+    def __ne__(self, other: Any) -> bool:
+        return self._core.read(self, set.__ne__, _plain(other))
+
+    def __lt__(self, other: Any) -> bool:
+        return self._core.read(self, set.__lt__, _plain(other))
+
+    def __le__(self, other: Any) -> bool:
+        return self._core.read(self, set.__le__, _plain(other))
+
+    def __gt__(self, other: Any) -> bool:
+        return self._core.read(self, set.__gt__, _plain(other))
+
+    def __ge__(self, other: Any) -> bool:
+        return self._core.read(self, set.__ge__, _plain(other))
+
+    __hash__ = None
+
+    def __or__(self, other: Any) -> set:
+        return self._core.read(self, set.__or__, _plain(other))
+
+    def __and__(self, other: Any) -> set:
+        return self._core.read(self, set.__and__, _plain(other))
+
+    def __sub__(self, other: Any) -> set:
+        return self._core.read(self, set.__sub__, _plain(other))
+
+    def __xor__(self, other: Any) -> set:
+        return self._core.read(self, set.__xor__, _plain(other))
+
+    def __ror__(self, other: Any) -> set:
+        return self._core.read(self, set.__ror__, _plain(other))
+
+    def __rand__(self, other: Any) -> set:
+        return self._core.read(self, set.__rand__, _plain(other))
+
+    def __rsub__(self, other: Any) -> set:
+        return self._core.read(self, set.__rsub__, _plain(other))
+
+    def __rxor__(self, other: Any) -> set:
+        return self._core.read(self, set.__rxor__, _plain(other))
+
+    def union(self, *others: Iterable[Any]) -> set:
+        others = tuple(_plain_iterable(o) for o in others)
+        return self._core.read(self, set.union, *others)
+
+    def intersection(self, *others: Iterable[Any]) -> set:
+        others = tuple(_plain_iterable(o) for o in others)
+        return self._core.read(self, set.intersection, *others)
+
+    def difference(self, *others: Iterable[Any]) -> set:
+        others = tuple(_plain_iterable(o) for o in others)
+        return self._core.read(self, set.difference, *others)
+
+    def symmetric_difference(self, other: Iterable[Any]) -> set:
+        return self._core.read(self, set.symmetric_difference, _plain_iterable(other))
+
+    def issubset(self, other: Iterable[Any]) -> bool:
+        return self._core.read(self, set.issubset, _plain_iterable(other))
+
+    def issuperset(self, other: Iterable[Any]) -> bool:
+        return self._core.read(self, set.issuperset, _plain_iterable(other))
+
+    def isdisjoint(self, other: Iterable[Any]) -> bool:
+        return self._core.read(self, set.isdisjoint, _plain_iterable(other))
+
+    def copy(self) -> set:
+        return self._core.read(self, _copy_set)
+
+    def __copy__(self) -> set:
+        return self.copy()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> set:
+        return _copy.deepcopy(self.copy(), memo)
+
+    __reduce_ex__ = _refuse_pickle
+
+    def __repr__(self) -> str:
+        return self._core.read(self, _set_repr, type(self).__name__)
+
+
+def _view_op(op: Callable[[Any, Any], Any], *, reflected: bool = False) -> Any:
+    def method(self: _CascadeDictView, other: Any) -> Any:
+        other = _plain(other)
+        if isinstance(other, _CascadeDictView):
+            other = other._materialize()
+        if reflected:
+            return self._read(lambda view: op(other, view))
+        return self._read(lambda view: op(view, other))
+
+    return method
+
 
 class _CascadeDictView:
     """Wrapper carrying the parent dict plus which projection to reduce over.
@@ -1009,8 +1222,35 @@ class _CascadeDictView:
         return self._read(operator.contains, item)
 
     def __repr__(self) -> str:
-        live = getattr(dict, self.which)(self.parent)
-        return f"cascade_{self.which}({list(live)!r})"
+        return self._read(lambda view: f"cascade_{self.which}({list(view)!r})")
+
+    def _materialize(self) -> Any:
+        """A real view of a plain copy, for use as the other operand."""
+        project = getattr(dict, self.which)
+        return project(self.parent.copy())
+
+    # Comparisons and set algebra are those of the real view: ``keys()`` and
+    # ``items()`` act as sets, ``values()`` supports none of it and raises
+    # or compares by identity as ``dict.values()`` does.
+    __eq__ = _view_op(operator.eq)
+    __ne__ = _view_op(operator.ne)
+    __lt__ = _view_op(operator.lt)
+    __le__ = _view_op(operator.le)
+    __gt__ = _view_op(operator.gt)
+    __ge__ = _view_op(operator.ge)
+    __hash__ = None
+    __and__ = _view_op(operator.and_)
+    __or__ = _view_op(operator.or_)
+    __sub__ = _view_op(operator.sub)
+    __xor__ = _view_op(operator.xor)
+    __rand__ = _view_op(operator.and_, reflected=True)
+    __ror__ = _view_op(operator.or_, reflected=True)
+    __rsub__ = _view_op(operator.sub, reflected=True)
+    __rxor__ = _view_op(operator.xor, reflected=True)
+
+    def isdisjoint(self, other: Iterable[Any]) -> bool:
+        other = _plain_iterable(other)
+        return self._read(lambda view: view.isdisjoint(other))
 
 
 class CascadeDict(dict):
@@ -1129,6 +1369,38 @@ class CascadeDict(dict):
 
     def get(self, key: Any, default: Any = None) -> Any:
         return self._core.read(self, dict.get, key, default)
+
+    def __eq__(self, other: Any) -> bool:
+        return self._core.read(self, dict.__eq__, _plain(other))
+
+    def __ne__(self, other: Any) -> bool:
+        return self._core.read(self, dict.__ne__, _plain(other))
+
+    __hash__ = None
+
+    def __or__(self, other: Any) -> dict:
+        if not isinstance(other, dict):
+            return NotImplemented
+        return self.copy() | _plain(other)
+
+    def __ror__(self, other: Any) -> dict:
+        if not isinstance(other, dict):
+            return NotImplemented
+        return _plain(other) | self.copy()
+
+    def copy(self) -> dict:
+        return self._core.read(self, _copy_dict)
+
+    def __copy__(self) -> dict:
+        return self.copy()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict:
+        return _copy.deepcopy(self.copy(), memo)
+
+    __reduce_ex__ = _refuse_pickle
+
+    def __repr__(self) -> str:
+        return self._core.read(self, dict.__repr__)
 
 
 CASCADE_COLLECTION_TYPES = (CascadeList, CascadeSet, CascadeDict)

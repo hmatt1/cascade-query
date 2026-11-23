@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D27).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D28).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import heapq
 import os
 import sqlite3
 import subprocess
@@ -158,7 +159,6 @@ def test_d4_fan_out_inside_a_query_tracks_dependencies(fan_out: str) -> None:
         engine.shutdown()
 
 
-@_defect(5, "untracked collection reads (here set union) go stale inside queries")
 def test_d5_set_union_inside_a_query_sees_later_mutations() -> None:
     engine = Engine()
     s = CascadeSet(engine, [1])
@@ -600,6 +600,21 @@ def test_d17_task_created_in_a_transaction_can_set_after_it_commits() -> None:
         return x()
 
     assert asyncio.run(main()) == 5
+
+
+@_defect(28, "C code that changes a collection's storage directly logs no diff")
+def test_d28_heapq_on_a_cascade_list_reaches_queries() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [5, 3])
+
+    @engine.query
+    def n() -> int:
+        return len(xs)
+
+    assert n() == 2
+    heapq.heappush(xs, 1)
+    # Either the push is seen, or it is refused; never silently missed.
+    assert n() == 3
 
 
 @_defect(27, "a commit that fails on an input value keeps collection changes")

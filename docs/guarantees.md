@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken (D5, D7) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Broken (D7) | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
@@ -42,7 +42,7 @@ Every open defect has a failing regression test in
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
 | G19 | Values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Good by example |
 | G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
-| G21 | Collections behave like `list`, `set` and `dict` | Holds with limits (D5) | Strong for mutators |
+| G21 | Collections behave like `list`, `set` and `dict`, and every read inside a query is tracked | Holds with limits (D28) | Strong |
 | G22 | A rewritten query returns what the plain Python would | Broken (D7) | Weak on edge cases |
 | G23 | One mutation costs one diff of work | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
@@ -587,19 +587,69 @@ directories you wrote.
 ### G21. Builtin equivalence
 
 `CascadeList`, `CascadeSet` and `CascadeDict` subclass the builtins. Every
-mutating method changes storage and logs a diff. Inside a query these reads are
-tracked: iteration, `len`, `in`, indexing, `reversed`, list `==`, `index`,
-`count`, `copy`, dict `get` and the `keys`/`values`/`items` views.
+mutating method changes storage and logs a diff.
+
+Inside a query, every read made through the collection's own methods and
+operators records a dependency and sees the contents as of the query's
+revision:
+
+- all three: iteration, `len`, truth value, `in`, `reversed` (not sets),
+  `copy()`, `copy.copy` and `copy.deepcopy`, `==` and `!=`, `repr`, `str`
+  and formatting;
+- lists: indexing and slicing, `index`, `count`, `<` `<=` `>` `>=`, `+` and
+  `*` in either operand order;
+- sets: `<` `<=` `>` `>=`, `|` `&` `-` `^` with a `set` in either operand
+  order, `union`, `intersection`, `difference`, `symmetric_difference`,
+  `issubset`, `issuperset`, `isdisjoint`;
+- dicts: indexing, `get`, `|` in either operand order, and the `keys()`,
+  `values()` and `items()` views with their iteration, `len`, `in`,
+  comparisons and set algebra.
+
+Whatever the builtins build on those is tracked with them: `list(xs)`,
+`tuple(xs)`, `sorted(xs)`, `sum`, `min`, `max`, `[*xs]`, `f(*xs)`,
+`plain.extend(xs)`, `dict(d)`, `{**d}`, `f(**d)`, `plain.update(d)`,
+`json.dumps`, `str.join`, `set(xs)` of a list or dict. When the other operand
+is a collection too (`a | b`, `xs == ys`), both are tracked.
+
+Every read gives a plain `list`, `set`, `dict` or scalar, never a second
+collection object. An operand the builtin refuses raises the builtin's
+`TypeError`, after the other operand's reflected method has had its turn.
 
 A mutator that raises changes nothing: storage and log stay in agreement, so
 queries see exactly what the collection holds. This makes
 `CascadeSet.update` and `difference_update` atomic, where the builtin keeps
 the elements handled before the failing one.
 
-Limits: dict views are wrappers, not real views, so set operations on them do
-not work. List slices return plain lists. Collections cannot be pickled.
+Limits:
 
-Enforced by: the example tests in `test_incremental_collections.py`
+- **C code that reads a `CascadeSet`'s storage itself is not tracked.** For
+  any `set` subclass, CPython's set and frozenset code reads the other
+  operand's hash table directly, and no method of the subclass runs. Inside
+  a query these record no dependency and read the live contents: `set(s)`
+  and `frozenset(s)` (except `set(s)` written in a rewritten query body,
+  which is tracked), `{*s}`, a plain set's or frozenset's methods given the
+  collection (`plain.union(s)`, `plain.update(s)`, `plain.issubset(s)`,
+  `plain |= s` and the like), and operators with a `frozenset` on the left
+  (`fs | s`, `fs == s`). Tracked spellings: `s.copy()`, the collection's own
+  method or operator (`s.union(plain)`, `s | fs`, `s == fs`), or `iter(s)`.
+  Lists and dicts have no such path: CPython takes its shortcuts for exact
+  `list` and `dict` only, or for subclasses that do not override `__iter__`.
+- **Calling a builtin's method on a collection by hand bypasses it**:
+  `list.__len__(xs)`, `set.union(s, t)`, `dict.items(d)`.
+- **C code that changes a collection's storage itself logs nothing** (D28).
+- Dict views are wrappers, not `dict_keys` objects: `isinstance(d.keys(),
+  collections.abc.KeysView)` is false and there is no `.mapping`.
+- `repr` of a `CascadeSet` is `CascadeSet({...})`; lists and dicts print as
+  the builtins do.
+- Collections cannot be pickled: `pickle.dumps` raises `TypeError`. Pickle
+  `xs.copy()`.
+
+Enforced by: `test_collection_read_tracking.py` (some 180 read expressions,
+each compared with the builtin after creation, after mutations and through a
+snapshot, with the result type; operand errors; two collections in one
+expression; `::test_limit_set_read_by_c_code_is_not_tracked` pins the first
+limit), `test_known_defects.py::test_d5_set_union_inside_a_query_sees_later_mutations`,
+the example tests in `test_incremental_collections.py`
 (`::test_failed_list_mutator_changes_nothing`, `::test_failed_set_mutator_changes_nothing`
 and `::test_failed_dict_mutator_changes_nothing` cover failing calls of every
 mutator) and its Hypothesis tests `::test_list_log_replay_matches_contents`,
@@ -771,7 +821,8 @@ Enforced by: `test_incremental_persistence.py::test_named_collections_restore_ac
 "Reproduced" means re-run independently for this audit on Python 3.12.9, and
 pinned by an expected-failure test in `tests/test_known_defects.py`. D22 was
 found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2;
-D27 while fixing D17. All were already present at the audit commit.
+D27 while fixing D17; D28 while fixing D5. All were already present at the
+audit commit.
 "Reported" means found and probed during the audit but not re-run a second
 time; it now applies only to the two sub-items of D7 marked that way.
 
@@ -779,9 +830,9 @@ time; it now applies only to the two sub-items of D7 marked that way.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D5 | Collection reads that are not tracked go stale inside queries: `set(s)`, `s \| x`, set and dict `==`, `s.issubset`, `xs + [...]`, `repr`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. | Reproduced |
 | D7 | Rewritten reducers differ from the builtins. Float `sum([0.1] * 10)` gives `0.9999999999999999` against `1.0`. `sorted(..., reverse=True)` is not stable (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`). `any` and `all` do not short-circuit (`any(1 / z for z in [1, 0])` raises `ZeroDivisionError`). Reported: `min`/`max` tie choice, and `len(map(...))` returning a count instead of raising. | Reproduced |
 | D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
+| D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
 | D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
 
 ### Data loss and corruption
@@ -821,6 +872,7 @@ time; it now applies only to the two sub-items of D7 marked that way.
 | D16 | A format-version change wiped collection logs along with cached results (`[1, 2, 3]` restored as `[]`, with no error, on both backends). Collection logs now have a format number of their own, `COLLECTION_FORMAT`; a `DISK_FORMAT` change deletes cached results only. Collection data that cannot be read is refused with `PersistentCacheError` instead of deleted. | `fix: a disk format change deleted named collections' data` |
 | D6 | Early bail-out treated dicts that differ only in insertion order as equal, so a dependent that iterated the dict kept the old order (`['a', 'b']` where a fresh run gives `['b', 'a']`). The same digest made `input.set` of a reordered dict a no-op, and the disk encoding sorted dict keys, so a stored dict came back in sorted order. Both digests and the disk encoding now keep insertion order; sets are unchanged. `DISK_FORMAT` went from 2 to 3: results stored under 2 are dropped on open, collections are kept. | `fix: a result that only changed a dict's order did not reach its dependents` |
 | D1 | A rewritten stage that read an input the query body had already read was not seen as reading anything, so its cached per-element results were kept: `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` returned 12 after `factor.set(10)` where a fresh run gives 60. The pipeline looked for new dependencies of the query, and a repeated read adds none. Every tracked read is now counted, and a pipeline whose stages read anything is rebuilt on each run. | `fix: a rewritten comprehension kept old results after an input it read changed` |
+| D5 | Collection reads that bypassed tracking went stale inside queries: `s \| x` and the other set operators and methods, set and dict `==`, list `<`, `xs + [...]`, `xs * n`, `repr`, `set.copy()`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. The builtins' implementations ran on the subclass's storage without any method of the collection being called, so no dependency was recorded and a snapshot read saw live contents. Each of these is now a tracked read on the collection. Found and fixed with it: `d.keys() == {'a'}` was always `False` and set operations on dict views raised; `copy.copy(xs)` returned a second collection object sharing the first one's log. What CPython reads without calling the subclass (`set(s)` outside a rewritten body, `frozenset(s)`, `plain.union(s)`, `fs \| s`) cannot be intercepted and is a documented limit (G21). | `fix: set operators, comparisons and repr of a collection went stale inside queries` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -841,7 +893,7 @@ running it.
 | **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
-| **Rewriting is on by default but not exact.** Rewritten reducers differ from the builtins (D7), and ordinary operations such as `set(s)` or `s \| x` are untracked (D5). | Anyone using collections for numeric work, ordering-sensitive output, or set algebra. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
+| **Rewriting is on by default but not exact.** Rewritten reducers differ from the builtins (D7). | Anyone using collections for numeric work or ordering-sensitive output. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
 
 Limits that narrow use without stopping it:
 
@@ -881,14 +933,14 @@ with a single sequential actor. TLC checks six invariants in CI.
   transactions, collections, compaction, errors, TTL, eviction. The model
   uses the revision as the change marker of a query result; the code uses a
   separate stamp (G1).
-- None of D1–D27 is reachable in the model.
+- None of D1–D28 is reachable in the model.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Regression tests for the open defects exist but are expected
-   failures.** `tests/test_known_defects.py` has one test per defect (D1-D27),
+   failures.** `tests/test_known_defects.py` has one test per defect (D1-D28),
    each asserting the correct behaviour; those for open defects run under
    `xfail(strict=True)`. A fix removes the marker. The two "Reported"
    sub-items of D7 have no test.

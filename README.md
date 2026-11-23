@@ -339,6 +339,9 @@ Rewriting covers comprehensions with a single `for` clause (`[...]`, `{...}`, `{
 *   Arbitrary `for` loops and comprehensions with more than one `for` are never rewritten, but invalidate through read tracking.
 *   Iterating a `CascadeSet`, in a comprehension or a loop, yields its elements in insertion order.
 *   `enumerate()` and `zip()` sources are explicitly excluded.
+*   Reads that are not rewritten are still tracked: indexing, slicing, `in`, `len`, comparisons, `xs + ys`, `s | t` and the other set operators and methods, `d.keys() & other`, `repr`, `list(xs)`, `dict(d)`, `json.dumps(xs)` and so on. Each returns a plain builtin and re-runs the query when the collection changes.
+*   **One limit:** CPython reads a `set` subclass's storage directly when a `CascadeSet` is handed to another set's code, and Cascade cannot see that. Inside a query, `frozenset(s)`, `{*s}`, `plain.union(s)`, `plain |= s`, `frozenset_a | s`, and `set(s)` in a helper function (in the query body itself `set(s)` is rewritten and fine) do not record the dependency. Write `s.copy()`, or put the collection on the left: `s.union(plain)`, `s | frozenset_a`.
+*   `copy.copy(xs)` and `xs.copy()` give plain builtins; collections cannot be pickled.
 *   A comprehension whose element expression, `if` clause or `key=` function itself reads an input, a query or another collection is recomputed in full each time its query re-runs. Read the value once before the comprehension (`f = factor()`) to keep it incremental.
 *   Opt out globally via `Engine(incremental=False)` or per-query `@engine.query(incremental=False)`.
 
