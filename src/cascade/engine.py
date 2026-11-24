@@ -12,6 +12,8 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from . import _canonical
 from ._ast_rewrite import rewrite_query
+from ._keys import EXACT_TYPES as _EXACT_TYPES
+from ._keys import ArgSpec, is_key_form, key_args
 from ._disk_cache import DiskCache, DiskCacheProtocol
 from ._errors import (
     CancellationError,
@@ -198,6 +200,16 @@ def _current_transaction() -> EngineTransaction | None:
     return tx
 
 
+def _keyed_calls(calls: Sequence[Any]) -> list[tuple[Any, tuple[Any, ...]]]:
+    """``(handle, args)`` or ``(handle, args, kwargs)`` entries, keyed."""
+    keyed = []
+    for call in calls:
+        handle, args = call[0], call[1]
+        kwargs = call[2] if len(call) > 2 else None
+        keyed.append((handle, handle._key_args(tuple(args), kwargs)))
+    return keyed
+
+
 def _stale_handle_error(kind: str, handle_id: str) -> StaleHandleError:
     return StaleHandleError(
         f"this handle for {kind} {handle_id!r} is stale: a different function "
@@ -209,18 +221,52 @@ def _stale_handle_error(kind: str, handle_id: str) -> StaleHandleError:
     )
 
 
+def _check_reserved(spec: ArgSpec, kind: str, reserved: tuple[str, ...]) -> None:
+    clash = spec.reserved_keyword_clash(reserved)
+    if clash is not None:
+        raise TypeError(
+            f"{spec.label}: keyword-only parameter {clash!r} cannot be passed, "
+            f"because {clash}= is taken by the {kind} handle itself. Rename it, "
+            "or make it a positional parameter and pass it positionally."
+        )
+
+
 class _InputHandle:
-    def __init__(self, engine: Engine, fn: Callable[..., Any], input_id: str) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        fn: Callable[..., Any],
+        input_id: str,
+        spec: ArgSpec | None = None,
+    ) -> None:
         self._engine = engine
         self._fn = fn
         self._id = input_id
         self._is_async_fn = inspect.iscoroutinefunction(fn)
+        self._spec = spec if spec is not None else ArgSpec(fn, f"input {input_id}")
+        self._fast_len = self._spec.fast_len
 
     def _mark_stale(self) -> None:
         # Swapping the class keeps the check off the path of live handles.
         self.__class__ = _StaleInputHandle
 
-    def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
+    def _key_args(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None
+    ) -> tuple[Any, ...]:
+        if not kwargs and len(args) == self._fast_len:
+            return key_args(args)
+        return self._spec.key(args, kwargs)
+
+    def __call__(
+        self, *args: Any, snapshot: Snapshot | None = None, **kwargs: Any
+    ) -> Any:
+        if kwargs or len(args) != self._fast_len:
+            args = self._spec.key(args, kwargs)
+        else:
+            for a in args:
+                if type(a) not in _EXACT_TYPES:
+                    args = key_args(args)
+                    break
         if not self._is_async_fn:
             return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
@@ -244,13 +290,14 @@ class _InputHandle:
 
         return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
-    def set(self, *args: Any, value: Any = _UNSET) -> int | None:
+    def set(self, *args: Any, value: Any = _UNSET, **kwargs: Any) -> int | None:
         if value is _UNSET:
             if not args:
                 raise TypeError("set() requires input value")
             *input_args, resolved_value = args
             args = tuple(input_args)
             value = resolved_value
+        args = self._key_args(args, kwargs)
 
         if _active_transaction.get() is not None:
             tx = _current_transaction()
@@ -271,10 +318,12 @@ class _InputHandle:
 class _StaleInputHandle(_InputHandle):
     """An input handle whose function was replaced; every use raises."""
 
-    def __call__(self, *args: Any, snapshot: Snapshot | None = None) -> Any:
+    def __call__(
+        self, *args: Any, snapshot: Snapshot | None = None, **kwargs: Any
+    ) -> Any:
         raise _stale_handle_error("input", self._id)
 
-    def set(self, *args: Any, value: Any = _UNSET) -> int | None:
+    def set(self, *args: Any, value: Any = _UNSET, **kwargs: Any) -> int | None:
         raise _stale_handle_error("input", self._id)
 
     def __repr__(self) -> str:
@@ -282,11 +331,19 @@ class _StaleInputHandle(_InputHandle):
 
 
 class _QueryHandle:
-    def __init__(self, engine: Engine, fn: Callable[..., Any], query_id: str) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        fn: Callable[..., Any],
+        query_id: str,
+        spec: ArgSpec | None = None,
+    ) -> None:
         self._engine = engine
         self._fn = fn
         self._id = query_id
         self._is_async_fn = inspect.iscoroutinefunction(fn)
+        self._spec = spec if spec is not None else ArgSpec(fn, f"query {query_id}")
+        self._fast_len = self._spec.fast_len
 
     def _mark_stale(self) -> None:
         # Swapping the class keeps the check off the path of live handles.
@@ -296,15 +353,32 @@ class _QueryHandle:
         """The function to run; raises on a stale handle."""
         return self._fn
 
+    def _key_args(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None
+    ) -> tuple[Any, ...]:
+        """The cache key form of a call with ``args`` and ``kwargs``."""
+        if not kwargs and len(args) == self._fast_len:
+            return key_args(args)
+        return self._spec.key(args, kwargs)
+
     def __call__(
         self,
         *args: Any,
         snapshot: Snapshot | None = None,
         effects: dict[str, list[Any]] | None = None,
+        **kwargs: Any,
     ) -> Any:
+        # Inlined ``_key_args``: this is the path of every cache hit.
+        if kwargs or len(args) != self._fast_len:
+            args = self._spec.key(args, kwargs)
+        else:
+            for a in args:
+                if type(a) not in _EXACT_TYPES:
+                    args = key_args(args)
+                    break
         if not self._is_async_fn:
             return self._engine._query_call(
-                self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+                self._id, self._fn, args, snapshot=snapshot, effects=effects
             )
 
         if _get_loop is not None and _get_loop() is not None:
@@ -313,23 +387,23 @@ class _QueryHandle:
                 # sync path serves a cached result and raises
                 # EventLoopBlockedError where it would have to block.
                 return self._engine._query_call(
-                    self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+                    self._id, self._fn, args, snapshot=snapshot, effects=effects
                 )
             return self._engine._query_call_async(
-                self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+                self._id, self._fn, args, snapshot=snapshot, effects=effects
             )
 
         if _get_loop is None:
             try:
                 asyncio.get_running_loop()
                 return self._engine._query_call_async(
-                    self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+                    self._id, self._fn, args, snapshot=snapshot, effects=effects
                 )
             except RuntimeError:
                 pass
 
         return self._engine._query_call(
-            self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+            self._id, self._fn, args, snapshot=snapshot, effects=effects
         )
 
     @property
@@ -352,6 +426,7 @@ class _StaleQueryHandle(_QueryHandle):
         *args: Any,
         snapshot: Snapshot | None = None,
         effects: dict[str, list[Any]] | None = None,
+        **kwargs: Any,
     ) -> Any:
         raise _stale_handle_error("query", self._id)
 
@@ -487,6 +562,9 @@ class Engine:
         self._internals = _EngineInternals(self._store, self._evaluator)
         self._submit_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._submit_executor_lock = threading.Lock()
+        # ("query" | "input", id) -> how calls of the registered function
+        # map to keys; used to key the roots given to prune() and subgraph().
+        self._arg_specs: dict[tuple[str, str], ArgSpec] = {}
 
     @property
     def revision(self) -> int:
@@ -543,8 +621,11 @@ class Engine:
 
         def decorator(f: Callable[..., Any]) -> _InputHandle:
             input_id = self._resolve_id(f, name)
+            spec = ArgSpec(f, f"input {input_id}")
+            _check_reserved(spec, "input", ("snapshot", "value"))
             registered = self._store.register_input(input_id, f)
-            handle = _InputHandle(self, registered, input_id)
+            self._arg_specs[("input", input_id)] = spec
+            handle = _InputHandle(self, registered, input_id, spec)
             self._store.track_handle("input", input_id, registered, handle)
             return handle
 
@@ -574,6 +655,8 @@ class Engine:
 
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
             query_id = self._resolve_id(f, name)
+            spec = ArgSpec(f, f"query {query_id}")
+            _check_reserved(spec, "query", ("snapshot", "effects"))
             enabled = self._incremental_default if incremental is None else incremental
             run_fn = f
             if enabled:
@@ -597,7 +680,8 @@ class Engine:
                     else max_iterations
                 ),
             )
-            handle = _QueryHandle(self, registered, query_id)
+            self._arg_specs[("query", query_id)] = spec
+            handle = _QueryHandle(self, registered, query_id, spec)
             self._store.track_handle("query", query_id, registered, handle)
             return handle
 
@@ -673,8 +757,9 @@ class Engine:
         snapshot: Snapshot | None = None,
         effects: dict[str, list[Any]] | None = None,
         executor: concurrent.futures.Executor | None = None,
+        **kwargs: Any,
     ) -> concurrent.futures.Future[Any]:
-        """Run ``query`` asynchronously.
+        """Run ``query(*args, **kwargs)`` asynchronously.
 
         If ``executor`` is ``None`` (default), the engine uses a lazily created
         shared :class:`~concurrent.futures.ThreadPoolExecutor` so repeated
@@ -696,6 +781,7 @@ class Engine:
                 "what the query read through it. Call the query directly, or "
                 "use engine.compute_many() to run several in parallel."
             )
+        key = query._key_args(tuple(args), kwargs)
         store = self._store
         run_snapshot = store.pin_snapshot(snapshot)
         rev = run_snapshot.revision
@@ -706,7 +792,7 @@ class Engine:
             return self._query_call(
                 query.id,
                 query._live_fn(),
-                tuple(args),
+                key,
                 snapshot=run_snapshot,
                 effects=effects,
                 cancel_epoch=cancel_epoch,
@@ -741,6 +827,7 @@ class Engine:
         """
         if not calls:
             return []
+        calls = _keyed_calls(calls)
         if self._evaluator.current_runtime() is not None:
             return self._compute_many_in_query(calls, workers, effects)
         run_snapshot = self._store.pin_snapshot(snapshot)
@@ -901,6 +988,7 @@ class Engine:
         """
         if not calls:
             return
+        calls = _keyed_calls(calls)
 
         runtime = self._evaluator.current_runtime()
         if runtime is not None:
@@ -1044,7 +1132,8 @@ class Engine:
 
         If ``condense`` is True, groups nodes sharing the same base query name (ignoring arguments) into a single summary node when N >= 2.
         """
-        return self._store.subgraph(roots, direction=direction, condense=condense)
+        keyed = [r if isinstance(r, str) else self._key_root(r) for r in roots]
+        return self._store.subgraph(keyed, direction=direction, condense=condense)
 
     def enable_stats(self, enabled: bool = True) -> None:
         self._store.set_stats_enabled(enabled)
@@ -1070,12 +1159,28 @@ class Engine:
         *,
         vacuum_disk: bool = False,
     ) -> None:
-        root_list = list(roots)
+        root_list = [self._key_root(root) for root in roots]
         self._store.prune(root_list)
         if vacuum_disk and self._disk is not None:
             self._evaluator.prune_disk_cache(root_list)
 
     # --- internals ---
+    def _key_root(self, root: Any) -> Any:
+        """A ``(kind, id, args)`` root with its args keyed like a call's."""
+        try:
+            kind, fid, args = root
+            args = tuple(args)
+        except (TypeError, ValueError):
+            return root
+        if is_key_form(args):
+            return (kind, fid, args)
+        spec = self._arg_specs.get((kind, fid))
+        try:
+            keyed = key_args(args) if spec is None else spec.key(args, None)
+        except TypeError:
+            return root
+        return (kind, fid, keyed)
+
     def _function_id(self, fn: Callable[..., Any]) -> str:
         return f"{fn.__module__}:{fn.__qualname__}"
 

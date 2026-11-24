@@ -7,6 +7,7 @@ import threading
 import concurrent.futures
 import contextvars
 import dataclasses
+import functools
 import inspect
 import time
 import types
@@ -14,7 +15,7 @@ import warnings
 import weakref
 from typing import Any, Callable, Mapping, Sequence
 
-from . import _canonical, _disk_cache
+from . import _canonical, _disk_cache, _keys
 from ._disk_cache import DiskCacheProtocol
 from ._errors import (
     CollectionBypassedError,
@@ -217,8 +218,8 @@ class Evaluator:
         self._write_failure_lock = threading.Lock()
         # QueryKey -> (canonical args blob, disk entry key). A key is otherwise
         # re-encoded when it is hydrated, once per dependent that records it,
-        # and again by the writer thread. Keys that compare equal share an
-        # entry (1, 1.0 and True are one memo key in memory as well).
+        # and again by the writer thread. Keys compare by type (``_keys``),
+        # so 1, 1.0 and True have an entry each, as they have a memo each.
         self._key_blobs: dict[QueryKey, tuple[bytes, bytes]] = {}
         # Reverse direction for dependency rows read back from disk.
         self._args_by_blob: dict[bytes, tuple[Any, ...]] = {}
@@ -276,7 +277,12 @@ class Evaluator:
         loop = asyncio.get_running_loop()
         executor = self._get_executor() if self._get_executor else None
         ctx = contextvars.copy_context()
-        return await loop.run_in_executor(executor, ctx.run, fn, *args)
+        positional, keywords = _keys.call_parts(args)
+        if keywords:
+            return await loop.run_in_executor(
+                executor, functools.partial(ctx.run, fn, *positional, **keywords)
+            )
+        return await loop.run_in_executor(executor, ctx.run, fn, *positional)
 
     def check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         if runtime_cancel_epoch is None:
@@ -484,7 +490,7 @@ class Evaluator:
         else:
             version = self._store.input_version_at((input_id, args), revision)
         if version is None:
-            default = fn(*args)
+            default = _keys.call(fn, args)
             if isinstance(default, types.CoroutineType):
                 default = _run_coroutine_blocking(
                     default, self._store.key_to_str(("input", input_id, args))
@@ -539,7 +545,7 @@ class Evaluator:
             version = self._store.input_version_at((input_id, args), revision)
         if version is None:
             if inspect.iscoroutinefunction(fn):
-                default = await fn(*args)
+                default = await _keys.call(fn, args)
             else:
                 default = await self._run_sync_in_executor(fn, args)
             should_materialize = False
@@ -2055,7 +2061,7 @@ class Evaluator:
         while True:
             try:
                 self.check_cancelled(runtime.cancel_epoch)
-                result = fn(*key[2])
+                result = _keys.call(fn, key[2])
                 if isinstance(result, types.CoroutineType):
                     # The body is a coroutine: what it calls may await.
                     frame.is_async_body = True
@@ -2145,7 +2151,7 @@ class Evaluator:
                 try:
                     self.check_cancelled(new_runtime.cancel_epoch)
                     if inspect.iscoroutinefunction(fn):
-                        result = await fn(*key[2])
+                        result = await _keys.call(fn, key[2])
                     else:
                         result = await self._run_sync_in_executor(fn, key[2])
                     self.check_cancelled(new_runtime.cancel_epoch)
@@ -2372,7 +2378,7 @@ class Evaluator:
         cached = self._key_blobs.get(key)
         if cached is None:
             kind, fid, args = key
-            args_blob = _canonical.encode(args)
+            args_blob = _canonical.encode(_keys.plain_args(args))
             cached = (args_blob, _disk_cache.entry_key(kind, fid, args_blob))
             if len(self._key_blobs) >= self._key_cache_limit():
                 self._key_blobs.clear()
@@ -2384,6 +2390,7 @@ class Evaluator:
         if args is None:
             args = _canonical.decode(args_blob)
             if isinstance(args, tuple):
+                args = _keys.key_from_plain(args)
                 if len(self._args_by_blob) >= self._key_cache_limit():
                     self._args_by_blob.clear()
                 self._args_by_blob[args_blob] = args
@@ -2588,7 +2595,7 @@ class Evaluator:
         # advance the store revision past the runtime snapshot and desync the
         # rest of the evaluation. changed_at=-1 matches the engine's existing
         # convention for never-set default inputs, so green checks stay stable.
-        value = fn(*args)
+        value = _keys.call(fn, args)
         if isinstance(value, types.CoroutineType):
             value = _run_coroutine_blocking(
                 value, self._store.key_to_str(("input", input_id, args))
@@ -2829,7 +2836,7 @@ class Evaluator:
         import inspect
 
         if inspect.iscoroutinefunction(fn):
-            value = await fn(*args)
+            value = await _keys.call(fn, args)
         else:
             value = await self._run_sync_in_executor(fn, args)
 
@@ -3164,7 +3171,7 @@ class Evaluator:
         if fn is None:
             return None  # pragma: no cover
         try:
-            return self._store.stable_hash(fn(*dep_args))
+            return self._store.stable_hash(_keys.call(fn, dep_args))
         except TypeError:  # pragma: no cover
             return None  # pragma: no cover
 

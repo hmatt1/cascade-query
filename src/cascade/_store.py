@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from typing import Any, Callable
 
 from ._errors import SnapshotExpiredError
+from ._keys import display as display_args
 from ._serde import hash_bytecode, stable_value_digest, unencodable_error
 from ._state import (
     Dependency,
@@ -625,7 +626,7 @@ class GraphStore:
 
     def key_to_str(self, key: QueryKey) -> str:
         kind, fid, args = key
-        return f"{kind}:{fid}{args}"
+        return f"{kind}:{fid}{display_args(args)}"
 
     def stable_hash(self, value: Any) -> str:
         """Digest of ``value``; ``TypeError`` if the codec cannot encode it."""

@@ -79,7 +79,11 @@ class TxnContext:
 # 4: new value types (Enum, Decimal, paths, ...; see _canonical), and a
 #    bytearray is stored as itself: format 3 stored it as bytes, so a result
 #    that returned one came back as bytes.
-DISK_FORMAT = 4
+# 5: arguments are keyed by type (1, 1.0 and True are three entries) and
+#    with defaults filled in. Format 4 shared one entry between arguments
+#    that compare equal, so a result computed for True could be stored
+#    under the key of 1.
+DISK_FORMAT = 5
 
 # Values whose canonical encoding is at most this many bytes are stored
 # inside their meta record instead of the content-addressed blob store, so

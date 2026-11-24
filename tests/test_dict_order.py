@@ -226,7 +226,7 @@ def test_setting_an_input_to_a_reordered_dict_is_a_change(
 
 
 def test_equal_hashable_arguments_share_a_result_whatever_their_dict_order() -> None:
-    """Argument identity is ``==`` and ``hash``, as for ``q(1)`` and ``q(1.0)``."""
+    """Arguments that are ``==`` and of one type share a key; dict order is not seen."""
     engine = Engine()
     runs = {"q": 0}
 

@@ -113,13 +113,27 @@ Limits, by design:
     engine: `UnencodableValueError`. A same-value `set` must be detected
     (G3), and a fixed point is reached when a result equals its guess
     (G7), so these need an encoding.
-- **Arguments are positional and hashable.** Keyword arguments raise
-  `TypeError`. Arguments that compare equal are one cache key, so `q(1)`,
-  `q(True)` and `q(1.0)` share a result. A dict is not hashable and cannot be
-  an argument. A hashable object that holds a dict (a frozen dataclass with
-  the field left out of its hash) follows the same rule: two that compare
-  equal share one result, the first call's, whatever the order of their
-  dicts. Results and input values are compared more strictly (G2).
+- **Arguments are hashable, bound to parameters, and keyed by type.**
+  Keyword arguments are bound to the function's parameters as Python binds
+  them, defaults filled in, so `q(1)`, `q(x=1)` and `q(1, y=2)` (where
+  `y=2` is the default) share one result. Two arguments are one key when
+  they are `==` and of the same type, recursively through tuples,
+  frozensets, `NamedTuple`s and dataclass fields; a float also by the sign
+  of a zero, and `Decimal`, `datetime`, `time`, `timezone`, `range` and
+  paths also by their `repr`. So `q(1)`, `q(True)`, `q(1.0)` and
+  `q(Decimal(1))` have a result each, as do `q((1, 2))` and `q((1, 2.0))`.
+  A default that is not hashable or cannot be encoded (`[]`, a sentinel
+  `object()`) is left out of the key when the call does not pass another
+  value. A call that does not bind (a missing or unexpected argument)
+  raises `TypeError` before the body runs, uncached. The handles keep
+  `snapshot=` and `effects=` (an input's: `snapshot=`, and `value=` on
+  `set`); a parameter with one of those names is passed positionally, and
+  a keyword-only one is refused when the function is registered. A dict is
+  not hashable and cannot be an argument. A hashable object that holds a
+  dict (a frozen dataclass with the field left out of its hash) shares one
+  result with an equal one, the first call's, whatever the order of their
+  dicts; differences that a class's own `==` hides are not seen either.
+  Results and input values are compared more strictly (G2).
 
 Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_recomputation`
 (seeded differential test against an independent model, 16 parametrisations),
@@ -128,7 +142,11 @@ Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_reco
 `test_fan_out_inside_queries.py` (dependencies, snapshots, effects, errors and
 cycles through `compute_many` and `compute_many_stream` inside a query;
 `submit` refused), `test_query_identity.py` (replaced functions, stale
-handles, `name=`).
+handles, `name=`), `test_argument_keys.py` (look-alike arguments in memory
+and on both backends; keyword, positional-only, keyword-only, `*args` and
+`**kwargs` binding; defaults that cannot be keys; binding errors; inputs,
+`compute_many` and `submit`; Hypothesis: equal keys only for arguments no
+body can tell apart, keys unchanged by the trip through the disk codec).
 
 ### G2. Minimal re-execution and early bail-out
 
@@ -585,6 +603,9 @@ the body when every recorded dependency matches: an input by the digest of its
 current value, a dependency query by the digest of its up-to-date result. An
 input never set in the new session is matched by the digest of its default.
 
+Arguments are stored by type, as they are keyed (G1): `q(True)` never
+loads what `q(1)` stored.
+
 Limits: a query whose arguments cannot be encoded is computed but not
 persisted. When a fixed-point cycle converges only the head's result is
 written; the other members are recomputed from it in a new session. Query identity on disk is `module:qualname` unless `name=` is
@@ -738,7 +759,7 @@ An undecodable query entry, a missing blob or a digest mismatch is treated as a
 miss and recomputed. Opening a directory with the other backend sees an empty
 cache, because each backend uses its own files.
 
-A cache directory carries two format numbers. `DISK_FORMAT` (now 4) covers
+A cache directory carries two format numbers. `DISK_FORMAT` (now 5) covers
 cached query results: results written under another number are deleted on
 open and recomputed. `COLLECTION_FORMAT` (now 2) covers the logs of named
 collections, which are data and are never deleted: a change of `DISK_FORMAT`
@@ -1280,7 +1301,8 @@ Limits that narrow use without stopping it:
   can be reached again, so a cycle has to be entered through it to get its
   value; a caller entering through another member may get `CycleError`
   (G7). Once the head has a result, any member can be called.
-- **Positional, hashable arguments only**, with equal arguments sharing a key.
+- **Arguments must be hashable** (G1), so a list or dict is passed as a
+  tuple or a frozen dataclass.
 - **Dict order counts.** A result or input value whose dict order varies
   without meaning defeats early bail-out and reuse across runs (G2).
 - **Returned values are shared with the cache.**
