@@ -15,6 +15,7 @@ from ._ast_rewrite import rewrite_query
 from ._disk_cache import DiskCache, DiskCacheProtocol
 from ._errors import (
     CancellationError,
+    CollectionBypassedError,
     CycleError,
     EventLoopBlockedError,
     PersistentCacheError,
@@ -50,6 +51,7 @@ def _default_submit_pool_workers() -> int:
 __all__ = [
     "Accumulator",
     "CancellationError",
+    "CollectionBypassedError",
     "CycleError",
     "Engine",
     "EventLoopBlockedError",

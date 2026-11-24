@@ -30,6 +30,7 @@ import cascade
 from cascade import (
     CascadeList,
     CascadeSet,
+    CollectionBypassedError,
     Engine,
     PersistentCacheError,
     QueryCancelled,
@@ -673,7 +674,6 @@ def test_d17_task_created_in_a_transaction_can_set_after_it_commits() -> None:
     assert asyncio.run(main()) == 5
 
 
-@_defect(28, "C code that changes a collection's storage directly logs no diff")
 def test_d28_heapq_on_a_cascade_list_reaches_queries() -> None:
     engine = Engine()
     xs = CascadeList(engine, [5, 3])
@@ -685,7 +685,13 @@ def test_d28_heapq_on_a_cascade_list_reaches_queries() -> None:
     assert n() == 2
     heapq.heappush(xs, 1)
     # Either the push is seen, or it is refused; never silently missed.
-    assert n() == 3
+    # Refused: C code wrote the storage and recorded nothing. The next use
+    # of the collection undoes the push and raises, and queries agree with
+    # what it holds.
+    with pytest.raises(CollectionBypassedError, match="heapq"):
+        xs.append(7)
+    assert list(xs) == [5, 3]
+    assert n() == 2
 
 
 def test_d27_commit_that_fails_on_an_input_applies_nothing() -> None:

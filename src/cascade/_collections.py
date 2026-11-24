@@ -40,7 +40,11 @@ import uuid
 from typing import Any, Callable, Iterable, Mapping
 
 from . import _canonical
-from ._errors import PersistentCacheError, SnapshotExpiredError
+from ._errors import (
+    CollectionBypassedError,
+    PersistentCacheError,
+    SnapshotExpiredError,
+)
 
 _KIND_LIST = "list"
 _KIND_SET = "set"
@@ -94,10 +98,16 @@ def _mutator(method: Callable[..., Any]) -> Callable[..., Any]:
                         "a transaction that belongs to another thread or task; "
                         "change it inside that transaction, or after it ends"
                     )
-                local.depth = getattr(local, "depth", 0) + 1
+                depth = getattr(local, "depth", 0)
+                if not depth and core.base_len(self) != core.tracked_len:
+                    core.repair_bypass()
+                local.depth = depth + 1
                 try:
                     return method(self, *args, **kwargs)
                 finally:
+                    # Whatever the method did (or undid when it raised) is
+                    # recorded: the size the next use is checked against.
+                    core.tracked_len = core.base_len(self)
                     local.depth -= 1
         finally:
             # Compaction asks the pipeline runtime for its checkpoints. That
@@ -365,6 +375,12 @@ class _CollectionCore:
         # Set once this object holds the collection's write lock on disk
         # (``_claim_writer``); only named collections take one.
         self._writer = False
+        # The storage's size as of the last change the collection made
+        # itself. C code that writes the storage directly (heapq) records no
+        # diff; the size no longer matching is how the next use notices
+        # (D28). ``base_len`` reads the storage's size without a dependency.
+        self.base_len = _BASE_LEN[kind]
+        self.tracked_len = 0
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -443,6 +459,8 @@ class _CollectionCore:
         Without this, ``xs[0]``, ``len(xs)``, ``for x in xs`` and every query
         the AST rewriter leaves alone would read live data at any revision.
         """
+        if self.base_len(owner) != self.tracked_len:
+            self.check_storage()
         if not self.engine._evaluator.in_runtime():
             return op(owner, *args)
         head = self.handle()
@@ -453,6 +471,44 @@ class _CollectionCore:
             if view is None:
                 return op(owner if copy is None else copy(owner), *args)
             return op(view, *args)
+
+    def check_storage(self) -> None:
+        """Raise ``CollectionBypassedError`` if the storage changed behind the log.
+
+        Only a change of size can be seen this cheaply; see ``repair_bypass``.
+        A size that differs while a mutation is under way on another thread
+        is that mutation, not yet recorded: the lock settles which it is.
+        """
+        owner = self.owner
+        if owner is None or self.base_len(owner) == self.tracked_len:
+            return
+        if getattr(self.mutating, "depth", 0):
+            return  # this thread's own mutation, part way through
+        with self.rw:
+            if self.base_len(owner) != self.tracked_len:
+                self.repair_bypass()
+
+    def repair_bypass(self) -> None:
+        """Undo a change made to the storage behind the log, and raise.
+
+        The log is what queries see; storage that differs from it can never
+        be published, and positions in a list no longer match its element
+        ids. The storage is put back to the log's contents and the caller
+        is told. Caller holds ``rw``.
+        """
+        recorded = self.tracked_len
+        found = self.base_len(self.owner)
+        self._rollback()
+        raise CollectionBypassedError(
+            f"collection {self.name!r} was changed without going through its "
+            f"own methods: it recorded {recorded} elements and held {found}. "
+            "C code that writes a list, set or dict subclass's storage "
+            "directly (heapq.heappush, heapq.heappop, or a builtin's method "
+            "called by hand, such as list.append(xs, v)) records no change, "
+            "so queries could never see it. The change has been undone. Use "
+            "the collection's own methods, or work on a plain copy "
+            "(.copy()) and write the result back."
+        )
 
     def _view_at_locked(self, head: int) -> Any:
         """Contents at log head ``head``, or None when that is the live state."""
@@ -682,6 +738,7 @@ class _CollectionCore:
         """Reset the owner's python-level storage to the committed log state."""
         if self.owner is not None:
             self.owner._reset_to(self.log.contents_at(self.log.head))
+            self.tracked_len = self.base_len(self.owner)
 
     def compact(self) -> None:
         """Squash the on-disk event log into a single snapshot at the current head."""
@@ -733,6 +790,7 @@ class CascadeList(list):
         if self._core.loaded is not None:
             super().__init__(v for _, v in self._core.loaded)
             self._uids = [u for u, _ in self._core.loaded]
+            self._core.tracked_len = list.__len__(self)
         else:
             super().__init__()
             self.extend(iterable)
@@ -1046,6 +1104,7 @@ class CascadeSet(set):
         if self._core.loaded is not None:
             set.update(self, self._core.loaded)
             self._order = dict.fromkeys(self._core.loaded)
+            self._core.tracked_len = set.__len__(self)
         else:
             self.update(iterable)
 
@@ -1369,6 +1428,7 @@ class CascadeDict(dict):
         super().__init__()
         if self._core.loaded is not None:
             dict.update(self, self._core.loaded)
+            self._core.tracked_len = dict.__len__(self)
         else:
             self.update(mapping, **kwargs)
 

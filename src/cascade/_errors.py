@@ -50,6 +50,20 @@ class UnencodableValueError(TypeError):
     """
 
 
+class CollectionBypassedError(RuntimeError):
+    """Raised when a collection's storage was changed behind its back.
+
+    ``CascadeList``, ``CascadeSet`` and ``CascadeDict`` record every change
+    made through their own methods. C code that writes a list, set or dict
+    subclass's storage directly (``heapq.heappush(xs, v)``,
+    ``heapq.heappop(xs)``, or a builtin's method called by hand, such as
+    ``list.append(xs, v)``) records nothing, so queries could never see the
+    change. The next use of the collection notices that its size no longer
+    matches what it recorded, undoes the change (the collection holds what
+    it held before) and raises this. Never cached.
+    """
+
+
 class EventLoopBlockedError(RuntimeError):
     """Raised instead of blocking an asyncio event loop for ever.
 

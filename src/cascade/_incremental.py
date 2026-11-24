@@ -718,6 +718,8 @@ class IncrementalRuntime:
             reversed(collection)  # raises TypeError exactly like plain Python
 
         core = collection._core
+        if core.base_len(collection) != core.tracked_len:
+            core.check_storage()  # raises: the storage was changed behind the log
         head = core.head_for_current_context()
         if head == ABSENT_HEAD:
             # Read at a revision from before this collection was created.

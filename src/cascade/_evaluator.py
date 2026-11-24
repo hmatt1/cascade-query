@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import _canonical, _disk_cache
 from ._disk_cache import DiskCacheProtocol
 from ._errors import (
+    CollectionBypassedError,
     CycleError,
     PersistentCacheError,
     QueryCancelled,
@@ -93,7 +94,14 @@ class _EnterThroughHead(CycleError):
         self.head = head
 
 
-_NEVER_CACHED_ERRORS = (*_CONTROL_FLOW_ERRORS, _ReenteredQuery, UnencodableValueError)
+# A bypassed collection is repaired as the error is raised: the next run
+# reads it as it is, so the error must not outlive the run.
+_NEVER_CACHED_ERRORS = (
+    *_CONTROL_FLOW_ERRORS,
+    _ReenteredQuery,
+    UnencodableValueError,
+    CollectionBypassedError,
+)
 
 # Stands in for the ``changed_at`` of a query that has no result yet (it is
 # running, or its result is provisional). Equal to no real marker, so

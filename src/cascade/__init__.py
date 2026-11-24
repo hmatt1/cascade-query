@@ -4,6 +4,7 @@ from ._state import QueryKey
 from .engine import (
     Accumulator,
     CancellationError,
+    CollectionBypassedError,
     CycleError,
     Engine,
     EventLoopBlockedError,
@@ -22,6 +23,7 @@ __all__ = [
     "CascadeDict",
     "CascadeList",
     "CascadeSet",
+    "CollectionBypassedError",
     "CycleError",
     "Engine",
     "EventLoopBlockedError",

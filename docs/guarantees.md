@@ -6,9 +6,9 @@ README are checked against.
 
 The second half is an audit dated 2026-11-23 (commit `03c7ed7`): defects where
 the code does not keep a promise, and guarantees with no test behind them.
-Every open defect has a failing regression test in
-`tests/test_known_defects.py`; defects fixed since the audit are listed under
-"Fixed since the audit".
+Every defect has a regression test in `tests/test_known_defects.py`. All of
+them have been fixed since the audit and are listed under "Fixed since the
+audit"; no defect is open.
 
 **Status key**
 
@@ -42,7 +42,7 @@ Every open defect has a failing regression test in
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
 | G19 | Values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Good by example |
 | G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
-| G21 | Collections behave like `list`, `set` and `dict`, and every read inside a query is tracked | Holds with limits (D28) | Strong |
+| G21 | Collections behave like `list`, `set` and `dict`, and every read inside a query is tracked | Holds with limits | Strong |
 | G22 | A rewritten query returns what the plain Python would | Holds | Strong for reducers (Hypothesis, against the builtins) |
 | G23 | One mutation costs one diff of work, where the result can be exact | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
@@ -777,7 +777,30 @@ Limits:
   `list` and `dict` only, or for subclasses that do not override `__iter__`.
 - **Calling a builtin's method on a collection by hand bypasses it**:
   `list.__len__(xs)`, `set.union(s, t)`, `dict.items(d)`.
-- **C code that changes a collection's storage itself logs nothing** (D28).
+- **C code that changes a collection's storage itself logs nothing.**
+  CPython calls no method of the subclass there, so it cannot be
+  intercepted. Cascade notices a change of size: every collection records
+  its size at each change it makes, and the next use of the collection (any
+  read, inside a query or not, any mutation, a rewritten pipeline over it)
+  compares. If the size differs, the change is undone (the storage is put
+  back to what the collection recorded, which is what queries see) and
+  `CollectionBypassedError` is raised, naming the collection. It is never
+  cached: a query that met it reads the repaired collection on its next
+  run. This catches `heapq.heappush` and `heapq.heappop`, and a builtin's
+  method called by hand that adds or removes (`list.append(xs, v)`,
+  `list.pop(xs)`, `list.extend(xs, ...)`, `set.add(s, v)`,
+  `set.discard(s, v)`, `dict.__setitem__(d, new_key, v)`,
+  `dict.pop(d, k)`). `bisect.insort` calls the list's own `insert` and is
+  tracked. Not noticed, because the size stays the same:
+  `heapq.heapify`, `heapq.heapreplace`, `heapq.heappushpop` (when it
+  replaces the smallest element), `list.sort(xs)`, `list.reverse(xs)`,
+  `list.__setitem__(xs, i, v)`, `dict.__setitem__(d, present_key, v)`, and
+  a by-hand removal followed by an addition. After one of those, queries
+  keep seeing the old contents, and a list's element ids no longer match
+  its positions, so later diffs can name the wrong element: use the
+  collection's own methods (`xs.sort()`, `xs.reverse()`, `xs[i] = v`), or
+  work on a copy and write it back. Until the collection is next used, a
+  result cached before the change is served as it was.
 - Dict views are wrappers, not `dict_keys` objects: `isinstance(d.keys(),
   collections.abc.KeysView)` is false and there is no `.mapping`.
 - `repr` of a `CascadeSet` is `CascadeSet({...})`, in iteration order; lists
@@ -792,6 +815,13 @@ each compared with the builtin after creation, after mutations and through a
 snapshot, with the result type; operand errors; two collections in one
 expression; `::test_limit_set_read_by_c_code_is_not_tracked` pins the first
 limit), `test_known_defects.py::test_d5_set_union_inside_a_query_sees_later_mutations`,
+`::test_d28_heapq_on_a_cascade_list_reaches_queries`,
+`test_collection_bypass.py` (nine size-changing bypasses of all three kinds,
+each met by six kinds of read, a mutation and a query that runs again; a
+rewritten pipeline; `bisect.insort`; a transaction; named collections on both
+backends; writers and readers on six threads with no false alarm; the
+same-size limit pinned for eight operations, and the cached result served
+until the next use),
 the example tests in `test_incremental_collections.py`
 (`::test_failed_list_mutator_changes_nothing`, `::test_failed_set_mutator_changes_nothing`
 and `::test_failed_dict_mutator_changes_nothing` cover failing calls of every
@@ -1100,7 +1130,8 @@ crashed holder).
 ## Defects
 
 "Reproduced" means re-run independently for this audit on Python 3.12.9, and
-pinned by an expected-failure test in `tests/test_known_defects.py`. D22 was
+pinned by a regression test in `tests/test_known_defects.py` (an
+expected failure until the defect was fixed). D22 was
 found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2;
 D27 while fixing D17; D28 while fixing D5; D29 to D31 while fixing D7; D32
 while fixing D30. All
@@ -1108,11 +1139,10 @@ were already present at the audit commit.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
-### Wrong results
-
-| ID | Defect | Evidence |
-|---|---|---|
-| D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
+There are no open defects: every defect found by the audit or since is
+fixed and listed below. The tables of open wrong results, data loss and
+hangs are empty, and every test in `tests/test_known_defects.py` passes
+without an expected-failure marker.
 
 ### Fixed since the audit
 
@@ -1149,6 +1179,7 @@ time; nothing is in that state now.
 | D30 | An assignment expression inside a rewritten comprehension was lost. The element expression was moved into a helper function, where `:=` bound a local of that helper: `last = None; out = [(last := x) for x in xs]; return last` returned `None` where Python returns the last element. A comprehension with `:=` anywhere in its element or `if` clauses, nested comprehensions included, is now left as written (G22). | `fix: an assignment expression inside a rewritten comprehension was lost` |
 | D32 | A pipeline nested in a comprehension that is not rewritten (two `for` clauses, or, after the D30 fix, a `:=`) had its helper placed before the statement, outside that comprehension, so it could not see the comprehension's loop variable: `[sum(y * x for y in ys) for x in xs for _ in (0,)]` raised `NameError`, and with a variable `x = 100` in the query returned `[3000, 3000]` where Python gives `[30, 60]`. Found while fixing D30, whose fix sends more comprehensions down this path; present at the audit commit. Such a pipeline is now left as written (G22). | `fix: an assignment expression inside a rewritten comprehension was lost` |
 | D29 | A `CascadeSet` was visited in two different orders. A rewritten comprehension or reducer saw insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gave `[30, 1, 20]`); a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` saw the builtin set's order (`[1, 20, 30]`), so the same body gave two results depending on whether it was rewritten. A `CascadeSet` now iterates in insertion order everywhere: it keeps that order beside its storage, its `__iter__` and `repr` follow it, and snapshot reads keep the order they had (G21). | `fix: a CascadeSet iterated in another order when the query was not rewritten` |
+| D28 | C code that changed the storage of a list, set or dict subclass directly bypassed the collection: `heapq.heappush(xs, 1)` on a `CascadeList` logged no diff, left `len(xs)` inside a query at its old value and the list's element ids out of step with its contents. It cannot be intercepted. The collection now records its size at every change it makes; the next use of it (a read, a mutation, a rewritten pipeline) that finds another size undoes the change and raises `CollectionBypassedError`. Changes that keep the size (`heapq.heapify`, `heapreplace`, `heappushpop`, by-hand `list.sort`, `list.reverse`, item assignment) are not noticed; that limit is documented and pinned (G21). | `fix: C code such as heapq.heappush changed a collection without a trace` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -1215,10 +1246,10 @@ with a single sequential actor. TLC checks six invariants in CI.
 
 Ordered by the risk they leave open.
 
-1. **Regression tests for the open defects exist but are expected
-   failures.** `tests/test_known_defects.py` has one test per defect (D1-D32),
-   each asserting the correct behaviour; those for open defects run under
-   `xfail(strict=True)`. A fix removes the marker.
+1. **Every defect has a regression test, and none is open.**
+   `tests/test_known_defects.py` has one test per defect (D1-D32), each
+   asserting the correct behaviour; a defect found from now on gets one
+   under `xfail(strict=True)` until it is fixed.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
    exits child processes without `shutdown()` and with `os._exit`.
    `test_disk_writer_errors.py` injects write failures into a live engine.
