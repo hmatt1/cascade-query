@@ -674,7 +674,6 @@ def test_d28_heapq_on_a_cascade_list_reaches_queries() -> None:
     assert n() == 3
 
 
-@_defect(27, "a commit that fails on an input value keeps collection changes")
 def test_d27_commit_that_fails_on_an_input_applies_nothing() -> None:
     engine = Engine()
 

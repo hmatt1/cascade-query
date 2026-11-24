@@ -46,7 +46,7 @@ Every open defect has a failing regression test in
 | G22 | A rewritten query returns what the plain Python would | Broken for set order and `:=` (D29, D30) | Strong for reducers (Hypothesis, against the builtins) |
 | G23 | One mutation costs one diff of work, where the result can be exact | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
-| G25 | A transaction applies completely or not at all | Broken for a commit that fails on an input value (D27) | Good, threads and tasks included |
+| G25 | A transaction applies completely or not at all | Holds with limits | Good, threads and tasks included |
 | G26 | A named collection is restored with the same contents after a restart | Holds with limits | Good, two engines and processes included |
 
 ## Core evaluation
@@ -908,7 +908,13 @@ Inside `with engine.transaction():`
 - opening a second transaction inside an open one raises `RuntimeError`, even
   for a different engine;
 - a transaction object is single-use: entering it a second time raises
-  `RuntimeError` and changes nothing.
+  `RuntimeError` and changes nothing;
+- a commit checks every input value (the last one set for each input) before
+  it applies or writes anything. A value that cannot be encoded, or an
+  argument that cannot be hashed, fails the whole commit: the collection
+  changes are rolled back as for a block that raised, no input changes, the
+  revision stays put, and the original error (`UnencodableValueError`, a
+  `TypeError`) propagates.
 
 **Who is inside.** A transaction belongs to whoever entered it: the asyncio
 task, or the thread when it was entered outside any task. Only work done
@@ -930,9 +936,7 @@ that runs after the block has ended. For code outside:
   queries. Collections the transaction has not changed are free.
 
 Limits: if the disk write for a later collection fails at commit, earlier
-collections are already on disk. If applying the input updates fails at
-commit (a value that cannot be encoded), collection changes are kept but not
-shown to queries (D27). Reads of a collection object from outside a query
+collections are already on disk. Reads of a collection object from outside a query
 see uncommitted changes from any thread. `asyncio.gather` inside a block does
 not batch the updates its coroutines make: they run as separate tasks.
 
@@ -950,7 +954,12 @@ shared collection),
 `test_collection_compaction_pins.py::test_rollback_of_a_collection_created_in_the_block`,
 `::test_rollback_restores_an_existing_collection_under_an_older_pin`,
 `::test_rolled_back_named_collection_is_unchanged_in_memory_and_on_disk` (both
-backends).
+backends),
+`test_known_defects.py::test_d27_commit_that_fails_on_an_input_applies_nothing`,
+`test_transaction_commit_failure.py` (every kind of collection, an unhashable
+argument, the error raised, queries inside the block, a collection created in
+the block, the collection free for other threads afterwards; named
+collections on both backends).
 
 ### G26. Named collection persistence
 
@@ -1025,12 +1034,6 @@ time; nothing is in that state now.
 | D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
 | D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
 
-### Data loss and corruption
-
-| ID | Defect | Evidence |
-|---|---|---|
-| D27 | A commit that fails while applying its input updates is applied in part. With `xs.append(2)` and `x.set(object())` in one block, the exit raises `TypeError` (the value cannot be hashed), `list(xs)` is `[1, 2]`, and a query still reads `len(xs) == 1`: the collection change is kept (for a named collection, also on disk) but its new head is never published. Found while fixing D17; present at the audit commit. | Reproduced |
-
 ### Hangs and misleading errors
 
 | ID | Defect | Evidence |
@@ -1065,6 +1068,7 @@ time; nothing is in that state now.
 | D19 | A direct caller that joined a `submit`-owned run of the same query received the owner's `QueryCancelled`, though only `submit` cancels. A caller whose run ends in another call's `QueryCancelled` now checks its own cancellation and, if it is not cancelled, runs the query itself at its own revision. | `fix: a direct call that joined a submitted run was cancelled with it` |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocked; reachable through the public API when a sync query that depends on an async query was called on the loop thread while that async query ran there. Also: a sync query body calling an async query on the loop thread got a coroutine back and cached the resulting `TypeError`, and a stale async dependency recomputed there cached `asyncio.run`'s `RuntimeError`. In-flight runs now record their owner (thread or task); a synchronous wait for a task on the caller's own thread is never started, and synchronous code on a loop thread raises `EventLoopBlockedError` where it would have to run or wait for an async query. | `fix: a sync call on the event loop's thread hung waiting for an async query` |
 | D24 | Two threads that entered one dependency cycle through different queries waited for each other for ever: each ran one query and asked for the other. With `fixed_point=` neither got a value; without it neither got a `CycleError`. In-flight runs now record their owner, blocked threads and awaiting tasks record the run they wait for, and a caller whose wait would close a loop runs the query on its own stack instead, where the cycle is handled as on one thread. A caller whose joined run ended in a `CycleError` (or the internal re-entry signal of a verification) runs the query itself. Found and fixed with it: once threads had read one fixed-point cycle at different revisions, the stored results could depend on each other in a loop, and verifying them recursed until `RecursionError`, which was then cached as a query's result; a verification walk that reaches a query it is already bringing up to date now counts it as changed. | `fix: two threads entering one cycle through different queries waited for each other for ever` |
+| D27 | A commit that failed while applying its input updates was applied in part. With `xs.append(2)` and `x.set(object())` in one block, the exit raised `TypeError`, `list(xs)` was `[1, 2]`, and a query still read `len(xs) == 1`: the collection change was kept (for a named collection, also on disk) but its new head was never published. A commit now hashes every input value before it writes or applies anything; if one fails, the collections are rolled back and the original error propagates. | `fix: a transaction commit that failed on an input value kept its collection changes` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of

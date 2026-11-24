@@ -915,12 +915,33 @@ class GraphStore:
         their current one are skipped, and when nothing changes the revision
         and cancel epoch stay put.
         """
+        return self.apply_prepared_inputs(
+            self.prepare_inputs(updates), bump_cancel_epoch=bump_cancel_epoch
+        )
+
+    def prepare_inputs(
+        self, updates: list[tuple[str, tuple[Any, ...], Any]]
+    ) -> list[tuple[InputKey, Any, str]]:
+        """Resolve last-write-wins and hash every value; changes nothing.
+
+        Everything in ``set_inputs`` that can fail on a bad value (an
+        unhashable argument, a value that cannot be encoded) happens here, so
+        a transaction can check its updates before it applies anything.
+        """
         final: dict[InputKey, Any] = {}
         for input_id, args, value in updates:
             final[(input_id, args)] = value
-        hashed = [
+        return [
             (key, value, self.input_digest(key, value)) for key, value in final.items()
         ]
+
+    def apply_prepared_inputs(
+        self,
+        hashed: list[tuple[InputKey, Any, str]],
+        *,
+        bump_cancel_epoch: bool = True,
+    ) -> int:
+        """Apply updates from ``prepare_inputs`` as one revision."""
         with self.lock:
             changed = []
             for key, value, value_hash in hashed:

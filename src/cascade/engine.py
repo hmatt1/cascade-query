@@ -129,6 +129,14 @@ class EngineTransaction:
                 self._roll_back_collections()
                 return
             try:
+                # Every input value is hashed before anything is applied or
+                # written, so a value that cannot be encoded fails the whole
+                # commit, collections included (D27).
+                prepared = (
+                    self.engine._store.prepare_inputs(self.updates)
+                    if self.updates
+                    else None
+                )
                 # Each collection's batch is one disk transaction. If a later
                 # one fails (disk full), earlier ones are already on disk;
                 # that rare partial write is the cost of not spanning
@@ -138,8 +146,8 @@ class EngineTransaction:
             except BaseException:
                 self._roll_back_collections()
                 raise
-            if self.updates:
-                self.engine._set_inputs(self.updates)
+            if prepared:
+                self.engine._store.apply_prepared_inputs(prepared)
             for core in self.collections:
                 core.after_commit()
         finally:
