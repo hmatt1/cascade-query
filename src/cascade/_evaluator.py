@@ -1767,6 +1767,13 @@ class Evaluator:
         frame.cycle_guess_hash = value_hash
         frame.is_cycle_root = False
         frame.deps.clear()
+        # The run is abandoned: what it pushed must not reach the callers
+        # above the head either, only the run that converges counts (D26).
+        stack = runtime.stack
+        pos = len(stack) - 1  # the head's frame is on top; compare by identity
+        while pos >= 0 and stack[pos] is not frame:
+            pos -= 1
+        self._retract_effects(runtime, stack[: max(pos, 0)], frame.effects)
         frame.effects.clear()
         frame.expires_at = None
         frame.cycle_heads = None

@@ -252,6 +252,8 @@ validate_data(effects=effects)
 print(effects["warnings"])
 ```
 
+A `fixed_point=` query re-runs until it converges; only the run that converged counts, so its effects (and those of the queries in its cycle, from that run) are what callers see, once.
+
 ### Persistent Disk Caching
 Passing `cache_dir` to the `Engine` turns on zero-config persistence. Cascade provisions an embedded store (MDBX by default), serializes query results with a deterministic msgpack encoding, and fingerprints every input value by hashing its serialized bytes with blake2b.
 

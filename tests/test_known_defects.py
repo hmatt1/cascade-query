@@ -381,7 +381,6 @@ def test_d22_reregistered_query_reaches_dependents_at_the_same_revision() -> Non
     assert top() == 11
 
 
-@_defect(26, "effects of abandoned fixed-point runs reach the caller")
 def test_d26_fixed_point_effects_are_those_of_the_final_run() -> None:
     engine = Engine()
     log = engine.accumulator("log")

@@ -28,12 +28,12 @@ Every open defect has a failing regression test in
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
 | G5 | Concurrent requests for one query at one revision run the body once | Holds with limits | Strong |
 | G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits | Good |
-| G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits (D26) | Good, threads and tasks included |
+| G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits | Good, threads and tasks included |
 | G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits | Strong |
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
-| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Broken for pushes inside a rewritten stage (D31); limits (D26) | Good |
+| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Broken for pushes inside a rewritten stage (D31) | Good |
 | G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Holds | Strong for eviction and prune |
 | G14 | Async queries behave like sync queries | Holds with limits | Medium |
 | G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path, good for async |
@@ -446,8 +446,18 @@ cache hit, to every waiting caller, in execution order. A query that fails
 leaks no partial effects. `compute_many(effects=)` merges per-call effects in
 call order.
 
-Limits: effects pushed in the abandoned runs of a fixed-point cycle are not
-dropped for callers above the cycle head (D26). Effects pushed inside the
+A fixed-point head runs until a run returns the guess it was computed from
+(G7). Only that last run counts: its effects (the head's own pushes and
+those of the members it ran) are the head's effects, and each member keeps
+what it pushed in that run. The pushes of the abandoned runs before it are
+taken back from every caller above the head, including the `effects=`
+dict, so a caller sees the converged run once, whether the cycle was
+computed for it, replayed from the cache or loaded from disk. A member
+whose run is abandoned to enter its cycle through the head (G7) is taken
+back the same way. A head whose last run raised a cached error keeps that
+run's effects with the error.
+
+Limits: effects pushed inside the
 element function of a rewritten comprehension are pushed only for the
 elements that changed since the query last ran (D31).
 
@@ -455,7 +465,12 @@ Enforced by: `test_engine.py::test_side_effect_replay_on_cache_hits`,
 `::test_nested_side_effect_replay_propagates_to_parent_effects`,
 `::test_failed_query_does_not_leak_partial_accumulator_effects`,
 `test_engine_compute_many.py::test_compute_many_can_collect_accumulator_effects`,
-`test_engine_concurrency.py::test_query_dedup_replays_effects_to_all_concurrent_callers`.
+`test_engine_concurrency.py::test_query_dedup_replays_effects_to_all_concurrent_callers`,
+`test_known_defects.py::test_d26_fixed_point_effects_are_those_of_the_final_run`,
+`test_fixed_point_effects.py` (callers above the head, the head and a member
+called directly, an input change, a cached error in the last run, nested
+heads, `compute_many`, threads, async queries, replay from disk on both
+backends).
 
 ### G13. Eviction, prune and sweep
 
@@ -1040,7 +1055,6 @@ time; nothing is in that state now.
 | D29 | A `CascadeSet` is visited in two different orders. A rewritten comprehension or reducer sees insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gives `[30, 1, 20]`), which is what the README promises for loops too; a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` see the builtin set's order (`[1, 20, 30]`). So the same body gives two results depending on whether it was rewritten. Found while fixing D7; present at the audit commit. | Reproduced |
 | D30 | An assignment expression inside a rewritten comprehension is lost. The element expression is moved into a helper function, where `:=` binds a local of that helper: `last = None; out = [(last := x) for x in xs]; return last` returns `None` where Python returns the last element. The rewriter should decline such a comprehension. Found while fixing D7; present at the audit commit. | Reproduced |
 | D31 | Accumulator effects pushed inside the element function of a rewritten comprehension are not replayed for elements the pipeline already holds. With `sum(note(x) for x in xs)` where `note` pushes `x`, the first run collects `[1, 2, 3]`; after `xs.append(4)` the re-run collects `[4]` where Python collects `[1, 2, 3, 4]`. (Not when the stage function closes over the accumulator object: that pipeline cannot be fingerprinted and is rebuilt on every run.) Found while fixing D7; present at the audit commit. | Reproduced |
-| D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
 | D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
 
 ### Fixed since the audit
@@ -1073,6 +1087,7 @@ time; nothing is in that state now.
 | D24 | Two threads that entered one dependency cycle through different queries waited for each other for ever: each ran one query and asked for the other. With `fixed_point=` neither got a value; without it neither got a `CycleError`. In-flight runs now record their owner, blocked threads and awaiting tasks record the run they wait for, and a caller whose wait would close a loop runs the query on its own stack instead, where the cycle is handled as on one thread. A caller whose joined run ended in a `CycleError` (or the internal re-entry signal of a verification) runs the query itself. Found and fixed with it: once threads had read one fixed-point cycle at different revisions, the stored results could depend on each other in a loop, and verifying them recursed until `RecursionError`, which was then cached as a query's result; a verification walk that reaches a query it is already bringing up to date now counts it as changed. | `fix: two threads entering one cycle through different queries waited for each other for ever` |
 | D27 | A commit that failed while applying its input updates was applied in part. With `xs.append(2)` and `x.set(object())` in one block, the exit raised `TypeError`, `list(xs)` was `[1, 2]`, and a query still read `len(xs) == 1`: the collection change was kept (for a named collection, also on disk) but its new head was never published. A commit now hashes every input value before it writes or applies anything; if one fails, the collections are rolled back and the original error propagates. | `fix: a transaction commit that failed on an input value kept its collection changes` |
 | D25 | After the cached result of a fixed-point cycle member was dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changed, a query that depended on that member raised `CycleError` where the same call with the member still cached returned 50. The member was recomputed on its own, entered the cycle from the wrong end and reached itself before the head. A member whose run reaches itself through a fixed-point head that has a result (in memory or on disk), or through the head it was last stored with, now starts again by bringing that head up to date. Found and fixed with it: the same `CycleError` for a member never stored in a session whose head was loaded from disk. | `fix: a query depending on a dropped fixed-point cycle member raised CycleError` |
+| D26 | Accumulator effects pushed in the abandoned runs of a fixed-point cycle reached every caller above the cycle head: with `fixed_point=0`, a head that pushed once per run and needed four runs handed its caller, and `effects=`, four copies, while the head's own cached result held one. The pushes of a run that is abandoned are now taken back from every frame above the head and from the root's `effects=`; only the converged run's effects are seen, also on cache hits and from disk (G12). | `fix: effects pushed in abandoned fixed-point runs reached the callers above the head` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
