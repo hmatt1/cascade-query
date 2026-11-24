@@ -128,7 +128,11 @@ class InFlight:
     same revision; only then is a ``concurrent.futures.Future`` allocated.
     """
 
-    __slots__ = ("future",)
+    __slots__ = ("future", "owner", "owner_thread")
 
-    def __init__(self) -> None:
+    def __init__(self, owner: Any = None, owner_thread: int | None = None) -> None:
         self.future: concurrent.futures.Future[MemoEntry] | None = None
+        # Who runs it: a thread id for a synchronous run, else the asyncio
+        # task; and the thread it runs on. See Evaluator._enter_wait_locked.
+        self.owner = owner
+        self.owner_thread = owner_thread

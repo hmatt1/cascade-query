@@ -154,6 +154,10 @@ class GraphStore:
         self.dependents: dict[QueryKey, set[QueryKey]] = defaultdict(set)
         # Keyed by (query key, snapshot revision) to keep dedup snapshot-safe.
         self.in_flight: dict[tuple[QueryKey, int], InFlight] = {}
+        # The in-flight run each blocked thread or awaiting task waits for,
+        # keyed like ``InFlight.owner``. Lets a caller see that waiting
+        # would never end (Evaluator._enter_wait_locked).
+        self.waiting_on: dict[Any, InFlight] = {}
         # Recency order of memo keys, least recently used first. Mirrors
         # ``memos`` and agrees with ``MemoEntry.last_access`` ordering. Replaces
         # a lazy heap that gained an entry per cache hit and was only drained by

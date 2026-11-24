@@ -23,6 +23,7 @@ from ._errors import (
     SnapshotExpiredError,
     StaleHandleError,
     UnencodableValueError,
+    EventLoopBlockedError,
 )
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
 from ._state import (
@@ -44,6 +45,7 @@ _CONTROL_FLOW_ERRORS = (
     PersistentCacheError,
     SnapshotExpiredError,
     StaleHandleError,
+    EventLoopBlockedError,
 )
 
 
@@ -88,6 +90,29 @@ _NEVER_CHANGED_AT = -2
 # interpreter exit drains their queues (see ``_flush_all_at_exit``). The set
 # holds weak references, and the single module-level hook holds none, so
 # registering here never keeps an engine alive.
+_running_loop = asyncio._get_running_loop
+
+
+def _run_coroutine_blocking(coro: Any, what: str) -> Any:
+    """Run ``coro`` to completion from synchronous code.
+
+    Synchronous code on the thread of a running event loop cannot do that:
+    the coroutine needs the loop, which the wait would block. That raises
+    ``EventLoopBlockedError`` at once instead of ``asyncio.run``'s
+    ``RuntimeError``, which a query would otherwise cache as its result.
+    """
+    if _running_loop() is not None:
+        coro.close()
+        raise EventLoopBlockedError(
+            f"{what} is async and has to run, but it was reached from "
+            "synchronous code on the thread of a running event loop, where "
+            "running it would block the loop. Await it from async code (an "
+            "async query), or make the synchronous call from another thread, "
+            "for example with `await asyncio.to_thread(...)`."
+        )
+    return asyncio.run(coro)
+
+
 _live_disk_writers: weakref.WeakSet[Evaluator] = weakref.WeakSet()
 _live_disk_writers_lock = threading.Lock()
 
@@ -290,6 +315,17 @@ class Evaluator:
                 "query that depends on it"
             )
 
+    def in_sync_body(self) -> bool:
+        """True while the innermost running query is a synchronous one.
+
+        Its body cannot await, so on an event loop's thread the handles it
+        calls take the synchronous path (see ``_QueryHandle.__call__``).
+        """
+        runtime = self._runtime_var.get()
+        if runtime is None or not runtime.stack:
+            return False
+        return not runtime.stack[-1].is_async_body
+
     def in_runtime(self) -> bool:
         """True when the current context is executing inside a query."""
         return self._runtime_var.get() is not None
@@ -418,7 +454,9 @@ class Evaluator:
         if version is None:
             default = fn(*args)
             if isinstance(default, types.CoroutineType):
-                default = asyncio.run(default)
+                default = _run_coroutine_blocking(
+                    default, self._store.key_to_str(("input", input_id, args))
+                )
             should_materialize = False
             if not snapshot_explicit:
                 with self._store.lock:
@@ -654,28 +692,40 @@ class Evaluator:
                 if is_memoized or not need_value:
                     return existing, True
 
+        agent = threading.get_ident()
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
             finished = self._finished_meanwhile_locked(
                 in_flight_key, existing, is_memoized or not need_value
             )
             if finished is None:
-                slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
+                slot, waiter_future = self._claim_in_flight_locked(
+                    in_flight_key, agent, agent
+                )
+                if waiter_future is not None:
+                    waits = self._enter_wait_locked(key, slot, agent, agent, True)
 
         if finished is not None:
             self._store.trace_event("cache_hit", key)
             return finished, True
         if waiter_future is not None:
-            self._refuse_wait_on_caller(key)
+            if waits is None:
+                self._refuse_wait_on_caller(key)
+            if not waits:
+                return self._run_instead_of_waiting(key, fn, runtime, slot), False
             self._store.trace_event("dedup_wait", key)
             try:
                 result = waiter_future.result()
             except _ProvisionalResult as pending_cycle:
+                self._leave_wait(agent, slot)
                 self._await_cycle_heads(pending_cycle.heads, runtime)
                 return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
-            except QueryCancelled:
-                self._joined_run_cancelled(key, runtime)
+            except QueryCancelled as exc:
+                self._leave_wait(agent, slot)
+                self._joined_run_failed(key, runtime, exc)
                 return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
+            finally:
+                self._leave_wait(agent, slot)
             return result, True
 
         try:
@@ -747,32 +797,49 @@ class Evaluator:
                 if is_memoized or not need_value:
                     return existing, True
 
+        thread = threading.get_ident()
+        task = asyncio.current_task()
+        # A task waits by awaiting, which leaves its thread free.
+        agent: Any = thread if task is None else task
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
             finished = self._finished_meanwhile_locked(
                 in_flight_key, existing, is_memoized or not need_value
             )
             if finished is None:
-                slot, waiter_future = self._claim_in_flight_locked(in_flight_key)
+                slot, waiter_future = self._claim_in_flight_locked(
+                    in_flight_key, agent, thread
+                )
+                if waiter_future is not None:
+                    waits = self._enter_wait_locked(
+                        key, slot, agent, thread, task is None
+                    )
 
         if finished is not None:
             self._store.trace_event("cache_hit", key)
             return finished, True
         if waiter_future is not None:
-            self._refuse_wait_on_caller(key)
+            if waits is None:
+                self._refuse_wait_on_caller(key)
+            if not waits:
+                return await self._run_instead_of_waiting_async(key, fn, runtime), False
             self._store.trace_event("dedup_wait", key)
             try:
                 result = await asyncio.wrap_future(waiter_future)
             except _ProvisionalResult as pending_cycle:
+                self._leave_wait(agent, slot)
                 await self._await_cycle_heads_async(pending_cycle.heads, runtime)
                 return await self.compute_or_get_memo_async(
                     key, fn, runtime, need_value=need_value
                 )
-            except QueryCancelled:
-                self._joined_run_cancelled(key, runtime)
+            except QueryCancelled as exc:
+                self._leave_wait(agent, slot)
+                self._joined_run_failed(key, runtime, exc)
                 return await self.compute_or_get_memo_async(
                     key, fn, runtime, need_value=need_value
                 )
+            finally:
+                self._leave_wait(agent, slot)
             return result, True
 
         try:
@@ -794,18 +861,106 @@ class Evaluator:
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
 
-    def _joined_run_cancelled(self, key: QueryKey, runtime: RuntimeState) -> None:
-        """The run this caller joined was cancelled; decide whether the caller is.
+    def _joined_run_failed(
+        self, key: QueryKey, runtime: RuntimeState, exc: BaseException
+    ) -> None:
+        """The run this caller joined ended in an error that is not the caller's.
 
-        Only ``submit`` cancels, and only the submitted call itself: its
-        ``QueryCancelled`` says that call's inputs changed, not that this
-        caller's did. A caller that cannot be cancelled (a direct call,
+        ``QueryCancelled``: only ``submit`` cancels, and only the submitted
+        call itself; the error says that call's inputs changed, not this
+        caller's. A caller that cannot be cancelled (a direct call,
         ``compute_many``), or a submitted one that started after the change,
         claims the query again and runs it at its own revision. A caller
         that is cancelled itself raises its own ``QueryCancelled`` here.
         """
-        self.check_cancelled(runtime.cancel_epoch)
-        self._store.trace_event("dedup_retry", key, detail="joined run was cancelled")
+        if isinstance(exc, QueryCancelled):
+            self.check_cancelled(runtime.cancel_epoch)
+        self._store.trace_event(
+            "dedup_retry", key, detail=f"joined run raised {type(exc).__name__}"
+        )
+
+    def _enter_wait_locked(
+        self,
+        key: QueryKey,
+        slot: InFlight,
+        agent: Any,
+        thread: int,
+        blocking: bool,
+    ) -> bool | None:
+        """Register ``agent`` as waiting for ``slot``, unless that never ends.
+
+        ``agent`` is a thread id for a synchronous caller (``blocking``) and
+        an asyncio task for an async one; ``thread`` is the thread it runs
+        on. Follows the chain owner -> run that owner waits for -> its owner
+        and so on. Waiting never ends when a blocking caller would wait for
+        a task on its own thread: that task needs the thread back to finish.
+        A task that is not waiting for a run can still be stuck because its
+        thread is blocked; the chain goes on through what that thread waits
+        for.
+
+        Returns True when registered (wait, then call ``_leave_wait``),
+        False when waiting would never end (run the query on this stack
+        instead: the cycle is then visible to it), and None when the caller
+        must refuse (``_refuse_wait_on_caller``). Caller holds ``store.lock``.
+        """
+        waiting = self._waiting_callers_var.get()
+        if waiting and key in waiting:
+            return None
+        waiting_on = self._store.waiting_on
+        seen: set[Any] = set()
+        current: InFlight | None = slot
+        while current is not None:
+            owner = current.owner
+            if blocking and owner != thread and current.owner_thread == thread:
+                self._store.trace_event("dedup_cycle", key)
+                return False
+            if owner in seen:
+                break  # a cycle of waits that does not include this caller
+            seen.add(owner)
+            nxt = waiting_on.get(owner)
+            if nxt is None and owner != current.owner_thread:
+                # An async owner that waits for nothing may still be stuck
+                # behind a synchronous wait on its thread.
+                nxt = waiting_on.get(current.owner_thread)
+            current = nxt
+        waiting_on[agent] = slot
+        return True
+
+    def _leave_wait(self, agent: Any, slot: InFlight) -> None:
+        with self._store.lock:
+            waiting_on = self._store.waiting_on
+            if waiting_on.get(agent) is slot:
+                del waiting_on[agent]
+
+    def _run_instead_of_waiting(
+        self,
+        key: QueryKey,
+        fn: Callable[..., Any],
+        runtime: RuntimeState,
+        slot: InFlight,
+    ) -> MemoEntry:
+        """Run ``key`` on this stack because waiting for its owner never ends.
+
+        The owner keeps its in-flight slot and finishes its own run later.
+        A synchronous query run by a task on this thread's event loop is
+        simply run here. An async one cannot be.
+        """
+        if slot.owner_thread == threading.get_ident() and inspect.iscoroutinefunction(
+            fn
+        ):
+            raise EventLoopBlockedError(
+                f"{self._store.key_to_str(key)} is running as a task on the "
+                "event loop of this thread, and synchronous code here would "
+                "wait for it while blocking that loop. Await it from async "
+                "code (an async query), or make the synchronous call from "
+                "another thread, for example with `await asyncio.to_thread(...)`."
+            )
+        return self.recompute(key, fn, runtime)
+
+    async def _run_instead_of_waiting_async(
+        self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState
+    ) -> MemoEntry:  # pragma: no cover
+        return await self.recompute_async(key, fn, runtime)
 
     def _commit_green(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
         """Record that ``memo`` was verified unchanged at ``revision``."""
@@ -843,18 +998,23 @@ class Evaluator:
         return memo
 
     def _claim_in_flight_locked(
-        self, in_flight_key: tuple[QueryKey, int]
+        self,
+        in_flight_key: tuple[QueryKey, int],
+        owner: Any = None,
+        owner_thread: int | None = None,
     ) -> tuple[InFlight, concurrent.futures.Future[MemoEntry] | None]:
         """Register as owner of ``in_flight_key`` or join the existing owner.
 
         Returns ``(slot, None)`` for the owner and ``(slot, future)`` for a
         waiter. The Future (and the Condition/RLock it allocates) is created
         only once a second caller shows up, so uncontended computes never pay
-        for it. Caller must hold ``store.lock``.
+        for it. ``owner`` (a thread id, or the asyncio task) and its thread
+        are recorded for ``_enter_wait_locked``. Caller must hold
+        ``store.lock``.
         """
         slot = self._store.in_flight.get(in_flight_key)
         if slot is None:
-            slot = InFlight()
+            slot = InFlight(owner, owner_thread)
             self._store.in_flight[in_flight_key] = slot
             return slot, None
         if slot.future is None:
@@ -1551,7 +1711,11 @@ class Evaluator:
                 self.check_cancelled(runtime.cancel_epoch)
                 result = fn(*key[2])
                 if isinstance(result, types.CoroutineType):
-                    result = asyncio.run(result)
+                    # The body is a coroutine: what it calls may await.
+                    frame.is_async_body = True
+                    result = _run_coroutine_blocking(
+                        result, self._store.key_to_str(key)
+                    )
                 self.check_cancelled(runtime.cancel_epoch)
                 try:
                     value_hash = self._store.stable_hash(result)
@@ -1596,7 +1760,7 @@ class Evaluator:
         fn: Callable[..., Any],
         runtime: RuntimeState,
     ) -> MemoEntry:
-        frame = RuntimeFrame(key=key)
+        frame = RuntimeFrame(key=key, is_async_body=True)
         new_runtime = RuntimeState(
             snapshot=runtime.snapshot,
             stack=runtime.stack + [frame],
@@ -2046,12 +2210,10 @@ class Evaluator:
         # rest of the evaluation. changed_at=-1 matches the engine's existing
         # convention for never-set default inputs, so green checks stay stable.
         value = fn(*args)
-        import types
-
         if isinstance(value, types.CoroutineType):
-            import asyncio
-
-            value = asyncio.run(value)
+            value = _run_coroutine_blocking(
+                value, self._store.key_to_str(("input", input_id, args))
+            )
         return InputVersion(
             revision=runtime.snapshot.revision,
             changed_at=-1,

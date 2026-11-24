@@ -16,6 +16,7 @@ from ._disk_cache import DiskCache, DiskCacheProtocol
 from ._errors import (
     CancellationError,
     CycleError,
+    EventLoopBlockedError,
     PersistentCacheError,
     QueryCancelled,
     SnapshotExpiredError,
@@ -51,6 +52,7 @@ __all__ = [
     "CancellationError",
     "CycleError",
     "Engine",
+    "EventLoopBlockedError",
     "PersistentCacheError",
     "QueryCancelled",
     "Snapshot",
@@ -212,6 +214,10 @@ class _InputHandle:
             return self._engine._read_input(self._id, self._fn, args, snapshot=snapshot)
 
         if _get_loop is not None and _get_loop() is not None:
+            if self._engine._evaluator.in_sync_body():
+                return self._engine._read_input(
+                    self._id, self._fn, args, snapshot=snapshot
+                )
             return self._engine._read_input_async(
                 self._id, self._fn, args, snapshot=snapshot
             )
@@ -291,6 +297,13 @@ class _QueryHandle:
             )
 
         if _get_loop is not None and _get_loop() is not None:
+            if self._engine._evaluator.in_sync_body():
+                # A sync query's body on the loop thread cannot await. The
+                # sync path serves a cached result and raises
+                # EventLoopBlockedError where it would have to block.
+                return self._engine._query_call(
+                    self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
+                )
             return self._engine._query_call_async(
                 self._id, self._fn, tuple(args), snapshot=snapshot, effects=effects
             )

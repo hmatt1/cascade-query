@@ -901,7 +901,6 @@ def test_d20_exception_with_unencodable_args_reaches_the_caller() -> None:
         q()
 
 
-@_defect(21, "a sync waiter on the event-loop thread deadlocks on an async run")
 def test_d21_sync_query_on_the_loop_does_not_deadlock_on_an_async_run() -> None:
     engine = Engine()
 

@@ -32,6 +32,8 @@ class RuntimeFrame:
     runtime: RuntimeState | None = field(default=None, repr=False, compare=False)
     # Earliest expiry among the TTL-bound results this frame has read.
     expires_at: float | None = None
+    # True for a frame run by the async evaluator (its body may await).
+    is_async_body: bool = False
 
 
 @dataclass

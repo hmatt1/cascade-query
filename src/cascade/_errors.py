@@ -48,3 +48,15 @@ class UnencodableValueError(TypeError):
     and its type. A ``TypeError``, as the codec's own error was. Never
     cached: a query whose result cannot be encoded runs again on every call.
     """
+
+
+class EventLoopBlockedError(RuntimeError):
+    """Raised instead of blocking an asyncio event loop for ever.
+
+    Synchronous code running on the thread of an event loop (a sync query
+    called from a coroutine, say) cannot wait for an ``async def`` query:
+    not for one that has to run (that needs the loop, which the wait
+    blocks), and not for one already running as a task on that loop. Await
+    the async query from async code, or make the synchronous call from
+    another thread (``await asyncio.to_thread(...)``). Never cached.
+    """

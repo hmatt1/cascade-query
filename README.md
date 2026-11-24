@@ -156,6 +156,8 @@ asyncio.run(main())
 
 Synchronous queries can also be called directly from inside asynchronous nodes (and vice versa). Cascade maintains type stability and performance segregation, ensuring pure-Python CPU-bound tasks suffer no context-switching overhead while I/O-bound tasks evaluate concurrently.
 
+One exception: synchronous code running on the event loop's own thread (a sync query called from a coroutine) cannot wait for an async query, because the wait would block the loop the async query needs. It gets an async query's cached result as usual; when the async query would have to run, or is running as a task on that loop, the call raises `EventLoopBlockedError` at once instead of hanging. Await the async query from async code, or move the synchronous call off the loop with `await asyncio.to_thread(sync_query)`.
+
 ### Parallel & Background Execution
 *   **`engine.submit(query, *args, executor=None)`**: Schedules a query for background execution. Returns a `concurrent.futures.Future`. Calling it from inside a running query raises `RuntimeError`, because the future could outlive the query and its read could not be tracked; call the query directly or use `compute_many` there.
 *   **`engine.compute_many(calls, workers=None)`**: Executes a list of queries in parallel using a thread pool. Blocks until all are complete and returns a list of results. Inside a running query, each requested query becomes a dependency of the calling query, just as if it had been called directly (`memoize=False` queries then run on the calling thread).

@@ -35,7 +35,7 @@ Every open defect has a failing regression test in
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
 | G12 | Accumulator effects are replayed on cache hits, in a fixed order | Broken for pushes inside a rewritten stage (D31); limits (D26) | Good |
 | G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Broken for fixed-point cycles (D25) | Strong for eviction and prune |
-| G14 | Async queries behave like sync queries | Holds with limits (D21) | Weak |
+| G14 | Async queries behave like sync queries | Holds with limits | Medium |
 | G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path, good for async |
 | G16 | A stale persisted result is never served | Holds with limits (G11's blind spots) | Medium |
 | G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
@@ -456,13 +456,37 @@ Enforced by: `test_dirty_propagation.py::test_lru_eviction_never_serves_stale_re
 `async def` queries follow G1–G13. Sync queries may call async queries and the
 reverse.
 
+**Synchronous code on the loop's thread.** A sync query called on the
+thread that runs an event loop (from a coroutine, say) cannot wait for an
+async query: running one needs that loop, and so does finishing one that runs
+as a task on it, while the synchronous wait blocks it. So there:
+
+- calling an async query from the sync query's body takes the synchronous
+  path: a cached result is returned as usual (before, the body got a
+  coroutine back and failed with a `TypeError` that was cached);
+- an async query or async input default that has to run raises
+  `EventLoopBlockedError` at once, naming it;
+- waiting for a run owned by a task on the same loop raises
+  `EventLoopBlockedError` for an async query, and for a sync query runs it
+  on this thread instead of waiting;
+- `EventLoopBlockedError` is never cached and is raised out of dependency
+  verification too, so the same call works once the async result is cached,
+  and from another thread (`await asyncio.to_thread(sync_query)`) at once.
+
+Waiting for a run on another thread or another loop is unaffected.
+
 Limits: the async verification path is recursive where the sync path is
 iterative, so very deep stale chains may hit the recursion limit. Almost all
 async internals are excluded from coverage with `# pragma: no cover`.
 
 Enforced by: `test_async.py::test_async_query_basic`, `::test_mixed_graph_sync_async`,
 `::test_dedup_yields_loop`, `test_async_dependency_tracking.py`,
-`test_history_retention.py::test_no_pins_leak_from_async_calls_and_cancellation`.
+`test_history_retention.py::test_no_pins_leak_from_async_calls_and_cancellation`,
+`test_known_defects.py::test_d21_sync_query_on_the_loop_does_not_deadlock_on_an_async_run`,
+`test_event_loop_blocking.py` (a task on the same loop, the `to_thread`
+workaround, uncached and cached async queries and async input defaults from
+a sync body on the loop, a sync query owned by a task, a task on another
+loop, async queries awaiting each other).
 
 ### Thread safety
 
@@ -997,7 +1021,6 @@ time; nothing is in that state now.
 |---|---|---|
 | D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
 | D25 | After the cached result of a fixed-point cycle member is dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changes, a query that depends on that member raises `CycleError`. With the member's result still cached the same call returns the right value. The member is recomputed on its own, enters the cycle from the wrong end and reaches itself before the head. | Reproduced |
-| D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocks. Also reachable through the public API: a sync query that depends on an async query, called on the loop thread while that async query is running there, blocks the loop while re-verifying. | Reproduced, through the private entry point and through the public path |
 
 ### Fixed since the audit
 
@@ -1025,6 +1048,7 @@ time; nothing is in that state now.
 | D10 | Two engines on one `cache_dir` that both changed the same named collection overwrote each other's revision numbers (after each appended once, a restart restored only the second one's item), and a result computed from one engine's contents could verify against the other's. The first engine to change a named collection now holds an OS-level lock on it until shutdown or process exit; a change from any other engine, or from an engine whose copy is out of date, raises `PersistentCacheError` and changes nothing. Sharing a `cache_dir` for cached results and reading collections from several engines still works. | `fix: two engines changing one named collection overwrote each other's changes` |
 | D20 | A query result that could not be encoded raised a bare `TypeError` from the codec, even with no `cache_dir`, naming the unsupported type but not the query; an exception with unencodable `args` was replaced by that `TypeError`. A result now raises `UnencodableValueError` (a `TypeError`) naming the query, the path to the bad part and its type, and is not cached; an exception that cannot be encoded reaches the caller as itself, uncached. Input values and `fixed_point=` guesses get the same error. | `fix: an unencodable result raised an error naming no query and hid the query's own exception` |
 | D19 | A direct caller that joined a `submit`-owned run of the same query received the owner's `QueryCancelled`, though only `submit` cancels. A caller whose run ends in another call's `QueryCancelled` now checks its own cancellation and, if it is not cancelled, runs the query itself at its own revision. | `fix: a direct call that joined a submitted run was cancelled with it` |
+| D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocked; reachable through the public API when a sync query that depends on an async query was called on the loop thread while that async query ran there. Also: a sync query body calling an async query on the loop thread got a coroutine back and cached the resulting `TypeError`, and a stale async dependency recomputed there cached `asyncio.run`'s `RuntimeError`. In-flight runs now record their owner (thread or task); a synchronous wait for a task on the caller's own thread is never started, and synchronous code on a loop thread raises `EventLoopBlockedError` where it would have to run or wait for an async query. | `fix: a sync call on the event loop's thread hung waiting for an async query` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
