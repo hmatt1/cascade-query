@@ -29,7 +29,7 @@ Every open defect has a failing regression test in
 | G5 | Concurrent requests for one query at one revision run the body once | Holds with limits | Strong |
 | G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits (D19) | Medium |
 | G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits (D24–D26) | Good on one thread |
-| G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits (D20) | Strong |
+| G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits | Strong |
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
@@ -95,7 +95,12 @@ Limits, by design:
   cannot be queries.
 - **Values must be encodable.** Results and input values are hashed through the
   canonical encoder even without `cache_dir`; an unsupported type raises
-  `TypeError`. G18 lists the supported types.
+  `UnencodableValueError`, a `TypeError` naming the query (with its
+  arguments) or the input, the path to the part that cannot be encoded
+  (`result[2]['k'].payload`, `value key 'x'`) and its type. A result that
+  cannot be encoded is not cached, so each call runs the body and raises
+  again; a caller that catches the error depends on what the query read
+  (G8). G18 lists the supported types.
 - **Arguments are positional and hashable.** Keyword arguments raise
   `TypeError`. Arguments that compare equal are one cache key, so `q(1)`,
   `q(True)` and `q(1.0)` share a result. A dict is not hashable and cannot be
@@ -287,6 +292,11 @@ restricts caching to those types. `QueryCancelled`, `CycleError`,
 `PersistentCacheError` and `SnapshotExpiredError` are never cached. A caller
 that catches a dependency's error still depends on it.
 
+The caller always sees the exception the query raised. One that cannot be
+encoded (its `args` hold an unsupported type) is not cached: it propagates
+as itself, like an error excluded by `cache_exceptions`, and the next call
+runs the body again. `UnencodableValueError` is never cached either.
+
 Limits: the same exception object is re-raised each time, so its traceback
 grows. `BaseException` subclasses outside `Exception` are not cached.
 
@@ -294,7 +304,13 @@ Enforced by: `test_error_caching.py::test_error_is_cached`,
 `::test_error_cache_invalidation`, `::test_selective_exception_caching`,
 `::test_caught_cached_error_does_not_escape_on_reverification`,
 `::test_caught_uncached_error_still_tracks_dependencies`,
-`::test_uncached_error_two_levels_down_reaches_the_handler`.
+`::test_uncached_error_two_levels_down_reaches_the_handler`,
+`test_known_defects.py::test_d20_unencodable_result_is_returned_or_reported_clearly`,
+`::test_d20_exception_with_unencodable_args_reaches_the_caller`,
+`test_unencodable_values.py` (in memory and on both backends: paths through
+lists, dicts, keys, dataclasses, NamedTuples and exception args; nothing
+cached; a caller that catches the error; async queries; inputs and input
+defaults; fixed-point guesses and results; `compute_many`).
 
 ### G9. TTL
 
@@ -534,8 +550,8 @@ exceptions keep only type and `args`. Dataclasses with `init=False` fields and
 classes defined inside functions cannot be decoded, so their results recompute
 every session.
 
-Unsupported, raising `TypeError`: `Enum`, `Decimal`, `Path`, `UUID`, `complex`,
-`range`, `deque`.
+Unsupported, raising `UnencodableValueError` (a `TypeError`, see G1): `Enum`,
+`Decimal`, `Path`, `UUID`, `complex`, `range`, `deque`.
 
 Enforced by: `test_disk_cache.py::test_round_trip`,
 `::test_round_trip_preserves_container_types`,
@@ -969,7 +985,6 @@ time; nothing is in that state now.
 | ID | Defect | Evidence |
 |---|---|---|
 | D19 | A direct caller that joins a `submit`-owned run of the same query receives the owner's `QueryCancelled`. | Reproduced |
-| D20 | A query result that cannot be encoded raises a bare `TypeError` even with no `cache_dir`. Its message names the unsupported type but not the query. An exception with unencodable `args` is replaced by that `TypeError`. | Reproduced |
 | D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
 | D25 | After the cached result of a fixed-point cycle member is dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changes, a query that depends on that member raises `CycleError`. With the member's result still cached the same call returns the right value. The member is recomputed on its own, enters the cycle from the wrong end and reaches itself before the head. | Reproduced |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocks. Also reachable through the public API: a sync query that depends on an async query, called on the loop thread while that async query is running there, blocks the loop while re-verifying. | Reproduced, through the private entry point and through the public path |
@@ -998,6 +1013,7 @@ time; nothing is in that state now.
 | D23 | A stored result of an `async def` query could not be loaded by a new engine: the call raised `TypeError: entry_from_runtime() missing ... 'computed_at_time'` instead of returning the value. The async loading path now passes the stored computation time, so a loaded result also expires with its TTL as on the sync path. | `fix: an async query's stored result could not be loaded by a new engine` |
 | D18 | If the disk writer thread hit an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread died and `flush_disk()` and `shutdown()` blocked for ever; a `PersistentCacheError` (map full) was dropped without a word. The writer now survives every error and goes on with the next batch, and the next `flush_disk()` or `shutdown()` raises `PersistentCacheError` with the original error as its cause. Also fixed: the `disk_store` counter and trace were recorded for writes that failed. | `fix: a disk write error stopped the writer and hung flush_disk() and shutdown()` |
 | D10 | Two engines on one `cache_dir` that both changed the same named collection overwrote each other's revision numbers (after each appended once, a restart restored only the second one's item), and a result computed from one engine's contents could verify against the other's. The first engine to change a named collection now holds an OS-level lock on it until shutdown or process exit; a change from any other engine, or from an engine whose copy is out of date, raises `PersistentCacheError` and changes nothing. Sharing a `cache_dir` for cached results and reading collections from several engines still works. | `fix: two engines changing one named collection overwrote each other's changes` |
+| D20 | A query result that could not be encoded raised a bare `TypeError` from the codec, even with no `cache_dir`, naming the unsupported type but not the query; an exception with unencodable `args` was replaced by that `TypeError`. A result now raises `UnencodableValueError` (a `TypeError`) naming the query, the path to the bad part and its type, and is not cached; an exception that cannot be encoded reaches the caller as itself, uncached. Input values and `fixed_point=` guesses get the same error. | `fix: an unencodable result raised an error naming no query and hid the query's own exception` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of

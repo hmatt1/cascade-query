@@ -872,7 +872,6 @@ def _plain_object() -> Any:
     return Plain()
 
 
-@_defect(20, "an unencodable result raises a bare TypeError that names no query")
 def test_d20_unencodable_result_is_returned_or_reported_clearly() -> None:
     engine = Engine()
     value = _plain_object()
@@ -892,7 +891,6 @@ def test_d20_unencodable_result_is_returned_or_reported_clearly() -> None:
         assert result is value
 
 
-@_defect(20, "an exception with unencodable args is replaced by a TypeError")
 def test_d20_exception_with_unencodable_args_reaches_the_caller() -> None:
     engine = Engine()
 

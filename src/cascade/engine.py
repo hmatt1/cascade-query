@@ -20,6 +20,7 @@ from ._errors import (
     QueryCancelled,
     SnapshotExpiredError,
     StaleHandleError,
+    UnencodableValueError,
 )
 from ._evaluator import Evaluator
 from ._incremental import IncrementalRuntime
@@ -56,6 +57,7 @@ __all__ = [
     "SnapshotExpiredError",
     "StaleHandleError",
     "TraceEvent",
+    "UnencodableValueError",
 ]
 
 

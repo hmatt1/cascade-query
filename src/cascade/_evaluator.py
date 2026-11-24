@@ -22,6 +22,7 @@ from ._errors import (
     QueryCancelled,
     SnapshotExpiredError,
     StaleHandleError,
+    UnencodableValueError,
 )
 from ._runtime import UNSET, RuntimeFrame, RuntimeState
 from ._state import (
@@ -73,7 +74,9 @@ class _ProvisionalResult(Exception):
         self.heads = heads
 
 
-_NEVER_CACHED_ERRORS = (*_CONTROL_FLOW_ERRORS, _ReenteredQuery)
+# An unencodable result is the engine refusing a value, not the body
+# failing; caching it would make one bad run stick.
+_NEVER_CACHED_ERRORS = (*_CONTROL_FLOW_ERRORS, _ReenteredQuery, UnencodableValueError)
 
 # Stands in for the ``changed_at`` of a query that has no result yet (it is
 # running, or its result is provisional). Equal to no real marker, so
@@ -371,7 +374,7 @@ class Evaluator:
         every read of the input in one call records the same marker, and the
         results are still valid at the revision the default was stored at.
         """
-        value_hash = self._store.stable_hash(default)
+        value_hash = self._store.input_digest(input_key, default)
         stored = self._store.first_version_after(input_key, revision)
         if stored is not None and stored.value_hash == value_hash:
             return stored
@@ -1299,6 +1302,7 @@ class Evaluator:
         frame: RuntimeFrame,
         key: QueryKey,
         result: Any,
+        value_hash: str,
         error: BaseException | None,
         iterations: int,
     ) -> bool:
@@ -1309,9 +1313,19 @@ class Evaluator:
         """
         if not frame.is_cycle_root or error is not None:
             return False
-        if self._store.stable_hash(result) == self._store.stable_hash(
-            frame.cycle_guess
-        ):
+        if frame.cycle_guess_hash is None:
+            guess = frame.cycle_guess
+            try:
+                frame.cycle_guess_hash = self._store.stable_hash(guess)
+            except TypeError as exc:
+                raise self._store.unencodable_error(
+                    f"the fixed_point= guess of {self._store.key_to_str(key)} "
+                    "cannot be encoded",
+                    "guess",
+                    guess,
+                    exc,
+                ) from exc
+        if value_hash == frame.cycle_guess_hash:
             return False
         self._discard_provisional(runtime, key)
         limit = self._store.lookup_fixed_point_limit(key[1])
@@ -1323,6 +1337,7 @@ class Evaluator:
                 "raise the limit with max_iterations= if it only needs longer"
             )
         frame.cycle_guess = result
+        frame.cycle_guess_hash = value_hash
         frame.is_cycle_root = False
         frame.deps.clear()
         frame.effects.clear()
@@ -1444,6 +1459,33 @@ class Evaluator:
                 else:
                     caller.cycle_heads.update(heads)
 
+    def _unencodable_result(
+        self, key: QueryKey, result: Any, exc: TypeError
+    ) -> TypeError:
+        return self._store.unencodable_error(
+            f"{self._store.key_to_str(key)} returned a value Cascade cannot encode",
+            "result",
+            result,
+            exc,
+        )
+
+    def _cacheable_error_digest(self, key: QueryKey, exc: BaseException) -> str | None:
+        """Digest of ``exc`` if it is to be cached as the result of ``key``.
+
+        None when it is not cached: by the error-caching rules, or because
+        its ``args`` cannot be encoded. Such an error is raised as it is,
+        uncached, so the caller always sees the exception the query raised.
+        """
+        if not self._should_cache_error(key, exc):
+            return None
+        try:
+            return self._store.stable_hash(exc)
+        except TypeError:
+            self._store.trace_event(
+                "error_not_cached", key, detail="exception args cannot be encoded"
+            )
+            return None
+
     def _should_cache_error(self, key: QueryKey, exc: BaseException) -> bool:
         if isinstance(exc, _NEVER_CACHED_ERRORS):
             return False
@@ -1490,11 +1532,17 @@ class Evaluator:
                 if isinstance(result, types.CoroutineType):
                     result = asyncio.run(result)
                 self.check_cancelled(runtime.cancel_epoch)
+                try:
+                    value_hash = self._store.stable_hash(result)
+                except TypeError as exc:
+                    raise self._unencodable_result(key, result, exc) from exc
                 error = None
             except BaseException as exc:
-                if self._should_cache_error(key, exc):
+                error_hash = self._cacheable_error_digest(key, exc)
+                if error_hash is not None:
                     error = exc
                     result = None
+                    value_hash = error_hash
                 else:
                     runtime.stack.pop()
                     if frame.cycle_guess is not UNSET:
@@ -1505,7 +1553,7 @@ class Evaluator:
             if frame.is_cycle_root:
                 try:
                     again = self._next_iteration(
-                        runtime, frame, key, result, error, iterations
+                        runtime, frame, key, result, value_hash, error, iterations
                     )
                 except CycleError:
                     runtime.stack.pop()
@@ -1517,7 +1565,9 @@ class Evaluator:
             runtime.stack.pop()
             break
 
-        return self._finish_recompute(key, frame, runtime, result, error, start)
+        return self._finish_recompute(
+            key, frame, runtime, result, error, start, value_hash
+        )
 
     async def recompute_async(  # pragma: no cover
         self,
@@ -1559,11 +1609,17 @@ class Evaluator:
                     else:
                         result = await self._run_sync_in_executor(fn, key[2])
                     self.check_cancelled(new_runtime.cancel_epoch)
+                    try:
+                        value_hash = self._store.stable_hash(result)
+                    except TypeError as exc:
+                        raise self._unencodable_result(key, result, exc) from exc
                     error = None
                 except BaseException as exc:
-                    if self._should_cache_error(key, exc):
+                    error_hash = self._cacheable_error_digest(key, exc)
+                    if error_hash is not None:
                         error = exc
                         result = None
+                        value_hash = error_hash
                     else:
                         if frame.cycle_guess is not UNSET:
                             self._discard_provisional(new_runtime, key)
@@ -1571,14 +1627,16 @@ class Evaluator:
                         raise
 
                 if frame.is_cycle_root and self._next_iteration(
-                    new_runtime, frame, key, result, error, iterations
+                    new_runtime, frame, key, result, value_hash, error, iterations
                 ):
                     iterations += 1
                     continue
 
                 break
 
-            return self._finish_recompute(key, frame, new_runtime, result, error, start)
+            return self._finish_recompute(
+                key, frame, new_runtime, result, error, start, value_hash
+            )
         finally:
             self._runtime_var.reset(token)
             frame.runtime = None  # break the frame <-> runtime reference cycle
@@ -1591,17 +1649,17 @@ class Evaluator:
         result: Any,
         error: BaseException | None,
         start: float,
+        value_hash: str,
     ) -> MemoEntry:
-        """Turn a finished run into a memo: stored, or provisional in a cycle."""
+        """Turn a finished run into a memo: stored, or provisional in a cycle.
+
+        ``value_hash`` is the digest of ``error`` if set, else of ``result``.
+        """
         store = self._store
         elapsed = store.monotonic_seconds() - start
         revision = runtime.snapshot.revision
 
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
-        if error is not None:
-            value_hash = store.stable_hash(error)
-        else:
-            value_hash = store.stable_hash(result)
 
         is_memoized = store.lookup_query_memoize(key[1])
         computed_at_time = time.time()

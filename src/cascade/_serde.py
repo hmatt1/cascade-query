@@ -13,7 +13,10 @@ import datetime
 import hashlib
 import json
 import math
-from typing import Any
+import reprlib
+from typing import Any, Callable, Iterator
+
+from ._errors import UnencodableValueError
 
 # What json.dumps(..., ensure_ascii=False) emits for a str.
 _encode_json_str = json.encoder.encode_basestring
@@ -157,4 +160,83 @@ def _to_jsonable(obj: Any) -> Any:
         f"cascade serde: unsupported type {type(obj).__module__}.{type(obj).__qualname__!r}; "
         "use primitives, bytes, collections, datetime, @dataclass / typing.NamedTuple instances, "
         "or BaseException."
+    )
+
+
+_SUPPORTED = (
+    "None, bool, int, float, str, bytes, list, tuple, set, frozenset, dict, "
+    "the datetime types, dataclasses, NamedTuples and exceptions"
+)
+
+
+def _children(obj: Any) -> Iterator[tuple[str, Any]]:
+    """The parts of ``obj`` the encoders visit, each with its path suffix."""
+    if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+        for name in obj._fields:
+            yield f".{name}", getattr(obj, name)
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for name in obj.__dataclass_fields__:
+            yield f".{name}", getattr(obj, name)
+    elif isinstance(obj, (tuple, list)):
+        for i, item in enumerate(obj):
+            yield f"[{i}]", item
+    elif isinstance(obj, (set, frozenset)):
+        for item in obj:
+            yield f" element {reprlib.repr(item)}", item
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield f" key {reprlib.repr(k)}", k
+            yield f"[{reprlib.repr(k)}]", v
+    elif isinstance(obj, BaseException):
+        for i, item in enumerate(obj.args):
+            yield f".args[{i}]", item
+
+
+def locate_unencodable(
+    value: Any, digest: Callable[[Any], str], root: str
+) -> tuple[str, type] | None:
+    """Path and type of the innermost part of ``value`` that ``digest`` refuses.
+
+    Only called after ``digest(value)`` raised, so its cost does not matter.
+    """
+
+    def refused(v: Any) -> bool:
+        try:
+            digest(v)
+        except TypeError:
+            return True
+        except Exception:  # noqa: BLE001 - not an encoding question
+            return False
+        return False
+
+    if not refused(value):
+        return None
+    path, obj = root, value
+    while True:
+        for suffix, child in _children(obj):
+            if refused(child):
+                path += suffix
+                obj = child
+                break
+        else:
+            return path, type(obj)
+
+
+def unencodable_error(
+    subject: str, root: str, value: Any, digest: Callable[[Any], str], exc: Exception
+) -> UnencodableValueError:
+    """The error for a ``value`` of ``subject`` that ``digest`` refused with ``exc``."""
+    found = locate_unencodable(value, digest, root)
+    if found is None:  # pragma: no cover - digest(value) did not fail again
+        where = f"{root} cannot be encoded"
+    else:
+        path, bad_type = found
+        where = (
+            f"{path} is a {bad_type.__module__}.{bad_type.__qualname__}, "
+            "which Cascade cannot encode"
+        )
+    return UnencodableValueError(
+        f"{subject}: {where}. Results and input values are encoded to tell "
+        "whether they changed, also without cache_dir; supported types are "
+        f"{_SUPPORTED}. (Codec error: {exc})"
     )

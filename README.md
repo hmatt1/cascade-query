@@ -81,7 +81,7 @@ The `Engine` manages caching, execution, and state tracking.
 
 A few rules apply to every engine, with or without `cache_dir`:
 
-*   **Values must be encodable.** Results and input values are fingerprinted with the same encoder the disk cache uses, so they must be primitives, bytes, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions. Anything else (`Enum`, `Path`, `Decimal`, arbitrary class instances) raises `TypeError`.
+*   **Values must be encodable.** Results and input values are fingerprinted with the same encoder the disk cache uses, so they must be primitives, bytes, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions. Anything else (`Enum`, `Path`, `Decimal`, arbitrary class instances) raises `UnencodableValueError`, a `TypeError` whose message names the query or input, the path to the offending part of the value (`result[2]['k'].field`) and its type. Such a result is not cached.
 *   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache.
 *   **A query's or input's identity is a name: its `module:qualname` by default.** One name holds one function. Registering a different function under a name in use replaces the earlier one: its cached results are dropped, and its handle raises `StaleHandleError` when called. That is what you want from a hot reload (pick up the new handle by importing it again), but it also happens when several functions are made from one body, as in a factory, a loop, or lambdas in one module. Give those their own identities with `name=`:
 
@@ -202,7 +202,7 @@ def net_profit() -> float:
 The iteration happens at the caller's revision: `bonus_pool(snapshot=s)` is the fixed point for the inputs as of `s`, and evaluating a fixed point never moves `engine.revision`. A cycle that has not converged after 1000 runs raises `CycleError`; pass `max_iterations=` to change the limit. Enter a cycle through the query that has `fixed_point=`, and from one thread at a time (see G7 in `docs/guarantees.md`).
 
 ### Error Caching
-By default, queries intercept and cache exceptions (excluding control flow exceptions like `QueryCancelled`).
+By default, queries intercept and cache exceptions (excluding control flow exceptions like `QueryCancelled`). The caller always gets the exception the query raised: one whose `args` cannot be encoded is raised as it is and not cached.
 
 ```python
 @engine.query(cache_exceptions=(ValueError, TypeError))

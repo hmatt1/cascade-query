@@ -12,6 +12,7 @@ from .engine import (
     SnapshotExpiredError,
     StaleHandleError,
     TraceEvent,
+    UnencodableValueError,
 )
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "SnapshotExpiredError",
     "StaleHandleError",
     "TraceEvent",
+    "UnencodableValueError",
     "condense_graph",
     "export_dot",
     "export_mermaid",

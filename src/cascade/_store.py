@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from typing import Any, Callable
 
 from ._errors import SnapshotExpiredError
-from ._serde import hash_bytecode, stable_value_digest
+from ._serde import hash_bytecode, stable_value_digest, unencodable_error
 from ._state import (
     Dependency,
     InFlight,
@@ -614,6 +614,25 @@ class GraphStore:
     def stable_hash(self, value: Any) -> str:
         return self._value_digest(value)
 
+    def unencodable_error(
+        self, subject: str, root: str, value: Any, exc: Exception
+    ) -> TypeError:
+        """``UnencodableValueError`` for ``value``, which ``stable_hash`` refused."""
+        return unencodable_error(subject, root, value, self._value_digest, exc)
+
+    def input_digest(self, key: InputKey, value: Any) -> str:
+        """``stable_hash`` of a value for input ``key``, with a clear error."""
+        try:
+            return self._value_digest(value)
+        except TypeError as exc:
+            input_id, args = key
+            raise self.unencodable_error(
+                f"input {input_id}{args!r} was given a value Cascade cannot encode",
+                "value",
+                value,
+                exc,
+            ) from exc
+
     def new_change_stamp_locked(self) -> int:
         """A ``changed_at`` value no memo has carried before.
 
@@ -869,7 +888,7 @@ class GraphStore:
         dirty.
         """
         key = (input_id, args)
-        value_hash = self.stable_hash(value)
+        value_hash = self.input_digest(key, value)
         with self.lock:
             versions = self.inputs.get(key)
             if versions and versions[-1].value_hash == value_hash:
@@ -895,7 +914,9 @@ class GraphStore:
         final: dict[InputKey, Any] = {}
         for input_id, args, value in updates:
             final[(input_id, args)] = value
-        hashed = [(key, value, self.stable_hash(value)) for key, value in final.items()]
+        hashed = [
+            (key, value, self.input_digest(key, value)) for key, value in final.items()
+        ]
         with self.lock:
             changed = []
             for key, value, value_hash in hashed:

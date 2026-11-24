@@ -24,6 +24,8 @@ class RuntimeFrame:
     # run read the guess. ``cycle_heads`` are the running queries whose
     # guesses this run has read, directly or through provisional results.
     cycle_guess: Any = UNSET
+    # Digest of ``cycle_guess``, once computed.
+    cycle_guess_hash: str | None = None
     is_cycle_root: bool = False
     cycle_heads: set[QueryKey] | None = None
     # The runtime this frame runs in (for async, the one made for it).

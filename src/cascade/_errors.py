@@ -37,3 +37,14 @@ class StaleHandleError(RuntimeError):
     longer knows about and store its results where the new handle reads
     them, so using it is an error. Never cached.
     """
+
+
+class UnencodableValueError(TypeError):
+    """Raised when a query result or an input value cannot be encoded.
+
+    Cascade encodes every result and input value to tell whether it changed,
+    with or without ``cache_dir``. The message names the query or input,
+    the path to the offending part of the value (``result[2]['k'].field``)
+    and its type. A ``TypeError``, as the codec's own error was. Never
+    cached: a query whose result cannot be encoded runs again on every call.
+    """
