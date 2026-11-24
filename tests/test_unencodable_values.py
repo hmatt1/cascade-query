@@ -230,3 +230,27 @@ def test_compute_many_reports_the_query(engine: Engine) -> None:
 
     with pytest.raises(UnencodableValueError, match=r"\(2,\)"):
         engine.compute_many([(item, (i,)) for i in range(4)])
+
+
+def test_a_caught_unencodable_guess_leaves_the_caller_consistent() -> None:
+    engine = Engine()
+    guess = Plain()
+
+    @engine.query(fixed_point=guess)
+    def bad_guess() -> int:
+        bad_guess()
+        return 1
+
+    @engine.query
+    def outer() -> Any:
+        seen = []
+        for _ in range(2):
+            try:
+                seen.append(bad_guess())
+            except UnencodableValueError:
+                seen.append("refused")
+        return seen
+
+    # The second call must be refused the same way, not see the first run
+    # still on the stack and get its guess back.
+    assert outer() == ["refused", "refused"]

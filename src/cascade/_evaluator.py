@@ -91,6 +91,7 @@ _NEVER_CHANGED_AT = -2
 # holds weak references, and the single module-level hook holds none, so
 # registering here never keeps an engine alive.
 _running_loop = asyncio._get_running_loop
+_get_ident = threading.get_ident
 
 
 def _run_coroutine_blocking(coro: Any, what: str) -> Any:
@@ -700,7 +701,7 @@ class Evaluator:
                 if is_memoized or not need_value:
                     return existing, True
 
-        agent = threading.get_ident()
+        agent = _get_ident()
         with self._store.lock:
             in_flight_key = (key, runtime.snapshot.revision)
             finished = self._finished_meanwhile_locked(
@@ -1738,6 +1739,31 @@ class Evaluator:
                 else:
                     caller.cycle_heads.update(heads)
 
+    def _result_digest(self, key: QueryKey, result: Any) -> str:
+        try:
+            return self._store.stable_hash(result)
+        except TypeError as exc:
+            raise self._unencodable_result(key, result, exc) from exc
+
+    def _fail_unencodable(
+        self,
+        key: QueryKey,
+        frame: RuntimeFrame,
+        runtime: RuntimeState,
+        result: Any,
+        exc: TypeError,
+    ) -> TypeError:
+        """A finished run's result cannot be encoded; its frame is off the stack.
+
+        The run fails like one that raised an error that is not cached:
+        nothing is stored, and a caller that catches the error still depends
+        on what the run read. Returns the error to raise.
+        """
+        if frame.cycle_guess is not UNSET:
+            self._discard_provisional(runtime, key)
+        self._inherit_failed_deps(runtime.stack, frame, exc)
+        return self._unencodable_result(key, result, exc)
+
     def _unencodable_result(
         self, key: QueryKey, result: Any, exc: TypeError
     ) -> TypeError:
@@ -1803,6 +1829,10 @@ class Evaluator:
                 self._drop_previous_cycle_locked(key, old_memo)
 
         error: BaseException | None = None
+        # Digest of the result, or of a cached error. Computed after the run
+        # (see _finish_run): the common path pays for it once, outside the
+        # body's exception handling.
+        value_hash: str | None = None
         iterations = 1
         while True:
             try:
@@ -1815,11 +1845,8 @@ class Evaluator:
                         result, self._store.key_to_str(key)
                     )
                 self.check_cancelled(runtime.cancel_epoch)
-                try:
-                    value_hash = self._store.stable_hash(result)
-                except TypeError as exc:
-                    raise self._unencodable_result(key, result, exc) from exc
                 error = None
+                value_hash = None
             except BaseException as exc:
                 error_hash = self._cacheable_error_digest(key, exc)
                 if error_hash is not None:
@@ -1835,11 +1862,16 @@ class Evaluator:
 
             if frame.is_cycle_root:
                 try:
+                    if value_hash is None:
+                        value_hash = self._result_digest(key, result)
                     again = self._next_iteration(
                         runtime, frame, key, result, value_hash, error, iterations
                     )
-                except CycleError:
+                except (CycleError, UnencodableValueError) as exc:
                     runtime.stack.pop()
+                    if isinstance(exc, UnencodableValueError):
+                        self._discard_provisional(runtime, key)
+                        self._inherit_failed_deps(runtime.stack, frame, exc)
                     raise
                 if again:
                     iterations += 1
@@ -1884,6 +1916,7 @@ class Evaluator:
                     self._drop_previous_cycle_locked(key, old_memo)
 
             error: BaseException | None = None
+            value_hash: str | None = None
             iterations = 1
             while True:
                 try:
@@ -1893,11 +1926,8 @@ class Evaluator:
                     else:
                         result = await self._run_sync_in_executor(fn, key[2])
                     self.check_cancelled(new_runtime.cancel_epoch)
-                    try:
-                        value_hash = self._store.stable_hash(result)
-                    except TypeError as exc:
-                        raise self._unencodable_result(key, result, exc) from exc
                     error = None
+                    value_hash = None
                 except BaseException as exc:
                     error_hash = self._cacheable_error_digest(key, exc)
                     if error_hash is not None:
@@ -1910,11 +1940,26 @@ class Evaluator:
                         self._inherit_failed_deps(runtime.stack, frame, exc)
                         raise
 
-                if frame.is_cycle_root and self._next_iteration(
-                    new_runtime, frame, key, result, value_hash, error, iterations
-                ):
-                    iterations += 1
-                    continue
+                if frame.is_cycle_root:
+                    try:
+                        if value_hash is None:
+                            value_hash = self._result_digest(key, result)
+                        again = self._next_iteration(
+                            new_runtime,
+                            frame,
+                            key,
+                            result,
+                            value_hash,
+                            error,
+                            iterations,
+                        )
+                    except UnencodableValueError as exc:
+                        self._discard_provisional(new_runtime, key)
+                        self._inherit_failed_deps(runtime.stack, frame, exc)
+                        raise
+                    if again:
+                        iterations += 1
+                        continue
 
                 break
 
@@ -1933,15 +1978,21 @@ class Evaluator:
         result: Any,
         error: BaseException | None,
         start: float,
-        value_hash: str,
+        value_hash: str | None,
     ) -> MemoEntry:
         """Turn a finished run into a memo: stored, or provisional in a cycle.
 
-        ``value_hash`` is the digest of ``error`` if set, else of ``result``.
+        ``value_hash`` is the digest of ``error`` if set, else of ``result``,
+        or None when it is still to be computed (the common case).
         """
         store = self._store
         elapsed = store.monotonic_seconds() - start
         revision = runtime.snapshot.revision
+        if value_hash is None:
+            try:
+                value_hash = store.stable_hash(result)
+            except TypeError as exc:
+                raise self._fail_unencodable(key, frame, runtime, result, exc) from exc
 
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
 
