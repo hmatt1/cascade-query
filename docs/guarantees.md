@@ -701,9 +701,21 @@ count only committed writes (a failed one traces `disk_store_failed`).
 Limits: a process that is killed (`os._exit`, SIGKILL, a crash in native
 code) runs no exit hook and loses the results still queued; the cache stays
 usable. Neither backend fsyncs each commit, so a power loss can lose recent
-commits even after a flush. If the writer thread is not running (it only
-stops at `shutdown()`), `flush_disk()` raises `PersistentCacheError` and the
-exit hook gives up, so neither waits for ever.
+commits even after a flush. If the writer thread is not running (it stops
+at `shutdown()`, or after its engine was dropped), `flush_disk()` raises
+`PersistentCacheError` and the exit hook gives up, so neither waits for
+ever.
+
+**Engines dropped without `shutdown()`.** The writer thread holds the cache
+but not the engine, so an engine the program no longer references is
+garbage-collected like any object (it has reference cycles, so by the cycle
+collector). Its writer then writes every result still queued, closes the
+cache, which releases the engine's collection locks (G26), and ends; a write
+that failed and was never reported is a `RuntimeWarning`. Until the thread
+has done so, a normal exit still waits for it. `with Engine(...) as engine:`
+calls `shutdown()` at the end of the block; if the block raised, a write
+failure `shutdown()` would report is a `RuntimeWarning` instead, so the
+block's own exception propagates.
 
 Enforced by: `test_known_defects.py::test_d15_results_survive_a_normal_exit_without_shutdown`,
 `test_durability_at_exit.py::test_normal_exit_without_shutdown_keeps_every_result`
@@ -714,7 +726,11 @@ Enforced by: `test_known_defects.py::test_d15_results_survive_a_normal_exit_with
 `test_disk_writer_errors.py` (both backends: the error and its cause, the
 writer going on after it, `shutdown()` reporting and closing, counters,
 `clear_disk_cache()`, a stopped writer, the exit warning, threads writing
-through intermittent errors).
+through intermittent errors),
+`test_engine_lifetime.py` (both backends: a dropped engine collected, its
+queued results written and its collection lock released; no threads left
+behind; `with Engine(...)`, with and without an error in the block; a failed
+write of a dropped engine).
 
 ### G18. Round-trip fidelity
 
@@ -1226,9 +1242,11 @@ read a named collection. The first change an engine makes to a named
 collection (any mutating call, `compact()`, or a transaction that changes
 it) takes an exclusive OS-level lock on that collection in the directory
 (`locks/collection-<hash>.lock`, `fcntl.flock` on POSIX, `msvcrt.locking` on
-Windows). The engine holds it until `shutdown()`, or until its process ends,
-also by a crash: the lock belongs to the open file, so a lock file left
-behind blocks nobody. A change from another engine while it is held raises
+Windows). The engine holds it until `shutdown()` (or the end of a `with
+Engine(...)` block), until the engine is garbage-collected and its writer
+has written what was queued (G17), or until its process ends, also by a
+crash: the lock belongs to the open file, so a lock file left behind blocks
+nobody. A change from another engine while it is held raises
 `PersistentCacheError` naming the collection and the directory, and changes
 nothing in memory or on disk. An engine whose copy of the collection is
 older than what is on disk (another engine changed it after this one loaded
@@ -1238,7 +1256,8 @@ copy of the log and overwrote each other's (D10).
 
 Limits: writes are committed but not fsynced, so they survive a process kill
 but not necessarily a power loss. An engine dropped without `shutdown()`
-keeps its locks until the process ends. An engine that only reads a
+keeps its locks until it is collected: while anything still references it
+(a collection object does), it is not. An engine that only reads a
 collection keeps the contents it loaded and does not see later changes
 another engine makes. Two collection objects with the same name in one
 engine are not told apart by the lock.

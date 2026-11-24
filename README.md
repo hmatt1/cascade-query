@@ -196,6 +196,7 @@ One exception: synchronous code running on the event loop's own thread (a sync q
 *   **`engine.compute_many(calls, workers=None)`**: Executes a list of `(query, args)` or `(query, args, kwargs)` calls in parallel using a thread pool. Blocks until all are complete and returns a list of results. Inside a running query, each requested query becomes a dependency of the calling query, just as if it had been called directly (`memoize=False` queries then run on the calling thread).
 *   **`engine.compute_many_stream(calls, workers=None)`**: Yields completed results as each call finishes. Yields `(index, value, call_effects)` in completion order. Tracks dependencies inside a query the same way `compute_many` does.
 *   **`engine.shutdown(*, wait=True, cancel_futures=False)`**: Shuts down the default thread pool executor used by `submit`. With `cache_dir`, it also writes any results still queued for the disk cache and closes it; like `flush_disk()`, it raises `PersistentCacheError` if a result could not be written and that was not reported yet.
+*   **`with Engine(...) as engine:`** calls `shutdown()` when the block ends. If the block raised, its exception propagates and a write failure is reported as a `RuntimeWarning` instead. An engine you simply drop is garbage-collected too, `cache_dir` or not: its disk writer finishes the queued writes, closes the cache and releases its collection locks.
 *   **`QueryCancelled`**: Exception raised if a background query's dependencies change before it completes. Only queries started with `submit` are cancelled; direct calls, `compute_many` and `compute_many_stream` always run to completion. A direct call that joins a submitted run of the same query is not cancelled with it: it runs the query itself at its own revision.
 
 ---
@@ -442,7 +443,7 @@ engine = Engine(cache_dir="./cache")
 items = CascadeList(engine, name="items", compact_every=1024)
 ```
 
-One engine at a time may change a named collection. The first change takes a lock on it in the cache directory, held until `engine.shutdown()` or the end of the process (a crashed process leaves no lock behind). Another engine, in the same process or another one, can open and read the collection and shares every cached query result, but changing the collection there raises `PersistentCacheError` and changes nothing. So does changing a copy that is older than what another engine has written since; open it again from a new engine.
+One engine at a time may change a named collection. The first change takes a lock on it in the cache directory, held until `engine.shutdown()` (or the end of a `with Engine(...)` block), until the engine is garbage-collected, or until the end of the process (a crashed process leaves no lock behind). Another engine, in the same process or another one, can open and read the collection and shares every cached query result, but changing the collection there raises `PersistentCacheError` and changes nothing. So does changing a copy that is older than what another engine has written since; open it again from a new engine.
 
 *   **`engine.inspect_pipelines()`**: Lists every observed pipeline with its source, logical stages, fused stage count, checkpoint revision, and consuming queries.
 

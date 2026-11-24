@@ -7,6 +7,7 @@ import itertools
 import concurrent.futures
 import os
 import threading
+import warnings
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 
@@ -663,6 +664,24 @@ class Engine:
         # ("query" | "input", id) -> how calls of the registered function
         # map to keys; used to key the roots given to prune() and subgraph().
         self._arg_specs: dict[tuple[str, str], ArgSpec] = {}
+
+    def __enter__(self) -> Engine:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """``shutdown()``: write what is queued, close the cache, stop the pool.
+
+        If the block raised, its exception propagates; a failed write that
+        ``shutdown()`` would report is then a ``RuntimeWarning`` instead of
+        replacing it.
+        """
+        if exc_type is None:
+            self.shutdown()
+            return
+        try:
+            self.shutdown()
+        except PersistentCacheError as failure:
+            warnings.warn(str(failure), RuntimeWarning, stacklevel=2)
 
     @property
     def revision(self) -> int:

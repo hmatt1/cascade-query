@@ -140,6 +140,10 @@ def _run_coroutine_blocking(coro: Any, what: str) -> Any:
 
 _live_disk_writers: weakref.WeakSet[Evaluator] = weakref.WeakSet()
 _live_disk_writers_lock = threading.Lock()
+# Writer threads still running, also those of engines already dropped (they
+# drain their queue before they stop). Strong references: a writer leaves
+# the set when its thread ends.
+_running_writers: set[_DiskWriter] = set()
 
 
 def _flush_all_at_exit() -> None:
@@ -149,12 +153,275 @@ def _flush_all_at_exit() -> None:
     process that is killed (``os._exit``, SIGKILL, a crash) never gets here.
     """
     with _live_disk_writers_lock:
-        evaluators = list(_live_disk_writers)
-    for evaluator in evaluators:
+        writers = list(_running_writers)
+    for writer in writers:
         try:
-            evaluator.flush_disk_at_exit()
+            writer.flush_at_exit()
         except Exception:  # pragma: no cover - never block or fail the exit
             pass
+
+
+_STOP = None  # ends the writer thread; the engine closes the cache
+_CLOSE = object()  # ends it after closing the cache: the engine was dropped
+
+
+class _KeyBlobs:
+    """Encoded argument blobs and disk entry keys of query keys, both ways.
+
+    A key is otherwise re-encoded when it is hydrated, once per dependent
+    that records it, and again by the writer thread. Keys compare by type
+    (``_keys``), so 1, 1.0 and True have an entry each, as they have a memo
+    each. Both caches are bounded; when one is full it starts over.
+    """
+
+    def __init__(self, store: GraphStore) -> None:
+        self._store = store
+        # QueryKey -> (canonical args blob, disk entry key).
+        self.by_key: dict[QueryKey, tuple[bytes, bytes]] = {}
+        # Reverse direction for dependency rows read back from disk.
+        self.args_by_blob: dict[bytes, tuple[Any, ...]] = {}
+
+    def limit(self) -> int:
+        return 2 * self._store.max_entries + 4096
+
+    def blobs_for(self, key: QueryKey) -> tuple[bytes, bytes]:
+        """``(args_blob, entry_key)`` for ``key``; TypeError if not encodable."""
+        cached = self.by_key.get(key)
+        if cached is None:
+            kind, fid, args = key
+            args_blob = _canonical.encode(_keys.plain_args(args))
+            cached = (args_blob, _disk_cache.entry_key(kind, fid, args_blob))
+            if len(self.by_key) >= self.limit():
+                self.by_key.clear()
+            self.by_key[key] = cached
+        return cached
+
+    def args_from_blob(self, args_blob: bytes) -> Any:
+        args = self.args_by_blob.get(args_blob)
+        if args is None:
+            args = _canonical.decode(args_blob)
+            if isinstance(args, tuple):
+                args = _keys.key_from_plain(args)
+                if len(self.args_by_blob) >= self.limit():
+                    self.args_by_blob.clear()
+                self.args_by_blob[args_blob] = args
+        return args
+
+
+class _DiskWriter:
+    """The thread that writes finished results to the disk cache in batches.
+
+    It holds the cache, the store (for traces and counters) and the key
+    blobs, but not the ``Evaluator`` or the ``Engine``: an engine dropped
+    without ``shutdown()`` can be collected. A finalizer on the evaluator
+    then queues ``_CLOSE``, and the thread writes what is still queued,
+    closes the cache (releasing the engine's collection locks) and ends.
+    """
+
+    def __init__(
+        self, disk: DiskCacheProtocol, store: GraphStore, keys: _KeyBlobs
+    ) -> None:
+        self.disk = disk
+        self.store = store
+        self.keys = keys
+        self.queue: queue.Queue[Any] = queue.Queue()
+        # The first error the writer met since one was last reported, and
+        # how many results were lost to errors in that time.
+        self.failure: BaseException | None = None
+        self.failures_lost = 0
+        self.failure_lock = threading.Lock()
+        self.thread = threading.Thread(
+            target=self._run, name="cascade-disk-writer", daemon=True
+        )
+        with _live_disk_writers_lock:
+            _running_writers.add(self)
+        self.thread.start()
+
+    def _run(self) -> None:
+        """Write queued results in batches until ``_STOP`` or ``_CLOSE`` arrives.
+
+        The thread never dies on an error. A batch that fails (the database
+        is locked by another process, the map is full, a value no longer
+        encodes) is dropped, counted, and reported by the next
+        ``flush_disk()`` or ``shutdown()``; the next batch is tried as usual,
+        so a transient failure costs only the results it hit. The results
+        stay correct in memory either way.
+        """
+        pending = self.queue
+        try:
+            while True:
+                item = pending.get()
+                if item is _STOP or item is _CLOSE:
+                    if item is _CLOSE:
+                        self._close_dropped()
+                    pending.task_done()
+                    break
+                batch = [item]
+                try:
+                    for _ in range(999):
+                        next_item = pending.get_nowait()
+                        if next_item is _STOP or next_item is _CLOSE:
+                            pending.put(next_item)
+                            break
+                        batch.append(next_item)
+                except queue.Empty:
+                    pass
+                try:
+                    self.write_batch(batch)
+                except BaseException as exc:  # noqa: BLE001 - reported by flush_disk
+                    self.note_failure(exc, len(batch))
+                    for entry in batch:
+                        self.store.trace_event(
+                            "disk_store_failed", entry[0], detail=type(exc).__name__
+                        )
+                finally:
+                    for _ in batch:
+                        pending.task_done()
+        finally:
+            with _live_disk_writers_lock:
+                _running_writers.discard(self)
+
+    def _close_dropped(self) -> None:
+        """The engine was dropped: close the cache, report a lost write."""
+        try:
+            self.disk.close()
+        except Exception:  # noqa: BLE001  # pragma: no cover - best effort
+            pass
+        failure = self.take_failure()
+        if failure is not None:
+            exc, lost = failure
+            warnings.warn(
+                f"{lost} result(s) of an Engine dropped without shutdown() "
+                f"could not be written to the persistent cache: "
+                f"{type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=1,
+            )
+
+    def release(self) -> None:
+        """Finalizer of the evaluator: stop the writer once the queue is drained."""
+        if self.thread.is_alive():
+            self.queue.put(_CLOSE)
+            return
+        # The writer was stopped already (shutdown() closed the cache too,
+        # or it was stopped by hand). Closing twice is harmless; closing
+        # here could wait for a lock this thread holds, so use another.
+        try:
+            threading.Thread(target=self.disk.close, daemon=True).start()
+        except RuntimeError:  # pragma: no cover - interpreter shutting down
+            pass
+
+    def write_batch(self, batch: list[Any]) -> None:
+        entries = []
+        store = self.store
+        for (
+            key,
+            deps_records,
+            memo_value,
+            memo_error,
+            memo_value_hash,
+            fn_hash,
+            computed_at_time,
+            effects_node,
+        ) in batch:
+            kind, fid, args = key
+            try:
+                entry_key = self.keys.blobs_for(key)[1]
+            except TypeError:  # pragma: no cover
+                store.trace_event("disk_unkeyed", key)
+                continue
+            try:
+                if memo_error is not None:
+                    value_blob = _canonical.encode(memo_error)
+                else:
+                    value_blob = _canonical.encode(memo_value)
+            except TypeError:  # pragma: no cover
+                continue
+
+            if _canonical.digest_bytes(value_blob) != memo_value_hash:
+                store.trace_event(
+                    "disk_skip", key, detail="value mutated before persist"
+                )
+                continue
+
+            record = {
+                "kind": kind,
+                "id": fid,
+                "fn_hash": fn_hash,
+                "value_hash": memo_value_hash,
+                "deps": deps_records,
+                "effects": effects_node,
+                "is_error": memo_error is not None,
+                "computed_at_time": computed_at_time,
+            }
+            stored_blob: bytes | None = value_blob
+            if len(value_blob) <= _disk_cache.INLINE_VALUE_MAX_BYTES:
+                record["value"] = value_blob
+                stored_blob = None
+
+            try:
+                record_blob = _canonical.encode(record)
+            except TypeError:  # pragma: no cover
+                continue
+
+            entries.append(
+                (key, (entry_key, record_blob, memo_value_hash, stored_blob))
+            )
+
+        if entries:
+            self.disk.store_entry_many([entry for _, entry in entries])
+            # Counted only once the write has committed.
+            for key, _ in entries:
+                store.trace_event("disk_store", key)
+                store.record_disk_store()
+
+    def note_failure(self, exc: BaseException, lost: int) -> None:
+        with self.failure_lock:
+            if self.failure is None:
+                self.failure = exc
+            self.failures_lost += lost
+
+    def take_failure(self) -> tuple[BaseException, int] | None:
+        with self.failure_lock:
+            exc = self.failure
+            if exc is None:
+                return None
+            lost = self.failures_lost
+            self.failure = None
+            self.failures_lost = 0
+            return exc, lost
+
+    def flush_at_exit(self) -> None:
+        """Wait for queued writes, giving up if the thread is gone.
+
+        At interpreter exit nothing may raise or wait for ever, so this
+        returns once nothing is left to drain the queue. A write failure
+        nobody was told about is printed as a warning.
+        """
+        pending = self.queue
+        thread = self.thread
+        with pending.all_tasks_done:
+            while pending.unfinished_tasks:
+                if not thread.is_alive():
+                    return
+                pending.all_tasks_done.wait(0.05)
+        failure = self.take_failure()
+        if failure is not None:
+            exc, lost = failure
+            path = _disk_path(self.disk)
+            warnings.warn(
+                f"{lost} result(s) could not be written to the persistent cache "
+                f"at {path!r}: {type(exc).__name__}: {exc}.",
+                RuntimeWarning,
+                stacklevel=1,
+            )
+
+
+def _disk_path(disk: Any) -> str:
+    try:
+        return str(disk.path)
+    except Exception:  # noqa: BLE001  # pragma: no cover - closed handle
+        return "<closed>"
 
 
 atexit.register(_flush_all_at_exit)
@@ -194,43 +461,28 @@ class Evaluator:
         self._waiting_callers_var: contextvars.ContextVar[frozenset[QueryKey]] = (
             contextvars.ContextVar("cascade_waiting_callers", default=frozenset())
         )
-        self._disk_queue: (
-            queue.Queue[
-                tuple[
-                    QueryKey,
-                    list[list[Any]],
-                    Any,
-                    Any,
-                    str,
-                    str | None,
-                    int,
-                    dict[str, list[Any]],
-                ]
-                | None
-            ]
-            | None
-        ) = None
-        self._disk_thread: threading.Thread | None = None
-        # The first error the writer thread met since one was last reported,
-        # and how many results were lost to errors in that time.
-        self._write_failure: BaseException | None = None
-        self._write_failures_lost = 0
-        self._write_failure_lock = threading.Lock()
-        # QueryKey -> (canonical args blob, disk entry key). A key is otherwise
-        # re-encoded when it is hydrated, once per dependent that records it,
-        # and again by the writer thread. Keys compare by type (``_keys``),
-        # so 1, 1.0 and True have an entry each, as they have a memo each.
-        self._key_blobs: dict[QueryKey, tuple[bytes, bytes]] = {}
-        # Reverse direction for dependency rows read back from disk.
-        self._args_by_blob: dict[bytes, tuple[Any, ...]] = {}
+        self._keys = _KeyBlobs(store)
+        # Aliases kept for introspection; the dicts are cleared in place.
+        self._key_blobs = self._keys.by_key
+        self._args_by_blob = self._keys.args_by_blob
+        self._writer: _DiskWriter | None = None
         if self._disk is not None:
-            self._disk_queue = queue.Queue()
-            self._disk_thread = threading.Thread(
-                target=self._disk_worker, name="cascade-disk-writer", daemon=True
-            )
-            self._disk_thread.start()
+            self._writer = _DiskWriter(self._disk, store, self._keys)
             with _live_disk_writers_lock:
                 _live_disk_writers.add(self)
+            # The writer holds no reference to this evaluator, so an engine
+            # dropped without shutdown() is collected; this then stops the
+            # writer once it has written what is queued, and closes the cache.
+            finalizer = weakref.finalize(self, self._writer.release)
+            finalizer.atexit = False
+
+    @property
+    def _disk_queue(self) -> queue.Queue[Any] | None:
+        return None if self._writer is None else self._writer.queue
+
+    @property
+    def _disk_thread(self) -> threading.Thread | None:
+        return None if self._writer is None else self._writer.thread
 
     def _run_in_runtime(self, runtime: RuntimeState, fn: Callable[[], Any]) -> Any:
         token = self._runtime_var.set(runtime)
@@ -2364,30 +2616,14 @@ class Evaluator:
     # --- persistent disk cache ---
 
     def _key_cache_limit(self) -> int:
-        return 2 * self._store.max_entries + 4096
+        return self._keys.limit()
 
     def _key_blobs_for(self, key: QueryKey) -> tuple[bytes, bytes]:
         """``(args_blob, entry_key)`` for ``key``; TypeError if not encodable."""
-        cached = self._key_blobs.get(key)
-        if cached is None:
-            kind, fid, args = key
-            args_blob = _canonical.encode(_keys.plain_args(args))
-            cached = (args_blob, _disk_cache.entry_key(kind, fid, args_blob))
-            if len(self._key_blobs) >= self._key_cache_limit():
-                self._key_blobs.clear()
-            self._key_blobs[key] = cached
-        return cached
+        return self._keys.blobs_for(key)
 
     def _args_from_blob(self, args_blob: bytes) -> Any:
-        args = self._args_by_blob.get(args_blob)
-        if args is None:
-            args = _canonical.decode(args_blob)
-            if isinstance(args, tuple):
-                args = _keys.key_from_plain(args)
-                if len(self._args_by_blob) >= self._key_cache_limit():
-                    self._args_by_blob.clear()
-                self._args_by_blob[args_blob] = args
-        return args
+        return self._keys.args_from_blob(args_blob)
 
     def _try_hydrate_from_disk(
         self, key: QueryKey, runtime: RuntimeState
@@ -2869,130 +3105,15 @@ class Evaluator:
         )
         return entry.value_hash, entry.changed_at, entry.expires_at
 
-    def _disk_worker(self) -> None:
-        """Write queued results in batches until the ``None`` sentinel arrives.
-
-        The thread never dies on an error. A batch that fails (the database
-        is locked by another process, the map is full, a value no longer
-        encodes) is dropped, counted, and reported by the next
-        ``flush_disk()`` or ``shutdown()``; the next batch is tried as usual,
-        so a transient failure costs only the results it hit. The results
-        stay correct in memory either way.
-        """
-        if self._disk is None or self._disk_queue is None:
-            return  # pragma: no cover
-        while True:
-            item = self._disk_queue.get()
-            if item is None:
-                self._disk_queue.task_done()
-                break
-            batch = [item]
-            try:
-                for _ in range(999):
-                    next_item = self._disk_queue.get_nowait()
-                    if next_item is None:
-                        self._disk_queue.put(None)
-                        break
-                    batch.append(next_item)
-            except queue.Empty:
-                pass
-            try:
-                self._write_batch(batch)
-            except BaseException as exc:  # noqa: BLE001 - reported by flush_disk
-                self._note_write_failure(exc, len(batch))
-                for entry in batch:
-                    self._store.trace_event(
-                        "disk_store_failed", entry[0], detail=type(exc).__name__
-                    )
-            finally:
-                for _ in batch:
-                    self._disk_queue.task_done()
-
-    def _write_batch(self, batch: list[Any]) -> None:
-        assert self._disk is not None
-        entries = []
-        for (
-            key,
-            deps_records,
-            memo_value,
-            memo_error,
-            memo_value_hash,
-            fn_hash,
-            computed_at_time,
-            effects_node,
-        ) in batch:
-            kind, fid, args = key
-            try:
-                entry_key = self._key_blobs_for(key)[1]
-            except TypeError:  # pragma: no cover
-                self._store.trace_event("disk_unkeyed", key)
-                continue
-            try:
-                if memo_error is not None:
-                    value_blob = _canonical.encode(memo_error)
-                else:
-                    value_blob = _canonical.encode(memo_value)
-            except TypeError:  # pragma: no cover
-                continue
-
-            if _canonical.digest_bytes(value_blob) != memo_value_hash:
-                self._store.trace_event(
-                    "disk_skip", key, detail="value mutated before persist"
-                )
-                continue
-
-            record = {
-                "kind": kind,
-                "id": fid,
-                "fn_hash": fn_hash,
-                "value_hash": memo_value_hash,
-                "deps": deps_records,
-                "effects": effects_node,
-                "is_error": memo_error is not None,
-                "computed_at_time": computed_at_time,
-            }
-            stored_blob: bytes | None = value_blob
-            if len(value_blob) <= _disk_cache.INLINE_VALUE_MAX_BYTES:
-                record["value"] = value_blob
-                stored_blob = None
-
-            try:
-                record_blob = _canonical.encode(record)
-            except TypeError:  # pragma: no cover
-                continue
-
-            entries.append(
-                (key, (entry_key, record_blob, memo_value_hash, stored_blob))
-            )
-
-        if entries:
-            self._disk.store_entry_many([entry for _, entry in entries])
-            # Counted only once the write has committed.
-            for key, _ in entries:
-                self._store.trace_event("disk_store", key)
-                self._store.record_disk_store()
-
     def _note_write_failure(self, exc: BaseException, lost: int) -> None:
-        with self._write_failure_lock:
-            if self._write_failure is None:
-                self._write_failure = exc
-            self._write_failures_lost += lost
+        if self._writer is not None:
+            self._writer.note_failure(exc, lost)
 
     def _take_write_failure(self) -> tuple[BaseException, int] | None:
-        with self._write_failure_lock:
-            exc = self._write_failure
-            if exc is None:
-                return None
-            lost = self._write_failures_lost
-            self._write_failure = None
-            self._write_failures_lost = 0
-            return exc, lost
+        return None if self._writer is None else self._writer.take_failure()
 
     def _disk_path(self) -> str:
-        try:
-            return str(self._disk.path)  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001  # pragma: no cover - closed handle
-            return "<closed>"
+        return _disk_path(self._disk)
 
     def _raise_write_failure(self) -> None:
         """Raise ``PersistentCacheError`` for writes that failed since the last report."""
@@ -3050,25 +3171,14 @@ class Evaluator:
         nothing is left to drain the queue. A write failure nobody was told
         about is printed as a warning.
         """
-        pending = self._disk_queue
-        thread = self._disk_thread
-        if pending is None:
-            return
-        with pending.all_tasks_done:
-            while pending.unfinished_tasks:
-                if thread is None or not thread.is_alive():
-                    return
-                pending.all_tasks_done.wait(0.05)
-        try:
-            self._raise_write_failure()
-        except PersistentCacheError as exc:
-            warnings.warn(str(exc), RuntimeWarning, stacklevel=1)
+        if self._writer is not None:
+            self._writer.flush_at_exit()
 
     def shutdown(self, wait: bool = True) -> None:
         """Stop the writer thread; raise for failed writes not reported yet."""
         if self._disk_queue is not None:
             thread = self._disk_thread
-            self._disk_queue.put(None)
+            self._disk_queue.put(_STOP)
             if wait and thread is not None:
                 thread.join()
                 # Joined, so nothing is left to flush at exit. Without the
