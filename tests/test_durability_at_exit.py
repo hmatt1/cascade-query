@@ -34,9 +34,10 @@ def square(i):
     return i * i
 
 if mode == "dead-writer":
-    def broken(entries):
-        raise RuntimeError("writer died")
-    engine._disk.store_entry_many = broken
+    # A write error no longer stops the writer (D18), so stop it from outside:
+    # the results computed below stay queued with nothing to drain them.
+    engine._evaluator._disk_queue.put(None)
+    engine._evaluator._disk_thread.join(30)
 
 for i in range(count):
     square(i)
@@ -101,8 +102,9 @@ def test_normal_exit_without_shutdown_keeps_every_result(
 
 
 def test_exit_does_not_hang_when_the_writer_thread_is_dead(tmp_path: Path) -> None:
-    # The child's writer thread dies on its first batch, leaving the queue
-    # non-empty for good. The exit hook must give up rather than wait.
+    # The child's writer thread is stopped before any result is queued,
+    # leaving the queue non-empty for good. The exit hook must give up
+    # rather than wait.
     done = _run_child("dead-writer", tmp_path, "sqlite", 50)
     assert done.returncode == 0, done.stderr
     assert "writer-alive False" in done.stdout

@@ -702,7 +702,6 @@ def test_d27_commit_that_fails_on_an_input_applies_nothing() -> None:
 # --- Hangs and misleading errors --------------------------------------------
 
 
-@_defect(18, "flush_disk() blocks forever after the disk writer thread dies")
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_d18_flush_disk_returns_after_a_writer_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

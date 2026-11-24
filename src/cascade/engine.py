@@ -490,7 +490,8 @@ class Engine:
             raise PersistentCacheError(
                 "engine has no persistent cache; pass cache_dir= to Engine"
             )
-        self._evaluator.flush_disk()
+        # Results whose write failed are being deleted anyway.
+        self._evaluator.flush_disk(report=False)
         self._disk.clear()
 
     def transaction(self) -> EngineTransaction:
@@ -581,6 +582,13 @@ class Engine:
         return Accumulator(self, name=name)
 
     def flush_disk(self) -> None:
+        """Wait until every finished result is written to the persistent cache.
+
+        Raises ``PersistentCacheError``, with the original error as its
+        cause, if writing any result failed since the last ``flush_disk()``
+        or ``shutdown()``. The results stay correct in memory, and the writer
+        keeps going with the next ones.
+        """
         self._evaluator.flush_disk()
 
     def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
@@ -589,15 +597,24 @@ class Engine:
         When ``executor`` is not passed to :meth:`submit`, work runs on a shared
         per-engine pool; call this when discarding the engine if you need prompt
         thread teardown (for example in tests).
+
+        With ``cache_dir`` it also writes the queued results and closes the
+        cache. Like :meth:`flush_disk` it raises ``PersistentCacheError`` if
+        a result could not be written and that was not reported yet; the
+        cache is closed first.
         """
         with self._submit_executor_lock:
             pool = self._submit_executor
             self._submit_executor = None
         if pool is not None:
             pool.shutdown(wait=wait, cancel_futures=cancel_futures)
-        self._evaluator.shutdown(wait=wait)
-        if self._disk is not None:
-            self._disk.close()
+        try:
+            # Raises PersistentCacheError for writes that failed and were not
+            # reported by flush_disk(); the cache is closed regardless.
+            self._evaluator.shutdown(wait=wait)
+        finally:
+            if self._disk is not None:
+                self._disk.close()
 
     def _ensure_submit_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         with self._submit_executor_lock:

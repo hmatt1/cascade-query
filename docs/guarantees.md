@@ -489,17 +489,34 @@ returns, and also when the interpreter exits normally without either: an
 `atexit` hook writes whatever is still queued. "Normally" covers falling off
 the end of the script, `sys.exit()` and an unhandled exception.
 
+A write that fails never stops the writer and never hangs a caller. The
+batch it hit is dropped and the writer goes on with the next one. The next
+`flush_disk()` or `shutdown()` raises `PersistentCacheError` naming the
+directory and the number of results lost, with the original error (sqlite
+"database is locked", a full map) as its `__cause__`; it is reported once.
+`shutdown()` closes the cache before raising. `clear_disk_cache()` forgets
+such failures, since it deletes the results anyway. A failure still
+unreported at a normal exit is printed as a `RuntimeWarning`. Results in
+memory are unaffected, and the `disk_stores` counter and `disk_store` trace
+count only committed writes (a failed one traces `disk_store_failed`).
+
 Limits: a process that is killed (`os._exit`, SIGKILL, a crash in native
 code) runs no exit hook and loses the results still queued; the cache stays
 usable. Neither backend fsyncs each commit, so a power loss can lose recent
-commits even after a flush. The exit hook gives up if the writer thread has
-died, so the exit never hangs (`flush_disk()` itself still does, see D18).
+commits even after a flush. If the writer thread is not running (it only
+stops at `shutdown()`), `flush_disk()` raises `PersistentCacheError` and the
+exit hook gives up, so neither waits for ever.
 
 Enforced by: `test_known_defects.py::test_d15_results_survive_a_normal_exit_without_shutdown`,
 `test_durability_at_exit.py::test_normal_exit_without_shutdown_keeps_every_result`
 (both backends; plain exit, `sys.exit`, unhandled exception, engine dropped),
 `::test_exit_does_not_hang_when_the_writer_thread_is_dead`,
-`::test_hard_kill_is_not_covered_but_leaves_a_usable_cache`.
+`::test_hard_kill_is_not_covered_but_leaves_a_usable_cache`,
+`test_known_defects.py::test_d18_flush_disk_returns_after_a_writer_error`,
+`test_disk_writer_errors.py` (both backends: the error and its cause, the
+writer going on after it, `shutdown()` reporting and closing, counters,
+`clear_disk_cache()`, a stopped writer, the exit warning, threads writing
+through intermittent errors).
 
 ### G18. Round-trip fidelity
 
@@ -925,7 +942,6 @@ time; nothing is in that state now.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D18 | If the disk writer thread hits an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread dies and `flush_disk()` and `shutdown()` block forever. | Reproduced on both backends by making the batch write raise `sqlite3.OperationalError` |
 | D19 | A direct caller that joins a `submit`-owned run of the same query receives the owner's `QueryCancelled`. | Reproduced |
 | D20 | A query result that cannot be encoded raises a bare `TypeError` even with no `cache_dir`. Its message names the unsupported type but not the query. An exception with unencodable `args` is replaced by that `TypeError`. | Reproduced |
 | D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
@@ -954,12 +970,11 @@ time; nothing is in that state now.
 | D5 | Collection reads that bypassed tracking went stale inside queries: `s \| x` and the other set operators and methods, set and dict `==`, list `<`, `xs + [...]`, `xs * n`, `repr`, `set.copy()`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. The builtins' implementations ran on the subclass's storage without any method of the collection being called, so no dependency was recorded and a snapshot read saw live contents. Each of these is now a tracked read on the collection. Found and fixed with it: `d.keys() == {'a'}` was always `False` and set operations on dict views raised; `copy.copy(xs)` returned a second collection object sharing the first one's log. What CPython reads without calling the subclass (`set(s)` outside a rewritten body, `frozenset(s)`, `plain.union(s)`, `fs \| s`) cannot be intercepted and is a documented limit (G21). | `fix: set operators, comparisons and repr of a collection went stale inside queries` |
 | D7 | Rewritten reducers differed from the builtins. Float `sum([0.1] * 10)` gave `0.9999999999999999` against `1.0`, and drifted further with each removal. `sorted(..., reverse=True)` reversed equal elements (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`), and any `sorted` did after an insert that was not at the end. `any` and `all` evaluated every element (`any(1 / z for z in [1, 0])` raised `ZeroDivisionError`). `min` and `max` returned the wrong one of several equal elements (`max([1, True])` gave `True`), and with NaN present did not follow the builtin's scan (`min([2.0, nan, 1.0])` gave `2.0` against `1.0`). `len(map(...))` returned a count instead of raising `TypeError`, over plain lists too. Also found and fixed: of two elements that raise, the one whose change arrived first was reported, not the first in the collection; a `set` or `dict` built from equal values of different types kept the wrong one; the function expression of `map`/`filter` was evaluated after the source. Each reducer now either maintains a result that is exact by construction or applies the builtin to the stored values, and anything that raises is settled by plain evaluation (G22). | `fix: rewritten sum, sorted, min, max, any, all and len differed from the builtins` |
 | D23 | A stored result of an `async def` query could not be loaded by a new engine: the call raised `TypeError: entry_from_runtime() missing ... 'computed_at_time'` instead of returning the value. The async loading path now passes the stored computation time, so a loaded result also expires with its TTL as on the sync path. | `fix: an async query's stored result could not be loaded by a new engine` |
+| D18 | If the disk writer thread hit an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread died and `flush_disk()` and `shutdown()` blocked for ever; a `PersistentCacheError` (map full) was dropped without a word. The writer now survives every error and goes on with the next batch, and the next `flush_disk()` or `shutdown()` raises `PersistentCacheError` with the original error as its cause. Also fixed: the `disk_store` counter and trace were recorded for writes that failed. | `fix: a disk write error stopped the writer and hung flush_disk() and shutdown()` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
-that input report the stored version, so its results stay valid afterwards);
-the `disk_store` counter and trace are recorded even when the write failed
-because the map was full.
+that input report the stored version, so its results stay valid afterwards).
 
 ## Limits that restrict who can use the library
 
@@ -982,8 +997,9 @@ Limits that narrow use without stopping it:
   `compute_many` and `compute_many_stream` track dependencies there;
   `submit` raises. `asyncio.gather` over async queries also tracks
   dependencies.
-- **One process per `cache_dir`.** Two processes on one directory can hang the
-  writer (D18) or mix collection state (D10). Parallel CI jobs and
+- **One process per `cache_dir`.** Two processes on one directory can mix
+  collection state (D10), and one can find the database locked by the other
+  (reported by `flush_disk()`, G17). Parallel CI jobs and
   `pytest-xdist` workers need separate directories.
 - **Only `submit` cancels.** An editor-style tool that calls queries directly
   or through `compute_many` cannot abandon stale work.
@@ -1025,10 +1041,10 @@ Ordered by the risk they leave open.
    each asserting the correct behaviour; those for open defects run under
    `xfail(strict=True)`. A fix removes the marker.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
-   exits child processes without `shutdown()` and with `os._exit`. The only
-   tests that inject a write failure into a live engine or put two engines on
-   one `cache_dir` are the expected failures for D18 and D10. Nothing runs
-   two processes on one `cache_dir`.
+   exits child processes without `shutdown()` and with `os._exit`.
+   `test_disk_writer_errors.py` injects write failures into a live engine.
+   The only test that puts two engines on one `cache_dir` is the expected
+   failure for D10. Nothing runs two processes on one `cache_dir`.
 3. **The Hypothesis state machine is narrow.** It covers inputs, one dynamic
    query and snapshots. It copies input history and the revision from the
    engine rather than modelling them, runs 35 examples of 25 steps, and has no
