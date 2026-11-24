@@ -15,7 +15,7 @@ between runs.
 | TLC output under `docs/formal/` | Deleted (255 files) and ignored. Done. |
 | State machine | Rewritten with the new rules, on three backends. Done. |
 | TLA+ model | Rewritten; both configurations pass. The on-demand workflow has never run on GitHub. |
-| Mutation testing | Tooling and a first baseline exist. The baseline is from one pass with known weak spots, and the runner that produced it is not in the repository. |
+| Mutation testing | Tooling, a first baseline and a repeat over two modules exist; the runner is in the repository. Outside those two modules most kills come from one pass. |
 
 ## State machine
 
@@ -65,10 +65,12 @@ python scripts/mutation.py summary
 ```
 
 `run` wraps `mutmut run` (two fixes it needs for this suite are in the
-script). mutmut needs `fork`, so `run` works on Linux, macOS and WSL, not on
-Windows. `.github/workflows/mutation.yml` does the same in eight shards when
-started by hand; it has never been started. Neither `run` nor the workflow
-has completed a run anywhere yet.
+script). mutmut needs `fork`, which Windows does not have: there `run` hands
+over to `scripts/mutation_windows.py`, which checks the same mutants against
+the same tests with one process per mutant. Every run so far was made that
+way. `.github/workflows/mutation.yml` does the same with mutmut itself in
+eight shards when started by hand; it has never been started, so mutmut's
+own `run` has not completed a run of this suite anywhere yet.
 
 ### First baseline
 
@@ -108,19 +110,27 @@ the test modules are imported with the mutant active, so a mutant in a
 function called at import time can stop pytest at collection. The runner
 counts that as a kill only if the same tests pass with no mutant.
 
-**That runner is not in the repository.** An untracked copy is in
-`scratch/mutation-windows/` of the working copy the run was made in. The
-result files (`results.json`, the diff of every survivor, `summary.md`) are
-in `mutation-results/` there, which is ignored.
+That runner is now `scripts/mutation_windows.py`; its docstring says how it
+differs from mutmut and how to repeat a set of verdicts. The baseline was
+made with an earlier copy of it, from a copy of the project. The result
+files are in `mutation-results/` of the working copy the runs were made
+in, which is ignored: one folder per run with `results.json` and the diff
+of every survivor, and a `summary.md` over both in which the later run
+replaces the earlier one for the modules it covers.
 
 ### What is unconfirmed
 
 - **A survivor is a finding as it stands.** The suite passed with the
   mutant active.
-- **Most kills come from one pass.** 1,935 of the 8,944 results that were
-  not "survived" have been repeated with a runner that caps each process at
-  8 GB. A repeat of all of them was stopped after 25 minutes; about 7,000
-  results have been seen once.
+- **Outside `_evaluator` and `_collections` most kills come from one
+  pass.** Those two modules have been run twice in full (see "Repeat over
+  `_evaluator` and `_collections`"). Of the baseline as a whole, 1,935 of
+  the 8,944 results that were not "survived" were repeated with a runner
+  that caps each process at 8 GB; a repeat of all of them was stopped
+  after 25 minutes.
+- **Some verdicts depend on how threads interleave**, and timeouts move
+  with the load. The repeat changed eleven verdicts that no new test
+  explains; they are listed in its section.
 - **The low-memory spell is settled.** For about 11 of the 310 minutes two
   mutants of `CascadeList.__iter__` had grown to 182 GB each and starved
   the other processes. All 282 results from that spell that were not
@@ -146,9 +156,9 @@ in `mutation-results/` there, which is ignored.
   each by its latest run: 95 as survived, the other three as killed. The
   state machine is also the test that failed for mutants 97 and 99 of that
   function, for `CascadeList._new_uid` mutant 3 and for `DiffLog.since`
-  mutant 5. A fixed test now fails for all of these but the last (see
-  "Covered since the baseline: uids of a reopened list"); the kill of
-  `DiffLog.since` mutant 5 still depends on chance.
+  mutant 5. Fixed tests now fail for all of these (see the two "Covered
+  since the baseline" sections on collections), so none of these kills
+  depends on chance any more.
 - The examples test used to load whatever cache the previous run had left
   in the working directory. `tests/test_examples.py` now runs each example
   in an empty directory. The first pass ran before that change.
@@ -186,12 +196,15 @@ Of the survivors, sorted roughly by the kind of change:
   95) the whole suite could pass; only the state machine failed, and only
   when its random examples happened to reopen a list and add to it. Found
   by the repeat of the low-memory spell (covered since, see below).
-- **No fixed test checks a read of a collection at an older revision once
+- **No fixed test checked a read of a collection at an older revision once
   its log no longer starts at zero.** In `DiffLog.since`, mutant 5 turns
   `up_to - self.base_rev` into `up_to + self.base_rev`. After a compaction,
-  or after reopening from a compacted state, a reader pinned at an older
-  revision would then be handed changes made after it. Every fixed test
-  passes with that change; only the state machine fails, in some runs.
+  or after reopening from a compacted state, a query run at a snapshot is
+  then handed changes made after the snapshot. Every fixed test passed with
+  that change, because wherever one reads at a snapshot the log's base is
+  still at zero: the tests with enough changes to compact hold a pin from
+  before the collection existed. Only the state machine failed, in some
+  runs (covered since, see below).
 - **TTL boundaries were not pinned.** In `try_mark_green`, `> ttl` could
   become `>= ttl`, and a dependency's expiry `<` could become `<=` (the
   first is covered since, the second changes nothing; see the next
@@ -205,8 +218,8 @@ Tests were added on 2026-11-24 for the disk-reload and TTL changes above and
 for the survivors in `_verify_disk_deps` that change a condition or a stored
 value. Each change was applied by hand to a copy of the source, to the sync
 function and to its async twin separately. The new tests fail on the copy
-and pass on the real source, on mdbx and on sqlite. No mutation run was
-repeated, so the table above is still the baseline.
+and pass on the real source, on mdbx and on sqlite. The repeat over
+`_evaluator` confirms them (see below).
 
 | Change (sync and async) | Killed by |
 |---|---|
@@ -268,8 +281,8 @@ and on sqlite. With a uid handed out twice, the change to the new item lands
 on an old one when the stored changes are replayed.
 
 Each change below was applied by hand to a copy of the source. The new test
-fails on the copy and passes on the real source. No mutation run was
-repeated, so the table above is still the baseline.
+fails on the copy and passes on the real source. The repeat over
+`_collections` confirms every row (see below).
 
 | Change | New test |
 |---|---|
@@ -283,29 +296,99 @@ only one that notices it. `_CollectionCore.__init__` mutant 100 (`uid + 2`)
 is not a defect and is not tested for: uids then skip a number and stay
 unique.
 
+### Covered since the baseline: snapshots of a compacted collection
+
+Two tests were added to `test_collection_compaction_pins.py` on 2026-11-24,
+each for a list, a set and a dict. A snapshot is taken once the log's base
+is above zero, the collection is changed, and a query run at the snapshot
+must return the contents as of the snapshot:
+
+- `test_snapshot_taken_after_a_compaction_keeps_its_contents`: the base
+  moved by compaction in memory;
+- `test_snapshot_of_a_collection_reopened_from_a_compacted_state_keeps_its_contents`:
+  the base comes from the snapshot stored on disk, on mdbx and on sqlite.
+
+With `DiffLog.since` mutant 5 applied by hand to a copy of the source all
+nine cases fail: the query at the snapshot returns the later changes too.
+They pass on the real source. The other four mutants of `since`, which
+ordinary tests already killed, fail them as well. In the repeat a snapshot
+test is the one that fails for mutant 5.
+
+### Repeat over `_evaluator` and `_collections`
+
+On 2026-11-24, after the tests of the three sections above, every mutant of
+the two modules was run again: 4,534 mutants against 1,967 tests, from the
+checkout, with `python scripts/mutation.py run` (so with
+`scripts/mutation_windows.py`), in 118 minutes on 28 processes. The mutants
+are the same as in the baseline, function by function.
+
+| Module | Killed | Survived | Timeout | Other | Survival rate | In the baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| `cascade._evaluator` | 2469 | 828 | 18 | 1 | 25.0% | 26.8% |
+| `cascade._collections` | 1102 | 116 | 0 | 0 | 9.5% | 9.4% |
+| **All fifteen modules**, the other thirteen as in the baseline | 8960 | 2281 | 36 | 5 | 20.2% | 20.8% |
+
+("Other" in the last row is three crashes and two mutants with no test.)
+
+- **The new tests do what the checks by hand said.** 62 mutants that
+  survived the baseline are now killed by one of them: 61 in `_evaluator`
+  and `_CollectionCore.__init__` mutant 95. Forty of the 61 are in the async
+  functions, which the new tests reach by awaiting on a running loop:
+  `try_mark_green_async` went from 40 survivors to 21, and
+  `_verify_disk_deps` and its async twin from 21 each to 13 each. Every
+  mutant the collection tests were written for is killed by them
+  (`__init__` 92 to 95, 97 and 99, `CascadeList._new_uid` 3,
+  `DiffLog.since` 5). Two timeouts of the baseline are kills as well
+  (`try_mark_green` 17, `DiffLog.compact_to` 11). In all, a new test is the
+  first to fail for 279 mutants.
+- **Six verdicts changed with how threads interleaved.** No new test
+  reaches these lines; the tests that do have threads in them.
+  - `compute_or_get_memo`, mutants 143, 152 and 153: killed in the baseline,
+    alive now. They change the calls made when a caller joins a run that
+    depends on a fixed point another thread is still iterating. Two of them
+    drop a required argument of `_await_cycle_heads`, so they raise as soon
+    as that line runs. In this run it did not run.
+  - `_CollectionCore.emit`, mutants 48 and 49: killed in both earlier runs,
+    the second time by
+    `test_snapshot_readers_and_a_writer_under_an_older_pin`, alive now.
+    With them a compaction that falls due inside a mutation runs at once
+    and not after it.
+  - `_await_cycle_heads`, mutant 5: alive in the baseline, killed now by
+    `test_many_threads_entering_a_cycle_at_random_while_inputs_change`.
+- **Five verdicts moved to or from a timeout** with no test to explain it:
+  two kills and two survivors of the baseline timed out
+  (`compute_or_get_memo_async` 75, 78 and 161, `_settle_dependencies` 79),
+  and one timeout survived (`_try_hydrate_from_disk` 177).
+- **Six kills have the state machine as the test that failed**
+  (`_CollectionCore.roll_back_to` 4 and 7, `Evaluator._store_memo_locked` 2
+  and 6, `Evaluator._default_version` 3 and 12), so they may not repeat.
+
+So a rate from one run is good to about a dozen mutants in these two
+modules, and two paths are tested only when threads happen to meet: the wait
+for another thread's cycle heads in the sync path, and a compaction that
+falls due while a mutation is in progress.
+
 ## Next steps
 
 In order of value for the time they take.
 
-1. **Decide where the Windows runner lives.** Either add it to the
-   repository behind `scripts/mutation.py run`, so that a run can be
-   repeated on the machine that has the cores, or drop it and rely on Linux
-   and the workflow. Until then the baseline cannot be reproduced from the
-   repository.
-2. **Start `.github/workflows/mutation.yml` once**, and
+1. **Start `.github/workflows/mutation.yml` once**, and
    `model-check.yml` once, to learn whether they work. One shard is enough
    for the first try.
-3. **Write a fixed test for a read of a collection at an older revision
-   after a compaction** (`DiffLog.since`, mutant 5). That is where the list
-   still points at behaviour and not at wording. The tests for the
-   disk-reload and TTL survivors and for the uids of a reopened list are
-   written (see the two "Covered since the baseline" sections); a mutation
-   run over `cascade._evaluator` and `cascade._collections` would confirm
-   them and update the table.
+2. **Write tests that force the two paths reached only by chance**: a
+   caller that joins a run depending on a fixed point another thread is
+   iterating (`compute_or_get_memo`, the call of `_await_cycle_heads`),
+   and a compaction that falls due inside a mutation
+   (`_CollectionCore.emit`). See "Repeat over `_evaluator` and
+   `_collections`".
+3. **Look at the survivors in the async paths that change a condition or
+   an operator.** `compute_or_get_memo_async` still has 78 survivors
+   against 42 in the sync function, and awaiting on a running loop is
+   what made the difference in `try_mark_green_async`.
 4. **Decide whether mutation runs fix the Hypothesis seed.** With random
    examples a few verdicts change from run to run; a fixed seed makes the
    rate comparable over time, at the price of always trying the same
-   examples.
+   examples. It does nothing for the verdicts that depend on threads.
 5. Leave the rest. Driving the overall rate down is not worth it: about a
    fifth of the survivors are strings, and many of the `None` arguments are
    tracing.

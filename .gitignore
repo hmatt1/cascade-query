@@ -7,6 +7,7 @@ __pycache__/
 .mutmut-cache
 mutants/
 mutation-results/
+mutation-workers/
 # TLC model checker output: state queues and counterexample traces
 states/
 *_TTrace_*.tla

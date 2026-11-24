@@ -1482,10 +1482,14 @@ Ordered by the risk they leave open.
     `scripts/mutation.py` runs mutmut (11,282 mutants on covered lines) and
     reports the survival rate per module with the diffs of the survivors.
     The first full run (2026-11-24) left 2,340 alive, 20.8%: from 41% in
-    `_serde` and 27% in `_evaluator` down to 9% in `_collections`. So the
-    95% line coverage figure overstates what the assertions would catch,
-    most in the async paths and where a result is reloaded from disk (its
-    TTL, its dependencies). `docs/verification-status.md` has the table,
-    how the run was made and what in it is unconfirmed. A full run is hours
-    of test runs, so it is done on demand, on a machine with many cores or
-    through `.github/workflows/mutation.yml`.
+    `_serde` and 27% in `_evaluator` down to 9% in `_collections`. Tests
+    written for what it showed, and a second run over those two modules,
+    brought that to 2,281, 20.2%. So the 95% line coverage figure
+    overstates what the assertions would catch, most in the async paths,
+    in the bookkeeping of a result reloaded from disk, and in two paths
+    that tests reach only when threads happen to meet.
+    `docs/verification-status.md` has the tables, how the runs were made
+    and what in them is unconfirmed. A full run is hours of test runs, so
+    it is done on demand, on a machine with many cores (on Windows through
+    `scripts/mutation_windows.py`) or through
+    `.github/workflows/mutation.yml`.

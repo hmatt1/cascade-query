@@ -1,16 +1,18 @@
 """Mutation testing with mutmut: run it, and turn its results into a report.
 
-    python scripts/mutation.py run [mutmut run args] run mutmut (POSIX only)
+    python scripts/mutation.py run [mutmut run args] run mutmut
     python scripts/mutation.py collect               mutants/ -> mutation-results/
     python scripts/mutation.py summary               the report, as Markdown
     python scripts/mutation.py shards [NAME ...]     the CI matrix, as JSON
 
 On one machine, the first three in that order are a whole run. mutmut needs
-``fork``: Linux, macOS or WSL. ``.github/workflows/mutation.yml`` (started
-by hand) does the same split over several runners: one ``run`` + ``collect``
-per shard, one ``summary`` over all of them. The survival rate is the share
-of mutants the tests ran against and did not notice: code that is covered
-but whose behaviour no assertion pins down.
+``fork``, which Windows does not have: there ``run`` hands over to
+``scripts/mutation_windows.py``, which checks the same mutants against the
+same tests with one process per mutant. ``.github/workflows/mutation.yml``
+(started by hand) does the same split over several runners: one ``run`` +
+``collect`` per shard, one ``summary`` over all of them. The survival rate
+is the share of mutants the tests ran against and did not notice: code that
+is covered but whose behaviour no assertion pins down.
 """
 
 from __future__ import annotations
@@ -112,6 +114,14 @@ def run(mutmut_args: list[str]) -> int:
     Both steps were found by running the suite the way mutmut does; without
     them mutmut stops with "failed to collect stats".
     """
+    if sys.platform == "win32":
+        # No fork: the same mutants and tests, one process per mutant. It
+        # takes mutant patterns and --max-children as mutmut does.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import mutation_windows
+
+        return mutation_windows.main(["all", *mutmut_args])
+
     # mutmut runs the suite several times in one process and, after its
     # coverage pass, drops every module that pass imported so that the
     # mutated copies get imported next. A msgpack imported a second time no
@@ -164,6 +174,11 @@ def _survivor_diffs(survivors: dict[Path, list[str]], limit: int) -> str:
     try:
         # mutmut refuses to import on Windows, with a message on stdout.
         with contextlib.redirect_stdout(said):
+            if sys.platform == "win32":
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                import mutation_windows
+
+                mutation_windows.import_mutmut()
             import libcst as cst
             from mutmut.__main__ import (
                 read_mutant_function,

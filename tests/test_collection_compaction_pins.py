@@ -281,3 +281,81 @@ def test_snapshot_readers_and_a_writer_under_an_older_pin() -> None:
     assert n() == 2 * CHURN + 1
     assert n(snapshot=before_collection) == 0
     before_collection.release()
+
+
+# --- reads at an older revision once the log no longer starts at zero ---
+#
+# The tests above hold a pin from before the collection exists, so its log
+# keeps its base at revision zero for as long as they read. A reader at an
+# older revision is counted from the base, and that is only visible when the
+# base has moved: after a compaction, or after reopening a compacted
+# collection.
+
+
+def _collection(kind: str, engine: Engine, name: str | None = None) -> Any:
+    """A collection of ints and a function that adds one to it."""
+    if kind == "list":
+        xs = CascadeList(engine, name=name)
+        return xs, xs.append
+    if kind == "set":
+        tags = CascadeSet(engine, name=name)
+        return tags, tags.add
+    table = CascadeDict(engine, name=name)
+    return table, lambda i: table.__setitem__(i, i)
+
+
+@pytest.mark.parametrize("kind", ["list", "set", "dict"])
+def test_snapshot_taken_after_a_compaction_keeps_its_contents(kind: str) -> None:
+    engine = Engine()
+    coll, add = _collection(kind, engine)
+
+    @engine.query
+    def contents() -> list[int]:
+        return sorted(coll)
+
+    for i in range(CHURN):
+        add(i)
+    assert _log(coll).base_rev > 0
+
+    snapshot = engine.snapshot()
+    for i in range(CHURN, CHURN + 5):
+        add(i)
+    assert contents(snapshot=snapshot) == list(range(CHURN))
+    assert contents() == list(range(CHURN + 5))
+
+    # The pin holds while compaction goes on behind it.
+    later = engine.snapshot()
+    for i in range(CHURN + 5, 2 * CHURN):
+        add(i)
+    assert contents(snapshot=later) == list(range(CHURN + 5))
+    assert contents() == list(range(2 * CHURN))
+    snapshot.release()
+    later.release()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("kind", ["list", "set", "dict"])
+def test_snapshot_of_a_collection_reopened_from_a_compacted_state_keeps_its_contents(
+    tmp_path: Path, kind: str, backend: str
+) -> None:
+    with Engine(cache_dir=tmp_path, cache_backend=backend) as engine:
+        coll, add = _collection(kind, engine, name="c")
+        for i in range(3):
+            add(i)
+        coll.compact()
+
+    with Engine(cache_dir=tmp_path, cache_backend=backend) as engine:
+        coll, add = _collection(kind, engine, name="c")
+        # Loaded from the stored snapshot: the log starts at its revision.
+        assert _log(coll).base_rev > 0
+
+        @engine.query
+        def contents() -> list[int]:
+            return sorted(coll)
+
+        snapshot = engine.snapshot()
+        add(3)
+        add(4)
+        assert contents(snapshot=snapshot) == [0, 1, 2]
+        assert contents() == [0, 1, 2, 3, 4]
+        snapshot.release()
