@@ -28,7 +28,7 @@ Every open defect has a failing regression test in
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
 | G5 | Concurrent requests for one query at one revision run the body once | Holds with limits | Strong |
 | G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits | Good |
-| G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits (D24–D26) | Good on one thread |
+| G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits (D25, D26) | Good, threads and tasks included |
 | G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits | Strong |
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
@@ -265,10 +265,21 @@ Limits, by design:
   stored.
 - **Every run re-runs the whole cycle**, and a head nested in another head's
   cycle starts again from its initial guess on each run of the outer one.
-- **One thread per cycle.** Any number of threads may ask for the head of a
-  cycle. A thread that asks for another member while the cycle is being
-  iterated, or two threads that enter one cycle through different queries,
-  can deadlock (D24).
+- **Threads and tasks.** Any number of threads or asyncio tasks may enter one
+  cycle at once, through the head or through other members. A caller that
+  would wait for a query another thread or task is running, while that one
+  waits (directly or through others) for a query this caller is running,
+  does not wait: the engine keeps a record of which run each blocked thread
+  or awaiting task waits for, finds the loop in it, and runs the query on
+  the caller's own stack, where the cycle is handled as on one thread. A
+  caller whose joined run ended in a `CycleError` runs the query itself
+  too, since whether a cycle is an error depends on where it was entered.
+  So whoever entered through the head gets the fixed point, and a caller
+  that entered through another member gets it as well or a `CycleError`;
+  without `fixed_point=` every caller gets `CycleError`. A loop closed
+  through a wait the engine cannot see (a query body that blocks on a
+  thread of its own, or awaits `asyncio.to_thread`, which then calls back
+  into the cycle) is not detected and still hangs.
 
 Enforced by: `test_engine.py::test_cycle_detection`,
 `::test_long_chain_cycle_detection_behavior`, `test_async_coverage.py::test_async_cycle`,
@@ -293,7 +304,12 @@ Enforced by: `test_engine.py::test_cycle_detection`,
 `::test_threads_reading_a_fixed_point_at_different_revisions`,
 `::test_async_fixed_point_honours_snapshots_and_the_revision`,
 `::test_fixed_point_with_a_disk_cache` (both backends),
-`test_known_defects.py::test_d2_fixed_point_query_honours_snapshot`.
+`test_known_defects.py::test_d2_fixed_point_query_honours_snapshot`,
+`::test_d24_threads_entering_a_cycle_from_both_ends_do_not_deadlock`,
+`test_cross_thread_cycles.py` (two threads in both orders with and without
+`fixed_point=`, three threads in a three-query cycle, tasks under
+`asyncio.gather`, a task and a thread, a stress run of six threads entering
+at random members while the input changes).
 
 ### G8. Error caching
 
@@ -496,9 +512,9 @@ traces and stats. All of these take the store lock. Mutating a collection is
 safe from any thread; while a transaction that changed it is open, a
 mutation from outside that transaction raises `RuntimeError` (G25).
 
-Not safe: two threads calling into one dependency cycle through different
-queries (D24). Two engines changing the same named collection is refused
-with `PersistentCacheError` (G26).
+Two threads or tasks entering one dependency cycle through different queries
+get what one thread would (G7). Two engines changing the same named
+collection is refused with `PersistentCacheError` (G26).
 
 ## Persistence
 
@@ -1019,7 +1035,6 @@ time; nothing is in that state now.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
 | D25 | After the cached result of a fixed-point cycle member is dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changes, a query that depends on that member raises `CycleError`. With the member's result still cached the same call returns the right value. The member is recomputed on its own, enters the cycle from the wrong end and reaches itself before the head. | Reproduced |
 
 ### Fixed since the audit
@@ -1049,6 +1064,7 @@ time; nothing is in that state now.
 | D20 | A query result that could not be encoded raised a bare `TypeError` from the codec, even with no `cache_dir`, naming the unsupported type but not the query; an exception with unencodable `args` was replaced by that `TypeError`. A result now raises `UnencodableValueError` (a `TypeError`) naming the query, the path to the bad part and its type, and is not cached; an exception that cannot be encoded reaches the caller as itself, uncached. Input values and `fixed_point=` guesses get the same error. | `fix: an unencodable result raised an error naming no query and hid the query's own exception` |
 | D19 | A direct caller that joined a `submit`-owned run of the same query received the owner's `QueryCancelled`, though only `submit` cancels. A caller whose run ends in another call's `QueryCancelled` now checks its own cancellation and, if it is not cancelled, runs the query itself at its own revision. | `fix: a direct call that joined a submitted run was cancelled with it` |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocked; reachable through the public API when a sync query that depends on an async query was called on the loop thread while that async query ran there. Also: a sync query body calling an async query on the loop thread got a coroutine back and cached the resulting `TypeError`, and a stale async dependency recomputed there cached `asyncio.run`'s `RuntimeError`. In-flight runs now record their owner (thread or task); a synchronous wait for a task on the caller's own thread is never started, and synchronous code on a loop thread raises `EventLoopBlockedError` where it would have to run or wait for an async query. | `fix: a sync call on the event loop's thread hung waiting for an async query` |
+| D24 | Two threads that entered one dependency cycle through different queries waited for each other for ever: each ran one query and asked for the other. With `fixed_point=` neither got a value; without it neither got a `CycleError`. In-flight runs now record their owner, blocked threads and awaiting tasks record the run they wait for, and a caller whose wait would close a loop runs the query on its own stack instead, where the cycle is handled as on one thread. A caller whose joined run ended in a `CycleError` (or the internal re-entry signal of a verification) runs the query itself. Found and fixed with it: once threads had read one fixed-point cycle at different revisions, the stored results could depend on each other in a loop, and verifying them recursed until `RecursionError`, which was then cached as a query's result; a verification walk that reaches a query it is already bringing up to date now counts it as changed. | `fix: two threads entering one cycle through different queries waited for each other for ever` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -1083,8 +1099,9 @@ Limits that narrow use without stopping it:
 - **Only `submit` cancels.** An editor-style tool that calls queries directly
   or through `compute_many` cannot abandon stale work.
 - **A dependency cycle has one way in.** Only the query with `fixed_point=`
-  can be reached again, so a cycle has to be entered through it, and from one
-  thread at a time (G7, D24, D25).
+  can be reached again, so a cycle has to be entered through it to get its
+  value; a caller entering through another member may get `CycleError`
+  (G7, D25).
 - **Positional, hashable arguments only**, with equal arguments sharing a key.
 - **Dict order counts.** A result or input value whose dict order varies
   without meaning defeats early bail-out and reuse across runs (G2).

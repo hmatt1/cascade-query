@@ -201,7 +201,7 @@ def net_profit() -> float:
     return base_profit() - bonus_pool()
 ```
 
-The iteration happens at the caller's revision: `bonus_pool(snapshot=s)` is the fixed point for the inputs as of `s`, and evaluating a fixed point never moves `engine.revision`. A cycle that has not converged after 1000 runs raises `CycleError`; pass `max_iterations=` to change the limit. Enter a cycle through the query that has `fixed_point=`, and from one thread at a time (see G7 in `docs/guarantees.md`).
+The iteration happens at the caller's revision: `bonus_pool(snapshot=s)` is the fixed point for the inputs as of `s`, and evaluating a fixed point never moves `engine.revision`. A cycle that has not converged after 1000 runs raises `CycleError`; pass `max_iterations=` to change the limit. Enter a cycle through the query that has `fixed_point=`. Several threads or tasks may enter one cycle at once, also through different queries: the one that entered through the head gets the fixed point, and one that entered through another member gets it too or a `CycleError`, as it would on one thread (see G7 in `docs/guarantees.md`).
 
 ### Error Caching
 By default, queries intercept and cache exceptions (excluding control flow exceptions like `QueryCancelled`). The caller always gets the exception the query raised: one whose `args` cannot be encoded is raised as it is and not cached.

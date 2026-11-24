@@ -816,7 +816,6 @@ def test_d23_async_query_result_is_reused_by_a_new_engine(
     assert runs["n"] == 1
 
 
-@_defect(24, "two threads entering one cycle from different queries deadlock")
 def test_d24_threads_entering_a_cycle_from_both_ends_do_not_deadlock() -> None:
     engine = Engine()
     in_head = threading.Event()

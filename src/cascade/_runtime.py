@@ -55,3 +55,6 @@ class RuntimeState:
     # Set on a shadow runtime (one that brings a dependency up to date for
     # a verification): the runtime that started the verification.
     outer: RuntimeState | None = None
+    # True for a runtime that brings a dependency up to date for a
+    # verification (a shadow runtime), and for everything run inside it.
+    verifying: bool = False

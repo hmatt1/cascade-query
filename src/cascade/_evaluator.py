@@ -152,6 +152,14 @@ class Evaluator:
         # Keys currently being verified against the disk cache in this context.
         # Guards against unbounded recursion if a corrupted store ever encodes
         # a dependency cycle; real cycles are still caught by the frame stack.
+        # Queries whose results this context is bringing up to date for a
+        # verification (``_dependency_entry``). Stored results can depend on
+        # each other in a cycle (results of a fixed-point cycle read at
+        # different revisions by different threads); a walk that reaches
+        # one of these again counts it as changed instead of recursing.
+        self._verifying_var: contextvars.ContextVar[frozenset[QueryKey]] = (
+            contextvars.ContextVar("cascade_verifying", default=frozenset())
+        )
         self._hydrating_var: contextvars.ContextVar[frozenset[QueryKey]] = (
             contextvars.ContextVar("cascade_hydrating", default=frozenset())
         )
@@ -714,19 +722,33 @@ class Evaluator:
             if not waits:
                 return self._run_instead_of_waiting(key, fn, runtime, slot), False
             self._store.trace_event("dedup_wait", key)
+            # The error objects come from another thread's run and are
+            # shared by every caller that joined it, so the retries below
+            # run outside the except clauses: an error raised there must not
+            # get one of them as its context.
+            pending_heads = failed = None
             try:
                 result = waiter_future.result()
             except _ProvisionalResult as pending_cycle:
-                self._leave_wait(agent, slot)
-                self._await_cycle_heads(pending_cycle.heads, runtime)
-                return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
-            except QueryCancelled as exc:
-                self._leave_wait(agent, slot)
-                self._joined_run_failed(key, runtime, exc)
-                return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
+                pending_heads = pending_cycle.heads
+            except (QueryCancelled, CycleError, _ReenteredQuery) as exc:
+                if not self._retry_after(exc, runtime):
+                    raise
+                failed = exc
             finally:
                 self._leave_wait(agent, slot)
-            return result, True
+            if pending_heads is not None:
+                if self._owns_any(runtime, pending_heads):
+                    # Computed from another run's guess for a head this
+                    # caller is iterating itself: run it here, on our guess.
+                    return self._run_instead_of_waiting(key, fn, runtime, slot), False
+                self._await_cycle_heads(pending_heads, runtime)
+            elif failed is not None:
+                self._joined_run_failed(key, runtime, failed)
+                failed = None
+            else:
+                return result, True
+            return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
 
         try:
             hydrated: MemoEntry | None = None
@@ -824,23 +846,33 @@ class Evaluator:
             if not waits:
                 return await self._run_instead_of_waiting_async(key, fn, runtime), False
             self._store.trace_event("dedup_wait", key)
+            # See compute_or_get_memo: retries run outside the except clauses.
+            pending_heads = failed = None
             try:
                 result = await asyncio.wrap_future(waiter_future)
             except _ProvisionalResult as pending_cycle:
-                self._leave_wait(agent, slot)
-                await self._await_cycle_heads_async(pending_cycle.heads, runtime)
-                return await self.compute_or_get_memo_async(
-                    key, fn, runtime, need_value=need_value
-                )
-            except QueryCancelled as exc:
-                self._leave_wait(agent, slot)
-                self._joined_run_failed(key, runtime, exc)
-                return await self.compute_or_get_memo_async(
-                    key, fn, runtime, need_value=need_value
-                )
+                pending_heads = pending_cycle.heads
+            except (QueryCancelled, CycleError, _ReenteredQuery) as exc:
+                if not self._retry_after(exc, runtime):
+                    raise
+                failed = exc
             finally:
                 self._leave_wait(agent, slot)
-            return result, True
+            if pending_heads is not None:
+                if self._owns_any(runtime, pending_heads):
+                    return (
+                        await self._run_instead_of_waiting_async(key, fn, runtime),
+                        False,
+                    )
+                await self._await_cycle_heads_async(pending_heads, runtime)
+            elif failed is not None:
+                self._joined_run_failed(key, runtime, failed)
+                failed = None
+            else:
+                return result, True
+            return await self.compute_or_get_memo_async(
+                key, fn, runtime, need_value=need_value
+            )
 
         try:
             hydrated: MemoEntry | None = None
@@ -861,6 +893,17 @@ class Evaluator:
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
 
+    @staticmethod
+    def _retry_after(exc: BaseException, runtime: RuntimeState) -> bool:
+        """Whether a caller whose joined run raised ``exc`` runs the query itself.
+
+        Not for a ``CycleError`` met while verifying a dependency: there it
+        propagates as before, the verification counts the dependency as
+        changed, and the query it verifies runs for real, where a joined
+        ``CycleError`` is retried.
+        """
+        return not (runtime.verifying and isinstance(exc, CycleError))
+
     def _joined_run_failed(
         self, key: QueryKey, runtime: RuntimeState, exc: BaseException
     ) -> None:
@@ -872,6 +915,16 @@ class Evaluator:
         ``compute_many``), or a submitted one that started after the change,
         claims the query again and runs it at its own revision. A caller
         that is cancelled itself raises its own ``QueryCancelled`` here.
+
+        ``CycleError``: whether a cycle is an error depends on where it was
+        entered (a fixed-point cycle entered through a member raises, entered
+        through its head converges), so the owner's error says nothing about
+        this caller, which runs the query itself and meets the cycle from its
+        own stack. Never cached, so the retry cannot loop on a stored error.
+
+        ``_ReenteredQuery``: the owner abandoned a verification that reached
+        a query running in its own runtime; that says nothing about this
+        caller either.
         """
         if isinstance(exc, QueryCancelled):
             self.check_cancelled(runtime.cancel_epoch)
@@ -892,11 +945,14 @@ class Evaluator:
         ``agent`` is a thread id for a synchronous caller (``blocking``) and
         an asyncio task for an async one; ``thread`` is the thread it runs
         on. Follows the chain owner -> run that owner waits for -> its owner
-        and so on. Waiting never ends when a blocking caller would wait for
-        a task on its own thread: that task needs the thread back to finish.
-        A task that is not waiting for a run can still be stuck because its
-        thread is blocked; the chain goes on through what that thread waits
-        for.
+        and so on. Waiting never ends when the chain comes back to
+        ``agent``: two threads or tasks that entered one dependency cycle
+        through different queries, each running one query and waiting for
+        the other's. It also never ends when a blocking caller would wait
+        for a task on its own thread: that task needs the thread back to
+        finish. A task that is not waiting for a run can still be stuck
+        because its thread is blocked; the chain goes on through what that
+        thread waits for.
 
         Returns True when registered (wait, then call ``_leave_wait``),
         False when waiting would never end (run the query on this stack
@@ -911,7 +967,7 @@ class Evaluator:
         current: InFlight | None = slot
         while current is not None:
             owner = current.owner
-            if blocking and owner != thread and current.owner_thread == thread:
+            if owner == agent or (blocking and current.owner_thread == thread):
                 self._store.trace_event("dedup_cycle", key)
                 return False
             if owner in seen:
@@ -942,8 +998,10 @@ class Evaluator:
         """Run ``key`` on this stack because waiting for its owner never ends.
 
         The owner keeps its in-flight slot and finishes its own run later.
-        A synchronous query run by a task on this thread's event loop is
-        simply run here. An async one cannot be.
+        Run here, the query reaches what is running on this stack again, so
+        the cycle is handled as on one thread: the guess of a fixed-point
+        head, or ``CycleError``. A synchronous query run by a task on this
+        thread's event loop is simply run here too. An async one cannot be.
         """
         if slot.owner_thread == threading.get_ident() and inspect.iscoroutinefunction(
             fn
@@ -1308,7 +1366,22 @@ class Evaluator:
             for frame in runtime.stack:
                 if frame.key == key:
                     return None
+        verifying = self._verifying_var.get()
+        if key in verifying:
+            return None
+        token = self._verifying_var.set(verifying | {key})
+        try:
+            return self._dependency_entry_shadowed(key, fn, snapshot, runtime)
+        finally:
+            self._verifying_var.reset(token)
 
+    def _dependency_entry_shadowed(
+        self,
+        key: QueryKey,
+        fn: Callable[..., Any],
+        snapshot: Snapshot,
+        runtime: RuntimeState | None,
+    ) -> MemoEntry:
         if runtime is None:
             self._store.pin_snapshot(snapshot)
             entry = self._run_in_runtime(
@@ -1320,6 +1393,7 @@ class Evaluator:
                     cancel_epoch=None,
                     snapshot_explicit=True,
                     pins=[snapshot.revision],
+                    verifying=True,
                 ),
                 lambda: self._shadow_entry(key, fn, need_value=False),
             )
@@ -1336,6 +1410,7 @@ class Evaluator:
                 outer=(
                     runtime if runtime.stack or runtime.provisional else runtime.outer
                 ),
+                verifying=True,
             )
             entry = self._run_in_runtime(
                 shadow,
@@ -1375,7 +1450,24 @@ class Evaluator:
             for frame in runtime.stack:
                 if frame.key == key:
                     return None
+        verifying = self._verifying_var.get()
+        if key in verifying:
+            return None
+        token = self._verifying_var.set(verifying | {key})
+        try:
+            return await self._dependency_entry_shadowed_async(
+                key, fn, snapshot, runtime
+            )
+        finally:
+            self._verifying_var.reset(token)
 
+    async def _dependency_entry_shadowed_async(
+        self,
+        key: QueryKey,
+        fn: Callable[..., Any],
+        snapshot: Snapshot,
+        runtime: RuntimeState | None,
+    ) -> MemoEntry:  # pragma: no cover
         if runtime is None:
             self._store.pin_snapshot(snapshot)
             entry = await self._run_in_runtime_async(
@@ -1388,6 +1480,7 @@ class Evaluator:
                     snapshot_explicit=True,
                     is_async=True,
                     pins=[snapshot.revision],
+                    verifying=True,
                 ),
                 lambda: self._shadow_entry_async(key, fn, need_value=False),
             )
@@ -1401,6 +1494,7 @@ class Evaluator:
                 snapshot_explicit=True,
                 is_async=True,
                 outer=self._shadow_outer(runtime),
+                verifying=True,
             )
             entry = await self._run_in_runtime_async(
                 shadow,
@@ -1566,6 +1660,10 @@ class Evaluator:
             if frame.key == key:
                 return True
         return False
+
+    @classmethod
+    def _owns_any(cls, runtime: RuntimeState, keys: frozenset[QueryKey]) -> bool:
+        return any(cls._owns(runtime, key) for key in keys)
 
     def _reentry_is_ours(self, reentry: _ReenteredQuery) -> bool:
         runtime = self._runtime_var.get()
@@ -1772,6 +1870,7 @@ class Evaluator:
             pins=runtime.pins,
             provisional=runtime.provisional,
             outer=runtime.outer,
+            verifying=runtime.verifying,
         )
         frame.runtime = new_runtime
         token = self._runtime_var.set(new_runtime)
@@ -2244,6 +2343,7 @@ class Evaluator:
             snapshot_explicit=runtime.snapshot_explicit,
             # Inlined ``_shadow_outer``.
             outer=(runtime if runtime.stack or runtime.provisional else runtime.outer),
+            verifying=True,
         )
         entry = self._run_in_runtime(
             shadow,
@@ -2481,6 +2581,7 @@ class Evaluator:
             snapshot_explicit=runtime.snapshot_explicit,
             is_async=True,
             outer=self._shadow_outer(runtime),
+            verifying=True,
         )
         entry = await self._run_in_runtime_async(
             shadow,
