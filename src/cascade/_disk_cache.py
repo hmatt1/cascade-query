@@ -76,7 +76,10 @@ class TxnContext:
 # 3: dicts are encoded in insertion order, and value fingerprints depend on
 #    it. A format 2 result holds its dicts in sorted key order, which is not
 #    the order the query returned, so format 2 results are not served.
-DISK_FORMAT = 3
+# 4: new value types (Enum, Decimal, paths, ...; see _canonical), and a
+#    bytearray is stored as itself: format 3 stored it as bytes, so a result
+#    that returned one came back as bytes.
+DISK_FORMAT = 4
 
 # Values whose canonical encoding is at most this many bytes are stored
 # inside their meta record instead of the content-addressed blob store, so
@@ -89,7 +92,13 @@ _FORMAT_KEY = b"format"
 # so that a ``DISK_FORMAT`` bump keeps them. Bump it only together with code
 # that migrates the older formats: collection data must never be dropped.
 # 1: snapshot record and one diff per revision, each a canonical msgpack map.
-COLLECTION_FORMAT = 1
+# 2: the same, with the value types of result format 4 (Enum, Decimal, ...,
+#    a bytearray as itself). Format 1 logs are read unchanged, so a directory
+#    in format 1 is only restamped; a release that reads only format 1
+#    refuses it instead of failing on a value it does not know.
+COLLECTION_FORMAT = 2
+# Collection formats this version reads.
+_READABLE_COLLECTION_FORMATS = frozenset({1, 2})
 _COLLECTION_FORMAT_KEY = b"collections_format"
 # Directories written before collections had a stamp of their own carry only
 # the result-cache stamp. This maps that stamp to the collection format the
@@ -126,11 +135,11 @@ def _check_collection_format(
                 "recomputed: open the directory with the version that wrote "
                 "it, or delete the directory if the data is not needed."
             )
-    if stored != COLLECTION_FORMAT:
+    if stored not in _READABLE_COLLECTION_FORMATS:
         raise PersistentCacheError(
             f"the cache at {path!r} holds named collections in collection "
-            f"format {stored}; this version of cascade reads format "
-            f"{COLLECTION_FORMAT}. Nothing was changed. Collection data "
+            f"format {stored}; this version of cascade reads formats "
+            f"{sorted(_READABLE_COLLECTION_FORMATS)}. Nothing was changed. Collection data "
             "cannot be recomputed: open the directory with a version of "
             "cascade that reads it, or delete the directory if the data is "
             "not needed."

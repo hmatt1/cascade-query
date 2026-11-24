@@ -2000,7 +2000,7 @@ class Evaluator:
         if not self._should_cache_error(key, exc):
             return None
         try:
-            return self._store.stable_hash(exc)
+            return self._store.digest_or_opaque(exc)
         except TypeError:
             self._store.trace_event(
                 "error_not_cached", key, detail="exception args cannot be encoded"
@@ -2217,7 +2217,7 @@ class Evaluator:
         revision = runtime.snapshot.revision
         if value_hash is None:
             try:
-                value_hash = store.stable_hash(result)
+                value_hash = store.digest_or_opaque(result)
             except TypeError as exc:
                 raise self._fail_unencodable(key, frame, runtime, result, exc) from exc
 

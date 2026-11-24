@@ -106,8 +106,10 @@ def test_round_trip_preserves_container_types() -> None:
     assert type(point) is _Point
 
 
-def test_bytearray_collapses_to_bytes_and_nan_round_trips() -> None:
-    assert canonical.decode(canonical.encode(bytearray(b"ab"))) == b"ab"
+def test_bytearray_round_trips_and_nan_round_trips() -> None:
+    # Disk format 4 keeps a bytearray a bytearray (format 3 gave bytes).
+    out = canonical.decode(canonical.encode(bytearray(b"ab")))
+    assert out == b"ab" and type(out) is bytearray
     out = canonical.decode(canonical.encode(float("nan")))
     assert out != out  # NaN
 

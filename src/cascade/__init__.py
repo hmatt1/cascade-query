@@ -1,6 +1,7 @@
 from ._collections import CascadeDict, CascadeList, CascadeSet
 from ._graph_export import condense_graph, export_dot, export_mermaid
 from ._state import QueryKey
+from ._types import register_type
 from .engine import (
     Accumulator,
     CancellationError,
@@ -38,4 +39,5 @@ __all__ = [
     "condense_graph",
     "export_dot",
     "export_mermaid",
+    "register_type",
 ]

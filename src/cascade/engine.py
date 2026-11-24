@@ -38,6 +38,7 @@ from ._state import (
     TraceEvent,
 )
 from ._store import DEFAULT_FIXED_POINT_ITERATIONS, GraphStore
+from ._types import register_type as _register_type
 
 _get_loop = getattr(asyncio, "_get_running_loop", None)
 
@@ -476,6 +477,7 @@ class Engine:
             stats_eviction_recent_cap=stats_eviction_recent_cap,
             monotonic_seconds=stats_clock,
             value_digest=value_digest,
+            allow_opaque=cache_dir is None,
         )
         self._evaluator = Evaluator(
             self._store, disk=self._disk, get_executor=self._ensure_submit_executor
@@ -605,6 +607,21 @@ class Engine:
 
     def accumulator(self, name: str) -> Accumulator:
         return Accumulator(self, name=name)
+
+    @staticmethod
+    def register_type(
+        cls: type,
+        *,
+        encode: Callable[[Any], Any],
+        decode: Callable[[Any], Any],
+        name: str | None = None,
+    ) -> None:
+        """Make instances of ``cls`` encodable; see ``cascade.register_type``.
+
+        The registration is process-wide, like the class: every engine
+        uses it.
+        """
+        _register_type(cls, encode=encode, decode=decode, name=name)
 
     def flush_disk(self) -> None:
         """Wait until every finished result is written to the persistent cache.

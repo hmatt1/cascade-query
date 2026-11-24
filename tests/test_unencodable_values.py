@@ -1,9 +1,12 @@
 """Values Cascade cannot encode are reported clearly, never masked (G8, D20).
 
-A query result that cannot be encoded raises ``UnencodableValueError`` (a
-``TypeError``) naming the query, the path to the bad part and its type; it
-is not cached. An exception raised by a query reaches the caller as itself,
-even when its ``args`` cannot be encoded; it is then not cached.
+With ``cache_dir``, a query result that cannot be encoded raises
+``UnencodableValueError`` (a ``TypeError``) naming the query, the path to
+the bad part and its type; it is not cached. An exception raised by a query
+reaches the caller as itself, even when its ``args`` cannot be encoded; it
+is then not cached. Without ``cache_dir`` such results and exceptions are
+kept as they are (``test_opaque_values.py``). Input values and fixed-point
+guesses must be encodable on every engine.
 """
 
 from __future__ import annotations
@@ -45,6 +48,14 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
     eng.shutdown()
 
 
+@pytest.fixture(params=BACKENDS)
+def disk_engine(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
+    """Results must be encodable only where they are written to disk."""
+    eng = Engine(cache_dir=tmp_path, cache_backend=request.param)
+    yield eng
+    eng.shutdown()
+
+
 @pytest.mark.parametrize(
     ("value", "path"),
     [
@@ -58,8 +69,9 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
     ],
 )
 def test_unencodable_result_names_the_query_path_and_type(
-    engine: Engine, value: Any, path: str
+    disk_engine: Engine, value: Any, path: str
 ) -> None:
+    engine = disk_engine
     runs = {"n": 0}
 
     @engine.query
@@ -81,8 +93,9 @@ def test_unencodable_result_names_the_query_path_and_type(
 
 
 def test_exception_with_unencodable_args_reaches_the_caller_uncached(
-    engine: Engine,
+    disk_engine: Engine,
 ) -> None:
+    engine = disk_engine
     runs = {"n": 0}
     raised: list[BaseException] = []
 
@@ -117,7 +130,11 @@ def test_encodable_exceptions_are_still_cached(engine: Engine) -> None:
     assert runs["n"] == 1
 
 
-def test_caller_that_catches_the_error_still_tracks_what_failed(engine: Engine) -> None:
+def test_caller_that_catches_the_error_still_tracks_what_failed(
+    disk_engine: Engine,
+) -> None:
+    engine = disk_engine
+
     @engine.input
     def mode() -> str:
         return "bad"
@@ -146,7 +163,9 @@ def test_caller_that_catches_the_error_still_tracks_what_failed(engine: Engine) 
     assert raw_parent() == "fine"
 
 
-def test_unencodable_async_result_is_reported(engine: Engine) -> None:
+def test_unencodable_async_result_is_reported(disk_engine: Engine) -> None:
+    engine = disk_engine
+
     @engine.query
     async def make() -> Any:
         return {"deep": [Plain()]}
@@ -223,7 +242,9 @@ def test_unencodable_fixed_point_results_are_reported_not_hung() -> None:
     assert not engine._internals.in_flight  # noqa: SLF001
 
 
-def test_compute_many_reports_the_query(engine: Engine) -> None:
+def test_compute_many_reports_the_query(disk_engine: Engine) -> None:
+    engine = disk_engine
+
     @engine.query
     def item(i: int) -> Any:
         return Plain() if i == 2 else i

@@ -8,14 +8,20 @@ in a canonical one. ``_canonical`` follows the same rule for the disk cache.
 from __future__ import annotations
 
 import base64
+import collections
 import dataclasses
 import datetime
+import decimal
+import enum
+import fractions
 import hashlib
 import json
 import math
 import reprlib
+import uuid
 from typing import Any, Callable, Iterator
 
+from . import _canonical, _types
 from ._errors import UnencodableValueError
 
 # What json.dumps(..., ensure_ascii=False) emits for a str.
@@ -102,18 +108,62 @@ def _to_jsonable(obj: Any) -> Any:
         return obj
     if type(obj) is bytes:
         return {"__bytes__": base64.standard_b64encode(obj).decode("ascii")}
+    reg = _types.registration_for(type(obj))
+    if reg is not None:
+        return {
+            "__registered__": [
+                reg.name,
+                _to_jsonable(_types.encode_registered(reg, obj)),
+            ]
+        }
     if type(obj) is bytearray:
-        return {"__bytes__": base64.standard_b64encode(bytes(obj)).decode("ascii")}
+        return {"__bytearray__": base64.standard_b64encode(bytes(obj)).decode("ascii")}
     if isinstance(obj, datetime.datetime):
+        if obj.fold:
+            return {"__datetime__": obj.isoformat(), "fold": 1}
         return {"__datetime__": obj.isoformat()}
     if isinstance(obj, datetime.date):
         return {"__date__": obj.isoformat()}
     if isinstance(obj, datetime.time):
+        if obj.fold:
+            return {"__time__": obj.isoformat(), "fold": 1}
         return {"__time__": obj.isoformat()}
     if isinstance(obj, datetime.timedelta):
         return {"__timedelta__": [obj.days, obj.seconds, obj.microseconds]}
     if isinstance(obj, datetime.timezone):
         return {"__timezone__": [_to_jsonable(obj.utcoffset(None)), obj.tzname(None)]}
+    t = type(obj)
+    if isinstance(obj, enum.Enum):
+        by_name, payload = _canonical.enum_payload(obj)
+        return {
+            "__enum__": {
+                "m": t.__module__,
+                "q": t.__qualname__,
+                "n" if by_name else "v": payload if by_name else _to_jsonable(payload),
+            }
+        }
+    if t is decimal.Decimal:
+        return {"__decimal__": str(obj)}
+    if t is fractions.Fraction:
+        return {"__fraction__": [obj.numerator, obj.denominator]}
+    if t is complex:
+        return {"__complex__": [_encode_float(obj.real), _encode_float(obj.imag)]}
+    if t is uuid.UUID:
+        return {"__uuid__": obj.hex}
+    if t in _canonical.PATH_CLASSES:
+        return {"__path__": [_canonical.PATH_CLASSES.index(t), str(obj)]}
+    if t is range:
+        return {"__range__": [obj.start, obj.stop, obj.step]}
+    if t is collections.deque:
+        return {"__deque__": [obj.maxlen, [_to_jsonable(x) for x in obj]]}
+    if t.__module__ == "numpy":
+        array = _canonical.numpy_array_parts(obj)
+        if array is not None:
+            dtype, shape, data = array
+            return {"__ndarray__": [dtype, shape, _b64(data)]}
+        scalar = _canonical.numpy_scalar_parts(obj)
+        if scalar is not None:
+            return {"__npscalar__": [scalar[0], _b64(scalar[1])]}
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return {
@@ -158,20 +208,40 @@ def _to_jsonable(obj: Any) -> Any:
 
     raise TypeError(
         f"cascade serde: unsupported type {type(obj).__module__}.{type(obj).__qualname__!r}; "
-        "use primitives, bytes, collections, datetime, @dataclass / typing.NamedTuple instances, "
-        "or BaseException."
+        "register the class with cascade.register_type() to make it encodable"
     )
 
 
-_SUPPORTED = (
-    "None, bool, int, float, str, bytes, list, tuple, set, frozenset, dict, "
-    "the datetime types, dataclasses, NamedTuples and exceptions"
+def _b64(data: bytes) -> str:
+    return base64.standard_b64encode(data).decode("ascii")
+
+
+SUPPORTED_TYPES = (
+    "None, bool, int, float, complex, str, bytes, bytearray, list, tuple, "
+    "set, frozenset, dict, deque, range, Decimal, Fraction, UUID, Enum "
+    "members, pathlib paths, the datetime types, dataclasses, NamedTuples, "
+    "exceptions, numpy arrays and scalars (when numpy is installed), and "
+    "classes registered with cascade.register_type()"
 )
 
 
 def _children(obj: Any) -> Iterator[tuple[str, Any]]:
     """The parts of ``obj`` the encoders visit, each with its path suffix."""
-    if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+    reg = _types.registration_for(type(obj))
+    if reg is not None:
+        try:
+            encoded = reg.encode(obj)
+        except Exception:  # noqa: BLE001 - reported as the object itself
+            return
+        yield " (as encoded)", encoded
+    elif isinstance(obj, enum.Enum):
+        by_name, payload = _canonical.enum_payload(obj)
+        if not by_name:
+            yield ".value", payload
+    elif isinstance(obj, collections.deque):
+        for i, item in enumerate(obj):
+            yield f"[{i}]", item
+    elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
         for name in obj._fields:
             yield f".{name}", getattr(obj, name)
     elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -237,6 +307,6 @@ def unencodable_error(
         )
     return UnencodableValueError(
         f"{subject}: {where}. Results and input values are encoded to tell "
-        "whether they changed, also without cache_dir; supported types are "
-        f"{_SUPPORTED}. (Codec error: {exc})"
+        "whether they changed and to store them; supported types are "
+        f"{SUPPORTED_TYPES}. (Codec error: {exc})"
     )

@@ -81,7 +81,24 @@ The `Engine` manages caching, execution, and state tracking.
 
 A few rules apply to every engine, with or without `cache_dir`:
 
-*   **Values must be encodable.** Results and input values are fingerprinted with the same encoder the disk cache uses, so they must be primitives, bytes, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions. Anything else (`Enum`, `Path`, `Decimal`, arbitrary class instances) raises `UnencodableValueError`, a `TypeError` whose message names the query or input, the path to the offending part of the value (`result[2]['k'].field`) and its type. Such a result is not cached.
+*   **Values are fingerprinted.** Results and input values are encoded to tell whether they changed (and, with `cache_dir`, to store them). The encoder knows the standard value types: primitives, `bytes`/`bytearray`, `complex`, builtin containers, `deque`, `range`, `Decimal`, `Fraction`, `UUID`, `Enum` members, `pathlib` paths, the `datetime` types, dataclasses, `NamedTuple`s, exceptions, and numpy arrays and scalars if your program uses numpy. Each comes back from disk as the same type. Other classes can be taught with `register_type` (below). A result the encoder does not know is fine on an engine without `cache_dir`: it is cached as it is, but never counts as equal to an earlier result, so its dependents always re-run when it is recomputed. With `cache_dir`, and for input values and `fixed_point=` values on any engine, it raises `UnencodableValueError`, a `TypeError` whose message names the query or input, the path to the offending part of the value (`result[2]['k'].field`) and its type. Such a result is not cached.
+*   **Your own types: `register_type`.** Give Cascade a pair of functions for a class, and its instances can be results, input values, arguments and collection items, also on disk:
+
+    ```python
+    from cascade import register_type
+
+    class Money:
+        def __init__(self, amount: Decimal, currency: str): ...
+
+    register_type(
+        Money,
+        encode=lambda m: (m.amount, m.currency),   # anything Cascade can encode
+        decode=lambda fields: Money(*fields),
+        name="billing.Money/1",                   # optional; the identity on disk
+    )
+    ```
+
+    Two values whose `encode` results are equal are treated as the same value (no re-run of dependents, a no-op `set`), so `encode` must capture everything a query can observe. Bump `name` when the encoding changes. The registry is process-wide (`Engine.register_type` is the same function): register next to the class, before an engine reads its values. Cascade never pickles; a cache directory can only produce values through the registered `decode`.
 *   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache.
 *   **A query's or input's identity is a name: its `module:qualname` by default.** One name holds one function. Registering a different function under a name in use replaces the earlier one: its cached results are dropped, and its handle raises `StaleHandleError` when called. That is what you want from a hot reload (pick up the new handle by importing it again), but it also happens when several functions are made from one body, as in a factory, a loop, or lambdas in one module. Give those their own identities with `name=`:
 
@@ -266,9 +283,9 @@ engine = Engine(max_entries=10_000, cache_dir=".cascade_cache")
 sqlite_engine = Engine(max_entries=10_000, cache_dir=".cascade_cache", cache_backend="sqlite")
 ```
 *   `libmdbx` and `msgpack` are required for the default backend (`pip install query-cascade[disk]`). You can also use `sqlite` which has no external dependencies.
-*   Values must be serializable (primitives, bytes, lists, dicts, dataclasses, etc.); this is required for every engine, not only with `cache_dir`. A query whose arguments cannot be serialized is computed but not persisted.
+*   Results and input values must be encodable (see "Values are fingerprinted" above). A query whose arguments cannot be encoded is computed but not persisted.
 *   **`engine.clear_disk_cache()`**: Deletes every cached query result in the persistent disk cache. Named collections are kept: their contents are data, not cache, and are restored as usual on the next run. To empty a collection, call its `clear()`.
-*   **Upgrades:** when a new version of Cascade changes how results are stored, the cached results in an existing `cache_dir` are dropped on open and recomputed (this version does: dicts are now stored in insertion order instead of sorted). Named collections are kept across such a change. If a directory holds collection data the running version cannot read, `Engine(cache_dir=...)` raises `PersistentCacheError` and leaves the directory untouched.
+*   **Upgrades:** when a new version of Cascade changes how results are stored, the cached results in an existing `cache_dir` are dropped on open and recomputed (this version does: it adds value types, and a `bytearray` is stored as itself rather than as `bytes`). Named collections are kept across such a change. If a directory holds collection data the running version cannot read, `Engine(cache_dir=...)` raises `PersistentCacheError` and leaves the directory untouched.
 *   **Reusing results across runs:** results are queued when their query finishes and written to the cache in batches by a background thread. They are on disk once `engine.flush_disk()` or `engine.shutdown()` returns; if a write failed (another process holds the database locked, the map is full), the call raises `PersistentCacheError` with the original error as its cause instead, the results stay correct in memory, and the writer carries on with the next ones. A normal interpreter exit (end of script, `sys.exit()`, an unhandled exception) writes whatever is still queued. A process that is killed (`os._exit`, SIGKILL, a crash) loses the results still in the queue, so call `flush_disk()` at the points where that matters. A new `Engine` with the same `cache_dir` reuses them once you set the same input values again, and recomputes only the queries whose inputs changed.
 
 ---
@@ -404,7 +421,7 @@ One engine at a time may change a named collection. The first change takes a loc
 
 1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`, unless the query reached again has `fixed_point=`. A fixed-point cycle must first be entered through that query; once it has a result (in memory or in `cache_dir`), any member of the cycle can be called directly, also after the member's own result was evicted or pruned. The cycle stops with a `CycleError` if it has not converged after `max_iterations` runs (default 1000).
 2. **Thread Safety:** Calling queries, reading inputs, `.set()`, transactions and registering queries or inputs are safe from any thread. Several engines and processes may share a `cache_dir` for cached results, but only one at a time may change a given named collection (see Persistence & Inspection above); with sqlite a busy database can make a write fail, which `flush_disk()` reports. A transaction belongs to the task or thread that opened it; mutating a collection from elsewhere while a transaction that changed it is open raises `RuntimeError` (see G25 in `docs/guarantees.md`).
-3. **Persistence Security:** The persistent disk cache resolves `@dataclass`, `NamedTuple` and exception types via `importlib`. Only open cache directories from trusted sources.
+3. **Persistence Security:** The persistent disk cache resolves `@dataclass`, `NamedTuple`, `Enum` and exception types via `importlib`, and calls the `decode` function of registered types. It never unpickles. Only open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.
 
 ### Examples (in `examples/`)

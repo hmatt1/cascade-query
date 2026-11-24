@@ -39,8 +39,8 @@ audit"; no defect is open.
 | G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path, good for async |
 | G16 | A stale persisted result is never served | Holds with limits (G11's blind spots) | Medium |
 | G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
-| G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
-| G19 | Values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Good by example |
+| G18 | Values round-trip through the disk codec with their types | Holds with limits | Strong (Hypothesis, nested values of every supported type) |
+| G19 | Only values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Strong (Hypothesis, both codecs) |
 | G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
 | G21 | Collections behave like `list`, `set` and `dict`, and every read inside a query is tracked | Holds with limits | Strong |
 | G22 | A rewritten query returns what the plain Python would | Holds | Strong for reducers (Hypothesis, against the builtins) |
@@ -93,14 +93,26 @@ Limits, by design:
   the same function again, or one with equal bytecode that captures the same
   objects (a module reloaded unchanged), keeps results and handles. Methods
   cannot be queries.
-- **Values must be encodable.** Results and input values are hashed through the
-  canonical encoder even without `cache_dir`; an unsupported type raises
-  `UnencodableValueError`, a `TypeError` naming the query (with its
-  arguments) or the input, the path to the part that cannot be encoded
-  (`result[2]['k'].payload`, `value key 'x'`) and its type. A result that
-  cannot be encoded is not cached, so each call runs the body and raises
-  again; a caller that catches the error depends on what the query read
-  (G8). G18 lists the supported types.
+- **Values are encoded to tell whether they changed.** G18 lists the
+  types the codecs know; any other class can be added with
+  `cascade.register_type` (G18). What happens to a value of a type neither
+  knows depends on where it is:
+  - a query result, or the `args` of an exception a query raises, on an
+    engine **without** `cache_dir`: kept as it is, under a digest that is
+    new every time. Such a result never counts as equal to an earlier one,
+    so a query that returns one and runs again always re-runs its
+    dependents: no early bail-out (G2), never a wrong answer. An exception
+    is cached as usual (G8);
+  - the same on an engine **with** `cache_dir`, where results are written
+    to disk: `UnencodableValueError`, a `TypeError` naming the query (with
+    its arguments), the path to the part that cannot be encoded
+    (`result[2]['k'].payload`, `value key 'x'`) and its type. Such a result
+    is not cached, so each call runs the body and raises again; a caller
+    that catches the error depends on what the query read (G8);
+  - an input value, or a `fixed_point=` guess or head result, on any
+    engine: `UnencodableValueError`. A same-value `set` must be detected
+    (G3), and a fixed point is reached when a result equals its guess
+    (G7), so these need an encoding.
 - **Arguments are positional and hashable.** Keyword arguments raise
   `TypeError`. Arguments that compare equal are one cache key, so `q(1)`,
   `q(True)` and `q(1.0)` share a result. A dict is not hashable and cannot be
@@ -322,10 +334,12 @@ restricts caching to those types. `QueryCancelled`, `CycleError`,
 `PersistentCacheError` and `SnapshotExpiredError` are never cached. A caller
 that catches a dependency's error still depends on it.
 
-The caller always sees the exception the query raised. One that cannot be
-encoded (its `args` hold an unsupported type) is not cached: it propagates
-as itself, like an error excluded by `cache_exceptions`, and the next call
-runs the body again. `UnencodableValueError` is never cached either.
+The caller always sees the exception the query raised. With `cache_dir`,
+one that cannot be encoded (its `args` hold an unsupported type) is not
+cached: it propagates as itself, like an error excluded by
+`cache_exceptions`, and the next call runs the body again. Without
+`cache_dir` it is cached like any other (G1). `UnencodableValueError` is
+never cached.
 
 Limits: the same exception object is re-raised each time, so its traceback
 grows. `BaseException` subclasses outside `Exception` are not cached.
@@ -337,10 +351,13 @@ Enforced by: `test_error_caching.py::test_error_is_cached`,
 `::test_uncached_error_two_levels_down_reaches_the_handler`,
 `test_known_defects.py::test_d20_unencodable_result_is_returned_or_reported_clearly`,
 `::test_d20_exception_with_unencodable_args_reaches_the_caller`,
-`test_unencodable_values.py` (in memory and on both backends: paths through
+`test_unencodable_values.py` (on both backends: paths through
 lists, dicts, keys, dataclasses, NamedTuples and exception args; nothing
 cached; a caller that catches the error; async queries; inputs and input
-defaults; fixed-point guesses and results; `compute_many`).
+defaults, also in memory; fixed-point guesses and results; `compute_many`),
+`test_opaque_values.py` (in memory: unencodable results and exceptions
+cached, dependents re-run, `memoize=False`, async, snapshots,
+`compute_many`; inputs and fixed points still refused).
 
 ### G9. TTL
 
@@ -631,25 +648,60 @@ through intermittent errors).
 
 ### G18. Round-trip fidelity
 
-Supported: `None`, `bool`, `int` of any size, `float`, `str`, `bytes`, `list`,
-`tuple`, `set`, `frozenset`, `dict`, `datetime`, `date`, `time`, `timedelta`,
-`timezone`, dataclasses, `NamedTuple`s and exceptions. These decode to an equal
-value of the same type.
+Supported: `None`, `bool`, `int` of any size, `float`, `complex`, `str`,
+`bytes`, `bytearray`, `list`, `tuple`, `set`, `frozenset`, `dict`,
+`collections.deque` (with its `maxlen`), `range`, `decimal.Decimal`
+(digits, exponent and sign as written, NaN included), `fractions.Fraction`,
+`uuid.UUID`, `Enum` members (`IntEnum`, `StrEnum` and `Flag` combinations
+included), `pathlib` paths of the four concrete classes (`PurePosixPath`,
+`PureWindowsPath`, `PosixPath`, `WindowsPath`), `datetime`, `date`,
+`time`, `timedelta`, `timezone`, dataclasses, `NamedTuple`s, exceptions,
+numpy arrays and scalars when numpy is installed, and classes registered
+with `cascade.register_type`. These decode to a value of the same type that
+no query could tell from the original: equal, and also the same where `==`
+looks away (a `Decimal`'s trailing zeros, a Windows path's case, the sign
+of a zero, a `datetime`'s `fold`, `range(0)` against `range(1, 1)`).
 
 A dict comes back in the insertion order it was stored with.
 
-Known losses: `bytearray` becomes `bytes`; subclasses of containers become the
-base type; `zoneinfo` zones become fixed offsets;
-exceptions keep only type and `args`. Dataclasses with `init=False` fields and
-classes defined inside functions cannot be decoded, so their results recompute
-every session.
+**Registered types.** `cascade.register_type(cls, encode=..., decode=...,
+name=None)` (also `Engine.register_type`) makes exact instances of `cls`
+encodable: `encode(obj)` returns a value Cascade can already encode, and
+`decode(that)` rebuilds the object. Values whose `encode` results are equal
+are treated as the same value, so `encode` must capture everything a query
+can observe. `name` (default `module:qualname`) identifies the type on
+disk; change it when the encoding changes. The registry is process-wide,
+registering a native type or one already registered with other functions is
+refused, and a value stored under a name that is not registered when it is
+read is not decoded: a cached result is recomputed, a named collection
+raises. Pickle is never used.
 
-Unsupported, raising `UnencodableValueError` (a `TypeError`, see G1): `Enum`,
-`Decimal`, `Path`, `UUID`, `complex`, `range`, `deque`.
+**numpy.** Arrays of exact type `numpy.ndarray` whose dtype holds no Python
+objects and no fields, and numpy scalars, are encoded as dtype, shape and
+bytes. numpy is never imported to encode (a value can only be an array if
+the program imported numpy) and is not a dependency. A Fortran-ordered
+array comes back C-ordered. Other arrays (object, structured, subclasses
+such as masked arrays) need `register_type`.
 
-Enforced by: `test_disk_cache.py::test_round_trip`,
+Known losses: subclasses of containers become the base type (an
+`OrderedDict` a `dict`); `zoneinfo` zones and named `timezone`s become
+fixed offsets; exceptions keep only type and `args`. Dataclasses with
+`init=False` fields and classes defined inside functions cannot be decoded,
+so their results recompute every session. A `PosixPath` cannot be built on
+Windows, nor a `WindowsPath` elsewhere, so such a result recomputes there.
+
+Unsupported, and handled as G1 says: anything else, for example plain class
+instances, `ast` nodes and pandas objects, unless registered.
+
+Enforced by: `test_codec_properties.py` (Hypothesis: nested values of every
+supported type decode to the same value and re-encode to the same bytes,
+and the digest of a decoded copy is the digest of the original),
+`test_value_types.py` (each type as a query argument, an input value and a
+result, in memory and on both backends, and read back by a new engine with
+its type; registered types and their errors; numpy),
+`test_disk_cache.py::test_round_trip`,
 `::test_round_trip_preserves_container_types`,
-`::test_bytearray_collapses_to_bytes_and_nan_round_trips`,
+`::test_bytearray_round_trips_and_nan_round_trips`,
 `test_disk_format2.py::test_round_trip_preserves_value_and_type`,
 `::test_container_subclasses_encode_as_their_base_type`,
 `test_dict_order.py::test_decoded_dict_keeps_its_order`,
@@ -665,9 +717,15 @@ because code can observe it (G2): the same items in another order are other
 bytes. This changed with disk format 3; format 2 sorted dict keys, so its
 results held dicts in an order the query had not returned, and they are
 dropped on open (G20). Collection logs written under format 2 are read
-unchanged.
+unchanged. The converse holds as well: two values a query could tell apart
+never encode to the same bytes, in the disk codec and in the in-memory
+digest alike (`1`, `1.0`, `True`, `Decimal(1)` and `Level.LOW` are five
+values).
 
-Enforced by: `test_disk_cache.py::test_encode_is_deterministic_for_dict_and_set_ordering`,
+Enforced by: `test_codec_properties.py` (Hypothesis: equal bytes or equal
+digests only for values no query can tell apart; sets in any insertion
+order; look-alikes such as `Decimal("1.0")` and `Decimal("1.00")`),
+`test_disk_cache.py::test_encode_is_deterministic_for_dict_and_set_ordering`,
 `test_disk_format2.py::test_encoding_is_independent_of_insertion_order`,
 `test_dict_order.py::test_digest_tells_dict_orders_apart_at_any_depth`,
 `::test_digest_of_sets_ignores_how_they_were_built`,
@@ -680,11 +738,14 @@ An undecodable query entry, a missing blob or a digest mismatch is treated as a
 miss and recomputed. Opening a directory with the other backend sees an empty
 cache, because each backend uses its own files.
 
-A cache directory carries two format numbers. `DISK_FORMAT` covers cached
-query results: results written under another number are deleted on open and
-recomputed. `COLLECTION_FORMAT` covers the logs of named collections, which
-are data and are never deleted: a change of `DISK_FORMAT` leaves them as they
-are, in both directions. A directory whose collection data this version
+A cache directory carries two format numbers. `DISK_FORMAT` (now 4) covers
+cached query results: results written under another number are deleted on
+open and recomputed. `COLLECTION_FORMAT` (now 2) covers the logs of named
+collections, which are data and are never deleted: a change of `DISK_FORMAT`
+leaves them as they are, in both directions. Collection format 2 added the
+value types of result format 4; format 1 logs are read unchanged, and the
+directory is restamped 2, so an older release refuses it instead of failing
+on a value type it does not know. A directory whose collection data this version
 cannot read (a newer `COLLECTION_FORMAT`, or collections left by a release
 older than the ones known) is refused with `PersistentCacheError` at
 `Engine(cache_dir=...)`, and nothing in it is changed. A directory written
@@ -710,8 +771,10 @@ nothing dropped),
 
 A cache directory is trusted input. Loading one can import any importable
 module named in it and construct any dataclass, `NamedTuple` or exception class
-with arguments it chooses. Result values are not authenticated. Only open cache
-directories you wrote.
+with arguments it chooses, look up any `Enum` member, import numpy, and call
+the `decode` function of any registered type with a value it chooses. Result
+values are not authenticated. Nothing is unpickled, and registering a type
+never adds pickle. Only open cache directories you wrote.
 
 ## Collections, rewriting and transactions
 
@@ -1190,12 +1253,13 @@ that input report the stored version, so its results stay valid afterwards).
 The library's aims, taken from the README: memoise ordinary Python functions
 with automatic dependency tracking; make ordinary comprehensions incremental;
 persist results across runs with no configuration; run in parallel and async.
-Three limits work against those aims for common uses. Each was checked by
-running it.
+The limits below worked against those aims for common uses. Each was
+checked by running it. Value types were lifted: the standard value types are
+encoded natively, other classes through `register_type`, and an engine
+without `cache_dir` keeps results it cannot encode (G1, G18).
 
 | Limit | Who it stops | Why it conflicts with the aim |
 |---|---|---|
-| **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
 
@@ -1266,8 +1330,9 @@ Ordered by the risk they leave open.
    generate query bodies, so interactions between several pipelines in one
    body, nested comprehensions and closures over changing values rest on
    example tests.
-5. **No Hypothesis test for the disk codec** and no cross-process or
-   cross-version determinism test.
+5. **No cross-process or cross-version determinism test for the codecs.**
+   `test_codec_properties.py` checks round trips and determinism within one
+   process with Hypothesis.
 6. **Backend parity is partial.** Five tests in `test_disk_cache.py` skip
    sqlite; `test_incremental_persistence.py`, `test_code_versioning.py` and
    `test_error_caching_persistence.py` run mdbx only; `test_transaction_collections.py`

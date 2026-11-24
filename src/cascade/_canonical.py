@@ -12,8 +12,11 @@ Fingerprints are blake2b digests of those byte streams. msgpack is imported
 lazily so the in-memory engine keeps working without it; enabling
 ``cache_dir`` requires it.
 
-Wire format (disk format 3; format 2 differed only in sorting dict keys)
-------------------------------------------------------------------------
+Wire format (disk format 4)
+---------------------------
+Format 2 sorted dict keys; format 3 kept their order; format 4 added the
+codes from ``_EXT_ENUM`` on and stopped writing a ``bytearray`` as ``bytes``.
+
 Values msgpack cannot represent natively (tuples, sets, dataclasses, ...) are
 written as an ordinary msgpack array whose first element is a zero-length
 extension marker carrying the type code::
@@ -29,12 +32,20 @@ packed with a single ``packb`` call and unpacked with a single ``unpackb``
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import datetime
+import decimal
+import enum
+import fractions
 import hashlib
 import importlib
+import pathlib
+import sys
+import uuid
 from typing import Any
 
+from . import _types
 from ._errors import PersistentCacheError
 
 try:
@@ -60,6 +71,29 @@ _EXT_DATE = 10
 _EXT_TIME = 11
 _EXT_TIMEDELTA = 12
 _EXT_TIMEZONE = 13
+_EXT_ENUM = 14
+_EXT_DECIMAL = 15
+_EXT_FRACTION = 16
+_EXT_COMPLEX = 17
+_EXT_UUID = 18
+_EXT_PATH = 19
+_EXT_BYTEARRAY = 20
+_EXT_RANGE = 21
+_EXT_DEQUE = 22
+_EXT_NDARRAY = 23
+_EXT_NPSCALAR = 24
+_EXT_REGISTERED = 25
+_LAST_EXT = _EXT_REGISTERED
+
+# The concrete path classes, by the number they are stored under. A path
+# keeps its class: a query can tell a POSIX path from a Windows one.
+PATH_CLASSES: tuple[type, ...] = (
+    pathlib.PurePosixPath,
+    pathlib.PureWindowsPath,
+    pathlib.PosixPath,
+    pathlib.WindowsPath,
+)
+_PATH_CODES = {cls: i for i, cls in enumerate(PATH_CLASSES)}
 
 _INT64_MIN = -(2**63)
 _UINT64_MAX = 2**64 - 1
@@ -76,7 +110,7 @@ class _Tag:
         self.code = code
 
 
-_TAGS: dict[int, _Tag] = {code: _Tag(code) for code in range(1, 14)}
+_TAGS: dict[int, _Tag] = {code: _Tag(code) for code in range(1, _LAST_EXT + 1)}
 # Encode-side markers, built on first use because msgpack is optional.
 _MARKERS: dict[int, Any] = {}
 
@@ -151,13 +185,25 @@ def _encode_node(obj: Any) -> Any:
     if t is dict:
         return _encode_dict(obj)
 
+    reg = _types.registration_for(t)
+    if reg is not None:
+        return [
+            _marker(_EXT_REGISTERED),
+            reg.name,
+            _encode_node(_types.encode_registered(reg, obj)),
+        ]
     if t is bytearray:
-        return bytes(obj)
+        return [_marker(_EXT_BYTEARRAY), bytes(obj)]
     if isinstance(obj, datetime.datetime):
+        # ``fold`` is not part of the ISO text; it follows when set.
+        if obj.fold:
+            return [_marker(_EXT_DATETIME), obj.isoformat(), 1]
         return [_marker(_EXT_DATETIME), obj.isoformat()]
     if isinstance(obj, datetime.date):
         return [_marker(_EXT_DATE), obj.isoformat()]
     if isinstance(obj, datetime.time):
+        if obj.fold:
+            return [_marker(_EXT_TIME), obj.isoformat(), 1]
         return [_marker(_EXT_TIME), obj.isoformat()]
     if isinstance(obj, datetime.timedelta):
         return [_marker(_EXT_TIMEDELTA), obj.days, obj.seconds, obj.microseconds]
@@ -170,6 +216,43 @@ def _encode_node(obj: Any) -> Any:
             td.microseconds,
             obj.tzname(None),
         ]
+    if isinstance(obj, enum.Enum):
+        by_name, payload = enum_payload(obj)
+        return [
+            _marker(_EXT_ENUM),
+            t.__module__,
+            t.__qualname__,
+            by_name,
+            payload if by_name else _encode_node(payload),
+        ]
+    if t is decimal.Decimal:
+        return [_marker(_EXT_DECIMAL), str(obj)]
+    if t is fractions.Fraction:
+        return [
+            _marker(_EXT_FRACTION),
+            _encode_node(obj.numerator),
+            _encode_node(obj.denominator),
+        ]
+    if t is complex:
+        return [_marker(_EXT_COMPLEX), obj.real, obj.imag]
+    if t is uuid.UUID:
+        return [_marker(_EXT_UUID), obj.bytes]
+    path_code = _PATH_CODES.get(t)
+    if path_code is not None:
+        return [_marker(_EXT_PATH), path_code, str(obj)]
+    if t is range:
+        return [
+            _marker(_EXT_RANGE),
+            _encode_node(obj.start),
+            _encode_node(obj.stop),
+            _encode_node(obj.step),
+        ]
+    if t is collections.deque:
+        return [_marker(_EXT_DEQUE), obj.maxlen, *[_encode_node(x) for x in obj]]
+    if t.__module__ == "numpy":
+        numpy_node = _encode_numpy(obj)
+        if numpy_node is not None:
+            return numpy_node
 
     if isinstance(obj, tuple) and hasattr(obj, "_fields"):
         return [
@@ -205,10 +288,85 @@ def _encode_node(obj: Any) -> Any:
         ]
 
     raise TypeError(
-        f"cascade persistent cache: cannot serialize {t.__module__}.{t.__qualname__!r}; "
-        "supported types are primitives, bytes, list/tuple/set/frozenset/dict, datetime, "
-        "@dataclass instances, typing.NamedTuple instances, and BaseException."
+        f"cascade persistent cache: cannot serialize {t.__module__}.{t.__qualname__!r}; register the "
+        "class with cascade.register_type() to make it encodable"
     )
+
+
+def enum_payload(obj: enum.Enum) -> tuple[bool, Any]:
+    """``(True, name)`` for a named member, else ``(False, value)``.
+
+    Composite and pseudo members of a ``Flag`` have no name of their own to
+    look up, so they are stored by value.
+    """
+    name = obj._name_
+    if name is not None and type(obj)._member_map_.get(name) is obj:
+        return True, name
+    return False, obj._value_
+
+
+def _plain_numpy_dtype(dtype: Any) -> bool:
+    # Arrays of Python objects and structured dtypes are not supported:
+    # their bytes are not their value.
+    return not (dtype.hasobject or dtype.fields is not None or dtype.subdtype)
+
+
+def numpy_array_parts(obj: Any) -> tuple[str, list[int], bytes] | None:
+    """``(dtype, shape, C-order bytes)`` of a plain ndarray; None otherwise.
+
+    numpy is never imported here: a value can only be a numpy array if the
+    program imported numpy itself.
+    """
+    np = sys.modules.get("numpy")
+    if np is None or type(obj) is not np.ndarray:
+        return None
+    if not _plain_numpy_dtype(obj.dtype):
+        return None
+    return obj.dtype.str, list(obj.shape), obj.tobytes(order="C")
+
+
+def numpy_scalar_parts(obj: Any) -> tuple[str, bytes] | None:
+    """``(dtype, bytes)`` of a numpy scalar such as ``numpy.float32(1.5)``."""
+    np = sys.modules.get("numpy")
+    if np is None or not isinstance(obj, np.generic):
+        return None
+    if not _plain_numpy_dtype(obj.dtype):
+        return None
+    return obj.dtype.str, obj.tobytes()
+
+
+def _encode_numpy(obj: Any) -> Any:
+    parts = numpy_array_parts(obj)
+    if parts is not None:
+        return [_marker(_EXT_NDARRAY), *parts]
+    scalar = numpy_scalar_parts(obj)
+    if scalar is not None:
+        return [_marker(_EXT_NPSCALAR), *scalar]
+    return None
+
+
+def make_numpy_array(dtype: str, shape: list[int], data: bytes) -> Any:
+    np = importlib.import_module("numpy")
+    dt = np.dtype(dtype)
+    if dt.itemsize == 0:
+        return np.empty(tuple(shape), dtype=dt)
+    return np.frombuffer(data, dtype=dt).reshape(tuple(shape)).copy()
+
+
+def make_numpy_scalar(dtype: str, data: bytes) -> Any:
+    np = importlib.import_module("numpy")
+    return np.frombuffer(data, dtype=np.dtype(dtype))[0]
+
+
+def make_enum(module_name: str, qualname: str, by_name: bool, payload: Any) -> Any:
+    cls = _resolve_type(module_name, qualname)
+    if not issubclass(cls, enum.Enum):
+        raise TypeError(f"{module_name}.{qualname!r} is not an Enum")
+    return cls[payload] if by_name else cls(payload)
+
+
+def make_path(code: int, text: str) -> Any:
+    return PATH_CLASSES[code](text)
 
 
 def _sorted_nodes(items: Any) -> list[Any]:
@@ -249,7 +407,7 @@ def _ext_hook(code: int, data: bytes) -> Any:
     if tag is None or data:
         raise ValueError(
             f"cascade persistent cache: unexpected extension (code {code}, "
-            f"{len(data)} payload bytes); the blob is not disk format 2"
+            f"{len(data)} payload bytes); the blob is not disk format 2 or later"
         )
     return tag
 
@@ -322,13 +480,39 @@ def _untag(code: int, items: list[Any]) -> Any:
     if code == _EXT_EXCEPTION:
         return _make_exception(items[1], items[2], items[3:])
     if code == _EXT_DATETIME:
-        return datetime.datetime.fromisoformat(items[1])
+        moment = datetime.datetime.fromisoformat(items[1])
+        return moment.replace(fold=1) if len(items) > 2 else moment
     if code == _EXT_DATE:
         return datetime.date.fromisoformat(items[1])
     if code == _EXT_TIME:
-        return datetime.time.fromisoformat(items[1])
+        clock = datetime.time.fromisoformat(items[1])
+        return clock.replace(fold=1) if len(items) > 2 else clock
     if code == _EXT_TIMEDELTA:
         return datetime.timedelta(
             days=items[1], seconds=items[2], microseconds=items[3]
         )
-    return _make_timezone(items[1], items[2], items[3], items[4])
+    if code == _EXT_TIMEZONE:
+        return _make_timezone(items[1], items[2], items[3], items[4])
+    if code == _EXT_ENUM:
+        return make_enum(items[1], items[2], items[3], items[4])
+    if code == _EXT_DECIMAL:
+        return decimal.Decimal(items[1])
+    if code == _EXT_FRACTION:
+        return fractions.Fraction(items[1], items[2])
+    if code == _EXT_COMPLEX:
+        return complex(items[1], items[2])
+    if code == _EXT_UUID:
+        return uuid.UUID(bytes=items[1])
+    if code == _EXT_PATH:
+        return make_path(items[1], items[2])
+    if code == _EXT_BYTEARRAY:
+        return bytearray(items[1])
+    if code == _EXT_RANGE:
+        return range(items[1], items[2], items[3])
+    if code == _EXT_DEQUE:
+        return collections.deque(items[2:], items[1])
+    if code == _EXT_NDARRAY:
+        return make_numpy_array(items[1], items[2], items[3])
+    if code == _EXT_NPSCALAR:
+        return make_numpy_scalar(items[1], items[2])
+    return _types.decode_registered(items[1], items[2])

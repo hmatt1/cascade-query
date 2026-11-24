@@ -85,9 +85,16 @@ class GraphStore:
         stats_eviction_recent_cap: int = 32,
         monotonic_seconds: Callable[[], float] | None = None,
         value_digest: Callable[[Any], str] | None = None,
+        allow_opaque: bool = False,
     ) -> None:
         self.lock = threading.RLock()
         self._value_digest: Callable[[Any], str] = value_digest or stable_value_digest
+        # Without a disk cache nothing has to be decoded again, so a result
+        # or input value the codec cannot encode is kept as it is, under a
+        # digest no other value ever has (``digest_or_opaque``).
+        self._allow_opaque = allow_opaque
+        self._opaque_lock = threading.Lock()
+        self._opaque_count = 0
         self.revision = 0
         self.cancel_epoch = 0
         self.next_access_id = 0
@@ -621,7 +628,28 @@ class GraphStore:
         return f"{kind}:{fid}{args}"
 
     def stable_hash(self, value: Any) -> str:
+        """Digest of ``value``; ``TypeError`` if the codec cannot encode it."""
         return self._value_digest(value)
+
+    def digest_or_opaque(self, value: Any) -> str:
+        """``stable_hash``, or on an engine without ``cache_dir`` an opaque digest.
+
+        An opaque digest is new every time, so a value that cannot be
+        encoded never counts as equal to another one, not even to itself:
+        a query that returns one always counts as changed, so its dependents
+        run again (no early bail-out). That is always safe; only the saving
+        is lost. With ``cache_dir`` the value must be encodable and
+        ``TypeError`` propagates. Used for query results and cached errors,
+        not for input values (``input_digest``) or fixed-point guesses.
+        """
+        try:
+            return self._value_digest(value)
+        except TypeError:
+            if not self._allow_opaque:
+                raise
+        with self._opaque_lock:
+            self._opaque_count += 1
+            return f"opaque:{self._opaque_count}"
 
     def unencodable_error(
         self, subject: str, root: str, value: Any, exc: Exception
@@ -630,7 +658,11 @@ class GraphStore:
         return unencodable_error(subject, root, value, self._value_digest, exc)
 
     def input_digest(self, key: InputKey, value: Any) -> str:
-        """``stable_hash`` of a value for input ``key``, with a clear error."""
+        """``stable_hash`` of a value for input ``key``, with a clear error.
+
+        Input values must be encodable on every engine: a same-value ``set``
+        is a no-op only when the engine can tell that the value is the same.
+        """
         try:
             return self._value_digest(value)
         except TypeError as exc:

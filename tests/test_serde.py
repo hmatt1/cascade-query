@@ -43,7 +43,8 @@ def test_stable_digest_float_specials_and_bytearray() -> None:
     h_nan = stable_value_digest(float("nan"))
     assert h_nan == stable_value_digest(math.copysign(float("nan"), 1.0))
     assert stable_value_digest(float("inf")) != stable_value_digest(float("-inf"))
-    assert stable_value_digest(bytearray(b"ab")) == stable_value_digest(b"ab")
+    # A bytearray round-trips as itself (disk format 4), so it is not bytes.
+    assert stable_value_digest(bytearray(b"ab")) != stable_value_digest(b"ab")
 
 
 @pytest.mark.parametrize(
