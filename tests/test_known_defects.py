@@ -268,7 +268,6 @@ def _d31_note(x: int) -> int:
     return x
 
 
-@_defect(31, "effects pushed in a rewritten stage are not replayed for held elements")
 def test_d31_effects_pushed_per_element_survive_an_incremental_update() -> None:
     engine = Engine()
     xs = CascadeList(engine, [1, 2, 3])

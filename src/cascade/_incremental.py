@@ -648,6 +648,11 @@ class _PipelineState:
     failed: set[Any] = field(default_factory=set)
     present: set[Any] = field(default_factory=set)
     impure: bool = False
+    # A stage, filter or key function pushed accumulator effects. The
+    # pipeline calls them for changed elements only, and in the order the
+    # changes arrived, so its effects could never be plain Python's; the
+    # expression is evaluated plainly from then on (D31).
+    effectful: bool = False
 
 
 @dataclass
@@ -735,6 +740,12 @@ class IncrementalRuntime:
             fingerprint += "|descending"
         state_key = (site, core.input_qualname, view, reducer_name)
         evaluator = self._engine._evaluator
+        state = self._states.get(state_key)
+        if state is not None and state.effectful:
+            return _fallback(
+                reducer_name, _items_at(core, view, head), stages, reducer_args
+            )
+        mark = evaluator.effects_mark()
         with self._lock:
             state = self._states.get(state_key)
             needs_rebuild = (
@@ -797,8 +808,10 @@ class IncrementalRuntime:
                     args=reducer_args,
                     positions=lambda uids: _positions_at(core, head, uids),
                 )
+                answered = False
                 if not state.failed:
-                    return state.reducer.result(ctx)
+                    result = state.reducer.result(ctx)
+                    answered = True
             except QueryCancelled:
                 self._states.pop(state_key, None)
                 raise
@@ -807,9 +820,23 @@ class IncrementalRuntime:
                 # the contents could not be read). Plain evaluation raises
                 # the same; the state may be half updated, so it goes.
                 self._states.pop(state_key, None)
+                answered = False
             except BaseException:
                 self._states.pop(state_key, None)
                 raise
+            if mark is not None and evaluator.effects_pushed_since(mark):
+                # Something the pipeline ran pushed accumulator effects (or
+                # replayed a query's). Plain Python pushes them for every
+                # element, in the collection's order, and stops where the
+                # expression stops; the pipeline ran only the changed
+                # elements. Take its pushes back and let plain evaluation
+                # push them, now and on every later run (D31).
+                evaluator.retract_effects_since(mark)
+                self._states[state_key] = _PipelineState(
+                    reducer=_Reducer(), env_fp=None, impure=True, effectful=True
+                )
+            elif answered:
+                return result
         return _fallback(
             reducer_name, _items_at(core, view, head), stages, reducer_args
         )

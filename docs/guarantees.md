@@ -33,7 +33,7 @@ Every open defect has a failing regression test in
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
 | G10 | `memoize=False` queries track dependencies but keep no value | Holds | Medium |
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
-| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Broken for pushes inside a rewritten stage (D31) | Good |
+| G12 | Accumulator effects are replayed on cache hits, in a fixed order | Holds with limits | Good |
 | G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Holds | Strong for eviction and prune |
 | G14 | Async queries behave like sync queries | Holds with limits | Medium |
 | G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path, good for async |
@@ -457,9 +457,20 @@ whose run is abandoned to enter its cycle through the head (G7) is taken
 back the same way. A head whose last run raised a cached error keeps that
 run's effects with the error.
 
-Limits: effects pushed inside the
-element function of a rewritten comprehension are pushed only for the
-elements that changed since the query last ran (D31).
+Inside a rewritten expression (G22) the effects are those plain Python
+pushes, in its order: a pipeline runs its element, filter and `key=`
+functions only for the elements that changed, in the order the changes
+arrived, so it cannot push them itself. It notices at run time when any of
+them pushes an effect, or calls a query whose effects are replayed: that
+run's pushes are taken back, the expression is evaluated plainly, and so it
+is on every later run of that expression in this engine. Detection is at
+run time because the push may sit in a helper function or depend on the
+element: a pipeline whose functions have never pushed stays incremental,
+which gives the same effects (none) as plain evaluation of the elements it
+holds.
+
+Limits: an expression whose functions push effects costs a plain
+evaluation on every run (G23).
 
 Enforced by: `test_engine.py::test_side_effect_replay_on_cache_hits`,
 `::test_nested_side_effect_replay_propagates_to_parent_effects`,
@@ -470,7 +481,15 @@ Enforced by: `test_engine.py::test_side_effect_replay_on_cache_hits`,
 `test_fixed_point_effects.py` (callers above the head, the head and a member
 called directly, an input change, a cached error in the last run, nested
 heads, `compute_many`, threads, async queries, replay from disk on both
-backends).
+backends),
+`test_known_defects.py::test_d31_effects_pushed_per_element_survive_an_incremental_update`,
+`test_rewrite_effects.py` (fourteen bodies over a list compared with plain
+evaluation after each of eight kinds of change: map, filter, both,
+short-circuiting `any` and `all`, `sorted` with `key=`, `max`, `len`,
+`join`, a push that depends on the element, builtin `map` and `filter`, an
+element that raises after pushing; a stage calling a query with effects, a
+stage closing over the accumulator, a dict source, a snapshot, pushes beside
+the pipeline, a pure pipeline staying incremental).
 
 ### G13. Eviction, prune and sweep
 
@@ -871,7 +890,10 @@ Where exactness costs more (G22):
   again, but the scan or sort is;
 - an element that raises makes every run a plain evaluation while it is in
   the collection: as far as Python itself gets, so to the first truthy
-  element for `any`, or to the element that raises.
+  element for `any`, or to the element that raises;
+- an element, filter or `key=` function that pushes accumulator effects (or
+  calls a query that has some) makes the expression a plain evaluation on
+  that run and every later one (G12).
 
 A full rebuild happens after `sort()` or `reverse()`, when a captured closure
 value changes, and when the same query is called with alternating arguments.
@@ -1054,7 +1076,6 @@ time; nothing is in that state now.
 |---|---|---|
 | D29 | A `CascadeSet` is visited in two different orders. A rewritten comprehension or reducer sees insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gives `[30, 1, 20]`), which is what the README promises for loops too; a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` see the builtin set's order (`[1, 20, 30]`). So the same body gives two results depending on whether it was rewritten. Found while fixing D7; present at the audit commit. | Reproduced |
 | D30 | An assignment expression inside a rewritten comprehension is lost. The element expression is moved into a helper function, where `:=` binds a local of that helper: `last = None; out = [(last := x) for x in xs]; return last` returns `None` where Python returns the last element. The rewriter should decline such a comprehension. Found while fixing D7; present at the audit commit. | Reproduced |
-| D31 | Accumulator effects pushed inside the element function of a rewritten comprehension are not replayed for elements the pipeline already holds. With `sum(note(x) for x in xs)` where `note` pushes `x`, the first run collects `[1, 2, 3]`; after `xs.append(4)` the re-run collects `[4]` where Python collects `[1, 2, 3, 4]`. (Not when the stage function closes over the accumulator object: that pipeline cannot be fingerprinted and is rebuilt on every run.) Found while fixing D7; present at the audit commit. | Reproduced |
 | D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
 
 ### Fixed since the audit
@@ -1088,6 +1109,7 @@ time; nothing is in that state now.
 | D27 | A commit that failed while applying its input updates was applied in part. With `xs.append(2)` and `x.set(object())` in one block, the exit raised `TypeError`, `list(xs)` was `[1, 2]`, and a query still read `len(xs) == 1`: the collection change was kept (for a named collection, also on disk) but its new head was never published. A commit now hashes every input value before it writes or applies anything; if one fails, the collections are rolled back and the original error propagates. | `fix: a transaction commit that failed on an input value kept its collection changes` |
 | D25 | After the cached result of a fixed-point cycle member was dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changed, a query that depended on that member raised `CycleError` where the same call with the member still cached returned 50. The member was recomputed on its own, entered the cycle from the wrong end and reached itself before the head. A member whose run reaches itself through a fixed-point head that has a result (in memory or on disk), or through the head it was last stored with, now starts again by bringing that head up to date. Found and fixed with it: the same `CycleError` for a member never stored in a session whose head was loaded from disk. | `fix: a query depending on a dropped fixed-point cycle member raised CycleError` |
 | D26 | Accumulator effects pushed in the abandoned runs of a fixed-point cycle reached every caller above the cycle head: with `fixed_point=0`, a head that pushed once per run and needed four runs handed its caller, and `effects=`, four copies, while the head's own cached result held one. The pushes of a run that is abandoned are now taken back from every frame above the head and from the root's `effects=`; only the converged run's effects are seen, also on cache hits and from disk (G12). | `fix: effects pushed in abandoned fixed-point runs reached the callers above the head` |
+| D31 | Accumulator effects pushed inside the element function of a rewritten comprehension were not replayed for elements the pipeline already held: with `sum(note(x) for x in xs)`, after `xs.append(4)` the re-run collected `[4]` where Python collects `[1, 2, 3, 4]`; with `any` the first run pushed for every element where Python stops at the first truthy one. The pipeline now notices at run time when anything it runs pushes or replays an effect, takes those pushes back and evaluates the expression plainly, on that run and every later one (G12). | `fix: effects pushed inside a rewritten comprehension were lost for elements that did not change` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -1106,7 +1128,7 @@ running it.
 | **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
-| **Rewriting is on by default and has three open gaps.** Set iteration order differs between rewritten and unrewritten code (D29), `:=` in a comprehension is lost (D30), and accumulator pushes inside a stage are not replayed (D31). | Anyone iterating a `CascadeSet` where order matters, or pushing effects per element. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
+| **Rewriting is on by default and has two open gaps.** Set iteration order differs between rewritten and unrewritten code (D29), and `:=` in a comprehension is lost (D30). | Anyone iterating a `CascadeSet` where order matters. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
 
 Limits that narrow use without stopping it:
 

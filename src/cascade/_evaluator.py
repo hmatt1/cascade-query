@@ -1693,17 +1693,67 @@ class Evaluator:
         stack and to the root's staged effects, so what the run added is
         the tail of each of those lists, as long as the run's own list.
         """
+        Evaluator._retract_counts(
+            runtime, ancestors, {name: len(items) for name, items in effects.items()}
+        )
+
+    @staticmethod
+    def _retract_counts(
+        runtime: RuntimeState, frames: list[RuntimeFrame], counts: Mapping[str, int]
+    ) -> None:
+        """Drop the last ``counts[name]`` items of each list ``name`` was pushed to."""
         staged = (
             runtime.staged_root_effects if runtime.root_effects is not None else None
         )
-        for name, items in effects.items():
-            count = len(items)
-            if not count:
+        for name, count in counts.items():
+            if count <= 0:
                 continue
-            for frame in ancestors:
+            for frame in frames:
                 del frame.effects[name][-count:]
             if staged is not None:
                 del staged[name][-count:]
+
+    # --- effects pushed by code the query runs on its behalf ---------------
+    #
+    # A rewritten pipeline calls stage functions for some elements only; if
+    # they push effects, the query's effects would depend on which elements
+    # changed (D31). The pipeline brackets its work with these to notice a
+    # push, take it back and evaluate the expression plainly instead.
+
+    def effects_mark(self) -> Any:
+        """Where the running query's effects stand now, or None outside a query."""
+        runtime = self._runtime_var.get()
+        if runtime is None or not runtime.stack:
+            return None
+        frame = runtime.stack[-1]
+        effects = frame.effects
+        lengths = (
+            {name: len(items) for name, items in effects.items()} if effects else None
+        )
+        return runtime, frame, lengths
+
+    @staticmethod
+    def effects_pushed_since(mark: Any) -> bool:
+        """Whether anything was pushed or replayed into the query since ``mark``."""
+        _, frame, lengths = mark
+        effects = frame.effects
+        if not effects:
+            return False
+        if lengths is None:
+            return any(effects.values())
+        return any(
+            len(items) != lengths.get(name, 0) for name, items in effects.items()
+        )
+
+    def retract_effects_since(self, mark: Any) -> None:
+        """Take back everything pushed or replayed into the query since ``mark``."""
+        runtime, frame, lengths = mark
+        lengths = lengths or {}
+        counts = {
+            name: len(items) - lengths.get(name, 0)
+            for name, items in frame.effects.items()
+        }
+        self._retract_counts(runtime, runtime.stack, counts)
 
     @staticmethod
     def _note_cycle_heads(runtime: RuntimeState, heads: frozenset[QueryKey]) -> None:
