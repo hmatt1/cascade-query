@@ -673,6 +673,9 @@ class Evaluator:
             except _ProvisionalResult as pending_cycle:
                 self._await_cycle_heads(pending_cycle.heads, runtime)
                 return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
+            except QueryCancelled:
+                self._joined_run_cancelled(key, runtime)
+                return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
             return result, True
 
         try:
@@ -765,6 +768,11 @@ class Evaluator:
                 return await self.compute_or_get_memo_async(
                     key, fn, runtime, need_value=need_value
                 )
+            except QueryCancelled:
+                self._joined_run_cancelled(key, runtime)
+                return await self.compute_or_get_memo_async(
+                    key, fn, runtime, need_value=need_value
+                )
             return result, True
 
         try:
@@ -785,6 +793,19 @@ class Evaluator:
             return result, False
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
+
+    def _joined_run_cancelled(self, key: QueryKey, runtime: RuntimeState) -> None:
+        """The run this caller joined was cancelled; decide whether the caller is.
+
+        Only ``submit`` cancels, and only the submitted call itself: its
+        ``QueryCancelled`` says that call's inputs changed, not that this
+        caller's did. A caller that cannot be cancelled (a direct call,
+        ``compute_many``), or a submitted one that started after the change,
+        claims the query again and runs it at its own revision. A caller
+        that is cancelled itself raises its own ``QueryCancelled`` here.
+        """
+        self.check_cancelled(runtime.cancel_epoch)
+        self._store.trace_event("dedup_retry", key, detail="joined run was cancelled")
 
     def _commit_green(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
         """Record that ``memo`` was verified unchanged at ``revision``."""

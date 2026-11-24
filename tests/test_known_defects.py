@@ -729,7 +729,6 @@ def test_d18_flush_disk_returns_after_a_writer_error(
     assert finished, "flush_disk()/shutdown() did not return after a writer error"
 
 
-@_defect(19, "a direct caller joining a submitted run receives its QueryCancelled")
 def test_d19_direct_caller_is_not_cancelled_by_a_submitted_run() -> None:
     engine = Engine()
     started = threading.Event()

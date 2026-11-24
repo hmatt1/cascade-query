@@ -27,7 +27,7 @@ Every open defect has a failing regression test in
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
 | G5 | Concurrent requests for one query at one revision run the body once | Holds with limits | Strong |
-| G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits (D19) | Medium |
+| G6 | A submitted query whose inputs change raises `QueryCancelled` and stores nothing | Holds with limits | Good |
 | G7 | Cycles raise `CycleError`; `fixed_point=` iterates to a stable value at the caller's revision | Holds with limits (D24–D26) | Good on one thread |
 | G8 | Cached errors are re-raised without re-running; control-flow errors are never cached | Holds with limits | Strong |
 | G9 | A TTL query recomputes once its TTL has elapsed, also when reached through dependents | Holds with limits | Good |
@@ -210,13 +210,24 @@ A query started with `engine.submit` raises `QueryCancelled` if an input
 changes value before it finishes. Its result is discarded and never cached.
 Dependencies that already finished keep their results.
 
+Only the submitted call is cancelled. Callers that joined its run (G5) are
+not: when the run they wait for ends in `QueryCancelled`, a caller that
+cannot be cancelled (a direct call, `compute_many`, a query calling it) or a
+submitted call that started after the change claims the query again and
+runs it at its own revision. A joined submitted call that is stale itself
+raises its own `QueryCancelled`.
+
 Limits: only `submit` cancels. Direct calls, `compute_many` and
 `compute_many_stream` always run to completion. A same-value `set` cancels
 nothing.
 
 Enforced by: `test_engine_concurrency.py::test_safe_task_cancellation_after_input_mutation`,
 `::test_cancellation_race_stress`, `test_async_coverage.py::test_async_query_cancelled`,
-`test_scale_behavior.py::test_concurrency_stress_submit_compute_many_and_writes`.
+`test_scale_behavior.py::test_concurrency_stress_submit_compute_many_and_writes`,
+`test_known_defects.py::test_d19_direct_caller_is_not_cancelled_by_a_submitted_run`,
+`test_cancellation_joins.py` (direct, `compute_many`, nested and async
+callers joining a cancelled submit; a later and a stale submit on one
+snapshot; a stress run of direct callers and submits under changing inputs).
 
 ### G7. Cycles and fixed points
 
@@ -984,7 +995,6 @@ time; nothing is in that state now.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D19 | A direct caller that joins a `submit`-owned run of the same query receives the owner's `QueryCancelled`. | Reproduced |
 | D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
 | D25 | After the cached result of a fixed-point cycle member is dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changes, a query that depends on that member raises `CycleError`. With the member's result still cached the same call returns the right value. The member is recomputed on its own, enters the cycle from the wrong end and reaches itself before the head. | Reproduced |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocks. Also reachable through the public API: a sync query that depends on an async query, called on the loop thread while that async query is running there, blocks the loop while re-verifying. | Reproduced, through the private entry point and through the public path |
@@ -1014,6 +1024,7 @@ time; nothing is in that state now.
 | D18 | If the disk writer thread hit an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread died and `flush_disk()` and `shutdown()` blocked for ever; a `PersistentCacheError` (map full) was dropped without a word. The writer now survives every error and goes on with the next batch, and the next `flush_disk()` or `shutdown()` raises `PersistentCacheError` with the original error as its cause. Also fixed: the `disk_store` counter and trace were recorded for writes that failed. | `fix: a disk write error stopped the writer and hung flush_disk() and shutdown()` |
 | D10 | Two engines on one `cache_dir` that both changed the same named collection overwrote each other's revision numbers (after each appended once, a restart restored only the second one's item), and a result computed from one engine's contents could verify against the other's. The first engine to change a named collection now holds an OS-level lock on it until shutdown or process exit; a change from any other engine, or from an engine whose copy is out of date, raises `PersistentCacheError` and changes nothing. Sharing a `cache_dir` for cached results and reading collections from several engines still works. | `fix: two engines changing one named collection overwrote each other's changes` |
 | D20 | A query result that could not be encoded raised a bare `TypeError` from the codec, even with no `cache_dir`, naming the unsupported type but not the query; an exception with unencodable `args` was replaced by that `TypeError`. A result now raises `UnencodableValueError` (a `TypeError`) naming the query, the path to the bad part and its type, and is not cached; an exception that cannot be encoded reaches the caller as itself, uncached. Input values and `fixed_point=` guesses get the same error. | `fix: an unencodable result raised an error naming no query and hid the query's own exception` |
+| D19 | A direct caller that joined a `submit`-owned run of the same query received the owner's `QueryCancelled`, though only `submit` cancels. A caller whose run ends in another call's `QueryCancelled` now checks its own cancellation and, if it is not cancelled, runs the query itself at its own revision. | `fix: a direct call that joined a submitted run was cancelled with it` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
