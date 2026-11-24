@@ -114,6 +114,21 @@ A few rules apply to every engine, with or without `cache_dir`:
     ```
 
     The name is also the identity in the disk cache, so keep it stable across runs.
+*   **Methods can be queries.** Decorate a method in the class body; calling it on an instance passes the instance as `self`, which becomes part of the cache key like any argument:
+
+    ```python
+    @dataclass(frozen=True)
+    class Document:
+        path: str
+
+        @engine.query
+        def word_count(self) -> int:
+            return len(read_file(self.path).split())   # read_file: an input
+
+    Document("a.txt").word_count()   # equal documents share one result
+    ```
+
+    `self` must be hashable; two instances share results when they are equal and of the same class. A frozen dataclass, a `NamedTuple` or a type registered with `register_type` is also stored on disk; an ordinary object (identity hash) gets results of its own, in memory only. Put `@staticmethod` or `@classmethod` above `@engine.query`.
 *   **Arguments are hashable, and keyed by type.** Calls are bound to the function's parameters, so keyword arguments work and `q(1)`, `q(x=1)` and `q(1, y=2)` (when `y=2` is the default) share one cached result. Arguments are compared by value and type, so `q(1)`, `q(True)` and `q(1.0)` each get their own, as do `q((1, 2))` and `q((1, 2.0))`. A dict or list cannot be an argument; pass a tuple or a frozen dataclass. `snapshot=` and `effects=` are the handle's own keywords: pass a parameter with one of those names positionally.
 
 ### Snapshots & Transactions (Input Debouncing)

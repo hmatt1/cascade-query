@@ -1,0 +1,251 @@
+"""Queries written as methods (G1).
+
+``@engine.query`` on a function in a class body makes a query whose first
+argument is ``self``: read from an instance, the handle binds it, as a
+function does. ``self`` is part of the cache key like any other argument.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from cascade import Engine, register_type
+
+BACKENDS = ("mdbx", "sqlite")
+
+
+def test_method_binds_self_and_caches_per_instance() -> None:
+    engine = Engine()
+    runs: list[Any] = []
+
+    class Scaler:
+        def __init__(self, k: int) -> None:
+            self.k = k
+
+        @engine.query
+        def scale(self, x: int, offset: int = 0) -> int:
+            runs.append((self, x, offset))
+            return self.k * x + offset
+
+    a, b = Scaler(2), Scaler(3)
+    assert a.scale(5) == 10
+    assert a.scale(5) == 10
+    assert a.scale(x=5) == 10
+    assert Scaler.scale(a, 5, offset=0) == 10  # through the class: same key
+    assert b.scale(5) == 15
+    assert a.scale(5, offset=1) == 11
+    assert [(obj, x) for obj, x, _ in runs] == [(a, 5), (b, 5), (a, 5)]
+    assert "bound QueryHandle" in repr(a.scale)
+    assert a.scale.id == Scaler.scale.id
+
+
+def test_method_follows_the_inputs_it_reads() -> None:
+    engine = Engine()
+
+    @engine.input
+    def rate() -> int:
+        return 2
+
+    @dataclasses.dataclass(frozen=True)
+    class Account:
+        balance: int
+
+        @engine.query
+        def interest(self) -> int:
+            return self.balance * rate()
+
+    acct = Account(100)
+    assert acct.interest() == 200
+    rate.set(3)
+    assert acct.interest() == 300
+    # Equal instances of one class share a result.
+    assert Account(100).interest() == 300
+
+
+def test_unhashable_self_is_refused_clearly_and_nothing_runs() -> None:
+    engine = Engine()
+    runs = {"n": 0}
+
+    class Mutable:
+        def __eq__(self, other: object) -> bool:  # makes the class unhashable
+            return self is other
+
+        @engine.query
+        def value(self) -> int:
+            runs["n"] += 1
+            return 1
+
+    with pytest.raises(TypeError, match="is a method, and its self"):
+        Mutable().value()
+    with pytest.raises(TypeError, match="is a method, and its self"):
+        engine.compute_many([(Mutable().value, ())])
+    assert runs["n"] == 0
+
+
+def test_static_and_class_methods() -> None:
+    engine = Engine()
+
+    class Tools:
+        @staticmethod
+        @engine.query
+        def double(x: int) -> int:
+            return 2 * x
+
+        @classmethod
+        @engine.query
+        def label(cls, x: int) -> str:
+            return f"{cls.__name__}:{x}"
+
+    class More(Tools):
+        pass
+
+    assert Tools.double(2) == 4 and Tools().double(2) == 4
+    assert Tools.label(1) == "Tools:1"
+    assert More.label(1) == "More:1"  # the class is an argument
+
+    with pytest.raises(TypeError, match="put @staticmethod above @engine.query"):
+
+        class Wrong:
+            @engine.query
+            @staticmethod
+            def f(x: int) -> int:
+                return x
+
+
+def test_handle_assigned_to_a_class_is_not_bound() -> None:
+    engine = Engine()
+
+    @engine.query
+    def plain(x: int) -> int:
+        return x + 1
+
+    class Holder:
+        q = plain
+
+    assert Holder().q(1) == 2  # a module-level query stays a plain function
+
+
+def test_bound_methods_work_with_submit_compute_many_and_async() -> None:
+    engine = Engine()
+
+    @dataclasses.dataclass(frozen=True)
+    class Item:
+        n: int
+
+        @engine.query
+        def square(self, extra: int = 0) -> int:
+            return self.n * self.n + extra
+
+        @engine.query
+        async def later(self) -> int:
+            await asyncio.sleep(0)
+            return -self.n
+
+    items = [Item(i) for i in range(4)]
+    try:
+        assert engine.compute_many([(item.square, ()) for item in items]) == [
+            0,
+            1,
+            4,
+            9,
+        ]
+        assert engine.compute_many([(items[2].square, (), {"extra": 1})]) == [5]
+        assert engine.submit(items[3].square, extra=1).result() == 10
+
+        async def main() -> list[int]:
+            return [await item.later() for item in items]
+
+        assert asyncio.run(main()) == [0, -1, -2, -3]
+    finally:
+        engine.shutdown()
+
+
+@dataclasses.dataclass(frozen=True)
+class Shape:
+    sides: int
+    length: float
+
+    def perimeter_plain(self) -> float:
+        return self.sides * self.length
+
+
+class Circle:
+    def __init__(self, r: float) -> None:
+        self.r = r
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is Circle and other.r == self.r
+
+    def __hash__(self) -> int:
+        return hash(self.r)
+
+
+register_type(
+    Circle, encode=lambda c: c.r, decode=Circle, name="tests.test_query_methods:Circle"
+)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_methods_on_encodable_instances_are_reused_from_disk(
+    tmp_path: Path, backend: str
+) -> None:
+    runs: list[str] = []
+
+    def session() -> tuple[Engine, Any, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        class Geometry:
+            @engine.query(name="methods.perimeter")
+            def perimeter(self: Shape) -> float:
+                runs.append("perimeter")
+                return self.perimeter_plain()
+
+            @engine.query(name="methods.area")
+            def area(self: Circle, scale: float = 1.0) -> float:
+                runs.append("area")
+                return 3.0 * self.r * self.r * scale
+
+        return engine, Geometry.perimeter, Geometry.area
+
+    engine, perimeter, area = session()
+    assert perimeter(Shape(3, 2.0)) == 6.0
+    assert area(Circle(2.0), scale=2.0) == 24.0
+    engine.shutdown()
+    assert runs == ["perimeter", "area"]
+    engine, perimeter, area = session()
+    try:
+        assert perimeter(Shape(3, 2.0)) == 6.0
+        assert area(Circle(2.0), 2.0) == 24.0
+        assert runs == ["perimeter", "area"]
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_methods_on_plain_instances_are_computed_but_not_stored(
+    tmp_path: Path, backend: str
+) -> None:
+    runs = {"n": 0}
+
+    def session() -> Engine:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        class Counter:
+            @engine.query(name="methods.count")
+            def count(self) -> int:
+                runs["n"] += 1
+                return 1
+
+        counter = Counter()
+        assert counter.count() == 1
+        assert counter.count() == 1
+        return engine
+
+    session().shutdown()
+    session().shutdown()
+    assert runs["n"] == 2

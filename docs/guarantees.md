@@ -91,8 +91,21 @@ Limits, by design:
   (a factory, a loop, lambdas in one module). Functions like that need
   `engine.query(name=...)` / `engine.input(name=...)` to coexist. Registering
   the same function again, or one with equal bytecode that captures the same
-  objects (a module reloaded unchanged), keeps results and handles. Methods
-  cannot be queries.
+  objects (a module reloaded unchanged), keeps results and handles.
+- **Methods are queries whose first argument is `self`.** `@engine.query` on
+  a function written in a class body gives a handle that, read from an
+  instance, binds it as `self`, as a function would; read from the class
+  it is the plain handle (`Cls.method(obj, x)` is the same call as
+  `obj.method(x)`). `self` is part of the key like any argument: it must
+  be hashable (otherwise the call raises `TypeError` saying so, before the
+  body runs), two instances share results when they are equal and of one
+  class, and the memo holds a reference to it. Instances with the default
+  identity hash get results of their own, kept in memory only, since they
+  cannot be encoded; a frozen dataclass, a `NamedTuple` or a registered
+  type is stored on disk like any argument. `@staticmethod` and
+  `@classmethod` go above `@engine.query` (the class is then the first
+  argument); below it they are refused when the class is defined. A query
+  defined outside a class and assigned to a class attribute is not bound.
 - **Values are encoded to tell whether they changed.** G18 lists the
   types the codecs know; any other class can be added with
   `cascade.register_type` (G18). What happens to a value of a type neither
@@ -142,7 +155,9 @@ Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_reco
 `test_fan_out_inside_queries.py` (dependencies, snapshots, effects, errors and
 cycles through `compute_many` and `compute_many_stream` inside a query;
 `submit` refused), `test_query_identity.py` (replaced functions, stale
-handles, `name=`), `test_argument_keys.py` (look-alike arguments in memory
+handles, `name=`), `test_query_methods.py` (binding, keyword arguments, an unhashable `self`,
+static and class methods, `compute_many`, `submit`, async, reuse from disk
+on both backends), `test_argument_keys.py` (look-alike arguments in memory
 and on both backends; keyword, positional-only, keyword-only, `*args` and
 `**kwargs` binding; defaults that cannot be keys; binding errors; inputs,
 `compute_many` and `submit`; Hypothesis: equal keys only for arguments no
@@ -1281,7 +1296,7 @@ without `cache_dir` keeps results it cannot encode (G1, G18).
 
 | Limit | Who it stops | Why it conflicts with the aim |
 |---|---|---|
-| **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
+| **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. After a reload, callers must pick up the new handle. (Methods can now be queries, with `self` as an argument: G1.) | Libraries that generate queries (one extra argument). | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
 
 Limits that narrow use without stopping it:

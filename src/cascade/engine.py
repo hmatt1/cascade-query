@@ -344,10 +344,18 @@ class _QueryHandle:
         self._is_async_fn = inspect.iscoroutinefunction(fn)
         self._spec = spec if spec is not None else ArgSpec(fn, f"query {query_id}")
         self._fast_len = self._spec.fast_len
+        # A function written in a class body is a method: read from an
+        # instance, the handle binds it as ``self``, like a function does.
+        self._is_method = _defined_in_class_body(fn)
 
     def _mark_stale(self) -> None:
         # Swapping the class keeps the check off the path of live handles.
         self.__class__ = _StaleQueryHandle
+
+    def __get__(self, obj: Any, objtype: Any = None) -> Any:
+        if obj is None or not self._is_method:
+            return self
+        return _BoundQueryHandle(self, obj)
 
     def _live_fn(self) -> Callable[..., Any]:
         """The function to run; raises on a stale handle."""
@@ -416,6 +424,86 @@ class _QueryHandle:
 
     def __repr__(self) -> str:
         return f"<QueryHandle {self._id}>"
+
+
+def _defined_in_class_body(fn: Callable[..., Any]) -> bool:
+    """True for a function written directly in a ``class`` statement.
+
+    ``Outer.method`` and ``f.<locals>.Cls.method`` are; ``f.<locals>.g`` and
+    a module-level function are not, even if later assigned to a class.
+    """
+    parts = getattr(fn, "__qualname__", "").split(".")
+    return len(parts) >= 2 and parts[-2] != "<locals>"
+
+
+class _BoundQueryHandle:
+    """A query method read from an instance: ``self`` is its first argument.
+
+    ``self`` is part of the cache key like any argument: it must be
+    hashable, two instances share results when they are equal and of one
+    class, and results are stored on disk only if it can be encoded (a
+    frozen dataclass, a ``NamedTuple``, a registered type).
+    """
+
+    __slots__ = ("_handle", "_self")
+
+    def __init__(self, handle: _QueryHandle, obj: Any) -> None:
+        self._handle = handle
+        self._self = obj
+
+    def _check_hashable(self) -> None:
+        try:
+            hash(self._self)
+        except TypeError:
+            cls = type(self._self)
+            raise TypeError(
+                f"query {self._handle._id} is a method, and its self (a "
+                f"{cls.__module__}.{cls.__qualname__}) is part of the cache "
+                "key, so it must be hashable. Give the class __eq__ and "
+                "__hash__ over the state the query reads (a frozen "
+                "dataclass does), or make the query a function that takes "
+                "that state as arguments."
+            ) from None
+
+    def __call__(
+        self,
+        *args: Any,
+        snapshot: Snapshot | None = None,
+        effects: dict[str, list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        self._check_hashable()
+        return self._handle(
+            self._self, *args, snapshot=snapshot, effects=effects, **kwargs
+        )
+
+    def _key_args(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None
+    ) -> tuple[Any, ...]:
+        self._check_hashable()
+        return self._handle._key_args((self._self, *args), kwargs)
+
+    def _live_fn(self) -> Callable[..., Any]:
+        return self._handle._live_fn()
+
+    @property
+    def id(self) -> str:
+        return self._handle._id
+
+    @property
+    def raw(self) -> Callable[..., Any]:
+        return self._handle._fn
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not _BoundQueryHandle:
+            return NotImplemented
+        return self._handle is other._handle and self._self is other._self
+
+    def __hash__(self) -> int:
+        return hash((id(self._handle), id(self._self)))
+
+    def __repr__(self) -> str:
+        return f"<bound QueryHandle {self._handle._id} of {self._self!r}>"
 
 
 class _StaleQueryHandle(_QueryHandle):
@@ -654,6 +742,13 @@ class Engine:
                 raise ValueError("max_iterations must be at least 1")
 
         def decorator(f: Callable[..., Any]) -> _QueryHandle:
+            if isinstance(f, (staticmethod, classmethod)):
+                raise TypeError(
+                    f"@engine.query cannot wrap a {type(f).__name__} object: "
+                    f"put @{type(f).__name__} above @engine.query instead. "
+                    "With @classmethod the class is then the query's first "
+                    "argument."
+                )
             query_id = self._resolve_id(f, name)
             spec = ArgSpec(f, f"query {query_id}")
             _check_reserved(spec, "query", ("snapshot", "effects"))
