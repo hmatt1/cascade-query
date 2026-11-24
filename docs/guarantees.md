@@ -150,7 +150,8 @@ Limits, by design:
 
 Enforced by: `test_dirty_propagation.py::test_random_operations_match_plain_recomputation`
 (seeded differential test against an independent model, 16 parametrisations),
-`test_stateful_engine_invariants.py` (Hypothesis state machine),
+`test_stateful_engine_invariants.py` (Hypothesis state machine against a
+plain-Python model, in memory and on both backends; see test gap 3),
 `test_dirty_propagation.py::test_concurrent_writers_and_readers_only_see_real_states`,
 `test_fan_out_inside_queries.py` (dependencies, snapshots, effects, errors and
 cycles through `compute_many` and `compute_many_stream` inside a query;
@@ -1383,18 +1384,35 @@ as a no-op, snapshot expiry after release, the error-caching rules,
 
 ## Formal model
 
-`docs/formal/CascadeCore.tla` models two inputs, a mode switch and one query,
-with a single sequential actor. TLC checks six invariants in CI.
+`docs/formal/CascadeCore.tla` models two inputs, a mode switch and two
+queries, one above the other, with two concurrent callers, writers and
+evictions. A write changes an input and nothing else; the callers bring the
+cached rows up to date by lazy re-verification, one critical section of the
+store lock per step (look up, verify, mark green or claim and run, store,
+release), each at the newest revision or at an older one, as through a
+snapshot. TLC checks every interleaving: eight invariants for two callers
+and two writes (26 million states), and minimal re-execution on top of them
+for one caller and five writes. CI runs the second, which takes seconds, on
+every push; the first takes minutes and is run on demand, locally or through
+`.github/workflows/model-check.yml`. `docs/formal/README.md` maps the
+actions to the code and the invariants to the guarantees.
 
-- Writes update the query result in the same atomic step, so lazy
-  re-verification, the mechanism behind G1 and G2, is not modelled.
-- `ReadLive` is defined but not part of `Next`; `ReadLiveReturnsChoose` is
-  defined but not listed in `CascadeCore.cfg`.
-- Not modelled: threads, in-flight deduplication, cancellation of running work,
-  transactions, collections, compaction, errors, TTL, eviction. The model
-  uses the revision as the change marker of a query result; the code uses a
-  separate stamp (G1).
-- None of D1–D32 is reachable in the model.
+- Covered: G1 and G4 (a call returns what a fresh run at its revision
+  would), the `head_clean` fast path and dirty propagation, change stamps
+  and the early bail-out (G2), in-flight deduplication (G5), eviction
+  (G13), loading a persisted record (G15, G16).
+- The invariants were tested: thirteen bugs seeded into the model one at a
+  time each violate one of them. One is the race
+  `test_snapshot_verification_race.py` guards, a dependent verified against
+  the stored row instead of the entry its nested call returned; TLC needs
+  both callers and 23 steps to reach it.
+- Not modelled: cancellation of running work, errors, TTL, re-registered
+  code, fixed points, effects, transactions, collections, compaction and
+  history retention. Change stamps are reused once nobody holds them, where
+  the code counts up; the outcome of a walk over input dependencies is fixed
+  in the step that looks the row up.
+- None of D1–D32 is reachable in the model: each is in a feature it leaves
+  out. The state machine (test gap 3) is what covers those.
 
 ## Test gaps
 
@@ -1410,10 +1428,19 @@ Ordered by the risk they leave open.
    `test_collection_write_lock.py` puts two engines, and two processes, on
    one `cache_dir`, but only around named collections; nothing runs two
    processes writing results to one directory under load.
-3. **The Hypothesis state machine is narrow.** It covers inputs, one dynamic
-   query and snapshots. It copies input history and the revision from the
-   engine rather than modelling them, runs 35 examples of 25 steps, and has no
-   transactions, collections, errors, TTL, eviction, persistence or threads.
+3. **The Hypothesis state machine is sequential.** It keeps a plain-Python
+   model (input values, a list, a clock, the revision) and compares every
+   read with a plain function of it: inputs, a dynamic dependency,
+   snapshots, a TTL query and a dependent, re-registered code, a fixed
+   point, a collection under transactions that commit or roll back,
+   compaction while snapshots are held, and a new engine on the same
+   directory, in memory and on both backends, 100 examples of 40 steps
+   each. Thirteen faults seeded into the engine one at a time (faults of
+   the kind of D2, D3, D12 and D22, a rollback that undoes nothing, a
+   persisted result loaded without comparing its dependencies, and so on)
+   each fail it. It has no threads, errors, eviction, async queries,
+   accumulator effects or `compute_many`, one collection (a list), and one
+   writer.
 4. **Rewrite equivalence is tested per reducer, not per program.**
    `test_rewrite_differential.py` compares each rewritten reducer with the
    builtin over ints, floats, strings, tuples and mixtures. It does not
@@ -1435,6 +1462,14 @@ Ordered by the risk they leave open.
 9. **Transactions inside the block are untested** for queries reading a
    mutated or newly created collection, `submit` and two engines. Threads and
    async tasks are covered by `test_transaction_ownership.py`.
-10. **Mutation testing is configured but never run in CI**, so the 95% line
-    coverage figure says nothing about whether the assertions would catch a
-    bug.
+10. **One in five mutants survives, and nothing gates on it.**
+    `scripts/mutation.py` runs mutmut (11,282 mutants on covered lines) and
+    reports the survival rate per module with the diffs of the survivors.
+    The first full run (2026-11-24) left 2,337 alive, 20.7%: from 41% in
+    `_serde` and 27% in `_evaluator` down to 9% in `_collections`. So the
+    95% line coverage figure overstates what the assertions would catch,
+    most in the async paths and where a result is reloaded from disk (its
+    TTL, its dependencies). `docs/verification-status.md` has the table,
+    how the run was made and what in it is unconfirmed. A full run is hours
+    of test runs, so it is done on demand, on a machine with many cores or
+    through `.github/workflows/mutation.yml`.

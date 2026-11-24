@@ -45,11 +45,17 @@ skip_covered = false
 show_missing = true
 
 [tool.mutmut]
-paths_to_mutate = ["src/cascade/"]
-tests_dir = ["tests/"]
-runner = "python -m pytest -q -m \"not slow\" --ignore=tests/test_performance.py"
+# mutmut 3 option names. It runs pytest inside a copy of the project under
+# mutants/, where this file's [tool.pytest.ini_options] applies as well, so
+# slow tests are deselected there too. Run by .github/workflows/mutation.yml.
+source_paths = ["src/cascade/"]
+pytest_add_cli_args_test_selection = ["tests/"]
+# The performance tests assert on timings, which the instrumented copy of the
+# source does not keep. CI runs them apart from the suite for the same reason.
+pytest_add_cli_args = ["--ignore=tests/test_performance.py"]
 mutate_only_covered_lines = true
-also_copy = ["pyproject.toml", "benchmarks"]
+# tests/test_examples.py runs the scripts in examples/.
+also_copy = ["benchmarks", "examples"]
 
 [tool.ruff]
 line-length = 88
