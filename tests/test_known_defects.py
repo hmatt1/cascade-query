@@ -325,7 +325,6 @@ def test_d9_factory_made_queries_do_not_share_results() -> None:
     assert q2() == 2
 
 
-@_defect(10, "two engines on one cache_dir overwrite each other's collection log")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_d10_two_engines_on_one_named_collection(tmp_path: Path, backend: str) -> None:
     engines: list[Engine] = []

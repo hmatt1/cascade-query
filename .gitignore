@@ -10,3 +10,4 @@ mutants/
 */lock.mdb
 */mdbx.dat
 */mdbx.lck
+*/locks/collection-*.lock

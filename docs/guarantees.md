@@ -47,7 +47,7 @@ Every open defect has a failing regression test in
 | G23 | One mutation costs one diff of work, where the result can be exact | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
 | G25 | A transaction applies completely or not at all | Broken for a commit that fails on an input value (D27) | Good, threads and tasks included |
-| G26 | A named collection is restored with the same contents after a restart | Broken for two engines on one directory (D10) | Good on the happy path |
+| G26 | A named collection is restored with the same contents after a restart | Holds with limits | Good, two engines and processes included |
 
 ## Core evaluation
 
@@ -445,8 +445,9 @@ traces and stats. All of these take the store lock. Mutating a collection is
 safe from any thread; while a transaction that changed it is open, a
 mutation from outside that transaction raises `RuntimeError` (G25).
 
-Not safe: two engines writing the same named collection (D10), and two
-threads calling into one dependency cycle through different queries (D24).
+Not safe: two threads calling into one dependency cycle through different
+queries (D24). Two engines changing the same named collection is refused
+with `PersistentCacheError` (G26).
 
 ## Persistence
 
@@ -897,15 +898,41 @@ restores exactly what each collection held at shutdown. To empty a
 collection, call its `clear()`. A change of the result cache's format
 keeps them too (G20).
 
+**One writer per collection.** Engines in one process or several may share a
+`cache_dir`: they share cached query results, and any of them may open and
+read a named collection. The first change an engine makes to a named
+collection (any mutating call, `compact()`, or a transaction that changes
+it) takes an exclusive OS-level lock on that collection in the directory
+(`locks/collection-<hash>.lock`, `fcntl.flock` on POSIX, `msvcrt.locking` on
+Windows). The engine holds it until `shutdown()`, or until its process ends,
+also by a crash: the lock belongs to the open file, so a lock file left
+behind blocks nobody. A change from another engine while it is held raises
+`PersistentCacheError` naming the collection and the directory, and changes
+nothing in memory or on disk. An engine whose copy of the collection is
+older than what is on disk (another engine changed it after this one loaded
+it) is refused the same way when it first changes it, saying the copy is out
+of date. Without this, both engines numbered their changes from their own
+copy of the log and overwrote each other's (D10).
+
 Limits: writes are committed but not fsynced, so they survive a process kill
-but not necessarily a power loss.
+but not necessarily a power loss. An engine dropped without `shutdown()`
+keeps its locks until the process ends. An engine that only reads a
+collection keeps the contents it loaded and does not see later changes
+another engine makes. Two collection objects with the same name in one
+engine are not told apart by the lock.
 
 Enforced by: `test_incremental_persistence.py::test_named_collections_restore_across_engines`,
 `::test_restored_list_keeps_uid_continuity`, `::test_compaction_squashes_log_tail`,
 `::test_unserializable_value_raises_persistent_cache_error`,
 `::test_clear_disk_cache_keeps_collections`,
 `::test_clear_disk_cache_drops_results_but_not_collections`,
-`test_transaction_collections.py::test_named_collection_writes_to_disk_only_on_commit`.
+`test_transaction_collections.py::test_named_collection_writes_to_disk_only_on_commit`,
+`test_known_defects.py::test_d10_two_engines_on_one_named_collection`,
+`test_collection_write_lock.py` (both backends: every kind of change refused
+and undone, in a transaction too, release at shutdown, an out-of-date copy,
+also after compaction, different collections and shared results, queries in
+two engines, two threads racing, another process holding the lock, a
+crashed holder).
 
 ---
 
@@ -930,7 +957,6 @@ time; nothing is in that state now.
 | D31 | Accumulator effects pushed inside the element function of a rewritten comprehension are not replayed for elements the pipeline already holds. With `sum(note(x) for x in xs)` where `note` pushes `x`, the first run collects `[1, 2, 3]`; after `xs.append(4)` the re-run collects `[4]` where Python collects `[1, 2, 3, 4]`. (Not when the stage function closes over the accumulator object: that pipeline cannot be fingerprinted and is rebuilt on every run.) Found while fixing D7; present at the audit commit. | Reproduced |
 | D26 | Accumulator effects pushed in the runs of a fixed-point cycle that were abandoned reach every caller above the cycle head. With `fixed_point=0`, a head that pushes once per run and needs four runs hands its caller, and `effects=`, four copies; the head's own cached result holds one. | Reproduced: `['a-run', 'b-run']` four times over |
 | D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
-| D10 | Two engines on one `cache_dir` that both mutate the same named collection overwrite each other's revision numbers, and one can hydrate the other's query result. | Reproduced on both backends: after each engine appended once, a restart restored only the second engine's item. The query-result half was not re-run. |
 
 ### Data loss and corruption
 
@@ -971,6 +997,7 @@ time; nothing is in that state now.
 | D7 | Rewritten reducers differed from the builtins. Float `sum([0.1] * 10)` gave `0.9999999999999999` against `1.0`, and drifted further with each removal. `sorted(..., reverse=True)` reversed equal elements (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`), and any `sorted` did after an insert that was not at the end. `any` and `all` evaluated every element (`any(1 / z for z in [1, 0])` raised `ZeroDivisionError`). `min` and `max` returned the wrong one of several equal elements (`max([1, True])` gave `True`), and with NaN present did not follow the builtin's scan (`min([2.0, nan, 1.0])` gave `2.0` against `1.0`). `len(map(...))` returned a count instead of raising `TypeError`, over plain lists too. Also found and fixed: of two elements that raise, the one whose change arrived first was reported, not the first in the collection; a `set` or `dict` built from equal values of different types kept the wrong one; the function expression of `map`/`filter` was evaluated after the source. Each reducer now either maintains a result that is exact by construction or applies the builtin to the stored values, and anything that raises is settled by plain evaluation (G22). | `fix: rewritten sum, sorted, min, max, any, all and len differed from the builtins` |
 | D23 | A stored result of an `async def` query could not be loaded by a new engine: the call raised `TypeError: entry_from_runtime() missing ... 'computed_at_time'` instead of returning the value. The async loading path now passes the stored computation time, so a loaded result also expires with its TTL as on the sync path. | `fix: an async query's stored result could not be loaded by a new engine` |
 | D18 | If the disk writer thread hit an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread died and `flush_disk()` and `shutdown()` blocked for ever; a `PersistentCacheError` (map full) was dropped without a word. The writer now survives every error and goes on with the next batch, and the next `flush_disk()` or `shutdown()` raises `PersistentCacheError` with the original error as its cause. Also fixed: the `disk_store` counter and trace were recorded for writes that failed. | `fix: a disk write error stopped the writer and hung flush_disk() and shutdown()` |
+| D10 | Two engines on one `cache_dir` that both changed the same named collection overwrote each other's revision numbers (after each appended once, a restart restored only the second one's item), and a result computed from one engine's contents could verify against the other's. The first engine to change a named collection now holds an OS-level lock on it until shutdown or process exit; a change from any other engine, or from an engine whose copy is out of date, raises `PersistentCacheError` and changes nothing. Sharing a `cache_dir` for cached results and reading collections from several engines still works. | `fix: two engines changing one named collection overwrote each other's changes` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -997,9 +1024,10 @@ Limits that narrow use without stopping it:
   `compute_many` and `compute_many_stream` track dependencies there;
   `submit` raises. `asyncio.gather` over async queries also tracks
   dependencies.
-- **One process per `cache_dir`.** Two processes on one directory can mix
-  collection state (D10), and one can find the database locked by the other
-  (reported by `flush_disk()`, G17). Parallel CI jobs and
+- **One writer per named collection.** Engines and processes may share a
+  `cache_dir`, but only one at a time may change a given named collection
+  (G26); with sqlite one can find the database locked by another (reported
+  by `flush_disk()`, G17). Parallel CI jobs and
   `pytest-xdist` workers need separate directories.
 - **Only `submit` cancels.** An editor-style tool that calls queries directly
   or through `compute_many` cannot abandon stale work.
@@ -1043,8 +1071,9 @@ Ordered by the risk they leave open.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
    exits child processes without `shutdown()` and with `os._exit`.
    `test_disk_writer_errors.py` injects write failures into a live engine.
-   The only test that puts two engines on one `cache_dir` is the expected
-   failure for D10. Nothing runs two processes on one `cache_dir`.
+   `test_collection_write_lock.py` puts two engines, and two processes, on
+   one `cache_dir`, but only around named collections; nothing runs two
+   processes writing results to one directory under load.
 3. **The Hypothesis state machine is narrow.** It covers inputs, one dynamic
    query and snapshots. It copies input history and the revision from the
    engine rather than modelling them, runs 35 examples of 25 steps, and has no

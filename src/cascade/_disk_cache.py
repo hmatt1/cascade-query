@@ -137,6 +137,133 @@ def _check_collection_format(
         )
 
 
+class _FileLock:
+    """Exclusive, non-blocking OS-level lock on one file.
+
+    ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows. The lock
+    belongs to the open file: it conflicts with another holder in the same
+    process as well as in another process, and the operating system drops
+    it when the holder closes the file, exits or crashes. A lock file left
+    behind therefore never blocks anyone.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._fd: int | None = None
+
+    def try_acquire(self) -> bool:
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            self._lock(fd)
+        except OSError:
+            os.close(fd)
+            return False
+        except BaseException:  # pragma: no cover
+            os.close(fd)
+            raise
+        self._fd = fd
+        return True
+
+    if sys.platform == "win32":
+
+        @staticmethod
+        def _lock(fd: int) -> None:
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+        @staticmethod
+        def _unlock(fd: int) -> None:
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+    else:
+
+        @staticmethod
+        def _lock(fd: int) -> None:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        @staticmethod
+        def _unlock(fd: int) -> None:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        try:
+            self._unlock(fd)
+        except OSError:  # pragma: no cover - closing releases it anyway
+            pass
+        finally:
+            os.close(fd)
+
+
+class _CollectionWriteLocks:
+    """The named collections one engine may change, each under a file lock.
+
+    Two engines that both change one named collection number their log
+    entries from their own copy of its log, so they overwrite each other's
+    entries on disk, and a result computed from one engine's contents
+    verifies against the other's (D10). An engine therefore takes an
+    exclusive lock on a collection the first time it changes it, and holds
+    it until the cache is closed (``Engine.shutdown()``, or the process
+    ending). Other engines can still open and read the collection, and share
+    every cached query result. Lock files live in ``locks/`` inside the
+    cache directory, one per collection name.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        self._dir = os.path.join(cache_dir, "locks")
+        self._cache_dir = cache_dir
+        self._held: dict[str, _FileLock] = {}
+        self._mutex = threading.Lock()
+
+    def acquire(self, name: str) -> bool:
+        """Take the lock for ``name``; False if this engine held it already.
+
+        Raises ``PersistentCacheError`` if another engine holds it.
+        """
+        with self._mutex:
+            if name in self._held:
+                return False
+            os.makedirs(self._dir, exist_ok=True)
+            digest = hashlib.blake2b(name.encode("utf-8"), digest_size=16).hexdigest()
+            lock = _FileLock(os.path.join(self._dir, f"collection-{digest}.lock"))
+            if not lock.try_acquire():
+                raise PersistentCacheError(
+                    f"named collection {name!r} in the cache directory "
+                    f"{self._cache_dir!r} is being changed by another Engine, "
+                    "in this process or another one. One engine at a time may "
+                    "change a named collection (any number may read it): call "
+                    "shutdown() on the other engine first, or give this one a "
+                    "cache_dir of its own."
+                )
+            self._held[name] = lock
+            return True
+
+    def release(self, name: str) -> None:
+        with self._mutex:
+            lock = self._held.pop(name, None)
+        if lock is not None:
+            lock.release()
+
+    def release_all(self) -> None:
+        with self._mutex:
+            held = list(self._held.values())
+            self._held.clear()
+        for lock in held:
+            lock.release()
+
+
 class _SharedEnv:
     def __init__(self, env: Any) -> None:
         self.env = env
@@ -218,6 +345,7 @@ class MdbxDiskCache:
         _canonical.require_msgpack()
         path = os.fspath(cache_dir)
         os.makedirs(path, exist_ok=True)
+        self._collection_locks = _CollectionWriteLocks(path)
         self._registry_key, self._env = _acquire_env(path, map_size)
         if _FREE_THREADED:  # pragma: no cover
             _FT_LOCK.acquire()
@@ -369,6 +497,30 @@ class MdbxDiskCache:
                     tail.append((rev, _canonical.decode(bytes(value))))
         return snapshot, tail
 
+    def collection_head(self, name: str) -> int:
+        """Revision of the newest change to ``name`` on disk (0 if none)."""
+        prefix = self._log_prefix(name)
+        last = None
+        with self._begin() as txn:
+            with mdbx.Cursor(self._collections, txn) as curs:
+                for key, _ in curs.iter(start_key=prefix):
+                    kb = bytes(key)
+                    if not kb.startswith(prefix):
+                        break
+                    last = kb
+            if last is not None:
+                return int.from_bytes(last[len(prefix) :], "big")
+            raw = self._collections.get(txn, self._snap_key(name))
+        if raw is None:
+            return 0
+        return int(_canonical.decode(bytes(raw)).get("base_rev", 0))
+
+    def lock_collection(self, name: str) -> bool:
+        return self._collection_locks.acquire(name)
+
+    def unlock_collection(self, name: str) -> None:
+        self._collection_locks.release(name)
+
     def collection_append_many(
         self, name: str, batch: list[tuple[int, dict[str, Any]]]
     ) -> None:
@@ -438,7 +590,10 @@ class MdbxDiskCache:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            _release_env(self._registry_key)
+            try:
+                _release_env(self._registry_key)
+            finally:
+                self._collection_locks.release_all()
 
 
 class SqliteDiskCache:
@@ -451,6 +606,7 @@ class SqliteDiskCache:
         self._path = os.path.join(path_dir, "cache.db")
 
         self._lock = threading.RLock()
+        self._collection_locks = _CollectionWriteLocks(path_dir)
         self._conn = sqlite3.connect(
             self._path, check_same_thread=False, isolation_level=None
         )
@@ -648,6 +804,29 @@ class SqliteDiskCache:
 
         return snapshot, tail
 
+    def collection_head(self, name: str) -> int:
+        """Revision of the newest change to ``name`` on disk (0 if none)."""
+        prefix = self._log_prefix(name)
+        with self._lock:
+            row = self._conn.execute(
+                "select max(k) from collections where k >= ? and k < ?",
+                (prefix, prefix[:-1] + b"\xff"),
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                return int.from_bytes(bytes(row[0])[len(prefix) :], "big")
+            row = self._conn.execute(
+                "select v from collections where k = ?", (self._snap_key(name),)
+            ).fetchone()
+        if row is None:
+            return 0
+        return int(_canonical.decode(bytes(row[0])).get("base_rev", 0))
+
+    def lock_collection(self, name: str) -> bool:
+        return self._collection_locks.acquire(name)
+
+    def unlock_collection(self, name: str) -> None:
+        self._collection_locks.release(name)
+
     def collection_append_many(
         self, name: str, batch: list[tuple[int, dict[str, Any]]]
     ) -> None:
@@ -718,8 +897,11 @@ class SqliteDiskCache:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            with self._lock:
-                self._conn.close()
+            try:
+                with self._lock:
+                    self._conn.close()
+            finally:
+                self._collection_locks.release_all()
 
 
 class DiskCacheProtocol(Protocol):
@@ -740,6 +922,9 @@ class DiskCacheProtocol(Protocol):
     def collection_append_many(
         self, name: str, batch: list[tuple[int, dict[str, Any]]]
     ) -> None: ...
+    def collection_head(self, name: str) -> int: ...
+    def lock_collection(self, name: str) -> bool: ...
+    def unlock_collection(self, name: str) -> None: ...
     def collection_snapshot(
         self, name: str, record: dict[str, Any], upto_rev: int
     ) -> None: ...

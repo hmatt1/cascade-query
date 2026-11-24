@@ -386,6 +386,8 @@ engine = Engine(cache_dir="./cache")
 items = CascadeList(engine, name="items", compact_every=1024)
 ```
 
+One engine at a time may change a named collection. The first change takes a lock on it in the cache directory, held until `engine.shutdown()` or the end of the process (a crashed process leaves no lock behind). Another engine, in the same process or another one, can open and read the collection and shares every cached query result, but changing the collection there raises `PersistentCacheError` and changes nothing. So does changing a copy that is older than what another engine has written since; open it again from a new engine.
+
 *   **`engine.inspect_pipelines()`**: Lists every observed pipeline with its source, logical stages, fused stage count, checkpoint revision, and consuming queries.
 
 ---
@@ -395,7 +397,7 @@ items = CascadeList(engine, name="items", compact_every=1024)
 ### Limitations
 
 1. **Cycle Detection:** Cascade detects and rejects recursive function calls (cycles) with a `CycleError`, unless the query reached again has `fixed_point=`. A fixed-point cycle must be entered through that query, and stops with a `CycleError` if it has not converged after `max_iterations` runs (default 1000).
-2. **Thread Safety:** Calling queries, reading inputs, `.set()`, transactions and registering queries or inputs are safe from any thread. Use one process per `cache_dir`. A transaction belongs to the task or thread that opened it; mutating a collection from elsewhere while a transaction that changed it is open raises `RuntimeError` (see G25 in `docs/guarantees.md`).
+2. **Thread Safety:** Calling queries, reading inputs, `.set()`, transactions and registering queries or inputs are safe from any thread. Several engines and processes may share a `cache_dir` for cached results, but only one at a time may change a given named collection (see Persistence & Inspection above); with sqlite a busy database can make a write fail, which `flush_disk()` reports. A transaction belongs to the task or thread that opened it; mutating a collection from elsewhere while a transaction that changed it is open raises `RuntimeError` (see G25 in `docs/guarantees.md`).
 3. **Persistence Security:** The persistent disk cache resolves `@dataclass`, `NamedTuple` and exception types via `importlib`. Only open cache directories from trusted sources.
 4. **Python Version:** Optimization for parallel CPU-bound work requires **CPython 3.14+ free-threaded** builds with `PYTHON_GIL=0`.
 

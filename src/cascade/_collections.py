@@ -332,6 +332,9 @@ class _CollectionCore:
         # That transaction. Until it ends, only its owner may change this
         # collection (see ``_mutator``). Guarded by ``rw``.
         self._tx: Any = None
+        # Set once this object holds the collection's write lock on disk
+        # (``_claim_writer``); only named collections take one.
+        self._writer = False
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -477,6 +480,8 @@ class _CollectionCore:
             # leaves no partial state: the owner collection is rolled back to
             # the log's truth.
             try:
+                if not self._writer:
+                    self._claim_writer()
                 if tx is None:
                     self.disk.collection_append_many(
                         self.name, [(diff["rev"], diff) for diff in diffs]
@@ -511,6 +516,35 @@ class _CollectionCore:
                 self.compact_due = True
             else:
                 self.compact_memory()
+
+    def _claim_writer(self) -> None:
+        """Become the one engine that changes this named collection on disk.
+
+        Takes the collection's write lock in the cache directory (raises
+        ``PersistentCacheError`` if another engine holds it) and checks that
+        no other engine changed the collection on disk since this one
+        loaded it: its changes would be numbered from a stale log and
+        overwrite the other engine's (D10).
+        """
+        disk = self.disk
+        acquired = disk.lock_collection(self.name)
+        try:
+            on_disk = disk.collection_head(self.name)
+            if on_disk > self.log.head:
+                raise PersistentCacheError(
+                    f"named collection {self.name!r} was changed on disk by "
+                    "another Engine after this engine loaded it (its newest "
+                    f"change there is {on_disk}, this engine has "
+                    f"{self.log.head}), so this engine's copy is out of date "
+                    "and changing it would overwrite the other engine's "
+                    "changes. Shut this engine down and open the collection "
+                    "from a new one."
+                )
+        except BaseException:
+            if acquired:
+                disk.unlock_collection(self.name)
+            raise
+        self._writer = True
 
     def _maybe_compact_disk(self) -> None:
         if (
@@ -623,6 +657,9 @@ class _CollectionCore:
         """Squash the on-disk event log into a single snapshot at the current head."""
         if self.disk is None:
             return
+        if not self._writer:
+            # Rewrites the log on disk: only the engine that changes it may.
+            self._claim_writer()
         head = self.log.head
         items = self.log.contents_at(head)
         if self.kind == _KIND_LIST:
