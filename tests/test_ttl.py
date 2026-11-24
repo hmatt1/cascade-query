@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import unittest.mock
 from collections import Counter
 from pathlib import Path
@@ -529,3 +530,268 @@ def test_async_result_loaded_from_disk_keeps_its_computed_time(
     assert runs["stamped"] == 1
     assert session(1010.5) == (1010.5, 1010.5)
     assert runs["stamped"] == 2
+
+
+# --- Boundaries, and the expiry of results loaded from disk ------------------
+#
+# A TTL result is good up to and including the moment its TTL runs out. One
+# that a new engine loads from disk expires when the stored one would have,
+# and whatever is loaded or verified above it expires with the earliest TTL
+# result beneath it. Sync and async queries take separate code paths in the
+# engine, so each test runs with both.
+
+_FLAVORS = ["sync", "async"]
+_BACKENDS = ["mdbx", "sqlite"]
+
+
+def _call(flavor: str, handle: Any) -> Any:
+    """Call a query: directly, or awaited on an event loop.
+
+    Called from plain code an async query takes the engine's sync path, so
+    the async one is only reached from a running loop.
+    """
+    if flavor == "sync":
+        return handle()
+
+    async def main() -> Any:
+        return await handle()
+
+    return asyncio.run(main())
+
+
+def _stamp(
+    engine: Engine,
+    clock: _Clock,
+    runs: Counter[str],
+    name: str,
+    flavor: str,
+    *,
+    ttl: float,
+) -> Any:
+    """Register ``name``: a TTL query that returns the time it ran at."""
+
+    def sync_body() -> float:
+        runs[name] += 1
+        return clock.now
+
+    async def async_body() -> float:
+        runs[name] += 1
+        return clock.now
+
+    body = sync_body if flavor == "sync" else async_body
+    return engine.query(name=name, ttl=ttl)(body)
+
+
+def _reads(
+    engine: Engine,
+    runs: Counter[str],
+    name: str,
+    flavor: str,
+    deps: list[Any],
+    *,
+    ttl: float | None = None,
+) -> Any:
+    """Register ``name``: a query that returns what ``deps`` return, in order."""
+
+    def sync_body() -> tuple[Any, ...]:
+        runs[name] += 1
+        return tuple([dep() for dep in deps])
+
+    async def async_body() -> tuple[Any, ...]:
+        runs[name] += 1
+        values = []
+        for dep in deps:
+            # An async query hands back an awaitable, an input its value.
+            value = dep()
+            values.append(await value if inspect.isawaitable(value) else value)
+        return tuple(values)
+
+    body = sync_body if flavor == "sync" else async_body
+    return engine.query(name=name, ttl=ttl)(body)
+
+
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_ttl_result_is_still_good_at_exactly_its_ttl(
+    clock: _Clock, flavor: str
+) -> None:
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.input
+    def unrelated() -> int:
+        return 0
+
+    stamped = _stamp(engine, clock, runs, "stamped", flavor, ttl=10.0)
+
+    assert _call(flavor, stamped) == 1000.0
+    # A new revision, so the next call verifies the result instead of
+    # finding it current. Exactly ten seconds old has not expired.
+    unrelated.set(1)
+    clock.now = 1010.0
+    assert _call(flavor, stamped) == 1000.0
+    assert runs["stamped"] == 1
+
+    unrelated.set(2)
+    clock.now = 1010.5
+    assert _call(flavor, stamped) == 1010.5
+    assert runs["stamped"] == 2
+
+
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_ttl_query_stays_cached_above_a_query_without_an_expiry(
+    clock: _Clock, flavor: str
+) -> None:
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.input
+    def unrelated() -> int:
+        return 0
+
+    @engine.input
+    def base() -> int:
+        return 7
+
+    plain = _reads(engine, runs, "plain", flavor, [base])
+    cached = _reads(engine, runs, "cached", flavor, [plain], ttl=10.0)
+
+    assert _call(flavor, cached) == ((7,),)
+    # Verified at the new revision: the dependency has no expiry to compare
+    # with, and the result keeps the one from its own TTL.
+    unrelated.set(1)
+    clock.now = 1005.0
+    assert _call(flavor, cached) == ((7,),)
+    assert runs == {"plain": 1, "cached": 1}
+    assert _memo(engine, plain).expires_at is None
+    assert _memo(engine, cached).expires_at == 1010.0
+
+
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_verified_dependent_keeps_the_shortest_expiry_beneath_it(
+    clock: _Clock, flavor: str
+) -> None:
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.input
+    def unrelated() -> int:
+        return 0
+
+    # The shorter TTL is read first, so taking the last expiry seen instead
+    # of the earliest would give the longer one.
+    fast = _stamp(engine, clock, runs, "fast", flavor, ttl=10.0)
+    slow = _stamp(engine, clock, runs, "slow", flavor, ttl=100.0)
+    both = _reads(engine, runs, "both", flavor, [fast, slow])
+
+    assert _call(flavor, both) == (1000.0, 1000.0)
+    unrelated.set(1)
+    clock.now = 1001.0
+    assert _call(flavor, both) == (1000.0, 1000.0)  # verified at the new revision
+    assert runs == {"fast": 1, "slow": 1, "both": 1}
+    assert _memo(engine, both).expires_at == 1010.0
+
+    clock.now = 1011.0
+    assert _call(flavor, both) == (1011.0, 1000.0)
+    assert runs == {"fast": 2, "slow": 1, "both": 2}
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_result_loaded_from_disk_expires_when_the_stored_one_would(
+    clock: _Clock, tmp_path: Path, backend: str, flavor: str
+) -> None:
+    runs: Counter[str] = Counter()
+
+    def session(now: float) -> tuple[float, float | None]:
+        """What a new engine returns at ``now``, and when that result expires."""
+        clock.now = now
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+        stamped = _stamp(engine, clock, runs, "stamped", flavor, ttl=10.0)
+        try:
+            return _call(flavor, stamped), _memo(engine, stamped).expires_at
+        finally:
+            engine.shutdown()
+
+    assert session(1000.0) == (1000.0, 1010.0)
+    # Loaded, and it expires ten seconds after it was computed, not after
+    # it was loaded.
+    assert session(1004.0) == (1000.0, 1010.0)
+    # Exactly ten seconds old has not expired: still loaded.
+    assert session(1010.0) == (1000.0, 1010.0)
+    assert runs["stamped"] == 1
+    assert session(1010.5) == (1010.5, 1020.5)
+    assert runs["stamped"] == 2
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_ttl_result_loaded_from_disk_expires_with_a_shorter_ttl_beneath_it(
+    clock: _Clock, tmp_path: Path, backend: str, flavor: str
+) -> None:
+    runs: Counter[str] = Counter()
+
+    def open_engine() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+        inner = _stamp(engine, clock, runs, "inner", flavor, ttl=10.0)
+        outer = _reads(engine, runs, "outer", flavor, [inner], ttl=100.0)
+        return engine, outer
+
+    engine, outer = open_engine()
+    try:
+        assert _call(flavor, outer) == (1000.0,)
+    finally:
+        engine.shutdown()
+
+    clock.now = 1004.0
+    engine, outer = open_engine()
+    try:
+        assert _call(flavor, outer) == (1000.0,)
+        assert runs == {"inner": 1, "outer": 1}
+        # Its own TTL would keep it until 1100; the result beneath it does not.
+        assert _memo(engine, outer).expires_at == 1010.0
+        clock.now = 1011.0
+        assert _call(flavor, outer) == (1011.0,)
+        assert runs == {"inner": 2, "outer": 2}
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_dependent_loaded_from_disk_expires_with_the_shortest_ttl_beneath_it(
+    clock: _Clock, tmp_path: Path, backend: str, flavor: str
+) -> None:
+    runs: Counter[str] = Counter()
+
+    def open_engine() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.input
+        def base() -> int:
+            return 7
+
+        # The shorter TTL first, then a longer one, then a dependency with
+        # no expiry at all: the earliest of them is the one that counts.
+        fast = _stamp(engine, clock, runs, "fast", flavor, ttl=10.0)
+        slow = _stamp(engine, clock, runs, "slow", flavor, ttl=100.0)
+        plain = _reads(engine, runs, "plain", flavor, [base])
+        top = _reads(engine, runs, "top", flavor, [fast, slow, plain])
+        return engine, top
+
+    engine, top = open_engine()
+    try:
+        assert _call(flavor, top) == (1000.0, 1000.0, (7,))
+    finally:
+        engine.shutdown()
+
+    clock.now = 1004.0
+    engine, top = open_engine()
+    try:
+        assert _call(flavor, top) == (1000.0, 1000.0, (7,))
+        assert runs == {"fast": 1, "slow": 1, "plain": 1, "top": 1}
+        assert _memo(engine, top).expires_at == 1010.0
+        clock.now = 1011.0
+        assert _call(flavor, top) == (1011.0, 1000.0, (7,))
+        assert runs == {"fast": 2, "slow": 1, "plain": 1, "top": 2}
+    finally:
+        engine.shutdown()

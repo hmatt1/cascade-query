@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -1048,4 +1049,259 @@ def test_format_bump_sqlite(tmp_path: Path) -> None:
 
     # Check .path for coverage
     assert engine_b._disk.path == str(cache / "cache.db")
+    engine_b.shutdown()
+
+
+# --- what a loaded record becomes, and records that are not well formed ---
+#
+# Sync and async queries are loaded by separate code, so each test runs with
+# both.
+
+
+def _call(flavor: str, handle: Any) -> Any:
+    """Call a query: directly, or awaited on an event loop.
+
+    Called from plain code an async query takes the engine's sync path, so
+    the async one is only reached from a running loop.
+    """
+    if flavor == "sync":
+        return handle()
+
+    async def main() -> Any:
+        return await handle()
+
+    return asyncio.run(main())
+
+
+@pytest.mark.parametrize("flavor", ["sync", "async"])
+def test_loaded_result_is_verified_like_a_computed_one(
+    tmp_path: Path, flavor: str
+) -> None:
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+
+    def build() -> tuple[Engine, Any, Any]:
+        engine = Engine(cache_dir=cache)
+
+        @engine.input
+        def number() -> int:
+            return 12
+
+        @engine.input
+        def label() -> str:
+            return "n"
+
+        if flavor == "sync":
+
+            @engine.query
+            def tens() -> int:
+                _count_run(runs, "tens")
+                return number() // 10
+
+            @engine.query
+            def report() -> str:
+                _count_run(runs, "report")
+                return f"{label()}={tens()}"
+
+        else:
+
+            @engine.query
+            async def tens() -> int:
+                _count_run(runs, "tens")
+                return number() // 10
+
+            @engine.query
+            async def report() -> str:
+                _count_run(runs, "report")
+                return f"{label()}={await tens()}"
+
+        return engine, number, report
+
+    engine_a, _, report_a = build()
+    assert _call(flavor, report_a) == "n=1"
+    engine_a.shutdown()
+
+    runs.clear()
+    engine_b, number_b, report_b = build()
+    assert _call(flavor, report_b) == "n=1"
+    assert runs == {}
+    # `tens` runs again and gives the same value. `report` was only loaded,
+    # so it is checked against the dependencies noted while loading it: an
+    # input it read and a query it called, both unchanged. It must not run.
+    number_b.set(15)
+    assert _call(flavor, report_b) == "n=1"
+    assert runs == {"tens": 1}
+    engine_b.shutdown()
+
+
+@pytest.mark.parametrize("flavor", ["sync", "async"])
+def test_dependent_notices_a_result_loaded_again_with_another_value(
+    tmp_path: Path, flavor: str
+) -> None:
+    """A result gets a new change stamp every time it is loaded.
+
+    ``report`` is loaded and keeps the stamp ``doubled`` got when it was
+    loaded. ``doubled`` then leaves memory, another engine on the same
+    directory stores a new value for it, and it is loaded again. With the
+    same stamp as before, ``report`` would be taken as still up to date.
+    """
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+
+    def build(**options: Any) -> tuple[Engine, Any, Any, Any]:
+        engine = Engine(cache_dir=cache, **options)
+
+        @engine.input
+        def number() -> int:
+            return 1
+
+        if flavor == "sync":
+
+            @engine.query
+            def doubled() -> int:
+                _count_run(runs, "doubled")
+                return number() * 2
+
+            @engine.query
+            def report() -> str:
+                _count_run(runs, "report")
+                return f"doubled={doubled()}"
+
+        else:
+
+            @engine.query
+            async def doubled() -> int:
+                _count_run(runs, "doubled")
+                return number() * 2
+
+            @engine.query
+            async def report() -> str:
+                _count_run(runs, "report")
+                return f"doubled={await doubled()}"
+
+        return engine, number, doubled, report
+
+    engine_a, _, _, report_a = build()
+    assert _call(flavor, report_a) == "doubled=2"
+    engine_a.shutdown()
+
+    # Room for one result: `doubled` is loaded, then dropped when `report` is.
+    runs.clear()
+    engine_b, number_b, _, report_b = build(max_entries=1)
+    assert _call(flavor, report_b) == "doubled=2"
+    assert runs == {}
+
+    engine_c, number_c, doubled_c, _ = build()
+    number_c.set(5)
+    assert _call(flavor, doubled_c) == 10
+    engine_c.shutdown()
+
+    runs.clear()
+    number_b.set(5)
+    assert _call(flavor, report_b) == "doubled=10"
+    assert runs == {"report": 1}
+    engine_b.shutdown()
+
+
+def _rewrite_record(
+    engine: Engine, handle: Any, change: Callable[[dict[str, Any]], None]
+) -> None:
+    """Apply ``change`` to the record stored for ``handle()`` and write it back."""
+    evaluator = engine._internals._evaluator  # noqa: SLF001
+    entry_key = evaluator._key_blobs_for(("query", handle.id, ()))[1]  # noqa: SLF001
+    disk = engine._disk  # noqa: SLF001
+    assert disk is not None
+    record = disk.load_entry(entry_key)
+    assert record is not None
+    change(record)
+    disk.store_entry_many(
+        [(entry_key, canonical.encode(record), record["value_hash"], None)]
+    )
+
+
+def _doubled_session(
+    cache: Path, runs: dict[str, int], flavor: str
+) -> tuple[Engine, Any]:
+    engine = Engine(cache_dir=cache)
+
+    @engine.input
+    def number() -> int:
+        return 2
+
+    if flavor == "sync":
+
+        @engine.query
+        def doubled() -> int:
+            _count_run(runs, "doubled")
+            return number() * 2
+
+    else:
+
+        @engine.query
+        async def doubled() -> int:
+            _count_run(runs, "doubled")
+            return number() * 2
+
+    return engine, doubled
+
+
+# A dependency row is [kind, name, encoded arguments, fingerprint]. Neither of
+# these can be compared with anything, so the record cannot be trusted.
+
+
+def _drop_a_field_of_the_row(record: dict[str, Any]) -> None:
+    record["deps"][0] = record["deps"][0][:3]
+
+
+def _make_the_name_a_list(record: dict[str, Any]) -> None:
+    record["deps"][0][1] = [record["deps"][0][1]]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_drop_a_field_of_the_row, _make_the_name_a_list],
+    ids=["row-too-short", "name-not-a-string"],
+)
+@pytest.mark.parametrize("flavor", ["sync", "async"])
+def test_malformed_dependency_row_falls_back_to_recompute(
+    tmp_path: Path, flavor: str, damage: Callable[[dict[str, Any]], None]
+) -> None:
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+    engine_a, doubled_a = _doubled_session(cache, runs, flavor)
+    assert _call(flavor, doubled_a) == 4
+    engine_a.shutdown()
+
+    runs.clear()
+    engine_b, doubled_b = _doubled_session(cache, runs, flavor)
+    _rewrite_record(engine_b, doubled_b, damage)
+    # Not an error for the caller: the record is passed over.
+    assert _call(flavor, doubled_b) == 4
+    assert runs == {"doubled": 1}
+    engine_b.shutdown()
+
+
+@pytest.mark.parametrize("flavor", ["sync", "async"])
+def test_record_without_an_error_flag_is_loaded_as_a_value(
+    tmp_path: Path, flavor: str
+) -> None:
+    """A stored record is an error only if it says so.
+
+    The engine writes ``is_error`` into every record, so one without it has
+    to be made by hand. It loads as the value it holds and is not raised.
+    """
+    cache = tmp_path / "cache"
+    runs: dict[str, int] = {}
+    engine_a, doubled_a = _doubled_session(cache, runs, flavor)
+    assert _call(flavor, doubled_a) == 4
+    engine_a.shutdown()
+
+    def drop_the_flag(record: dict[str, Any]) -> None:
+        del record["is_error"]
+
+    runs.clear()
+    engine_b, doubled_b = _doubled_session(cache, runs, flavor)
+    _rewrite_record(engine_b, doubled_b, drop_the_flag)
+    assert _call(flavor, doubled_b) == 4
+    assert runs == {}
     engine_b.shutdown()
