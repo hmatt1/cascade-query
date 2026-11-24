@@ -93,6 +93,11 @@ class GraphStore:
         self.next_access_id = 0
         # Source of ``MemoEntry.changed_at`` stamps; see ``new_change_stamp_locked``.
         self.change_stamp = 0
+        # Member of a fixed-point cycle -> the head it was last stored with.
+        # Outlives the member's memo: a member whose result was dropped is
+        # brought back by entering the cycle through its head, as its cached
+        # result would have been (D25). One entry per member ever stored.
+        self.cycle_head_of: dict[QueryKey, QueryKey] = {}
         self.max_entries = max_entries
         self.trace_limit = trace_limit
         # Raw rows (event, key, revision, detail, timestamp). ``key`` is the

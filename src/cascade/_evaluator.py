@@ -78,6 +78,21 @@ class _ProvisionalResult(Exception):
 
 # An unencodable result is the engine refusing a value, not the body
 # failing; caching it would make one bad run stick.
+class _EnterThroughHead(CycleError):
+    """A cycle member reached itself and should have entered through ``head``.
+
+    Internal. Raised where a run of ``member`` would raise ``CycleError``,
+    and caught where that run was started, which brings ``head`` up to date
+    and looks ``member`` up again (D25). A ``CycleError``, so that anything
+    in between treats it as one: never cached, retried by joined callers.
+    """
+
+    def __init__(self, message: str, member: QueryKey, head: QueryKey) -> None:
+        super().__init__(message)
+        self.member = member
+        self.head = head
+
+
 _NEVER_CACHED_ERRORS = (*_CONTROL_FLOW_ERRORS, _ReenteredQuery, UnencodableValueError)
 
 # Stands in for the ``changed_at`` of a query that has no result yet (it is
@@ -655,6 +670,7 @@ class Evaluator:
         runtime: RuntimeState,
         *,
         need_value: bool = True,
+        _routed: bool = False,
     ) -> tuple[MemoEntry, bool]:
         # Both are None outside fixed-point cycles and verification.
         provisional = runtime.provisional
@@ -751,6 +767,7 @@ class Evaluator:
                 return result, True
             return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
 
+        redirect: QueryKey | None = None
         try:
             hydrated: MemoEntry | None = None
             if self._disk is not None and existing is None and is_memoized:
@@ -758,10 +775,22 @@ class Evaluator:
             if hydrated is not None:
                 self._release_in_flight(in_flight_key, slot, result=hydrated)
                 return hydrated, True
-            result = self.recompute(key, fn, runtime)
+            result = self.recompute(key, fn, runtime, routed=_routed)
+        except _EnterThroughHead as exc:
+            self._release_in_flight(in_flight_key, slot, exc=exc)
+            if exc.member != key:
+                raise
+            redirect = exc.head
         except BaseException as exc:
             self._release_in_flight(in_flight_key, slot, exc=exc)
             raise
+        if redirect is not None:
+            # Outside the except clause, so that what this raises does not
+            # carry the redirect as its context.
+            self._enter_cycle_through_head(redirect, runtime)
+            return self.compute_or_get_memo(
+                key, fn, runtime, need_value=need_value, _routed=True
+            )
         if result.cycle_heads is not None:
             # Provisional: good for this runtime only. Callers on other
             # threads that joined this run must wait for the cycle instead.
@@ -779,6 +808,7 @@ class Evaluator:
         runtime: RuntimeState,
         *,
         need_value: bool = True,
+        _routed: bool = False,
     ) -> tuple[MemoEntry, bool]:
         # Both are None outside fixed-point cycles and verification.
         provisional = runtime.provisional
@@ -875,6 +905,7 @@ class Evaluator:
                 key, fn, runtime, need_value=need_value
             )
 
+        redirect: QueryKey | None = None
         try:
             hydrated: MemoEntry | None = None
             if self._disk is not None and existing is None and is_memoized:
@@ -882,10 +913,20 @@ class Evaluator:
             if hydrated is not None:
                 self._release_in_flight(in_flight_key, slot, result=hydrated)
                 return hydrated, True
-            result = await self.recompute_async(key, fn, runtime)
+            result = await self.recompute_async(key, fn, runtime, routed=_routed)
+        except _EnterThroughHead as exc:
+            self._release_in_flight(in_flight_key, slot, exc=exc)
+            if exc.member != key:
+                raise
+            redirect = exc.head
         except BaseException as exc:
             self._release_in_flight(in_flight_key, slot, exc=exc)
             raise
+        if redirect is not None:
+            await self._enter_cycle_through_head_async(redirect, runtime)
+            return await self.compute_or_get_memo_async(
+                key, fn, runtime, need_value=need_value, _routed=True
+            )
         if result.cycle_heads is not None:
             self._release_in_flight(
                 in_flight_key, slot, exc=_ProvisionalResult(result.cycle_heads)
@@ -1529,7 +1570,12 @@ class Evaluator:
             if not has_fp:
                 cycle_start = [f.key for f in stack[index:]] + [key]
                 cycle = " -> ".join(self._store.key_to_str(k) for k in cycle_start)
-                raise CycleError(f"cycle detected: {cycle}")
+                message = f"cycle detected: {cycle}"
+                if not frame.routed:
+                    head = self._head_to_enter_through(stack, index, key)
+                    if head is not None:
+                        raise _EnterThroughHead(message, key, head)
+                raise CycleError(message)
             frame.cycle_guess = fp_val
         frame.is_cycle_root = True
         overlay = runtime.provisional
@@ -1553,6 +1599,111 @@ class Evaluator:
         else:
             top.cycle_heads.add(key)
         return frame.cycle_guess
+
+    def _head_to_enter_through(
+        self, stack: list[RuntimeFrame], index: int, key: QueryKey
+    ) -> QueryKey | None:
+        """The head a run of ``key`` should have entered its cycle through.
+
+        ``key`` runs at ``stack[index]``, has no ``fixed_point=`` and was
+        reached again. That is the documented ``CycleError`` for a cycle
+        entered cold through a member. But if the path back to ``key``
+        passes a fixed-point head that already has a result (in memory or
+        on disk), or ``key`` was last stored as a member of that head's
+        cycle, a cached result of ``key`` would have been brought up to date
+        through the head (its dependency on the head is verified first).
+        ``key`` runs here only because its result is missing: dropped, or
+        never stored in this session (a head loaded from disk stores no
+        members). Entering through the head gives what the cached result
+        would have (D25). Only reached on the way to a ``CycleError``.
+        """
+        store = self._store
+        known_head = store.cycle_head_of.get(key)
+        for running in stack[index + 1 :]:
+            head = running.key
+            if not store.lookup_query_fixed_point(head[1])[0]:
+                continue
+            if head == known_head or head in store.memos or self._stored_on_disk(head):
+                return head
+        return None
+
+    def _stored_on_disk(self, key: QueryKey) -> bool:
+        """Whether the disk cache holds a result of ``key`` from its current code."""
+        disk = self._disk
+        if disk is None:
+            return False
+        try:
+            record = disk.load_entry(self._key_blobs_for(key)[1])
+        except Exception:  # noqa: BLE001 - unreadable counts as absent
+            return False
+        if record is None:
+            return False
+        fn_hash = record.get("fn_hash")
+        with self._store.lock:
+            current = self._store.query_hashes.get(key[1])
+        return fn_hash is None or current is None or fn_hash == current
+
+    def _enter_cycle_through_head(self, head: QueryKey, runtime: RuntimeState) -> bool:
+        """Bring the fixed-point head ``head`` up to date before a member runs.
+
+        Called for a cycle member whose run reached itself through ``head``
+        (see ``_head_to_enter_through``). Bringing ``head`` up to date from
+        here enters the cycle through it and stores its members; the caller
+        then looks the member up once more, and runs it if it is not there.
+
+        Returns False when ``head`` runs in this runtime: the member is then
+        part of that run. Errors are left for the member's own run to meet.
+        """
+        if self._owns(runtime, head):
+            return False
+        try:
+            self._dependency_entry(head, runtime.snapshot)
+        except CycleError:
+            pass
+        except _CONTROL_FLOW_ERRORS:
+            raise
+        except Exception:  # noqa: BLE001 - the member's own run meets it again
+            pass
+        return True
+
+    async def _enter_cycle_through_head_async(
+        self, head: QueryKey, runtime: RuntimeState
+    ) -> bool:  # pragma: no cover
+        if self._owns(runtime, head):
+            return False
+        try:
+            await self._dependency_entry_async(head, runtime.snapshot)
+        except CycleError:
+            pass
+        except _CONTROL_FLOW_ERRORS:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    @staticmethod
+    def _retract_effects(
+        runtime: RuntimeState,
+        ancestors: list[RuntimeFrame],
+        effects: Mapping[str, list[Any]],
+    ) -> None:
+        """Take back what an abandoned run pushed into its callers.
+
+        Every push or replay during a run is appended to each frame on the
+        stack and to the root's staged effects, so what the run added is
+        the tail of each of those lists, as long as the run's own list.
+        """
+        staged = (
+            runtime.staged_root_effects if runtime.root_effects is not None else None
+        )
+        for name, items in effects.items():
+            count = len(items)
+            if not count:
+                continue
+            for frame in ancestors:
+                del frame.effects[name][-count:]
+            if staged is not None:
+                del staged[name][-count:]
 
     @staticmethod
     def _note_cycle_heads(runtime: RuntimeState, heads: frozenset[QueryKey]) -> None:
@@ -1817,8 +1968,10 @@ class Evaluator:
         key: QueryKey,
         fn: Callable[..., Any],
         runtime: RuntimeState,
+        *,
+        routed: bool = True,
     ) -> MemoEntry:
-        frame = RuntimeFrame(key=key, runtime=runtime)
+        frame = RuntimeFrame(key=key, runtime=runtime, routed=routed)
         runtime.stack.append(frame)
         start = self._store.monotonic_seconds()
         self._store.trace_event("recompute_start", key)
@@ -1857,6 +2010,9 @@ class Evaluator:
                     runtime.stack.pop()
                     if frame.cycle_guess is not UNSET:
                         self._discard_provisional(runtime, key)
+                    if isinstance(exc, _EnterThroughHead) and exc.member == key:
+                        # This run is abandoned and the query looked up again.
+                        self._retract_effects(runtime, runtime.stack, frame.effects)
                     self._inherit_failed_deps(runtime.stack, frame, exc)
                     raise
 
@@ -1889,8 +2045,10 @@ class Evaluator:
         key: QueryKey,
         fn: Callable[..., Any],
         runtime: RuntimeState,
+        *,
+        routed: bool = True,
     ) -> MemoEntry:
-        frame = RuntimeFrame(key=key, is_async_body=True)
+        frame = RuntimeFrame(key=key, is_async_body=True, routed=routed)
         new_runtime = RuntimeState(
             snapshot=runtime.snapshot,
             stack=runtime.stack + [frame],
@@ -1937,6 +2095,10 @@ class Evaluator:
                     else:
                         if frame.cycle_guess is not UNSET:
                             self._discard_provisional(new_runtime, key)
+                        if isinstance(exc, _EnterThroughHead) and exc.member == key:
+                            self._retract_effects(
+                                new_runtime, runtime.stack, frame.effects
+                            )
                         self._inherit_failed_deps(runtime.stack, frame, exc)
                         raise
 
@@ -2108,8 +2270,10 @@ class Evaluator:
                 for dep_key in deps:
                     dependents[dep_key].add(key)
                 store.refresh_head_clean_locked(stored_memo, revision, key[1])
+                cycle_head_of = store.cycle_head_of
                 for member_key, entry in members:
                     del runtime.provisional[member_key]  # type: ignore[index]
+                    cycle_head_of[member_key] = key
                     entry.cycle_heads = None
                     entry.verified_at = revision
                     if not store.lookup_query_memoize(member_key[1]):

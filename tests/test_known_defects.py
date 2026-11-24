@@ -409,7 +409,6 @@ def test_d26_fixed_point_effects_are_those_of_the_final_run() -> None:
     assert effects == {"log": ["head"]}
 
 
-@_defect(25, "a dependent of an evicted cycle member raises CycleError")
 def test_d25_evicting_a_cycle_member_does_not_change_the_outcome() -> None:
     engine = Engine()
 

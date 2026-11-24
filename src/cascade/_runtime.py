@@ -34,6 +34,9 @@ class RuntimeFrame:
     expires_at: float | None = None
     # True for a frame run by the async evaluator (its body may await).
     is_async_body: bool = False
+    # False while a run that reaches itself through a fixed-point head may
+    # still start again from that head (``Evaluator._head_to_enter_through``).
+    routed: bool = True
 
 
 @dataclass
