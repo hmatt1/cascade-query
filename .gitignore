@@ -6,6 +6,11 @@ __pycache__/
 *.egg-info/
 .mutmut-cache
 mutants/
+mutation-results/
+# TLC model checker output: state queues and counterexample traces
+states/
+*_TTrace_*.tla
+*_TTrace_*.bin
 */data.mdb
 */lock.mdb
 */mdbx.dat
