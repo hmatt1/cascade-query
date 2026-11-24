@@ -469,7 +469,30 @@ wrote. Across runs the blind spot remains: two closures of one body
 registered under one name in different runs can serve each other's persisted
 results. `name=` avoids that.
 
-Enforced by: `test_code_versioning.py::test_memory_cache_invalidation_on_code_change`,
+**Manual versions.** What the hash cannot see, the program can declare:
+
+- `engine.query(version=v)` (a `str` or an `int`) is part of the query's
+  code hash. Registering the query with another `version` is a code change:
+  its results are dropped in memory, and persisted results stored under
+  another version are not served (G16) but recomputed, and replaced when
+  the new result is stored. Dependents follow the new result as for any
+  code change: they re-run if its value differs and keep their results if
+  it is equal.
+- `Engine(cache_version=v)` salts the hash of every persisted result of
+  that engine. An engine with another salt, or none, does not serve them.
+  It is the switch for a change that touches everything (a library
+  upgrade, a new data format); it does not touch named collections, which
+  are data.
+
+Results stored under an old version are not deleted when a new version is
+registered; each is replaced when its query is next computed and stored,
+and `prune(vacuum_disk=True)` or `clear_disk_cache()` removes the rest.
+
+Enforced by: `test_cache_versions.py` (both backends: a helper edit served
+stale until the version changes, a new version with a different and with
+an equal result, the engine salt, a new version inside one process, argument
+checks),
+`test_code_versioning.py::test_memory_cache_invalidation_on_code_change`,
 `::test_disk_cache_invalidation_on_code_change`,
 `::test_input_cache_invalidation_on_code_change`,
 `test_dirty_propagation.py::test_reregistering_a_query_dirties_its_dependents`,
@@ -638,10 +661,13 @@ Enforced by: `test_disk_cache.py::test_cross_session_hit_skips_all_query_bodies`
 ### G16. No stale persisted result
 
 A persisted result is not served if an input value differs, a dependency's
-result differs, the set of dependencies changed, its TTL elapsed, or the
-function's bytecode hash changed. G11's blind spots apply here too.
+result differs, the set of dependencies changed, its TTL elapsed, the
+function's bytecode hash changed, its `version=` changed, or the engine's
+`cache_version=` differs from the one it was stored under. G11's blind
+spots apply here too, for code whose change no version declares.
 
-Enforced by: `test_code_versioning.py::test_disk_cache_invalidation_on_code_change`,
+Enforced by: `test_cache_versions.py`,
+`test_code_versioning.py::test_disk_cache_invalidation_on_code_change`,
 `test_disk_cache.py::test_dynamic_graph_topology_cross_session`,
 `::test_in_session_invalidation_still_works_after_hydration`.
 
@@ -1297,7 +1323,7 @@ without `cache_dir` keeps results it cannot encode (G1, G18).
 | Limit | Who it stops | Why it conflicts with the aim |
 |---|---|---|
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. After a reload, callers must pick up the new handle. (Methods can now be queries, with `self` as an argument: G1.) | Libraries that generate queries (one extra argument). | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
-| **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
+| **Persistence across code edits needs a declared version.** Code invalidation sees only the query's own bytecode. `version=` per query and `cache_version=` per engine now force invalidation (G11), but an edit to a helper, a global or a default that no version declares still leaves the old result in place. (Results are written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache who forgets to bump a version after editing a helper. | "Zero-config persistence" implies it works without the user knowing about it; it now works with one declared number. |
 
 Limits that narrow use without stopping it:
 

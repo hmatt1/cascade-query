@@ -87,8 +87,13 @@ class GraphStore:
         monotonic_seconds: Callable[[], float] | None = None,
         value_digest: Callable[[Any], str] | None = None,
         allow_opaque: bool = False,
+        cache_version: str | int | None = None,
     ) -> None:
         self.lock = threading.RLock()
+        # Engine-wide salt of the hashes persisted results are stored under
+        # (``_stored_hash_locked``): results stored under another one are
+        # not served.
+        self._cache_version = cache_version
         self._value_digest: Callable[[Any], str] = value_digest or stable_value_digest
         # Without a disk cache nothing has to be decoded again, so a result
         # or input value the codec cannot encode is kept as it is, under a
@@ -268,14 +273,20 @@ class GraphStore:
         cache_exceptions: bool | tuple[type[BaseException], ...] = False,
         ttl: float | None = None,
         max_iterations: int = DEFAULT_FIXED_POINT_ITERATIONS,
+        version: str | int | None = None,
     ) -> Callable[..., Any]:
         """Register ``fn`` as ``query_id`` and return the function to run.
 
         That is ``fn``, unless the same query is already registered (see
         ``_replace_locked``): then the registered function is returned, and
         cached results and existing handles stay valid.
+
+        ``version`` is part of the code hash: changing it is a code change,
+        in memory and for persisted results.
         """
         fn_hash = hash_bytecode(fn)
+        if version is not None:
+            fn_hash = f"{fn_hash}|version={version!r}"
         slot = ("query", query_id)
         with self.lock:
             known = query_id in self.queries
@@ -315,7 +326,8 @@ class GraphStore:
         Returns the function to register and whether cached results (memos,
         or input values) must be dropped. Four cases:
 
-        * Nothing registered, or the same function object: register it.
+        * Nothing registered, or the same function object: register it,
+          dropping results if its ``version=`` changed.
         * The same source function again, for example with other options
           (``incremental=False`` turns a rewritten function back into the
           original): register the new variant and keep existing handles.
@@ -336,8 +348,11 @@ class GraphStore:
         """
         old_hash = self._code_hashes.get(slot)
         self._code_hashes[slot] = new_hash
-        if old is None or old is new:
+        if old is None:
             return new, False
+        if old is new:
+            # Only ``version=`` can change the hash of the same function.
+            return new, old_hash != new_hash
         same_code = old_hash == new_hash
         if _origin(old) is _origin(new):
             return new, not same_code
@@ -362,7 +377,10 @@ class GraphStore:
         """
         code_hash = self._code_hashes[slot]
         salt = self._hash_salts.get(slot, 0)
-        return code_hash if not salt else f"{code_hash}#{salt}"
+        stored = code_hash if not salt else f"{code_hash}#{salt}"
+        if self._cache_version is not None:
+            stored = f"{stored}@{self._cache_version!r}"
+        return stored
 
     def track_handle(
         self, kind: str, fid: str, fn: Callable[..., Any], handle: Any

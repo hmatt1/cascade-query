@@ -67,10 +67,11 @@ print(get_result())
 
 The `Engine` manages caching, execution, and state tracking.
 
-*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental=True)`**: Initializes the engine. 
+*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental=True, cache_version=None)`**: Initializes the engine. 
     *   `max_entries` sets the limit for the Least Recently Used (LRU) in-memory cache. 
     *   Passing `cache_dir` enables persistent disk caching.
     *   `cache_backend` allows you to select the storage engine for persistence (`"mdbx"` or `"sqlite"`).
+    *   `cache_version` (a `str` or `int`) salts every result this engine stores; results stored under another salt are not used. Change it to throw away the whole result cache, for example after upgrading a library your queries use.
 
 ### Defining Nodes: `@engine.input` and `@engine.query`
 
@@ -209,7 +210,24 @@ If a function's logic evaluates to a result identical to its previous run, early
 ### Code-Aware Auto-Invalidation
 Cascade automatically inspects the Python bytecode of your `@engine.query` and `@engine.input` functions. If you edit a function's logic and the module is hot-reloaded (or you restart your script), Cascade compares the new function's bytecode hash against the previously cached logic when the function is registered again. If the logic has changed, Cascade invalidates that function's memory and persistent disk caches at that point, and results that other queries computed from the old function are re-run the next time they are used, whether or not an input changed in between. Handles to the old function become stale: calling one raises `StaleHandleError` rather than running the old code, so modules that imported the handle need to import it again after the reload.
 
-The hash covers only the function's own bytecode, constants and names. It does not cover helper functions the query calls, closure values, default arguments or globals, so editing those leaves cached results in place; clear the cache (`engine.clear_disk_cache()`) after such an edit.
+#### What the code hash sees, and `version=`
+
+The hash covers the query function's own code: its bytecode, the constants and names in it, its local variable names, and functions and comprehensions written inside it. It does **not** cover:
+
+*   helper functions the query calls (their code lives in another function);
+*   global variables, module-level constants and imported modules;
+*   closure values and default arguments;
+*   files, environment variables, library versions, or anything else read without an `@engine.input`.
+
+Editing one of those leaves old results in place, also on disk across runs. Declare the change with `version=` on each query that calls the edited helper (or reads the edited constant) directly:
+
+```python
+@engine.query(version=2)          # bumped: normalize() changed
+def tokens(path: str) -> list[str]:
+    return normalize(read_file(path)).split()
+```
+
+Any new value works (`str` or `int`). Results computed under another version are not used: the query runs again, and queries that depend on it run again if its result changed. Queries that only call `tokens()` need no bump. To discard every stored result at once, change `Engine(cache_version=...)`, or call `engine.clear_disk_cache()`. Old results are replaced as their queries are recomputed; `engine.prune(roots, vacuum_disk=True)` removes the ones nothing reaches.
 
 ### Time-To-Live (TTL) Caching
 Cascade supports expiring cache entries automatically based on wall-clock time. By passing the `ttl` flag to `@engine.query`, you ask for a node to recompute its value if it is needed after the specified number of seconds has elapsed. That covers queries that depend on it too: calling one after the TTL has elapsed re-runs the expired query and then whatever its new value changes, with no input change needed. If the new value equals the old one, the dependents are not re-run. Queries with no TTL query beneath them are unaffected.

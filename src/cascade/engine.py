@@ -200,6 +200,13 @@ def _current_transaction() -> EngineTransaction | None:
     return tx
 
 
+def _check_version(what: str, version: Any) -> None:
+    if version is None:
+        return
+    if isinstance(version, bool) or not isinstance(version, (str, int)):
+        raise TypeError(f"{what}= must be a str or an int, not {version!r}")
+
+
 def _keyed_calls(calls: Sequence[Any]) -> list[tuple[Any, tuple[Any, ...]]]:
     """``(handle, args)`` or ``(handle, args, kwargs)`` entries, keyed."""
     keyed = []
@@ -617,7 +624,9 @@ class Engine:
         cache_map_size: int = 1 << 30,
         cache_backend: str = "mdbx",
         incremental: bool = True,
+        cache_version: str | int | None = None,
     ) -> None:
+        _check_version("cache_version", cache_version)
         self._trace_limit = trace_limit
         # Global opt-out for the map/reduce AST interception; per-query
         # incremental= on @engine.query overrides it in either direction.
@@ -641,6 +650,7 @@ class Engine:
             monotonic_seconds=stats_clock,
             value_digest=value_digest,
             allow_opaque=cache_dir is None,
+            cache_version=cache_version,
         )
         self._evaluator = Evaluator(
             self._store, disk=self._disk, get_executor=self._ensure_submit_executor
@@ -732,7 +742,16 @@ class Engine:
         ttl: float | None = None,
         incremental: bool | None = None,
         max_iterations: int | None = None,
+        version: str | int | None = None,
     ) -> Any:
+        """Register a query. Use as ``@engine.query`` or ``@engine.query(...)``.
+
+        ``version`` marks a change the code hash cannot see (a helper the
+        query calls, a global, a default, a data file): give it a new value
+        and results computed under the old one are not used again, in
+        memory or on disk. See "What the code hash sees" in the README.
+        """
+        _check_version("version", version)
         if max_iterations is not None:
             if fixed_point is _UNSET:
                 raise TypeError("max_iterations= needs fixed_point=")
@@ -774,6 +793,7 @@ class Engine:
                     if max_iterations is None
                     else max_iterations
                 ),
+                version=version,
             )
             self._arg_specs[("query", query_id)] = spec
             handle = _QueryHandle(self, registered, query_id, spec)
