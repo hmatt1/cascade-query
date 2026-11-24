@@ -35,8 +35,8 @@ Every open defect has a failing regression test in
 | G11 | Re-registering a query with changed code drops its cached results and reaches its dependents | Holds with limits | Good inside a process |
 | G12 | Accumulator effects are replayed on cache hits, in a fixed order | Broken for pushes inside a rewritten stage (D31); limits (D26) | Good |
 | G13 | Eviction, `prune` and `sweep_unaccessed` change cost, never results | Broken for fixed-point cycles (D25) | Strong for eviction and prune |
-| G14 | Async queries behave like sync queries | Holds with limits (D21, D23) | Weak |
-| G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Broken for async queries (D23) | Strong on the sync path |
+| G14 | Async queries behave like sync queries | Holds with limits (D21) | Weak |
+| G15 | A new engine on the same `cache_dir` reuses results whose inputs match | Holds with limits | Strong on the sync path, good for async |
 | G16 | A stale persisted result is never served | Holds with limits (G11's blind spots) | Medium |
 | G17 | A finished result is on disk once the process exits normally | Holds with limits | Good for normal exits |
 | G18 | Values round-trip through the disk codec with their types | Holds with limits | Good by example |
@@ -328,7 +328,8 @@ Enforced by: `test_ttl.py::test_ttl_invalidation_basic`,
 `::test_dependent_expires_with_the_shortest_ttl_beneath_it`,
 `::test_expired_ttl_reaches_a_caller_that_caught_a_dependency_error`,
 `::test_expired_ttl_refreshes_async_dependents`,
-`::test_expired_ttl_refreshes_dependents_loaded_from_disk` (both backends),
+`::test_expired_ttl_refreshes_dependents_loaded_from_disk` and
+`::test_expired_ttl_refreshes_async_dependents_loaded_from_disk` (both backends),
 `::test_queries_without_a_ttl_beneath_them_carry_no_expiry`,
 `test_known_defects.py::test_d3_expired_ttl_dependency_refreshes_through_its_dependent`,
 `test_dirty_propagation.py::test_ttl_dependency_keeps_dependents_on_the_slow_path`.
@@ -456,9 +457,6 @@ the body when every recorded dependency matches: an input by the digest of its
 current value, a dependency query by the digest of its up-to-date result. An
 input never set in the new session is matched by the digest of its default.
 
-Broken for `async def` queries: loading a stored result raises `TypeError`
-(D23).
-
 Limits: a query whose arguments cannot be encoded is computed but not
 persisted. When a fixed-point cycle converges only the head's result is
 written; the other members are recomputed from it in a new session. Query identity on disk is `module:qualname` unless `name=` is
@@ -468,7 +466,10 @@ Enforced by: `test_disk_cache.py::test_cross_session_hit_skips_all_query_bodies`
 `::test_file_edit_invalidates_only_its_chain`,
 `::test_early_cutoff_survives_across_sessions`,
 `::test_deep_dependency_chain_cross_session`,
-`test_persistence_permutations.py::test_permutation_incremental_mdbx`.
+`test_persistence_permutations.py::test_permutation_incremental_mdbx`,
+`test_known_defects.py::test_d23_async_query_result_is_reused_by_a_new_engine`,
+`test_ttl.py::test_expired_ttl_refreshes_async_dependents_loaded_from_disk` and
+`::test_async_result_loaded_from_disk_keeps_its_computed_time` (both backends).
 
 ### G16. No stale persisted result
 
@@ -927,7 +928,6 @@ time; nothing is in that state now.
 | D18 | If the disk writer thread hits an error other than `PersistentCacheError` (for example sqlite "database is locked"), the thread dies and `flush_disk()` and `shutdown()` block forever. | Reproduced on both backends by making the batch write raise `sqlite3.OperationalError` |
 | D19 | A direct caller that joins a `submit`-owned run of the same query receives the owner's `QueryCancelled`. | Reproduced |
 | D20 | A query result that cannot be encoded raises a bare `TypeError` even with no `cache_dir`. Its message names the unsupported type but not the query. An exception with unencodable `args` is replaced by that `TypeError`. | Reproduced |
-| D23 | A stored result of an `async def` query cannot be loaded by a new engine: the call raises `TypeError: entry_from_runtime() missing ... 'computed_at_time'` instead of returning the value. Sync queries are not affected. | Reproduced on both backends |
 | D24 | Two threads that enter one dependency cycle through different queries wait for each other for ever: each runs one query and asks for the other. With `fixed_point=` neither gets a value; without it neither gets the `CycleError` one thread would. | Reproduced with `fixed_point=`; the plain-cycle half was not re-run |
 | D25 | After the cached result of a fixed-point cycle member is dropped (LRU eviction, `prune`, `sweep_unaccessed`) and an input changes, a query that depends on that member raises `CycleError`. With the member's result still cached the same call returns the right value. The member is recomputed on its own, enters the cycle from the wrong end and reaches itself before the head. | Reproduced |
 | D21 | A sync waiter on the event-loop thread, waiting for an async run of the same query on that loop, deadlocks. Also reachable through the public API: a sync query that depends on an async query, called on the loop thread while that async query is running there, blocks the loop while re-verifying. | Reproduced, through the private entry point and through the public path |
@@ -953,6 +953,7 @@ time; nothing is in that state now.
 | D1 | A rewritten stage that read an input the query body had already read was not seen as reading anything, so its cached per-element results were kept: `f = factor(); return sum(x * factor() for x in xs)` over `[1, 2, 3]` returned 12 after `factor.set(10)` where a fresh run gives 60. The pipeline looked for new dependencies of the query, and a repeated read adds none. Every tracked read is now counted, and a pipeline whose stages read anything is rebuilt on each run. | `fix: a rewritten comprehension kept old results after an input it read changed` |
 | D5 | Collection reads that bypassed tracking went stale inside queries: `s \| x` and the other set operators and methods, set and dict `==`, list `<`, `xs + [...]`, `xs * n`, `repr`, `set.copy()`. `sorted(s \| {99})` stayed `[1, 99]` after `s.add(2)`. The builtins' implementations ran on the subclass's storage without any method of the collection being called, so no dependency was recorded and a snapshot read saw live contents. Each of these is now a tracked read on the collection. Found and fixed with it: `d.keys() == {'a'}` was always `False` and set operations on dict views raised; `copy.copy(xs)` returned a second collection object sharing the first one's log. What CPython reads without calling the subclass (`set(s)` outside a rewritten body, `frozenset(s)`, `plain.union(s)`, `fs \| s`) cannot be intercepted and is a documented limit (G21). | `fix: set operators, comparisons and repr of a collection went stale inside queries` |
 | D7 | Rewritten reducers differed from the builtins. Float `sum([0.1] * 10)` gave `0.9999999999999999` against `1.0`, and drifted further with each removal. `sorted(..., reverse=True)` reversed equal elements (`[(1,'b'), (1,'a')]` against `[(1,'a'), (1,'b')]`), and any `sorted` did after an insert that was not at the end. `any` and `all` evaluated every element (`any(1 / z for z in [1, 0])` raised `ZeroDivisionError`). `min` and `max` returned the wrong one of several equal elements (`max([1, True])` gave `True`), and with NaN present did not follow the builtin's scan (`min([2.0, nan, 1.0])` gave `2.0` against `1.0`). `len(map(...))` returned a count instead of raising `TypeError`, over plain lists too. Also found and fixed: of two elements that raise, the one whose change arrived first was reported, not the first in the collection; a `set` or `dict` built from equal values of different types kept the wrong one; the function expression of `map`/`filter` was evaluated after the source. Each reducer now either maintains a result that is exact by construction or applies the builtin to the stored values, and anything that raises is settled by plain evaluation (G22). | `fix: rewritten sum, sorted, min, max, any, all and len differed from the builtins` |
+| D23 | A stored result of an `async def` query could not be loaded by a new engine: the call raised `TypeError: entry_from_runtime() missing ... 'computed_at_time'` instead of returning the value. The async loading path now passes the stored computation time, so a loaded result also expires with its TTL as on the sync path. | `fix: an async query's stored result could not be loaded by a new engine` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -1046,8 +1047,7 @@ Ordered by the risk they leave open.
    runs sqlite only. The sqlite vacuum delete paths are excluded from coverage.
 7. **Async is thinly tested** and its internals are excluded from coverage:
    no async tests for effects, bail-out counts or eviction, and snapshots,
-   TTL and fixed points have one or two each. Loading an async result from
-   disk fails outright (D23).
+   TTL and fixed points have one or two each.
 8. **Collection concurrency has one deterministic test.** No multi-writer or
    writer-against-pipeline stress, and none on free-threaded builds.
 9. **Transactions inside the block are untested** for queries reading a

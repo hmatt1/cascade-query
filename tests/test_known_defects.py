@@ -788,7 +788,6 @@ def test_d19_direct_caller_is_not_cancelled_by_a_submitted_run() -> None:
     assert direct == [1]
 
 
-@_defect(23, "an async query's stored result cannot be loaded: TypeError")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_d23_async_query_result_is_reused_by_a_new_engine(
     tmp_path: Path, backend: str

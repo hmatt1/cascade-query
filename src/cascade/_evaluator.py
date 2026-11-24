@@ -2099,6 +2099,7 @@ class Evaluator:
                 deps=observed,
                 effects=effects,
                 last_access=self._store.next_access_id,
+                computed_at_time=computed_at_time,
                 error=error,
                 expires_at=expires_at,
             )

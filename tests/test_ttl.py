@@ -447,3 +447,85 @@ def test_expired_ttl_refreshes_dependents_loaded_from_disk(
         assert runs == {"external": 3, "parent": 3, "top": 3}
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["mdbx", "sqlite"])
+def test_expired_ttl_refreshes_async_dependents_loaded_from_disk(
+    clock: _Clock, tmp_path: Path, backend: str
+) -> None:
+    runs: Counter[str] = Counter()
+
+    def session(now: float) -> float:
+        clock.now = now
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.query(ttl=10.0)
+        async def external() -> float:
+            runs["external"] += 1
+            return clock.now
+
+        @engine.query
+        async def parent() -> float:
+            runs["parent"] += 1
+            return await external() + 1
+
+        @engine.query
+        async def top() -> float:
+            runs["top"] += 1
+            return await parent() + 1
+
+        async def main() -> float:
+            first = await top()
+            if now == 1004.0:
+                # Loaded from disk; it still expires with the stored TTL result.
+                assert runs == {"external": 1, "parent": 1, "top": 1}
+                clock.now = 1011.0
+                assert await top() == 1013.0
+                assert runs == {"external": 2, "parent": 2, "top": 2}
+            return first
+
+        try:
+            return asyncio.run(main())
+        finally:
+            engine.shutdown()
+
+    assert session(1000.0) == 1002.0
+    assert runs == {"external": 1, "parent": 1, "top": 1}
+    # A new session inside the TTL loads everything from disk.
+    assert session(1004.0) == 1002.0
+    # A session that starts after the TTL has elapsed loads none of it: the
+    # results stored by the second session expired at 1021.
+    assert session(1030.0) == 1032.0
+    assert runs == {"external": 3, "parent": 3, "top": 3}
+
+
+@pytest.mark.parametrize("backend", ["mdbx", "sqlite"])
+def test_async_result_loaded_from_disk_keeps_its_computed_time(
+    clock: _Clock, tmp_path: Path, backend: str
+) -> None:
+    runs: Counter[str] = Counter()
+
+    def session(now: float) -> tuple[float, float]:
+        clock.now = now
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.query(ttl=10.0)
+        async def stamped() -> float:
+            runs["stamped"] += 1
+            return clock.now
+
+        async def main() -> float:
+            return await stamped()
+
+        try:
+            value = asyncio.run(main())
+            return value, _memo(engine, stamped).computed_at_time
+        finally:
+            engine.shutdown()
+
+    assert session(1000.0) == (1000.0, 1000.0)
+    # Loaded, not recomputed, and the TTL counts from the original run.
+    assert session(1009.0) == (1000.0, 1000.0)
+    assert runs["stamped"] == 1
+    assert session(1010.5) == (1010.5, 1010.5)
+    assert runs["stamped"] == 2
