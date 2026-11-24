@@ -252,10 +252,14 @@ jobs:
       - name: Download TLA+ tools
         run: wget -qN https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 
+      # The quick configuration: one caller, 4 million states. The one with
+      # concurrent callers (CascadeCore.cfg, 26 million states) takes minutes
+      # and runs on demand: .github/workflows/model-check.yml, or locally as
+      # docs/formal/README.md says.
       - name: Run TLC Model Checker
         run: |
           cd docs/formal
-          java -cp ../../tla2tools.jar tlc2.TLC -workers auto -deadlock CascadeCore.tla -config CascadeCore.cfg
+          java -cp ../../tla2tools.jar tlc2.TLC -workers auto -deadlock CascadeCore.tla -config CascadeMinimal.cfg
 
   package:
     name: Package build

@@ -1,0 +1,35 @@
+name: Model check (concurrent callers)
+
+# The exhaustive TLC run of docs/formal/CascadeCore.cfg: two callers at any
+# revisions, writers and evictions, 26 million states. It takes minutes, so
+# it is started by hand, after a change to the model or to the evaluator's
+# verification path. Every push checks docs/formal/CascadeMinimal.cfg
+# (workflow.yml). docs/formal/README.md has the command to run it locally.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tla_check:
+    name: TLC, concurrent callers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Download TLA+ tools
+        run: wget -qN https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+
+      - name: Run TLC Model Checker
+        run: |
+          cd docs/formal
+          java -cp ../../tla2tools.jar tlc2.TLC -workers auto -deadlock CascadeCore.tla -config CascadeCore.cfg
