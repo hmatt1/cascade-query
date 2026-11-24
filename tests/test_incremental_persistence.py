@@ -47,6 +47,37 @@ def test_restored_list_keeps_uid_continuity(cache_dir):
     e2.shutdown()
 
 
+@pytest.mark.parametrize("backend", ["mdbx", "sqlite"])
+@pytest.mark.parametrize("compact_before_last_change", [False, True])
+def test_item_added_to_a_reopened_list_gets_a_uid_of_its_own(
+    tmp_path, backend, compact_before_last_change
+):
+    # A change names its item by uid, and a later session rebuilds the list by
+    # replaying the stored changes. So an item added after reopening must not
+    # get the uid of an item stored since the last compaction: a change to
+    # the new item would then land on the old one in the replay.
+    def open_engine() -> Engine:
+        return Engine(cache_dir=tmp_path / "cache", cache_backend=backend)
+
+    with open_engine() as engine:
+        xs = CascadeList(engine, ["a", "b"], name="xs", compact_every=10_000)
+        if compact_before_last_change:
+            xs.compact()
+        xs.append("c")
+
+    with open_engine() as engine:
+        # What this test is about: there are changes that are in no snapshot.
+        _, tail = engine._disk.collection_load("xs")
+        assert tail
+        xs = CascadeList(engine, name="xs", compact_every=10_000)
+        xs.append("d")
+        xs[3] = "D"
+        assert list(xs) == ["a", "b", "c", "D"]
+
+    with open_engine() as engine:
+        assert list(CascadeList(engine, name="xs")) == ["a", "b", "c", "D"]
+
+
 def test_initial_argument_ignored_when_disk_state_exists(cache_dir):
     e1 = make_engine(cache_dir)
     CascadeList(e1, [1, 2, 3], name="xs")
