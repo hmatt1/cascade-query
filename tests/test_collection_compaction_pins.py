@@ -8,6 +8,8 @@ pinned revision predates the collection (D12).
 from __future__ import annotations
 
 import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ from cascade import (
 
 BACKENDS = ("mdbx", "sqlite")
 CHURN = 3_000  # enough appends for several in-memory compaction checks
+TIMEOUT = 10.0  # for threads that must not wait for each other
 
 
 def _log(collection: Any) -> Any:
@@ -359,3 +362,73 @@ def test_snapshot_of_a_collection_reopened_from_a_compacted_state_keeps_its_cont
         assert contents(snapshot=snapshot) == [0, 1, 2]
         assert contents() == [0, 1, 2, 3, 4]
         snapshot.release()
+
+
+# --- a compaction that falls due inside a mutation ---
+#
+# In-memory compaction asks the pipelines how far they have read the log,
+# which takes the pipeline runtime's lock. A pipeline holds that lock while it
+# reads the collection, and a read takes the collection's lock; a mutation
+# holds the collection's lock until its change is recorded. So a compaction
+# that falls due inside a mutation must wait until the mutation has let go of
+# the collection, or a reader and a writer end up waiting for each other.
+
+
+def test_compaction_due_inside_a_mutation_does_not_block_a_pipeline_reading() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2])
+    reader_in_pipeline = threading.Event()
+    writer_in_mutation = threading.Event()
+
+    def plus_length(x: int) -> int:
+        if not reader_in_pipeline.is_set():
+            # The first element: the pipeline holds its lock here. Go on only
+            # once the writer is inside its mutation, so that reading the
+            # collection below has to wait for the mutation to end.
+            reader_in_pipeline.set()
+            assert writer_in_mutation.wait(TIMEOUT)
+        return x + len(xs)
+
+    @engine.query
+    def shifted() -> list[int]:
+        return [plus_length(x) for x in xs]
+
+    def many() -> Iterator[int]:
+        # extend() consumes this inside the mutation.
+        writer_in_mutation.set()
+        yield from range(CHURN)
+
+    outcomes: dict[str, Any] = {}
+
+    def reader() -> None:
+        try:
+            outcomes["reader"] = shifted()
+        except BaseException as exc:  # noqa: BLE001
+            outcomes["reader"] = exc
+
+    def writer() -> None:
+        try:
+            assert reader_in_pipeline.wait(TIMEOUT)
+            # Enough changes at once for a compaction check to fall due.
+            xs.extend(many())
+            outcomes["writer"] = "done"
+        except BaseException as exc:  # noqa: BLE001
+            outcomes["writer"] = exc
+
+    threads = [
+        threading.Thread(target=reader, daemon=True),
+        threading.Thread(target=writer, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + TIMEOUT
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    assert not any(t.is_alive() for t in threads), "reader and writer deadlocked"
+
+    # The scenario is the one described: the query is a pipeline, and the
+    # reader ran at the revision from before the mutation.
+    assert [p["reducer"] for p in engine.inspect_pipelines()] == ["list"]
+    assert outcomes == {"reader": [3, 4], "writer": "done"}
+    everything = [1, 2, *range(CHURN)]
+    assert shifted() == [x + len(everything) for x in everything]

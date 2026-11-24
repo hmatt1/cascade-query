@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D32).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D34).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -880,6 +880,204 @@ def test_d24_threads_entering_a_cycle_from_both_ends_do_not_deadlock() -> None:
     assert not any(thread.is_alive() for thread in threads), "threads deadlocked"
     assert outcomes["head"] == 7
     assert outcomes["member"] == 3 or isinstance(outcomes["member"], cascade.CycleError)
+
+
+def test_d33_caller_the_owner_just_stopped_waiting_for_does_not_run_the_query_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Thread B runs total(), which needs part(), and waits for thread A's run
+    # of part(). A finishes part() and asks for total() itself. B has its
+    # answer by then. It used to stay recorded as waiting for A until it had
+    # taken the engine's lock again, and A, asking in between, concluded
+    # that the two waited for each other and ran total() a second time (G5).
+    #
+    # Under the interpreter lock A got there first nearly every time. The
+    # test holds B where it used to remove its record, so that A always asks
+    # in between, on any build.
+    engine = Engine()
+    evaluator = engine._evaluator  # noqa: SLF001
+    part_running = threading.Event()
+    total_runs: list[int] = []
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    def poll(condition: Any) -> bool:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while not condition():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.002)
+        return True
+
+    @engine.query
+    def part() -> int:
+        part_running.set()
+        assert poll(lambda: waiting() >= 1)  # B waits for this run
+        return 1
+
+    @engine.query
+    def total() -> int:
+        total_runs.append(1)
+        return part() + 1
+
+    def a_went_on() -> bool:
+        # A waits for B's run of total(), or runs it itself (the defect).
+        waits = [t.event for t in engine.traces()].count("dedup_wait")
+        return len(total_runs) > 1 or waits > 1
+
+    held = threading.Event()
+    leave_wait = evaluator._leave_wait  # noqa: SLF001
+
+    def leave_wait_late(agent: Any, slot: Any) -> None:
+        if not held.is_set():
+            held.set()
+            poll(a_went_on)
+        leave_wait(agent, slot)
+
+    monkeypatch.setattr(evaluator, "_leave_wait", leave_wait_late)
+    outcomes: dict[str, Any] = {}
+
+    def call(name: str, fn: Any) -> None:
+        try:
+            outcomes[name] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            outcomes[name] = exc
+
+    def a() -> int:
+        part()
+        return total()
+
+    def b() -> int:
+        assert part_running.wait(HANG_TIMEOUT)
+        return total()
+
+    threads = [
+        threading.Thread(target=call, args=("a", a), daemon=True),
+        threading.Thread(target=call, args=("b", b), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2 * HANG_TIMEOUT)
+    assert not any(thread.is_alive() for thread in threads), "threads hung"
+    assert outcomes == {"a": 2, "b": 2}
+    assert len(total_runs) == 1
+    assert "dedup_cycle" not in [t.event for t in engine.traces()]
+
+
+def test_d34_cancelling_a_waiting_task_leaves_the_owner_and_other_waiters_alone() -> (
+    None
+):
+    # Three tasks ask for one query. The first runs it, the other two wait
+    # for that run. Cancelling one of the two must cancel that one only: the
+    # three used to share one future, which the cancelled task cancelled.
+    engine = Engine()
+    runs: list[int] = []
+    state: dict[str, Any] = {}
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    async def poll(condition: Any) -> None:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.002)
+
+    @engine.query
+    async def slow() -> int:
+        runs.append(1)
+        await state["go"].wait()
+        return 42
+
+    async def main() -> list[Any]:
+        state["go"] = asyncio.Event()
+        owner = asyncio.create_task(slow())
+        await poll(lambda: runs)
+        cancelled = asyncio.create_task(slow())
+        other = asyncio.create_task(slow())
+        await poll(lambda: waiting() == 2)
+        cancelled.cancel()
+        await asyncio.gather(cancelled, return_exceptions=True)
+        state["go"].set()
+        return await asyncio.gather(owner, cancelled, other, return_exceptions=True)
+
+    owner, cancelled, other = asyncio.run(asyncio.wait_for(main(), 4 * HANG_TIMEOUT))
+    assert isinstance(cancelled, asyncio.CancelledError)
+    assert owner == 42
+    assert other == 42
+    assert len(runs) == 1
+
+
+def test_d34_sync_query_keeps_its_value_when_a_task_waiting_for_its_run_is_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A thread runs outer(), a sync query that calls the async query slow().
+    # A task on another loop asks for slow() as well, waits for the thread's
+    # run of it and is cancelled. outer() used to raise InvalidStateError
+    # where the run set its result, and that error was cached: later calls
+    # raised it again without running anything.
+    engine = Engine()
+    started = threading.Event()
+    release = threading.Event()
+    runs = {"slow": 0, "outer": 0}
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    @engine.query
+    async def slow() -> int:
+        runs["slow"] += 1
+        started.set()
+        deadline = time.monotonic() + 4 * HANG_TIMEOUT
+        while not release.is_set():
+            assert time.monotonic() < deadline, "never released"
+            await asyncio.sleep(0.002)
+        return 42
+
+    @engine.query
+    def outer() -> int:
+        runs["outer"] += 1
+        return slow() + 1
+
+    outcome: list[Any] = []
+
+    def call_outer() -> None:
+        try:
+            outcome.append(outer())
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+
+    thread = threading.Thread(target=call_outer, daemon=True)
+    thread.start()
+    assert started.wait(HANG_TIMEOUT)
+
+    async def cancelled_waiter() -> Any:
+        task = asyncio.create_task(slow())
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while waiting() < 1:
+            assert time.monotonic() < deadline, "the task never waited"
+            await asyncio.sleep(0.002)
+        task.cancel()
+        return (await asyncio.gather(task, return_exceptions=True))[0]
+
+    try:
+        # The task's loop is closed by the time the run ends.
+        assert isinstance(asyncio.run(cancelled_waiter()), asyncio.CancelledError)
+    finally:
+        release.set()
+    thread.join(HANG_TIMEOUT)
+    assert not thread.is_alive(), "outer() hung"
+    assert outcome == [43]
+    assert outer() == 43
+    assert runs == {"slow": 1, "outer": 1}
+    # The run ended after the cancelled task's loop was closed, and has to
+    # cope with that quietly.
+    assert not [r for r in caplog.records if r.name == "concurrent.futures"]
 
 
 def _plain_object() -> Any:

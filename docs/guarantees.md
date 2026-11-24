@@ -251,12 +251,18 @@ The body can run more than once when callers are at different revisions, when
 the query is `memoize=False`, when the first run raised an error that is not
 cached, or when the cached row was evicted in between.
 
+A caller that stops waiting for a run (a cancelled task, a timeout around
+the call) leaves the run, its owner and its other waiters alone.
+
 Enforced by: `test_engine_concurrency.py::test_query_dedup_concurrent_requests`,
 `::test_query_dedup_heavy_contention_stress`,
 `::test_query_dedup_failure_propagates_and_recovers`,
 `::test_in_flight_dedup_does_not_cross_snapshot_boundaries`,
 `test_dependency_parallelism.py::test_compute_many_layered_dependencies_run_once_per_key`,
-`::test_result_stored_between_cache_miss_and_claim_is_reused`.
+`::test_result_stored_between_cache_miss_and_claim_is_reused`,
+`test_known_defects.py::test_d33_caller_the_owner_just_stopped_waiting_for_does_not_run_the_query_again`,
+`::test_d34_cancelling_a_waiting_task_leaves_the_owner_and_other_waiters_alone`,
+`::test_d34_sync_query_keeps_its_value_when_a_task_waiting_for_its_run_is_cancelled`.
 
 ### G6. Cancellation
 
@@ -366,7 +372,9 @@ Enforced by: `test_engine.py::test_cycle_detection`,
 `test_cross_thread_cycles.py` (two threads in both orders with and without
 `fixed_point=`, three threads in a three-query cycle, tasks under
 `asyncio.gather`, a task and a thread, a stress run of six threads entering
-at random members while the input changes).
+at random members while the input changes, a thread and a task that joined
+a run which ended on a guess, a task that iterates a fixed point whose owner
+was cancelled, a wait that stays on record when another run is released).
 
 ### G8. Error caching
 
@@ -1166,7 +1174,8 @@ Enforced by: `test_collection_snapshot_direct_reads.py`,
 `test_collection_snapshot_before_creation.py`,
 `test_collection_compaction_pins.py` (several snapshots under an older pin,
 all three kinds, the public error for an unpinned reader, snapshot readers
-against a writer thread),
+against a writer thread, a compaction that falls due inside a mutation
+while a pipeline reads the collection),
 `test_known_defects.py::test_d12_snapshot_read_survives_compaction_with_an_older_pin`,
 `test_history_retention.py::test_collection_snapshot_reads_survive_compaction`,
 `::test_collection_log_stays_bounded_under_churn`.
@@ -1304,7 +1313,9 @@ expected failure until the defect was fixed). D22 was
 found after the audit, while fixing D9; D23 to D26 while fixing D3 and D2;
 D27 while fixing D17; D28 while fixing D5; D29 to D31 while fixing D7; D32
 while fixing D30. All
-were already present at the audit commit.
+of those were already present at the audit commit. D33 and D34 were found
+on 2026-11-24, while writing tests for what mutation testing showed; D33
+came with the fix for D24.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
@@ -1349,6 +1360,8 @@ without an expected-failure marker.
 | D32 | A pipeline nested in a comprehension that is not rewritten (two `for` clauses, or, after the D30 fix, a `:=`) had its helper placed before the statement, outside that comprehension, so it could not see the comprehension's loop variable: `[sum(y * x for y in ys) for x in xs for _ in (0,)]` raised `NameError`, and with a variable `x = 100` in the query returned `[3000, 3000]` where Python gives `[30, 60]`. Found while fixing D30, whose fix sends more comprehensions down this path; present at the audit commit. Such a pipeline is now left as written (G22). | `fix: an assignment expression inside a rewritten comprehension was lost` |
 | D29 | A `CascadeSet` was visited in two different orders. A rewritten comprehension or reducer saw insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gave `[30, 1, 20]`); a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` saw the builtin set's order (`[1, 20, 30]`), so the same body gave two results depending on whether it was rewritten. A `CascadeSet` now iterates in insertion order everywhere: it keeps that order beside its storage, its `__iter__` and `repr` follow it, and snapshot reads keep the order they had (G21). | `fix: a CascadeSet iterated in another order when the query was not rewritten` |
 | D28 | C code that changed the storage of a list, set or dict subclass directly bypassed the collection: `heapq.heappush(xs, 1)` on a `CascadeList` logged no diff, left `len(xs)` inside a query at its old value and the list's element ids out of step with its contents. It cannot be intercepted. The collection now records its size at every change it makes; the next use of it (a read, a mutation, a rewritten pipeline) that finds another size undoes the change and raises `CollectionBypassedError`. Changes that keep the size (`heapq.heapify`, `heapreplace`, `heappushpop`, by-hand `list.sort`, `list.reverse`, item assignment) are not noticed; that limit is documented and pinned (G21). | `fix: C code such as heapq.heappush changed a collection without a trace` |
+| D33 | The body of a query ran twice at one revision, on two threads, with no cycle anywhere, and the trace showed `dedup_cycle` (G5). Thread B ran `total()`, which needs `part()`, and waited for thread A's run of `part()`; A finished `part()` and asked for `total()`. B had its answer but was still recorded as waiting for A, because a waiter removed its record itself, after it had taken the engine's lock again. A took the record for two threads waiting for each other (D24) and ran `total()` on its own stack: 300 of 300 trials with nothing patched. Both runs returned the right value; with `fixed_point=`, both threads iterated the fixed point. A run that is released now drops the records of the callers that waited for it. | `fix: a query ran twice, and a cancelled waiter failed the run it waited for` |
+| D34 | Cancelling one task that waited for a run of an async query failed the run's owner and its other waiters. With three tasks asking for one query, one running it and two waiting, and one waiter cancelled (`task.cancel()`, or `asyncio.wait_for` running out), the task that ran it got `concurrent.futures.InvalidStateError` where 42 was due and the other waiter got `CancelledError`. A thread that calls an async query from sync code runs it in a task of its own: a sync query `outer()` that calls async `slow()` raised `InvalidStateError` when a task elsewhere had waited for that run and been cancelled, and the error was cached, so later calls raised it again without running anything. The callers that join a run share one future, and a task that stopped waiting for it cancelled it for all of them. A task now waits on a future of its own, which the shared one settles; one that has stopped waiting, or whose loop is closed, is left alone. | `fix: a query ran twice, and a cancelled waiter failed the run it waited for` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
@@ -1427,15 +1440,17 @@ actions to the code and the invariants to the guarantees.
   history retention. Change stamps are reused once nobody holds them, where
   the code counts up; the outcome of a walk over input dependencies is fixed
   in the step that looks the row up.
-- None of D1–D32 is reachable in the model: each is in a feature it leaves
-  out. The state machine (test gap 3) is what covers those.
+- None of D1–D34 is reachable in the model: each is in a feature it leaves
+  out (for D33 the record of who waits for whom, for D34 tasks and their
+  cancellation). The state machine (test gap 3) is what covers the others;
+  it has no threads or tasks, so neither of these two.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Every defect has a regression test, and none is open.**
-   `tests/test_known_defects.py` has one test per defect (D1-D32), each
+   `tests/test_known_defects.py` has a test for each defect (D1-D34), each
    asserting the correct behaviour; a defect found from now on gets one
    under `xfail(strict=True)` until it is fixed.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
@@ -1474,7 +1489,9 @@ Ordered by the risk they leave open.
    no async tests for effects, bail-out counts or eviction, and snapshots,
    TTL and fixed points have one or two each.
 8. **Collection concurrency has one deterministic test.** No multi-writer or
-   writer-against-pipeline stress, and none on free-threaded builds.
+   writer-against-pipeline stress, and none on free-threaded builds. One
+   more since: a writer whose mutation makes a compaction fall due while a
+   pipeline reads the collection (`test_collection_compaction_pins.py`).
 9. **Transactions inside the block are untested** for queries reading a
    mutated or newly created collection, `submit` and two engines. Threads and
    async tasks are covered by `test_transaction_ownership.py`.
@@ -1487,7 +1504,8 @@ Ordered by the risk they leave open.
     brought that to 2,281, 20.2%. So the 95% line coverage figure
     overstates what the assertions would catch, most in the async paths,
     in the bookkeeping of a result reloaded from disk, and in two paths
-    that tests reach only when threads happen to meet.
+    that tests reached only when threads happened to meet. Fixed tests
+    force those two since, and writing them found D33 and D34.
     `docs/verification-status.md` has the tables, how the runs were made
     and what in them is unconfirmed. A full run is hours of test runs, so
     it is done on demand, on a machine with many cores (on Windows through

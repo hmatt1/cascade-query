@@ -174,7 +174,8 @@ class GraphStore:
         self.in_flight: dict[tuple[QueryKey, int], InFlight] = {}
         # The in-flight run each blocked thread or awaiting task waits for,
         # keyed like ``InFlight.owner``. Lets a caller see that waiting
-        # would never end (Evaluator._enter_wait_locked).
+        # would never end (Evaluator._enter_wait_locked). A record goes
+        # when the run is released, or when the waiter gives up first.
         self.waiting_on: dict[Any, InFlight] = {}
         # Recency order of memo keys, least recently used first. Mirrors
         # ``memos`` and agrees with ``MemoEntry.last_access`` ordering. Replaces

@@ -138,6 +138,39 @@ def _run_coroutine_blocking(coro: Any, what: str) -> Any:
     return asyncio.run(coro)
 
 
+async def _wait_for_joined_run(shared: concurrent.futures.Future[Any]) -> Any:
+    """Wait, in a task, for the run this caller joined, and return its result.
+
+    Every caller that joined the run waits on ``shared``. A task must not
+    await it through ``asyncio.wrap_future``: cancelling the task would then
+    cancel ``shared`` for all of them, the run's owner would fail where it
+    sets the result, and the other waiters would be cancelled with this one
+    (D34). The task waits on a future of its own instead, which ``shared``
+    settles when the run ends. A task that has stopped waiting by then, or
+    whose loop is closed, is left alone.
+    """
+    loop = asyncio.get_running_loop()
+    mine: asyncio.Future[Any] = loop.create_future()
+
+    def settle() -> None:
+        if mine.done():
+            return
+        exc = shared.exception()
+        if exc is None:
+            mine.set_result(shared.result())
+        else:
+            mine.set_exception(exc)
+
+    def relay(_done: concurrent.futures.Future[Any]) -> None:
+        try:
+            loop.call_soon_threadsafe(settle)
+        except RuntimeError:
+            pass  # the loop is closed: nobody waits on it any more
+
+    shared.add_done_callback(relay)
+    return await mine
+
+
 _live_disk_writers: weakref.WeakSet[Evaluator] = weakref.WeakSet()
 _live_disk_writers_lock = threading.Lock()
 # Writer threads still running, also those of engines already dropped (they
@@ -1014,9 +1047,13 @@ class Evaluator:
             finally:
                 self._leave_wait(agent, slot)
             if pending_heads is not None:
-                if self._owns_any(runtime, pending_heads):
+                if self._owns_any(runtime, pending_heads):  # pragma: no cover
                     # Computed from another run's guess for a head this
                     # caller is iterating itself: run it here, on our guess.
+                    # Two callers iterate one head at one revision only when
+                    # the owner of the head's run gave up (a cancelled task,
+                    # a wait cut short by an interrupt) while another ran it
+                    # on its own stack. No test brings a thread here.
                     return self._run_instead_of_waiting(key, fn, runtime, slot), False
                 self._await_cycle_heads(pending_heads, runtime)
             elif failed is not None:
@@ -1139,7 +1176,7 @@ class Evaluator:
             # See compute_or_get_memo: retries run outside the except clauses.
             pending_heads = failed = None
             try:
-                result = await asyncio.wrap_future(waiter_future)
+                result = await _wait_for_joined_run(waiter_future)
             except _ProvisionalResult as pending_cycle:
                 pending_heads = pending_cycle.heads
             except (QueryCancelled, CycleError, _ReenteredQuery) as exc:
@@ -1284,6 +1321,12 @@ class Evaluator:
         return True
 
     def _leave_wait(self, agent: Any, slot: InFlight) -> None:
+        """Forget that ``agent`` waits for ``slot``, if it is still on record.
+
+        A run that is released drops the records of its waiters itself
+        (``_release_in_flight``). This is for a waiter that stops before
+        that: a cancelled task, an interrupted thread.
+        """
         with self._store.lock:
             waiting_on = self._store.waiting_on
             if waiting_on.get(agent) is slot:
@@ -1395,6 +1438,16 @@ class Evaluator:
             if self._store.in_flight.get(in_flight_key) is slot:
                 del self._store.in_flight[in_flight_key]
             future = slot.future
+            if future is not None:
+                # Whoever joined this run stops waiting here, not when it
+                # gets round to saying so. Until then its record would tell
+                # the owner of this run, asking for a query the waiter
+                # runs, that the waiter still waits for it: a cycle of
+                # waits that is not there, and a second run of that query
+                # (D33).
+                waiting_on = self._store.waiting_on
+                for waiter in [a for a, s in waiting_on.items() if s is slot]:
+                    del waiting_on[waiter]
         if future is None:
             return
         if exc is not None:

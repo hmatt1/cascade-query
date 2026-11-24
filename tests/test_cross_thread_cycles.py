@@ -12,6 +12,7 @@ every thread is a daemon joined with a timeout.
 from __future__ import annotations
 
 import asyncio
+import gc
 import random
 import threading
 import time
@@ -340,3 +341,255 @@ def test_verifying_stored_results_that_depend_on_each_other_in_a_loop() -> None:
     outcomes = _run_threads({"m2": m2})
     assert outcomes["m2"] == 10
     assert (head(), m1(), m2()) == (10, 11, 10)
+
+
+# --- joining a run that ends on a guess ---
+#
+# While a fixed point is iterated, the queries in its cycle return results
+# computed from a guess. Such a result is good for the iterating thread only,
+# so a caller that joined the run gets none: it is told which fixed points
+# the result hangs on, and waits for those. The random test above gets a
+# caller into that place only when its threads happen to meet; these put one
+# there on purpose.
+#
+# A caller that iterates one of those fixed points itself runs the query on
+# its own guess instead. Two callers iterate one fixed point at one revision
+# only when the owner of its run gives up part way while another runs it on
+# its own stack. The last test of this group gets tasks there by cancelling
+# the owner; no test gets threads there. (Before D33 was fixed, callers also
+# got there whenever a waiter was slow to say that it had stopped waiting.)
+
+
+def _dedup_waits(engine: Engine) -> int:
+    return [t.event for t in engine.traces()].count("dedup_wait")
+
+
+def test_thread_joining_a_run_that_ends_on_a_guess_waits_for_the_fixed_point() -> None:
+    engine = Engine()
+    member_running = threading.Event()
+    ran: dict[str, set[int]] = {"head": set(), "member": set()}
+    head_runs: list[int] = []
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        ran["head"].add(threading.get_ident())
+        head_runs.append(1)
+        if len(head_runs) == 2:
+            # Not before the joiner has gone on from the member's run to
+            # waiting for this one: its second wait.
+            _until(lambda: _dedup_waits(engine) >= 2)
+        return member() + inp()
+
+    @engine.query
+    def member() -> int:
+        ran["member"].add(threading.get_ident())
+        if not member_running.is_set():
+            member_running.set()
+            _until(lambda: _waiters(engine) >= 1)  # the other thread has joined
+        return head() // 2
+
+    def join_member() -> int:
+        assert member_running.wait(TIMEOUT)
+        return member()
+
+    outcomes = _run_threads({"head": head, "member": join_member})
+    assert outcomes == {"head": 7, "member": 3}
+    # The joiner waited for the member's run, then for the fixed point, and
+    # read the member's final result: it ran nothing itself.
+    assert _dedup_waits(engine) == 2
+    assert len(ran["head"]) == 1
+    assert ran["member"] == ran["head"]
+    assert not engine._internals.in_flight  # noqa: SLF001
+    assert _waiters(engine) == 0
+
+
+def test_task_joining_a_run_that_ends_on_a_guess_waits_for_the_fixed_point() -> None:
+    engine = Engine()
+    ran: dict[str, set[Any]] = {"head": set(), "member": set()}
+    runs = {"head": 0, "member": 0}
+
+    async def until(predicate: Any) -> None:
+        deadline = time.monotonic() + TIMEOUT
+        while not predicate():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.002)
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    async def head() -> int:
+        ran["head"].add(asyncio.current_task())
+        runs["head"] += 1
+        if runs["head"] == 2:
+            await until(lambda: _dedup_waits(engine) >= 2)
+        return await member() + inp()
+
+    @engine.query
+    async def member() -> int:
+        ran["member"].add(asyncio.current_task())
+        runs["member"] += 1
+        if runs["member"] == 1:
+            await until(lambda: _waiters(engine) >= 1)
+        return await head() // 2
+
+    async def main() -> list[Any]:
+        iterating = asyncio.create_task(head())
+        await until(lambda: runs["member"] == 1)
+        return await asyncio.gather(iterating, member(), return_exceptions=True)
+
+    outcomes = _run_threads({"main": lambda: asyncio.run(main())})["main"]
+    assert outcomes == [7, 3]
+    assert _dedup_waits(engine) == 2
+    assert len(ran["head"]) == 1
+    assert ran["member"] == ran["head"]
+    assert not engine._internals.in_flight  # noqa: SLF001
+    assert _waiters(engine) == 0
+
+
+def test_task_iterating_a_fixed_point_runs_a_joined_member_on_its_own_guess(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Three tasks. One enters the cycle through side() and runs it. The
+    # second owns the run of head() and waits for side(), so the first, when
+    # it asks for head(), runs it on its own stack. The second is cancelled
+    # there, which frees the run of head() while the first still iterates
+    # it. A third task claims the run and joins the first one's run of
+    # member(). That run ends on the first task's guess, which is of no use
+    # to the third: it runs member() itself, on its own.
+    engine = Engine()
+    runs = {"member": 0, "side": 0}
+    state = {"owner_cancelled": False}
+
+    async def until(predicate: Any) -> None:
+        deadline = time.monotonic() + TIMEOUT
+        while not predicate():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.002)
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    async def head() -> int:
+        m = await member()
+        s = await side()
+        return m + s + inp()
+
+    @engine.query
+    async def member() -> int:
+        runs["member"] += 1
+        if runs["member"] == 2:
+            # The first task's run, inside its own head(). Held until the
+            # owner is gone and the third task has joined this run.
+            await until(lambda: state["owner_cancelled"] and _waiters(engine) >= 1)
+        return await head() // 2
+
+    @engine.query
+    async def side() -> int:
+        runs["side"] += 1
+        if runs["side"] == 1:
+            await until(lambda: _waiters(engine) >= 1)  # the owner of head() waits
+        return await head() // 4
+
+    async def main() -> list[Any]:
+        first = asyncio.create_task(side())
+        await until(lambda: runs["side"] == 1)
+        owner = asyncio.create_task(head())
+        await until(lambda: runs["member"] == 2)
+        owner.cancel()
+        cancelled = (await asyncio.gather(owner, return_exceptions=True))[0]
+        state["owner_cancelled"] = True
+        third = asyncio.create_task(head())
+        rest = await asyncio.gather(third, first, return_exceptions=True)
+        return [cancelled, *rest]
+
+    async def settled() -> tuple[int, int, int]:
+        return await head(), await member(), await side()
+
+    outcomes = _run_threads({"main": lambda: asyncio.run(main())})["main"]
+    cancelled, third, first = outcomes
+    assert isinstance(cancelled, asyncio.CancelledError)
+    # head = head // 2 + head // 4 + 4 converges to 11.
+    assert third == 11
+    # Entered through side(), as when a thread enters through a member.
+    assert first == 2 or isinstance(first, CycleError)
+    assert asyncio.run(settled()) == (11, 5, 2)
+    assert not engine._internals.in_flight  # noqa: SLF001
+    assert _waiters(engine) == 0
+    # The cancelled task waited for a run that then failed: nothing of that
+    # may be left behind for asyncio to report.
+    del outcomes, cancelled, third, first
+    gc.collect()
+    reported = [r.getMessage() for r in caplog.records if r.name == "asyncio"]
+    assert not [m for m in reported if "never retrieved" in m or "callback" in m]
+
+
+# --- the record of who waits for whom ---
+
+
+def test_releasing_one_run_leaves_the_waits_for_other_runs_on_record() -> None:
+    # A run that is released drops the records of the callers that waited for
+    # it (D33). Every other record has to stay: two threads in one cycle are
+    # kept from waiting for each other only by the record of the first wait.
+    engine = Engine()
+    member_running = threading.Event()
+    unrelated_running = threading.Event()
+    unrelated_released = threading.Event()
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query
+    def unrelated() -> int:
+        unrelated_running.set()
+        # Until head()'s thread waits for member() and a second caller for this.
+        _until(lambda: _waiters(engine) >= 2)
+        return 1
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        return member() + inp()
+
+    @engine.query
+    def member() -> int:
+        member_running.set()
+        assert unrelated_released.wait(TIMEOUT)
+        return head() // 2
+
+    def call_head() -> int:
+        assert member_running.wait(TIMEOUT)
+        return head()
+
+    def run_unrelated() -> int:
+        assert member_running.wait(TIMEOUT)
+        value = unrelated()
+        unrelated_released.set()
+        return value
+
+    def join_unrelated() -> int:
+        assert unrelated_running.wait(TIMEOUT)
+        return unrelated()
+
+    outcomes = _run_threads(
+        {
+            "member": member,
+            "head": call_head,
+            "unrelated": run_unrelated,
+            "joined": join_unrelated,
+        }
+    )
+    assert (outcomes["unrelated"], outcomes["joined"]) == (1, 1)
+    # As when two threads enter the cycle from both ends, see above.
+    assert outcomes["head"] == 7
+    assert outcomes["member"] == 3 or isinstance(outcomes["member"], CycleError)
+    assert "dedup_cycle" in [t.event for t in engine.traces()]
+    assert not engine._internals.in_flight  # noqa: SLF001
+    assert _waiters(engine) == 0

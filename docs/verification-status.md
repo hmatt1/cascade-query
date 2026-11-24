@@ -6,16 +6,19 @@ the TLC output that had been committed. This file says what each one
 established, what is unconfirmed, and what to do next. It is a snapshot;
 `docs/guarantees.md` stays the reference for what the engine promises.
 
-**No defect in the engine was found by any of the three checks.** What the
-work did find is where the tests are thin, and one test that leaked state
-between runs.
+**None of the three checks failed on a defect in the engine. Writing tests
+for what the mutation runs showed found two**, both fixed since: D33, a
+query that ran twice at one revision, and D34, a cancelled task that
+failed the run it waited for and that run's other waiters (see the two
+sections named "Defect found on the way"). Apart from that the work found
+where the tests are thin, and one test that leaked state between runs.
 
 | Item | State |
 |---|---|
 | TLC output under `docs/formal/` | Deleted (255 files) and ignored. Done. |
 | State machine | Rewritten with the new rules, on three backends. Done. |
 | TLA+ model | Rewritten; both configurations pass. The on-demand workflow has never run on GitHub. |
-| Mutation testing | Tooling, a first baseline and a repeat over two modules exist; the runner is in the repository. Outside those two modules most kills come from one pass. |
+| Mutation testing | Tooling, a first baseline and a repeat over two modules exist; the runner is in the repository. Outside those two modules most kills come from one pass. Two defects were found while writing tests for its findings, D33 and D34; both are fixed. |
 
 ## State machine
 
@@ -366,7 +369,151 @@ are the same as in the baseline, function by function.
 So a rate from one run is good to about a dozen mutants in these two
 modules, and two paths are tested only when threads happen to meet: the wait
 for another thread's cycle heads in the sync path, and a compaction that
-falls due while a mutation is in progress.
+falls due while a mutation is in progress. Fixed tests force both since
+(next section).
+
+### Covered since the repeat: the two paths reached by chance
+
+Tests were added on 2026-11-24 that put a caller on each path on purpose.
+Each change named below was applied by hand to a copy of the source and
+the tests run against it; on the real source they passed 300 times in a
+row. No mutation run was repeated, so the tables above stand.
+
+**A compaction that falls due inside a mutation.** In-memory compaction asks
+the pipelines how far they have read, which takes the pipeline runtime's
+lock; a pipeline holds that lock while it reads the collection; a mutation
+holds the collection's lock. `emit` therefore only notes that a compaction
+is due, and it runs once the mutation has let go. `emit` mutants 42, 48 and
+49 run it at once, and a reader and a writer then wait for each other.
+`test_collection_compaction_pins.py::test_compaction_due_inside_a_mutation_does_not_block_a_pipeline_reading`
+stops a reader inside a pipeline stage until a writer is inside an `extend`
+of 3,000 items. With each of the three mutants both threads hang, every
+time; before, that took a reader and the writer meeting by chance.
+
+**A caller that joined a run which ended on a guess.** Tests in
+`test_cross_thread_cycles.py`:
+
+- `test_thread_joining_a_run_that_ends_on_a_guess_waits_for_the_fixed_point`:
+  the caller iterates none of the fixed points. It has to wait for them
+  (`_await_cycle_heads`) and then read the final result; the test checks
+  that it waited twice and ran nothing itself. It fails with
+  `compute_or_get_memo` mutants 125, 137, 138, 150, 151, 152 and 153, and
+  with `_await_cycle_heads` mutants 2, 3, 4, 6, 8, 9 and 10. Mutants 151,
+  152 and 153 and those seven were alive after the repeat. The seven raise
+  inside `_await_cycle_heads`, which lets such an error pass, so the caller
+  still got the right value; the test notices that the caller then runs the
+  member itself. Mutants 1, 5, 7, 11 and 12 of `_await_cycle_heads` still
+  pass: they change the function handed over and `need_value`, which do not
+  matter to a caller that joins the fixed point's run.
+- `test_task_joining_a_run_that_ends_on_a_guess_waits_for_the_fixed_point`:
+  the same with two tasks on one loop. mutmut made no mutants for
+  `_await_cycle_heads_async` or for the lines that call it, so four changes
+  were made by hand (an argument of the call dropped, the call replaced by
+  `pass`, `_owns_any(None, ...)`, an argument of the inner call dropped).
+  The test fails with each.
+- A caller that iterates one of the fixed points itself runs the member on
+  its own guess. A third test,
+  `test_two_threads_iterating_one_fixed_point_each_use_their_own_guess`,
+  put two threads there and failed with `compute_or_get_memo` mutants 141,
+  142, 143, 144 and 147. It could do so only through defect D33, by
+  holding that defect's window open, and was removed with the fix. The
+  branch stays in the code. `test_task_iterating_a_fixed_point_runs_a_joined_member_on_its_own_guess`
+  now gets tasks there by cancelling the owner of the fixed point's run;
+  nothing gets threads there. See "What the fix leaves" below.
+
+### Defect found on the way: D33 (fixed)
+
+Found while working out how the random test reached the last of those
+states.
+
+- **What.** The body of a query ran twice at one revision, on two threads,
+  with no cycle anywhere, and the trace showed `dedup_cycle`. G5 says one
+  caller runs the body and the others wait.
+- **When.** Thread B runs `total()`, which needs `part()`, and waits for
+  thread A's run of `part()`. A finishes `part()` and asks for `total()`.
+  B had its answer by then but was still recorded as waiting for A: a
+  waiter removed its record itself, after it had taken the engine's lock
+  again. A read "B runs `total()` and waits for me", took that for two
+  threads waiting for each other, and ran `total()` on its own stack.
+- **How often.** With nothing patched, in 300 of 300 trials on Python
+  3.12.9: under the interpreter lock A goes on before B wakes.
+- **Consequence.** A second run of the body, with whatever it does outside
+  the engine. Both runs returned the right value in every trial and no
+  wrong result was found. With `fixed_point=`, both threads iterated the
+  fixed point.
+- **Where it came from.** The record of who waits for whom came with the
+  fix for D24.
+- **The fix.** A run that is released (`_release_in_flight`) now drops the
+  records of the callers that waited for it, in the critical section that
+  unregisters it. `_leave_wait` remains for a waiter that stops before the
+  run does.
+- **Tests.**
+  `tests/test_known_defects.py::test_d33_caller_the_owner_just_stopped_waiting_for_does_not_run_the_query_again`
+  asserts one run and no `dedup_cycle`. It holds B where it used to remove
+  its record, so the outcome does not depend on the build; it failed before
+  the fix. `test_cross_thread_cycles.py::test_releasing_one_run_leaves_the_waits_for_other_runs_on_record`
+  is for the other direction: with a fix that drops the records of other
+  runs' waiters too, two threads in one cycle wait for each other for good.
+  Four ways of breaking the fix were applied to a copy (never dropping,
+  dropping the others' records, dropping every record, finding the records
+  and keeping them); each fails one of the two tests.
+- **After the fix.** The plain reproduction shows no second run in 300
+  trials. The random test no longer runs a query a second time because of a
+  record that is out of date (11 to 19 times a run before).
+
+**What the fix leaves.** `compute_or_get_memo` and its async twin have a
+branch for a caller that joined a run computed from another caller's guess
+for a fixed point it iterates itself. Before the fix the random test took it
+7 to 47 times a run, always through D33; after it, not once in three runs.
+It is kept: two callers still iterate one fixed point at one revision when
+the owner of its run gives up part way while another caller runs it on its
+own stack.
+
+- For tasks that is a cancelled owner.
+  `test_cross_thread_cycles.py::test_task_iterating_a_fixed_point_runs_a_joined_member_on_its_own_guess`
+  does it with three tasks and takes the async branch every time (20 of 20
+  trials before it became a test). With `None` in place of the runtime on
+  that line the test fails. It could only be written once D34 was fixed:
+  cancelling the owner is cancelling a task that waits for a run.
+- For threads it takes a wait cut short by an interrupt. No test brings one
+  there, and the line is marked `# pragma: no cover`.
+
+### Defect found on the way: D34 (fixed)
+
+Found while checking what the D33 fix leaves reachable. It was in the
+committed source, so it did not come from that fix.
+
+- **What.** Several tasks ask for one async query: one runs it, the others
+  wait for that run. One waiter is cancelled, with `task.cancel()` or by
+  `asyncio.wait_for` running out. When the run finished, the task that ran
+  it got `concurrent.futures.InvalidStateError` where its value was due, and
+  every other waiter got `CancelledError` though nobody had cancelled it.
+- **The worse case.** A thread that calls an async query from sync code runs
+  it in a task of its own. With `outer()` a sync query that calls async
+  `slow()`, and a task elsewhere that waited for that run of `slow()` and
+  was cancelled, `outer()` raised `InvalidStateError`, and the error was
+  cached: two more calls raised it again without running anything. A thread
+  that only runs and waits for sync queries was not affected; that was
+  tried too.
+- **Why.** The callers that join a run share one `concurrent.futures`
+  future. A task waited for it through `asyncio.wrap_future`, which hands a
+  cancellation of the wait on to the future it wraps.
+- **How often.** On every try, on Python 3.12.9. It does not depend on
+  timing: cancelling the wait cancels the shared future at once.
+- **The fix.** A task now waits on a future of its own, which the shared one
+  settles when the run ends (`_wait_for_joined_run`). A task that has
+  stopped waiting by then, or whose loop is closed, is left alone.
+  `asyncio.shield` around the old wait was tried first. It cures the
+  failures, but a cancelled waiter whose run later fails then leaves a
+  "Future exception was never retrieved" for asyncio to log.
+- **Tests.** Two in `tests/test_known_defects.py`: `test_d34_cancelling_a_waiting_task_leaves_the_owner_and_other_waiters_alone`
+  (three tasks; it failed before the fix) and `test_d34_sync_query_keeps_its_value_when_a_task_waiting_for_its_run_is_cancelled`
+  (the thread, with the cancelled task's loop closed before the run ends).
+  Five ways of breaking the fix were applied to a copy: the old wait, the
+  shielded wait, settling a future whose task has stopped waiting, not
+  coping with a closed loop, and mixing up result and error. Each fails one
+  of those two tests or the three-task test above, which also checks that
+  nothing is left for asyncio to report.
 
 ## Next steps
 
@@ -375,12 +522,9 @@ In order of value for the time they take.
 1. **Start `.github/workflows/mutation.yml` once**, and
    `model-check.yml` once, to learn whether they work. One shard is enough
    for the first try.
-2. **Write tests that force the two paths reached only by chance**: a
-   caller that joins a run depending on a fixed point another thread is
-   iterating (`compute_or_get_memo`, the call of `_await_cycle_heads`),
-   and a compaction that falls due inside a mutation
-   (`_CollectionCore.emit`). See "Repeat over `_evaluator` and
-   `_collections`".
+2. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
+   from before the two fixes and the tests of the last three sections,
+   which were checked against changes made by hand only.
 3. **Look at the survivors in the async paths that change a condition or
    an operator.** `compute_or_get_memo_async` still has 78 survivors
    against 42 in the sync function, and awaiting on a running loop is
