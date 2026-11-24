@@ -1465,7 +1465,7 @@ Ordered by the risk they leave open.
 10. **One in five mutants survives, and nothing gates on it.**
     `scripts/mutation.py` runs mutmut (11,282 mutants on covered lines) and
     reports the survival rate per module with the diffs of the survivors.
-    The first full run (2026-11-24) left 2,337 alive, 20.7%: from 41% in
+    The first full run (2026-11-24) left 2,340 alive, 20.8%: from 41% in
     `_serde` and 27% in `_evaluator` down to 9% in `_collections`. So the
     95% line coverage figure overstates what the assertions would catch,
     most in the async paths and where a result is reloaded from disk (its
