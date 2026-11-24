@@ -350,7 +350,7 @@ A rewritten expression returns exactly what the same Python returns: the same va
 
 *   Arbitrary `for` loops and comprehensions with more than one `for` are never rewritten, but invalidate through read tracking.
 *   A rewritten comprehension or reducer visits a `CascadeSet` in insertion order. A `for` loop, a helper function and `list(s)` see the builtin set's order instead; until that is settled (D29 in `docs/guarantees.md`), do not rely on the order of a `CascadeSet` outside rewritten expressions.
-*   One more open gap in rewriting: an assignment expression (`:=`) inside a rewritten comprehension does not reach the enclosing function (D30). Use `@engine.query(incremental=False)` for such a query.
+*   A comprehension with an assignment expression (`:=`) in its element or `if` clauses is left as written, so the name is bound in the query as in Python. So is a comprehension or reducer nested inside a comprehension that is left as written (for example one with two `for` clauses) when it uses that comprehension's loop variable.
 *   If an element, filter or `key=` function pushes to an `Accumulator` (or calls a query that does), the expression is evaluated as plain Python from the first run on which that happens, so the effects are exactly Python's, in Python's order; such an expression is no longer incremental.
 *   `enumerate()` and `zip()` sources are explicitly excluded.
 *   Reads that are not rewritten are still tracked: indexing, slicing, `in`, `len`, comparisons, `xs + ys`, `s | t` and the other set operators and methods, `d.keys() & other`, `repr`, `list(xs)`, `dict(d)`, `json.dumps(xs)` and so on. Each returns a plain builtin and re-runs the query when the collection changes.

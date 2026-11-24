@@ -23,6 +23,13 @@ Boundaries are strict and fail toward normal execution:
 * If any relevant builtin name is shadowed in the function, in a function
   enclosing it, or in its module, or the source cannot be parsed, or the
   function is async or a lambda, the function is registered unmodified.
+* A comprehension's element and ``if`` clauses move into a helper function.
+  Two things would change meaning there, so the comprehension is left as
+  written instead: an assignment expression (``:=``) anywhere in them,
+  which must bind in the query, not the helper (D30); and, for a pipeline
+  nested inside a comprehension that is not rewritten, a helper that uses
+  that comprehension's loop variables, which the helper would not see
+  (D32).
 
 The rewritten function is compiled against the original filename with the
 original line numbers, and its closure cells are the original cell objects,
@@ -133,6 +140,9 @@ class _Rewriter(ast.NodeTransformer):
         self.count = 0
         self._n = 0
         self._pending: list[list[ast.stmt]] = []
+        # Loop variables of the enclosing comprehensions that stay as
+        # written. A helper hoisted out of them cannot see these names.
+        self._comp_scopes: list[frozenset[str]] = []
 
     # --- statement-level plumbing ---
     def rewrite_block(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
@@ -191,6 +201,22 @@ class _Rewriter(ast.NodeTransformer):
         # functions, so everything inside runs unmodified.
         return node
 
+    def _keep(self, node: ast.AST) -> ast.AST:
+        """Leave ``node`` as written; rewrite what is inside it where safe."""
+        if not isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        ):
+            return self.generic_visit(node)
+        self._comp_scopes.append(frozenset(_loop_names(node)))
+        try:
+            return self.generic_visit(node)
+        finally:
+            self._comp_scopes.pop()
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> ast.AST:
+        # Reached only when no reducer takes it as its pipeline.
+        return self._keep(node)
+
     # --- the actual interception ---
     def visit_Call(self, node: ast.Call) -> ast.AST:
         matched = self._match_terminal(node)
@@ -205,21 +231,23 @@ class _Rewriter(ast.NodeTransformer):
             # len() of map(), filter() or reversed() is a TypeError: those
             # are iterators. Only a list comprehension has a length.
             return self.generic_visit(node)
+        if self._hides_loop_names(stages):
+            return self.generic_visit(node)
         return self._build_run_call(node, reducer, source, stages, extra)
 
     def visit_ListComp(self, node: ast.ListComp) -> ast.AST:
         # A bare comprehension is its own terminal: [f(x) for x in xs]
         # is list-reduce over a map stage.
         pipeline = _match_pipeline(node)
-        if pipeline is _ABORT:
-            return self.generic_visit(node)
+        if pipeline is _ABORT or self._hides_loop_names(pipeline[1]):
+            return self._keep(node)
         source, stages = pipeline
         return self._build_run_call(node, "list", source, stages, [])
 
     def visit_SetComp(self, node: ast.SetComp) -> ast.AST:
         decomposed = _decompose_comp(node, node.elt)
-        if decomposed is _ABORT:
-            return self.generic_visit(node)
+        if decomposed is _ABORT or self._hides_loop_names(decomposed[1]):
+            return self._keep(node)
         source, stages = decomposed
         return self._build_run_call(node, "set", source, stages, [])
 
@@ -239,10 +267,31 @@ class _Rewriter(ast.NodeTransformer):
             elt = ast.Tuple(elts=[node.key, node.value], ctx=ast.Load())
             ast.copy_location(elt, node.key)
         decomposed = _decompose_comp(node, elt)
-        if decomposed is _ABORT:
-            return self.generic_visit(node)
+        if decomposed is _ABORT or self._hides_loop_names(decomposed[1]):
+            return self._keep(node)
         source, stages = decomposed
         return self._build_run_call(node, "dict", source, stages, [])
+
+    def _hides_loop_names(self, stages: list[tuple[Any, ...]]) -> bool:
+        """Whether a helper for ``stages`` would use an enclosing loop variable.
+
+        Helpers are hoisted to the enclosing statement. Inside a
+        comprehension that stays as written, its loop variables are not
+        visible there: the helper would raise ``NameError``, or read a
+        variable of the query with the same name (D32).
+        """
+        if not self._comp_scopes:
+            return False
+        hidden = frozenset().union(*self._comp_scopes)
+        for stage in stages:
+            if stage[0] not in ("comp_map", "comp_filter"):
+                continue
+            _, target, body = stage
+            bound = set(_store_names(target))
+            for name in _load_names(body):
+                if name in hidden and name not in bound:
+                    return True
+        return False
 
     def _match_terminal(
         self, node: ast.Call
@@ -376,6 +425,11 @@ def _decompose_comp(
     gen = comp.generators[0]
     if gen.is_async:
         return _ABORT
+    moved = [*gen.ifs, *([] if elt is None else [elt])]
+    if any(isinstance(n, ast.NamedExpr) for part in moved for n in ast.walk(part)):
+        # ``:=`` in a comprehension binds in the enclosing function. Moved
+        # into a helper it would bind there and be lost (D30).
+        return _ABORT
     inner = _match_pipeline(gen.iter)
     if inner is _ABORT:
         return _ABORT
@@ -389,6 +443,28 @@ def _decompose_comp(
     ):
         stages.append(("comp_map", gen.target, elt))
     return source, stages
+
+
+def _loop_names(
+    comp: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
+) -> list[str]:
+    return [name for gen in comp.generators for name in _store_names(gen.target)]
+
+
+def _store_names(target: ast.AST) -> list[str]:
+    return [
+        n.id
+        for n in ast.walk(target)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    ]
+
+
+def _load_names(expr: ast.AST) -> list[str]:
+    return [
+        n.id
+        for n in ast.walk(expr)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    ]
 
 
 def _match_pipeline(expr: ast.expr) -> tuple[ast.expr, list[tuple[Any, ...]]] | object:

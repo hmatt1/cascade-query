@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D31).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D32).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -243,7 +243,6 @@ def test_d29_set_order_is_the_same_rewritten_or_not() -> None:
     assert rewritten() == unrewritten()
 
 
-@_defect(30, "an assignment expression in a rewritten comprehension is lost")
 def test_d30_walrus_in_a_comprehension_binds_in_the_query() -> None:
     engine = Engine()
     xs = CascadeList(engine, [1, 2, 3])
@@ -255,6 +254,25 @@ def test_d30_walrus_in_a_comprehension_binds_in_the_query() -> None:
         return (last, out)
 
     assert last_seen() == (3, [1, 2, 3])
+
+
+def test_d32_nested_pipeline_sees_the_loop_variable_of_a_kept_comprehension() -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2])
+    ys = CascadeList(engine, [10, 20])
+
+    @engine.query
+    def scaled() -> Any:
+        # Two ``for`` clauses: the outer comprehension stays as written.
+        return [sum(y * x for y in ys) for x in xs for _ in (0,)]
+
+    @engine.query
+    def shadowed() -> Any:
+        x = 100
+        return [sum(y * x for y in ys) for x in xs for _ in (0,)], x
+
+    assert scaled() == [30, 60]  # was NameError: name 'x' is not defined
+    assert shadowed() == ([30, 60], 100)  # was ([3000, 3000], 100)
 
 
 # The accumulator is reached through a global: a stage function that closes
