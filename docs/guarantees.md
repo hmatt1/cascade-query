@@ -436,6 +436,14 @@ Enforced by: `test_ttl.py::test_ttl_invalidation_basic`,
 `::test_expired_ttl_refreshes_dependents_loaded_from_disk` and
 `::test_expired_ttl_refreshes_async_dependents_loaded_from_disk` (both backends),
 `::test_queries_without_a_ttl_beneath_them_carry_no_expiry`,
+`::test_ttl_result_is_still_good_at_exactly_its_ttl`,
+`::test_ttl_query_stays_cached_above_a_query_without_an_expiry`,
+`::test_verified_dependent_keeps_the_shortest_expiry_beneath_it`,
+`::test_result_loaded_from_disk_expires_when_the_stored_one_would`,
+`::test_ttl_result_loaded_from_disk_expires_with_a_shorter_ttl_beneath_it` and
+`::test_dependent_loaded_from_disk_expires_with_the_shortest_ttl_beneath_it`
+(these six for sync queries and for async ones awaited on a loop, the last
+three on both backends),
 `test_known_defects.py::test_d3_expired_ttl_dependency_refreshes_through_its_dependent`,
 `test_dirty_propagation.py::test_ttl_dependency_keeps_dependents_on_the_slow_path`.
 
@@ -662,6 +670,8 @@ Enforced by: `test_disk_cache.py::test_cross_session_hit_skips_all_query_bodies`
 `::test_file_edit_invalidates_only_its_chain`,
 `::test_early_cutoff_survives_across_sessions`,
 `::test_deep_dependency_chain_cross_session`,
+`::test_loaded_result_is_verified_like_a_computed_one`,
+`::test_record_without_an_error_flag_is_loaded_as_a_value`,
 `test_persistence_permutations.py::test_permutation_incremental_mdbx`,
 `test_known_defects.py::test_d23_async_query_result_is_reused_by_a_new_engine`,
 `test_ttl.py::test_expired_ttl_refreshes_async_dependents_loaded_from_disk` and
@@ -678,7 +688,12 @@ spots apply here too, for code whose change no version declares.
 Enforced by: `test_cache_versions.py`,
 `test_code_versioning.py::test_disk_cache_invalidation_on_code_change`,
 `test_disk_cache.py::test_dynamic_graph_topology_cross_session`,
-`::test_in_session_invalidation_still_works_after_hydration`.
+`::test_in_session_invalidation_still_works_after_hydration`,
+`::test_dependent_notices_a_result_loaded_again_with_another_value`,
+`test_ttl.py::test_result_loaded_from_disk_expires_when_the_stored_one_would`,
+`::test_ttl_result_loaded_from_disk_expires_with_a_shorter_ttl_beneath_it` and
+`::test_dependent_loaded_from_disk_expires_with_the_shortest_ttl_beneath_it`
+(a stored result whose TTL, or one beneath it, has elapsed; both backends).
 
 ### G17. Durability
 
@@ -844,6 +859,7 @@ opens a directory with a result format it does not know, so do not open a
 directory with an older release than the one that wrote it.
 
 Enforced by: `test_disk_cache.py::test_corrupt_blob_falls_back_to_recompute`,
+`::test_malformed_dependency_row_falls_back_to_recompute`,
 `::test_format_bump_wipes_stale_cache`, `::test_format_bump_sqlite`,
 `test_format_bump.py` (both backends: results recomputed and collections
 kept across a bump and back, a compacted log with its tail, a directory
