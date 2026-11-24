@@ -231,6 +231,11 @@ def test_concurrent_writers_and_readers_see_no_false_alarm() -> None:
     def sizes() -> tuple[int, int, int]:
         return (len(xs), len(s), len(d))
 
+    @engine.query
+    def contents() -> tuple[int, int, int]:
+        # Iterated inside a query: each read is of one recorded state.
+        return (len(list(xs)), len(list(s)), len(dict(d)))
+
     def writer(k: int) -> None:
         barrier.wait()
         try:
@@ -249,8 +254,11 @@ def test_concurrent_writers_and_readers_see_no_false_alarm() -> None:
         barrier.wait()
         try:
             for _ in range(300):
-                len(xs), list(s), dict(d)
+                # Outside a query only sizes: iterating live storage while
+                # other threads change it races as it does for the builtins.
+                len(xs), len(s), len(d)
                 sizes()
+                contents()
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
