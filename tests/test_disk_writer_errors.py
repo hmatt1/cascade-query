@@ -21,6 +21,7 @@ from cascade import Engine, PersistentCacheError
 
 BACKENDS = ("mdbx", "sqlite")
 TIMEOUT = 10.0
+_count_lock = threading.Lock()
 
 
 def _call(fn: Any, timeout: float = TIMEOUT) -> tuple[str, Any]:
@@ -62,7 +63,8 @@ def _open(tmp_path: Path, backend: str, runs: dict[str, int]) -> tuple[Engine, A
 
     @engine.query
     def square(i: int) -> int:
-        runs["n"] += 1
+        with _count_lock:  # += is not atomic on free-threaded builds
+            runs["n"] += 1
         return i * i
 
     return engine, square
