@@ -959,6 +959,37 @@ class GraphStore:
             self._record_change_locked(key, value, value_hash)
             return self.revision
 
+    def store_default(
+        self, key: InputKey, value: Any, revision: int
+    ) -> InputVersion | None:
+        """Keep the default an input was first read with, at ``revision``.
+
+        Only when nothing is stored for ``key`` and ``revision`` is still the
+        newest. The revision does not move and nothing is invalidated: a
+        read is not a change. The version's ``changed_at`` is a marker of
+        its own (below -2, so no revision and no placeholder), which readers
+        of the default from before it was kept do not match: they verify
+        against it and run again, in case the default function now returns
+        something else. Returns the version, or None if nothing was kept.
+        """
+        value_hash = self.input_digest(key, value)
+        with self.lock:
+            if revision != self.revision or self.inputs.get(key):
+                return None
+            version = InputVersion(
+                revision=revision,
+                changed_at=-2 - self.new_change_stamp_locked(),
+                value_hash=value_hash,
+                value=value,
+            )
+            self._append_version_locked(key, version)
+            self.trace_event(
+                "input_default",
+                ("input", key[0], key[1]),
+                detail=f"revision={revision}",
+            )
+            return version
+
     def set_inputs(
         self,
         updates: list[tuple[str, tuple[Any, ...], Any]],

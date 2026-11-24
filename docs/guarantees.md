@@ -197,16 +197,24 @@ unaffected; in memory and on both backends).
 revision alone, invalidates nothing and cancels nothing. Inside a transaction
 the same rule applies per input after last-write-wins.
 
+Reading an input that was never set is not a change either. The first read
+at the newest revision (directly, in a query, or through a snapshot of the
+newest revision) keeps the default as the input's value, so the default
+function is not called again and every reader at that revision sees the same
+value, but the revision does not move and nothing is invalidated or
+cancelled. A read at an older revision keeps nothing.
+
 Limits: "same" is digest equality (G2), so `set(1)` then `set(1.0)` is a
 change, and so is setting a dict with the same items in another order.
-The first read of an input that was never set stores its default and bumps
-the revision.
 
 Enforced by: `test_history_retention.py::test_same_value_set_is_a_full_noop`,
 `::test_transaction_with_only_unchanged_values_does_not_bump`,
 `::test_transaction_bumps_once_and_skips_unchanged_inputs`,
 `::test_transaction_that_returns_to_the_original_value_is_a_noop`,
-`test_dirty_propagation.py::test_same_value_set_keeps_everything_clean`.
+`test_dirty_propagation.py::test_same_value_set_keeps_everything_clean`,
+`test_input_default_reads.py` (first reads in and out of queries, async,
+through a snapshot, from eight threads at once; reuse from disk on both
+backends).
 
 ### G4. Snapshot isolation for inputs
 
@@ -1306,9 +1314,9 @@ without an expected-failure marker.
 | D29 | A `CascadeSet` was visited in two different orders. A rewritten comprehension or reducer saw insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gave `[30, 1, 20]`); a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` saw the builtin set's order (`[1, 20, 30]`), so the same body gave two results depending on whether it was rewritten. A `CascadeSet` now iterates in insertion order everywhere: it keeps that order beside its storage, its `__iter__` and `repr` follow it, and snapshot reads keep the order they had (G21). | `fix: a CascadeSet iterated in another order when the query was not rewritten` |
 | D28 | C code that changed the storage of a list, set or dict subclass directly bypassed the collection: `heapq.heappush(xs, 1)` on a `CascadeList` logged no diff, left `len(xs)` inside a query at its old value and the list's element ids out of step with its contents. It cannot be intercepted. The collection now records its size at every change it makes; the next use of it (a read, a mutation, a rewritten pipeline) that finds another size undoes the change and raises `CollectionBypassedError`. Changes that keep the size (`heapq.heapify`, `heapreplace`, `heappushpop`, by-hand `list.sort`, `list.reverse`, item assignment) are not noticed; that limit is documented and pinned (G21). | `fix: C code such as heapq.heappush changed a collection without a trace` |
 
-Smaller items: the first read of a never-set input bumps `engine.revision`
-(the call that did it keeps running at its own revision; its later reads of
-that input report the stored version, so its results stay valid afterwards).
+Smaller items, fixed: the first read of a never-set input bumped
+`engine.revision`. It now keeps the default at the current revision without
+moving it (G3).
 
 ## Limits that restrict who can use the library
 

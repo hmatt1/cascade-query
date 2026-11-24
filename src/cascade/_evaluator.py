@@ -441,12 +441,12 @@ class Evaluator:
     ) -> InputVersion:
         """The version to report for an input read by default at ``revision``.
 
-        Normally a placeholder that says "no stored version". But a call that
-        reads a never-set input stores the default at a new revision while it
-        keeps running at its own, older one, and its later reads land here.
-        They report that stored version when it holds this same value, so
-        every read of the input in one call records the same marker, and the
-        results are still valid at the revision the default was stored at.
+        Normally a placeholder that says "no stored version": the read is at
+        an older revision than the newest, where nothing is kept. But the
+        default may have been kept since, at a newer revision, by a read
+        there. A read that finds that stored version holding this same value
+        reports it, so its results are still valid at the revision the
+        default was kept at.
         """
         value_hash = self._store.input_digest(input_key, default)
         stored = self._store.first_version_after(input_key, revision)
@@ -459,6 +459,31 @@ class Evaluator:
             value=default,
         )
 
+    def _keep_default(
+        self,
+        input_key: tuple[str, tuple[Any, ...]],
+        revision: int,
+        default: Any,
+    ) -> InputVersion:
+        """The version to report for a read of a never-set input at ``revision``.
+
+        A read at the newest revision, through a snapshot of it or not,
+        keeps the default as the input's value (``GraphStore.store_default``),
+        so every later read at that revision sees the same value and the
+        default function is not called again. That does not move
+        ``engine.revision``: a read is not a change. A read at an older
+        revision keeps nothing.
+        """
+        version = self._store.store_default(input_key, default, revision)
+        if version is not None:
+            return version
+        # Another thread may have kept its default at this revision in the
+        # meantime: report that one, as every later read will.
+        version = self._store.input_version_at(input_key, revision)
+        if version is not None:
+            return version
+        return self._default_version(input_key, revision, default)
+
     def read_input(
         self,
         input_id: str,
@@ -470,13 +495,10 @@ class Evaluator:
         runtime = self._runtime_var.get()
         if snapshot is not None:
             revision = snapshot.revision
-            snapshot_explicit = True
         elif runtime is not None:
             revision = runtime.snapshot.revision
-            snapshot_explicit = runtime.snapshot_explicit
         else:
             revision = -1
-            snapshot_explicit = False
         if runtime is not None:
             self.check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
@@ -495,20 +517,7 @@ class Evaluator:
                 default = _run_coroutine_blocking(
                     default, self._store.key_to_str(("input", input_id, args))
                 )
-            should_materialize = False
-            if not snapshot_explicit:
-                with self._store.lock:
-                    latest = self._store.latest_input_version((input_id, args))
-                    should_materialize = (
-                        latest is None and revision == self._store.revision
-                    )
-            if should_materialize:
-                self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
-                version = self._store.latest_input_version((input_id, args))
-                if version is None:  # pragma: no cover - safety belt
-                    raise RuntimeError("input version missing after initialization")
-            else:
-                version = self._default_version((input_id, args), revision, default)
+            version = self._keep_default((input_id, args), revision, default)
         self.record_dependency(key, version.changed_at)
         self._store.trace_event("input_read", key)
         return version.value
@@ -524,13 +533,10 @@ class Evaluator:
         runtime = self._runtime_var.get()
         if snapshot is not None:
             revision = snapshot.revision
-            snapshot_explicit = True
         elif runtime is not None:
             revision = runtime.snapshot.revision
-            snapshot_explicit = runtime.snapshot_explicit
         else:
             revision = -1
-            snapshot_explicit = False
         if runtime is not None:
             self.check_cancelled(runtime.cancel_epoch)
         key = ("input", input_id, args)
@@ -548,20 +554,7 @@ class Evaluator:
                 default = await _keys.call(fn, args)
             else:
                 default = await self._run_sync_in_executor(fn, args)
-            should_materialize = False
-            if not snapshot_explicit:
-                with self._store.lock:
-                    latest = self._store.latest_input_version((input_id, args))
-                    should_materialize = (
-                        latest is None and revision == self._store.revision
-                    )
-            if should_materialize:
-                self._store.set_input(input_id, args, default, bump_cancel_epoch=False)
-                version = self._store.latest_input_version((input_id, args))
-                if version is None:  # pragma: no cover
-                    raise RuntimeError("input version missing after initialization")
-            else:
-                version = self._default_version((input_id, args), revision, default)
+            version = self._keep_default((input_id, args), revision, default)
         self.record_dependency(key, version.changed_at)
         self._store.trace_event("input_read", key)
         return version.value

@@ -355,9 +355,10 @@ def test_misc_api_edges_and_default_input_paths() -> None:
     def plus_one(x: int) -> int:
         return number(x) + 1
 
-    # Unset input falls back to its default function and initializes a version.
+    # Unset input falls back to its default function and initializes a version;
+    # a read does not move the revision.
     assert plus_one(3) == 7
-    assert engine.revision == 1
+    assert engine.revision == 0
     assert number.id in repr(number)
     assert plus_one.id in repr(plus_one)
     assert repr(warnings) == "<Accumulator warnings>"
