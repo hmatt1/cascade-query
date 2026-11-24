@@ -349,7 +349,7 @@ A rewritten expression returns exactly what the same Python returns: the same va
 *   `len(...)` is rewritten for a list comprehension or a collection. `len(map(...))` and `len(filter(...))` raise `TypeError`, as in Python.
 
 *   Arbitrary `for` loops and comprehensions with more than one `for` are never rewritten, but invalidate through read tracking.
-*   A rewritten comprehension or reducer visits a `CascadeSet` in insertion order. A `for` loop, a helper function and `list(s)` see the builtin set's order instead; until that is settled (D29 in `docs/guarantees.md`), do not rely on the order of a `CascadeSet` outside rewritten expressions.
+*   A `CascadeSet` iterates in insertion order (like a dict's keys), everywhere: rewritten comprehensions and reducers, `for` loops, helper functions, `list(s)`, `repr`, snapshots and restarts. A plain `set` built from it (`set(s)`, `s.copy()`, `s | t`) iterates in the builtin's own order.
 *   A comprehension with an assignment expression (`:=`) in its element or `if` clauses is left as written, so the name is bound in the query as in Python. So is a comprehension or reducer nested inside a comprehension that is left as written (for example one with two `for` clauses) when it uses that comprehension's loop variable.
 *   If an element, filter or `key=` function pushes to an `Accumulator` (or calls a query that does), the expression is evaluated as plain Python from the first run on which that happens, so the effects are exactly Python's, in Python's order; such an expression is no longer incremental.
 *   `enumerate()` and `zip()` sources are explicitly excluded.

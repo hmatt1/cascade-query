@@ -22,7 +22,7 @@ Every open defect has a failing regression test in
 
 | # | Guarantee | Status | Test strength |
 |---|---|---|---|
-| G1 | A query returns what a fresh run at that revision would return | Broken for set order in rewriting (D29) | Strong for pure integer graphs |
+| G1 | A query returns what a fresh run at that revision would return | Holds with limits | Strong for pure integer graphs |
 | G2 | Unchanged dependencies mean the body does not run; equal results stop propagation | Holds with limits | Strong for run counts |
 | G3 | Setting an input to its current value is a no-op | Holds with limits | Strong |
 | G4 | A snapshot read sees inputs as of the snapshot's revision | Holds with limits | Strong |
@@ -43,7 +43,7 @@ Every open defect has a failing regression test in
 | G19 | Values no code can tell apart encode to the same bytes; dict order is part of the value | Holds | Good by example |
 | G20 | A corrupt or old-format cache entry is recomputed, not served; a format change keeps collections | Holds | Good |
 | G21 | Collections behave like `list`, `set` and `dict`, and every read inside a query is tracked | Holds with limits (D28) | Strong |
-| G22 | A rewritten query returns what the plain Python would | Broken for set order (D29) | Strong for reducers (Hypothesis, against the builtins) |
+| G22 | A rewritten query returns what the plain Python would | Holds | Strong for reducers (Hypothesis, against the builtins) |
 | G23 | One mutation costs one diff of work, where the result can be exact | Holds with limits | Adequate |
 | G24 | A snapshot read sees collection contents as of the snapshot | Holds with limits | Strong |
 | G25 | A transaction applies completely or not at all | Holds with limits | Good, threads and tasks included |
@@ -742,6 +742,16 @@ Whatever the builtins build on those is tracked with them: `list(xs)`,
 `json.dumps`, `str.join`, `set(xs)` of a list or dict. When the other operand
 is a collection too (`a | b`, `xs == ys`), both are tracked.
 
+A `CascadeSet` iterates in insertion order, as a dict's keys do: the order
+in which the elements now present were added, so removing one and adding it
+again moves it to the end. A plain `set` iterates in an order that depends
+on hashes and on its history; Cascade chooses insertion order so that the
+order is one thing everywhere: a `for` loop, a helper function, `list(s)`,
+`sorted` ties, `repr`, a rewritten comprehension, a snapshot read and a
+collection restored from disk all see it (D29). Equal elements keep the
+first one added, and its place. `pop()` still removes whichever element the
+storage gives, like the builtin.
+
 Every read gives a plain `list`, `set`, `dict` or scalar, never a second
 collection object. An operand the builtin refuses raises the builtin's
 `TypeError`, after the other operand's reflected method has had its turn.
@@ -770,8 +780,10 @@ Limits:
 - **C code that changes a collection's storage itself logs nothing** (D28).
 - Dict views are wrappers, not `dict_keys` objects: `isinstance(d.keys(),
   collections.abc.KeysView)` is false and there is no `.mapping`.
-- `repr` of a `CascadeSet` is `CascadeSet({...})`; lists and dicts print as
-  the builtins do.
+- `repr` of a `CascadeSet` is `CascadeSet({...})`, in iteration order; lists
+  and dicts print as the builtins do.
+- A plain set built from a `CascadeSet` by C code (`set(s)`, `s.copy()`,
+  `s | t`) is a builtin set and iterates in the builtin's order.
 - Collections cannot be pickled: `pickle.dumps` raises `TypeError`. Pickle
   `xs.copy()`.
 
@@ -854,8 +866,7 @@ stops.
 Function expressions are evaluated in Python's order: for
 `sorted(filter(f, map(g, xs)), key=k)` that is `f`, `g`, `xs`, `k`.
 
-Broken: a rewritten comprehension visits a `CascadeSet` in insertion order,
-while unrewritten code iterates it in the builtin set's order (D29).
+A `CascadeSet` is visited in its insertion order on both paths (G21).
 
 Enforced by: `test_rewrite_differential.py` (Hypothesis: random mutation
 sequences over a list, a dict and a set, about 100 query bodies, each compared
@@ -875,6 +886,11 @@ updates stay incremental), `test_known_defects.py::test_d7_rewritten_float_sum_m
 `::test_enumerate_and_zip_sources_untouched`,
 `test_known_defects.py::test_d30_walrus_in_a_comprehension_binds_in_the_query`,
 `::test_d32_nested_pipeline_sees_the_loop_variable_of_a_kept_comprehension`,
+`::test_d29_set_order_is_the_same_rewritten_or_not`,
+`test_set_order.py` (eleven ways of iterating, rewritten and not, after
+thirteen kinds of change; snapshots, equal elements, a rolled-back
+transaction, a restart and compaction on both backends, four writer
+threads, effects pushed per element),
 `test_rewrite_scoping.py` (`:=` in the element, the filter, a reducer's
 generator, nested comprehensions and their filters, set and dict
 comprehensions, beside a comprehension that is still rewritten; pipelines
@@ -1096,7 +1112,6 @@ time; nothing is in that state now.
 
 | ID | Defect | Evidence |
 |---|---|---|
-| D29 | A `CascadeSet` is visited in two different orders. A rewritten comprehension or reducer sees insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gives `[30, 1, 20]`), which is what the README promises for loops too; a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` see the builtin set's order (`[1, 20, 30]`). So the same body gives two results depending on whether it was rewritten. Found while fixing D7; present at the audit commit. | Reproduced |
 | D28 | C code that changes the storage of a list, set or dict subclass directly bypasses the collection: no diff is logged and no query is invalidated. `heapq.heappush(xs, 1)` on a `CascadeList` leaves `len(xs)` inside a query at its old value and the list's element ids out of step with its contents; `heapq.heappop`, `heapify`, `heapreplace` and `heappushpop` do the same. CPython calls no method of the subclass there, so it cannot be intercepted; a read could detect the mismatch and raise. Found while fixing D5; present at the audit commit. | Reproduced |
 
 ### Fixed since the audit
@@ -1133,6 +1148,7 @@ time; nothing is in that state now.
 | D31 | Accumulator effects pushed inside the element function of a rewritten comprehension were not replayed for elements the pipeline already held: with `sum(note(x) for x in xs)`, after `xs.append(4)` the re-run collected `[4]` where Python collects `[1, 2, 3, 4]`; with `any` the first run pushed for every element where Python stops at the first truthy one. The pipeline now notices at run time when anything it runs pushes or replays an effect, takes those pushes back and evaluates the expression plainly, on that run and every later one (G12). | `fix: effects pushed inside a rewritten comprehension were lost for elements that did not change` |
 | D30 | An assignment expression inside a rewritten comprehension was lost. The element expression was moved into a helper function, where `:=` bound a local of that helper: `last = None; out = [(last := x) for x in xs]; return last` returned `None` where Python returns the last element. A comprehension with `:=` anywhere in its element or `if` clauses, nested comprehensions included, is now left as written (G22). | `fix: an assignment expression inside a rewritten comprehension was lost` |
 | D32 | A pipeline nested in a comprehension that is not rewritten (two `for` clauses, or, after the D30 fix, a `:=`) had its helper placed before the statement, outside that comprehension, so it could not see the comprehension's loop variable: `[sum(y * x for y in ys) for x in xs for _ in (0,)]` raised `NameError`, and with a variable `x = 100` in the query returned `[3000, 3000]` where Python gives `[30, 60]`. Found while fixing D30, whose fix sends more comprehensions down this path; present at the audit commit. Such a pipeline is now left as written (G22). | `fix: an assignment expression inside a rewritten comprehension was lost` |
+| D29 | A `CascadeSet` was visited in two different orders. A rewritten comprehension or reducer saw insertion order (`[x for x in s]` over `CascadeSet([30, 1, 20])` gave `[30, 1, 20]`); a `for` loop, a comprehension in a helper function, a query with `incremental=False` and `list(s)` saw the builtin set's order (`[1, 20, 30]`), so the same body gave two results depending on whether it was rewritten. A `CascadeSet` now iterates in insertion order everywhere: it keeps that order beside its storage, its `__iter__` and `repr` follow it, and snapshot reads keep the order they had (G21). | `fix: a CascadeSet iterated in another order when the query was not rewritten` |
 
 Smaller items: the first read of a never-set input bumps `engine.revision`
 (the call that did it keeps running at its own revision; its later reads of
@@ -1143,7 +1159,7 @@ that input report the stored version, so its results stay valid afterwards).
 The library's aims, taken from the README: memoise ordinary Python functions
 with automatic dependency tracking; make ordinary comprehensions incremental;
 persist results across runs with no configuration; run in parallel and async.
-Four limits work against those aims for common uses. Each was checked by
+Three limits work against those aims for common uses. Each was checked by
 running it.
 
 | Limit | Who it stops | Why it conflicts with the aim |
@@ -1151,7 +1167,6 @@ running it.
 | **Value types.** Results and input values must be primitives, builtin containers, `datetime` types, dataclasses, `NamedTuple`s or exceptions, even with no `cache_dir`. `Enum`, `Path`, `Decimal`, `UUID`, plain class instances, `ast` nodes and numpy arrays all raise `TypeError`. | Anyone whose functions return domain objects: compilers and analysers (syntax trees), data work (arrays, frames), most application code (`Enum`, `Path`). | "Ordinary Python functions" return these. An in-memory engine has no need to encode a value; it only needs to tell whether it changed. |
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. Methods cannot be queries. After a reload, callers must pick up the new handle. | Libraries that generate queries (one extra argument), class-based designs. | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
 | **Persistence cannot be trusted across code edits.** Code invalidation sees only the query's own bytecode, and there is no manual version or salt to force invalidation. (Results are now written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache: edit a helper and the old result is served. | "Zero-config persistence" implies it works without the user knowing about it. |
-| **Rewriting is on by default and has one open gap.** Set iteration order differs between rewritten and unrewritten code (D29). | Anyone iterating a `CascadeSet` where order matters. | The promise is "standard Python, rewritten"; a rewrite that changes a result has to decline instead. |
 
 Limits that narrow use without stopping it:
 

@@ -1025,6 +1025,8 @@ def _raw_at(core: Any, head: int) -> Any:
                 return list(zip(owner._uids, list.__iter__(owner)))
             if core.kind == "dict":
                 return _copy_dict(owner)
+            # Insertion order, as the log replays it and iteration gives it.
+            return list(owner._order)
         return core.contents_at(head)
 
 
@@ -1037,6 +1039,7 @@ def _order_at(core: Any, head: int) -> list[Any]:
                 return list(owner._uids)
             if core.kind == "dict":
                 return list(dict.keys(owner))
+            return list(owner._order)
         contents = core.contents_at(head)
     if core.kind == "list":
         return [uid for uid, _ in contents]

@@ -157,12 +157,42 @@ def _plain_iterable(other: Any) -> Any:
     return list(other)
 
 
+class _SetAt(set):
+    """A set's contents at an older revision, with their insertion order."""
+
+    __slots__ = ("order",)
+
+    def __init__(self, order: list[Any]) -> None:
+        super().__init__(order)
+        self.order = order
+
+
+def _set_order(data: Any) -> Any:
+    """The elements of a set's contents in the order they were added.
+
+    ``data`` is the live collection, a list copied from it, or ``_SetAt``.
+    """
+    if isinstance(data, CascadeSet):
+        return data._order
+    if isinstance(data, _SetAt):
+        return data.order
+    return data
+
+
+def _iter_set(data: Any) -> Any:
+    return iter(_set_order(data))
+
+
+def _copy_set_order(owner: Any) -> list[Any]:
+    return list(owner._order)
+
+
 def _set_repr(data: set, name: str) -> str:
-    # Live storage is the subclass, which the builtin already names; the
-    # contents at an older revision are a plain set.
-    if type(data) is not set:
-        return set.__repr__(data)
-    return f"{name}({set.__repr__(data)})" if data else f"{name}()"
+    # In iteration order, like the builtin's repr.
+    items = _set_order(data)
+    if not items:
+        return f"{name}()"
+    return f"{name}({{{', '.join(repr(v) for v in items)}}})"
 
 
 def _refuse_pickle(self: Any, protocol: Any = None) -> Any:
@@ -441,7 +471,7 @@ class _CollectionCore:
             if self.kind == _KIND_LIST:
                 view: Any = [value for _uid, value in raw]
             elif self.kind == _KIND_SET:
-                view = set(raw)
+                view = _SetAt(list(raw))
             else:
                 view = raw
             self._snapshot_cache = (head, view)
@@ -993,7 +1023,13 @@ def _clamped_insert_index(index: int, length: int) -> int:
 
 
 class CascadeSet(set):
-    """A ``set`` that emits ``add``/``remove`` diffs; the value is its own uid."""
+    """A ``set`` that emits ``add``/``remove`` diffs; the value is its own uid.
+
+    Iteration follows insertion order, as for a dict's keys: the order in
+    which the elements now present were added. Every Python-level way of
+    iterating it gives that order, rewritten or not (D29). ``_order`` keeps
+    it beside the set's own storage, which is used for everything else.
+    """
 
     def __init__(
         self,
@@ -1003,17 +1039,21 @@ class CascadeSet(set):
         name: str | None = None,
         compact_every: int = 1024,
     ) -> None:
+        self._order: dict[Any, None] = {}
         self._core = _CollectionCore(engine, _KIND_SET, name, compact_every)
         self._core.owner = self
         super().__init__()
         if self._core.loaded is not None:
             set.update(self, self._core.loaded)
+            self._order = dict.fromkeys(self._core.loaded)
         else:
             self.update(iterable)
 
     def _reset_to(self, contents: Iterable[Any]) -> None:
+        contents = list(contents)
         set.clear(self)
         set.update(self, contents)
+        self._order = dict.fromkeys(contents)
 
     def compact(self) -> None:
         """Squash the on-disk event log into a snapshot at the current head."""
@@ -1031,11 +1071,13 @@ class CascadeSet(set):
         if value in self:
             return
         set.add(self, value)
+        self._order[value] = None
         self._emit_adds([value])
 
     @_mutator
     def remove(self, value: Any) -> None:
         set.remove(self, value)
+        del self._order[value]
         self._emit_removes([value])
 
     @_mutator
@@ -1043,11 +1085,14 @@ class CascadeSet(set):
         if value not in self:
             return
         set.discard(self, value)
+        del self._order[value]
         self._emit_removes([value])
 
     @_mutator
     def pop(self) -> Any:
+        # Like the builtin, an arbitrary element: the one the storage gives.
         value = set.pop(self)
+        del self._order[value]
         self._emit_removes([value])
         return value
 
@@ -1055,6 +1100,7 @@ class CascadeSet(set):
     def clear(self) -> None:
         values = list(self)
         set.clear(self)
+        self._order.clear()
         self._emit_removes(values)
 
     @_mutator
@@ -1068,6 +1114,7 @@ class CascadeSet(set):
                 if v not in self:
                     added[v] = None
         set.update(self, added)
+        self._order.update(added)
         self._emit_adds(added)
 
     @_mutator
@@ -1080,6 +1127,7 @@ class CascadeSet(set):
                 if v in self:
                     removed[v] = None
         set.difference_update(self, removed)
+        self._forget(removed)
         self._emit_removes(removed)
 
     @_mutator
@@ -1087,6 +1135,7 @@ class CascadeSet(set):
         keep = set(self).intersection(*others) if others else set(self)
         removed = [v for v in self if v not in keep]
         set.difference_update(self, removed)
+        self._forget(removed)
         self._emit_removes(removed)
 
     @_mutator
@@ -1095,6 +1144,8 @@ class CascadeSet(set):
         removed = [v for v in other if v in self]
         added = [v for v in other if v not in self]
         set.symmetric_difference_update(self, other)
+        self._forget(removed)
+        self._order.update(dict.fromkeys(added))
         self._core.emit(
             [{"action": "remove", "value": v} for v in removed]
             + [{"action": "add", "value": v} for v in added]
@@ -1120,9 +1171,14 @@ class CascadeSet(set):
         self.symmetric_difference_update(other)
         return self
 
+    def _forget(self, values: Iterable[Any]) -> None:
+        order = self._order
+        for v in values:
+            order.pop(v, None)
+
     # --- tracked reads ---
     def __iter__(self):
-        return self._core.read(self, set.__iter__, copy=_copy_set)
+        return self._core.read(self, _iter_set, copy=_copy_set_order)
 
     def __len__(self) -> int:
         return self._core.read(self, set.__len__)

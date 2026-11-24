@@ -226,7 +226,6 @@ def test_d7_rewritten_any_short_circuits() -> None:
     assert any_reciprocal() is True
 
 
-@_defect(29, "a CascadeSet iterates in another order when the body is not rewritten")
 def test_d29_set_order_is_the_same_rewritten_or_not() -> None:
     engine = Engine()
     s = CascadeSet(engine, [30, 1, 20])
