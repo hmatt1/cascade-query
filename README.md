@@ -89,6 +89,8 @@ Cascade returns correct results only if queries follow these rules. Breaking one
 
     The same goes for input values: `cfg()["k"] = 1` changes nothing Cascade can see. Call `cfg.set(new_value)`.
 
+    Cascade checks for this. When a query's body finishes, every value it read must still have the digest it was stored with; if one was changed in place, the query raises `MutatedValueError` naming it. A changed query result is dropped and computed again on its next use; a changed input value keeps raising until `set()` gives it a new one. A value changed by code outside any query is caught when something that reads it runs again, or at once by `engine.check_mutations()`, which checks everything the engine holds (useful in tests). The check costs one digest of each value a query reads, per run of that query.
+
 3. **Return values, not iterators.** A generator, `map` or `zip` can be read once; the second caller gets it empty. Return `list(...)` or a tuple. Cascade raises `UnencodableValueError` when a query returns one (a `memoize=False` query may, since it keeps no value).
 
 4. **Do not rely on side effects.** On a cache hit the body does not run, so a `print`, a log line or a write does not happen again. Use an `Accumulator` for effects that must be replayed ([Side-Effect Accumulators](#side-effect-accumulators)).

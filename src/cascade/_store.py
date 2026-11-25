@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import threading
 import time
 import weakref
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Sequence
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from ._code_refs import refs_hash
-from ._errors import SnapshotExpiredError
+from ._errors import MutatedValueError, SnapshotExpiredError
 from ._keys import display as display_args
 from ._serde import hash_bytecode, stable_value_digest, unencodable_error
 from ._state import (
@@ -691,6 +692,116 @@ class GraphStore:
         kind, fid, args = key
         return f"{kind}:{fid}{display_args(args)}"
 
+    def _value_changed(self, value: Any, value_hash: str) -> bool:
+        """True when ``value`` no longer has the digest it was stored with."""
+        if value_hash.startswith("opaque:"):
+            return False  # never compared by content
+        try:
+            return self._value_digest(value) != value_hash
+        except TypeError:
+            return True  # it was encodable when stored: something was put in
+
+    def mutated_values(
+        self, deps: Mapping[QueryKey, int], revision: int
+    ) -> list[QueryKey]:
+        """The dependencies whose value was changed in place since it was stored.
+
+        Called when a query's body has finished, for what that body read: a
+        query result as cached, an input value as of ``revision``. A query
+        result changed in place is dropped, so the next read computes it
+        again. Costs one digest per dependency per run.
+        """
+        found: list[QueryKey] = []
+        for dep_key in deps:
+            kind, fid, args = dep_key
+            if kind == "query":
+                with self.lock:
+                    memo = self.memos.get(dep_key)
+                if memo is None or memo.error is not None:
+                    continue
+                if not self.query_memoize.get(fid, True):
+                    continue
+                if self._value_changed(memo.value, memo.value_hash):
+                    found.append(dep_key)
+                    with self.lock:
+                        if self.memos.get(dep_key) is memo:  # pragma: no branch
+                            self.drop_memo_locked(dep_key)
+            else:
+                with self.lock:
+                    try:
+                        version = self.input_version_at((fid, args), revision)
+                    except SnapshotExpiredError:  # pragma: no cover
+                        # The running call pins this revision's history.
+                        continue
+                if version is not None and self._value_changed(
+                    version.value, version.value_hash
+                ):
+                    found.append(dep_key)
+        return found
+
+    def _replace_changed_value_locked(
+        self, versions: list[InputVersion], value: Any
+    ) -> None:
+        """A same-value ``set``: put ``value`` back if the stored object was changed.
+
+        The digest of the new value equals the one stored, so nothing that
+        was computed from the input is affected. But if the stored object
+        was changed in place since, it no longer holds that value: swap in
+        the object just given, so that the ``set`` repairs it.
+        """
+        latest = versions[-1]
+        if latest.value is not value and self._value_changed(
+            latest.value, latest.value_hash
+        ):
+            versions[-1] = dataclasses.replace(latest, value=value)
+
+    def check_mutations(self) -> list[QueryKey]:
+        """Every cached result and current input value changed in place."""
+        with self.lock:
+            memos = list(self.memos.items())
+            inputs = [(k, v[-1]) for k, v in self.inputs.items() if v]
+        found: list[QueryKey] = []
+        for key, memo in memos:
+            if memo.error is not None or not self.query_memoize.get(key[1], True):
+                continue
+            if self._value_changed(memo.value, memo.value_hash):
+                found.append(key)
+                with self.lock:
+                    if self.memos.get(key) is memo:  # pragma: no branch
+                        self.drop_memo_locked(key)
+        for (fid, args), version in inputs:
+            if self._value_changed(version.value, version.value_hash):
+                found.append(("input", fid, args))
+        return found
+
+    def mutation_error(
+        self, keys: list[QueryKey], reader: QueryKey | None = None
+    ) -> MutatedValueError:
+        names = ", ".join(self.key_to_str(k) for k in keys)
+        where = (
+            f" {self.key_to_str(reader)} read it, and its body has finished."
+            if reader is not None
+            else ""
+        )
+        parts = [
+            f"the value of {names} was changed in place after Cascade stored "
+            f"it.{where} Queries and inputs hand out the stored object itself, "
+            "not a copy, so changing it changes what every later reader gets."
+        ]
+        if any(k[0] == "query" for k in keys):
+            parts.append(
+                "Build a new value instead of changing the returned one (for "
+                "example [*rows, x] instead of rows.append(x)); the changed "
+                "result has been dropped and is computed again on its next use."
+            )
+        if any(k[0] == "input" for k in keys):
+            parts.append(
+                "Give an input a new value with set() instead of changing the "
+                "one it returned; until then every query that reads it raises "
+                "this error."
+            )
+        return MutatedValueError(" ".join(parts), tuple(keys))
+
     def stable_hash(self, value: Any) -> str:
         """Digest of ``value``; ``TypeError`` if the codec cannot encode it."""
         return self._value_digest(value)
@@ -997,6 +1108,7 @@ class GraphStore:
         with self.lock:
             versions = self.inputs.get(key)
             if versions and versions[-1].value_hash == value_hash:
+                self._replace_changed_value_locked(versions, value)
                 return self.revision
             self.revision += 1
             if bump_cancel_epoch:
@@ -1080,6 +1192,8 @@ class GraphStore:
                 versions = self.inputs.get(key)
                 if not versions or versions[-1].value_hash != value_hash:
                     changed.append((key, value, value_hash))
+                else:
+                    self._replace_changed_value_locked(versions, value)
             if not changed:
                 return self.revision
             self.revision += 1

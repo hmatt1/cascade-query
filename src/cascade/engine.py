@@ -21,6 +21,7 @@ from ._errors import (
     CollectionBypassedError,
     CycleError,
     EventLoopBlockedError,
+    MutatedValueError,
     PersistentCacheError,
     QueryCancelled,
     SnapshotExpiredError,
@@ -59,6 +60,7 @@ __all__ = [
     "CycleError",
     "Engine",
     "EventLoopBlockedError",
+    "MutatedValueError",
     "PersistentCacheError",
     "QueryCancelled",
     "Snapshot",
@@ -1337,6 +1339,21 @@ class Engine:
 
     def enable_stats(self, enabled: bool = True) -> None:
         self._store.set_stats_enabled(enabled)
+
+    def check_mutations(self) -> None:
+        """Raise ``MutatedValueError`` if any cached value was changed in place.
+
+        A query checks the values it read when its body finishes. A value
+        changed by code outside any query, and read only by cached results
+        that do not run again, is not seen by that check. This one hashes
+        every cached query result and the current value of every input, so
+        its cost grows with what the engine holds: call it in tests, or at
+        points where you want to be sure. Changed query results are dropped,
+        so their next use computes them again.
+        """
+        found = self._store.check_mutations()
+        if found:
+            raise self._store.mutation_error(found)
 
     def stats_summary(self) -> dict[str, Any]:
         return self._store.stats_summary()

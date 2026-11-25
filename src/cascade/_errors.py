@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class CycleError(RuntimeError):
     """Raised when a query cycle is detected."""
@@ -48,6 +50,26 @@ class UnencodableValueError(TypeError):
     and its type. A ``TypeError``, as the codec's own error was. Never
     cached: a query whose result cannot be encoded runs again on every call.
     """
+
+
+class MutatedValueError(RuntimeError):
+    """Raised when a cached result or an input value was changed in place.
+
+    A query returns its cached object itself, not a copy, and an input
+    returns the value it was given. Code that changes such an object (a
+    caller appending to a returned list, a query changing the dict another
+    query returned, ``cfg()["k"] = 1`` instead of ``cfg.set(...)``) changes
+    what every later reader gets, and Cascade never learns of it. A query
+    checks, when its body finishes, that every value it read still has the
+    digest it had when it was stored; ``Engine.check_mutations()`` checks all
+    of them. A changed query result is dropped, so the next call computes it
+    again; a changed input value stays wrong until ``set()`` gives the input
+    a new one. Never cached.
+    """
+
+    def __init__(self, message: str, keys: tuple[Any, ...] = ()) -> None:
+        super().__init__(message)
+        self.keys = keys
 
 
 class CollectionBypassedError(RuntimeError):

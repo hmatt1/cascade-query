@@ -21,6 +21,7 @@ from ._disk_cache import DiskCacheProtocol
 from ._errors import (
     CollectionBypassedError,
     CycleError,
+    MutatedValueError,
     PersistentCacheError,
     QueryCancelled,
     SnapshotExpiredError,
@@ -103,6 +104,7 @@ _NEVER_CACHED_ERRORS = (
     _ReenteredQuery,
     UnencodableValueError,
     CollectionBypassedError,
+    MutatedValueError,
 )
 
 # Stands in for the ``changed_at`` of a query that has no result yet (it is
@@ -2554,6 +2556,14 @@ class Evaluator:
                 value_hash = store.digest_or_opaque(result)
             except TypeError as exc:
                 raise self._fail_unencodable(key, frame, runtime, result, exc) from exc
+
+        mutated = store.mutated_values(frame.deps, revision)
+        if mutated:
+            if frame.cycle_guess is not UNSET:
+                self._discard_provisional(runtime, key)
+            failure = store.mutation_error(mutated, reader=key)
+            self._inherit_failed_deps(runtime.stack, frame, failure)
+            raise failure
 
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
 
