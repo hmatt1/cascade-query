@@ -163,3 +163,68 @@ def test_with_cache_dir_an_unencodable_result_is_an_error(tmp_path: Any) -> None
             make()
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: (x for x in range(3)),
+        lambda: map(str, [1, 2]),
+        lambda: zip("ab", "cd"),
+        lambda: iter([1, 2]),
+    ],
+    ids=["generator", "map", "zip", "iter"],
+)
+def test_one_shot_iterator_result_warns(make: Any) -> None:
+    """A cached iterator is used up by its first caller; say so when it is stored."""
+    engine = Engine()
+
+    @engine.query
+    def items() -> Any:
+        return make()
+
+    with pytest.warns(RuntimeWarning, match="can be read only once") as caught:
+        first = list(items())
+    assert first
+    assert "items" in str(caught[0].message)
+    # The result is still cached as before: only the warning is new.
+    assert list(items()) == []
+
+
+def test_one_shot_iterator_from_an_async_query_warns() -> None:
+    engine = Engine()
+
+    @engine.query
+    async def items() -> Any:
+        return (x for x in range(3))
+
+    async def main() -> list[int]:
+        return list(await items())
+
+    with pytest.warns(RuntimeWarning, match="can be read only once"):
+        assert asyncio.run(main()) == [0, 1, 2]
+
+
+def test_no_iterator_warning_for_values_that_can_be_read_again() -> None:
+    import warnings
+
+    engine = Engine()
+
+    @engine.query
+    def tree() -> ast.AST:
+        return ast.parse("x = 1")
+
+    @engine.query
+    def numbers() -> list[int]:
+        return [1, 2, 3]
+
+    @engine.query(memoize=False)
+    def stream() -> Any:
+        return (x for x in range(3))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        tree()
+        numbers()
+        assert list(stream()) == [0, 1, 2]
+        assert list(stream()) == [0, 1, 2]

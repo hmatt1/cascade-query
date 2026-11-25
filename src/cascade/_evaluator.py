@@ -13,6 +13,7 @@ import time
 import types
 import warnings
 import weakref
+from collections.abc import Iterator as _IteratorABC
 from typing import Any, Callable, Mapping, Sequence
 
 from . import _canonical, _disk_cache, _keys
@@ -2557,6 +2558,23 @@ class Evaluator:
         frozen_effects = {name: tuple(items) for name, items in frame.effects.items()}
 
         is_memoized = store.lookup_query_memoize(key[1])
+        if (
+            is_memoized
+            and error is None
+            and value_hash.startswith("opaque:")
+            and isinstance(result, _IteratorABC)
+        ):
+            # Only reached for a result the codec cannot encode, so results
+            # of the known value types pay nothing for this check.
+            warnings.warn(
+                f"{store.key_to_str(key)} returned a {type(result).__name__}, "
+                "which can be read only once. The cached object is handed to "
+                "every later caller, who will find it already used up. Return "
+                "a list or a tuple instead (for example list(...)), or "
+                "register the query with memoize=False.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         computed_at_time = time.time()
         expires_at = frame.expires_at
         ttl = store.lookup_query_ttl(key[1])
