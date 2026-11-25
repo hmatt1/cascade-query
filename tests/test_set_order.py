@@ -114,7 +114,7 @@ def test_every_way_of_iterating_agrees(body_name: str) -> None:
     s = CascadeSet(engine, [30, 1, 20])
     rewritten = engine.query(_bodies(s)[body_name], name=f"rw:{body_name}")
     plain = engine.query(
-        _bodies(s)[body_name], name=f"plain:{body_name}", incremental=False
+        _bodies(s)[body_name], name=f"plain:{body_name}", incremental_per_element=False
     )
     for step in STEPS:
         step(s)
@@ -244,7 +244,7 @@ def test_effects_follow_the_order_too() -> None:
         return sum(note(x) for x in s)
 
     rewritten = engine.query(body, name="effects_rw")
-    plain = engine.query(body, name="effects_plain", incremental=False)
+    plain = engine.query(body, name="effects_plain", incremental_per_element=False)
     for step in STEPS[:6]:
         step(s)
         got: dict[str, list[Any]] = {}

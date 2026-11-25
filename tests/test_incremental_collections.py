@@ -277,7 +277,7 @@ def test_list_plain_reads_invalidate_queries(engine, read):
     xs = CascadeList(engine, [1])
     runs = []
 
-    @engine.query(incremental=False)
+    @engine.query(incremental_per_element=False)
     def q():
         runs.append(1)
         read(xs)
@@ -296,7 +296,7 @@ def test_set_and_dict_plain_reads_invalidate_queries(engine):
     d = CascadeDict(engine, {"a": 1})
     runs = []
 
-    @engine.query(incremental=False)
+    @engine.query(incremental_per_element=False)
     def q():
         runs.append(1)
         return (

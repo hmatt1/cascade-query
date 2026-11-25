@@ -236,7 +236,7 @@ def test_d29_set_order_is_the_same_rewritten_or_not() -> None:
     def rewritten() -> list[int]:
         return [x for x in s]
 
-    @engine.query(incremental=False)
+    @engine.query(incremental_per_element=False)
     def unrewritten() -> list[int]:
         return [x for x in s]
 

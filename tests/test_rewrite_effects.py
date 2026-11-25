@@ -4,7 +4,7 @@ A pipeline runs its stage, filter and key functions for changed elements
 only, in the order the changes arrived. When any of them pushes an effect
 (or calls a query whose effects are replayed), the pipeline takes its pushes
 back and the expression is evaluated plainly, then and on every later run.
-Each test runs one body rewritten and once with ``incremental=False`` and
+Each test runs one body rewritten and once with ``incremental_per_element=False`` and
 compares value and effects after every change.
 """
 
@@ -143,7 +143,7 @@ BODY_NAMES = [
 def _pair(engine: Engine, xs: Any, body_name: str) -> tuple[Any, Any]:
     rewritten = engine.query(_bodies(xs)[body_name], name=f"rw:{body_name}")
     plain = engine.query(
-        _bodies(xs)[body_name], name=f"plain:{body_name}", incremental=False
+        _bodies(xs)[body_name], name=f"plain:{body_name}", incremental_per_element=False
     )
     assert getattr(rewritten.raw, "__cascade_rewritten__", False)
     assert not getattr(plain.raw, "__cascade_rewritten__", False)
@@ -233,7 +233,7 @@ def test_stage_calling_a_query_with_effects() -> None:
     def total() -> int:
         return sum(tag(x) for x in xs)
 
-    @engine.query(incremental=False)
+    @engine.query(incremental_per_element=False)
     def total_plain() -> int:
         return sum(tag(x) for x in xs)
 
@@ -274,7 +274,7 @@ def test_dict_source_matches_plain_python() -> None:
         return {k: note(v) for k, v in source.items()}
 
     rewritten = engine.query(body, name="dict_rw")
-    plain = engine.query(body, name="dict_plain", incremental=False)
+    plain = engine.query(body, name="dict_plain", incremental_per_element=False)
     steps: list[Callable[[], Any]] = [
         lambda: None,
         lambda: source.__setitem__("c", 3),
@@ -295,7 +295,7 @@ def test_snapshot_read_matches_plain_python() -> None:
         return any(big(x) for x in xs)
 
     rewritten = engine.query(body, name="snap_rw")
-    plain = engine.query(body, name="snap_plain", incremental=False)
+    plain = engine.query(body, name="snap_plain", incremental_per_element=False)
     assert getattr(rewritten.raw, "__cascade_rewritten__", False)
     assert _outcome(rewritten) == _outcome(plain)
     with engine.snapshot() as before:

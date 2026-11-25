@@ -190,7 +190,7 @@ def test_internals_probe_shows_inputs_queries_and_the_entry_limit() -> None:
     def source(name: str) -> str:
         return ""
 
-    @engine.query(incremental=False)
+    @engine.query(incremental_per_element=False)
     def shout(name: str) -> str:
         return source(name).upper()
 

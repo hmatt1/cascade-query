@@ -905,7 +905,7 @@ def test_plain_reversed_reads_track_dependencies(engine):
     d = CascadeDict(engine, {"a": 1, "b": 2})
     runs = []
 
-    @engine.query(incremental=False)
+    @engine.query(incremental_per_element=False)
     def q():
         runs.append(1)
         return (

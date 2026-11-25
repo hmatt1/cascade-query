@@ -232,7 +232,7 @@ def test_clear_disk_cache_drops_results_but_not_collections(tmp_path, backend):
             ys = CascadeDict(engine, {"a": 1}, name="ys")
             zs = CascadeSet(engine, [5], name="zs")
 
-            @engine.query(incremental=False)
+            @engine.query(incremental_per_element=False)
             def total() -> int:
                 runs[0] += 1
                 return sum(list(xs)) + sum(ys.values()) + sum(zs)

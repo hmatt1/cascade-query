@@ -6,7 +6,7 @@ comprehension is not rewritten (D30). A pipeline nested in a comprehension
 that stays as written gets its helper hoisted out of that comprehension,
 where its loop variables are not visible, so such a pipeline is not
 rewritten either (D32). Each body is compared with the same body registered
-with ``incremental=False``, after every change to the collections.
+with ``incremental_per_element=False``, after every change to the collections.
 """
 
 from __future__ import annotations
@@ -139,7 +139,9 @@ def test_rewritten_body_matches_plain_python(body_name: str) -> None:
     s = CascadeSet(engine, [5])
     rewritten = engine.query(_bodies(xs, ys, d, s)[body_name], name=f"rw:{body_name}")
     plain = engine.query(
-        _bodies(xs, ys, d, s)[body_name], name=f"plain:{body_name}", incremental=False
+        _bodies(xs, ys, d, s)[body_name],
+        name=f"plain:{body_name}",
+        incremental_per_element=False,
     )
     steps: list[Callable[[], Any]] = [
         lambda: None,
@@ -184,7 +186,7 @@ def test_nested_pipeline_that_needs_no_loop_variable_is_still_rewritten(
     ys = CascadeList(engine, [10, -20])
     body = _bodies(xs, ys, None, None)[body_name]
     q = engine.query(body, name=f"rw:{body_name}")
-    plain = engine.query(body, name=f"plain:{body_name}", incremental=False)
+    plain = engine.query(body, name=f"plain:{body_name}", incremental_per_element=False)
     assert getattr(q.raw, "__cascade_rewritten__", False)
     assert q() == plain()
     assert [p["reducer"] for p in engine.inspect_pipelines()] == ["sum"]

@@ -330,7 +330,7 @@ class GraphStore:
         * Nothing registered, or the same function object: register it,
           dropping results if its ``version=`` changed.
         * The same source function again, for example with other options
-          (``incremental=False`` turns a rewritten function back into the
+          (``incremental_per_element=False`` turns a rewritten function back into the
           original): register the new variant and keep existing handles.
           Results are dropped only if the bytecode differs.
         * Equal bytecode and the same captured objects, as when a module is

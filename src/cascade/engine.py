@@ -201,17 +201,9 @@ def _current_transaction() -> EngineTransaction | None:
     return tx
 
 
-def _per_element(new: bool | None, old: bool | None) -> bool | None:
-    """The value of ``incremental_per_element=``, or of its old name ``incremental=``."""
-    for what, value in (("incremental_per_element", new), ("incremental", old)):
-        if value is not None and not isinstance(value, bool):
-            raise TypeError(f"{what} must be a bool")
-    if new is not None and old is not None and new != old:
-        raise TypeError(
-            "incremental= is the old name of incremental_per_element=: "
-            "pass only incremental_per_element="
-        )
-    return old if new is None else new
+def _check_per_element(value: Any) -> None:
+    if value is not None and not isinstance(value, bool):
+        raise TypeError("incremental_per_element must be a bool")
 
 
 def _check_version(what: str, version: Any) -> None:
@@ -638,7 +630,6 @@ class Engine:
     reducers over Cascade collections redo only the elements that changed;
     off, they run as plain Python over every element, with the same result.
     Queries are cached and invalidated the same way with either setting.
-    ``incremental`` is the old name of this option.
     """
 
     # Explicit private-policy contract for tests/introspection.
@@ -656,18 +647,17 @@ class Engine:
         cache_dir: str | os.PathLike[str] | None = None,
         cache_map_size: int = 1 << 30,
         cache_backend: str = "mdbx",
-        incremental_per_element: bool | None = None,
+        incremental_per_element: bool = True,
         cache_version: str | int | None = None,
-        incremental: bool | None = None,
     ) -> None:
         _check_version("cache_version", cache_version)
         self._trace_limit = trace_limit
         # Engine-wide default for rewriting comprehensions and reducers over
         # collections into per-element pipelines; incremental_per_element=
-        # on @engine.query overrides it in either direction. incremental=
-        # is the old name of the same option.
-        per_element = _per_element(incremental_per_element, incremental)
-        self._incremental_default = True if per_element is None else per_element
+        # on @engine.query overrides it in either direction.
+        if not isinstance(incremental_per_element, bool):
+            raise TypeError("incremental_per_element must be a bool")
+        self._incremental_default = incremental_per_element
         # Passing cache_dir switches on zero-config persistence (MDBX by default,
         # or sqlite), deterministic msgpack serialization, and content
         # fingerprints as the cross-session revision markers. Missing dependencies
@@ -798,7 +788,6 @@ class Engine:
         incremental_per_element: bool | None = None,
         max_iterations: int | None = None,
         version: str | int | None = None,
-        incremental: bool | None = None,
     ) -> Any:
         """Register a query. Use as ``@engine.query`` or ``@engine.query(...)``.
 
@@ -821,8 +810,7 @@ class Engine:
         collection (``sum(f(x) for x in xs)``) redoes only the elements
         that changed. Off, it runs as plain Python over every element. The
         result is the same, and the query is cached and invalidated the
-        same way, either way. ``incremental`` is the old name of this
-        option.
+        same way, either way.
 
         ``version`` marks a change the code hash cannot see (a helper the
         query calls, a global, a default, a data file): give it a new value
@@ -830,7 +818,8 @@ class Engine:
         memory or on disk. See "What the code hash sees" in the README.
         """
         _check_version("version", version)
-        per_element = _per_element(incremental_per_element, incremental)
+        _check_per_element(incremental_per_element)
+        per_element = incremental_per_element
         if max_iterations is not None:
             if fixed_point is _UNSET:
                 raise TypeError("max_iterations= needs fixed_point=")
