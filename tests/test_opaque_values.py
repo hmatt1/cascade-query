@@ -175,37 +175,63 @@ def test_with_cache_dir_an_unencodable_result_is_an_error(tmp_path: Any) -> None
     ],
     ids=["generator", "map", "zip", "iter"],
 )
-def test_one_shot_iterator_result_warns(make: Any) -> None:
-    """A cached iterator is used up by its first caller; say so when it is stored."""
+def test_one_shot_iterator_result_is_refused(make: Any) -> None:
+    """A cached iterator would be used up by its first caller."""
     engine = Engine()
+    runs = {"n": 0}
 
     @engine.query
     def items() -> Any:
+        runs["n"] += 1
         return make()
 
-    with pytest.warns(RuntimeWarning, match="can be read only once") as caught:
-        first = list(items())
-    assert first
-    assert "items" in str(caught[0].message)
-    # The result is still cached as before: only the warning is new.
-    assert list(items()) == []
+    with pytest.raises(UnencodableValueError, match="can be read only once") as info:
+        items()
+    assert "items" in str(info.value)
+    # Not cached: the next call runs the body and raises again.
+    with pytest.raises(UnencodableValueError):
+        items()
+    assert runs["n"] == 2
 
 
-def test_one_shot_iterator_from_an_async_query_warns() -> None:
+def test_caller_that_catches_a_refused_iterator_still_tracks_its_inputs() -> None:
+    engine = Engine()
+
+    @engine.input
+    def n() -> int:
+        return 2
+
+    @engine.query
+    def items() -> Any:
+        return (x for x in range(n())) if n() < 5 else list(range(n()))
+
+    @engine.query
+    def safe() -> Any:
+        try:
+            return items()
+        except UnencodableValueError:
+            return "refused"
+
+    assert safe() == "refused"
+    n.set(6)
+    assert safe() == [0, 1, 2, 3, 4, 5]
+
+
+def test_one_shot_iterator_from_an_async_query_is_refused() -> None:
     engine = Engine()
 
     @engine.query
     async def items() -> Any:
         return (x for x in range(3))
 
-    async def main() -> list[int]:
-        return list(await items())
+    async def main() -> Any:
+        return await items()
 
-    with pytest.warns(RuntimeWarning, match="can be read only once"):
-        assert asyncio.run(main()) == [0, 1, 2]
+    with pytest.raises(UnencodableValueError, match="can be read only once"):
+        asyncio.run(main())
 
 
-def test_no_iterator_warning_for_values_that_can_be_read_again() -> None:
+def test_values_that_can_be_read_again_and_unmemoized_iterators_are_fine() -> None:
     import warnings
 
     engine = Engine()

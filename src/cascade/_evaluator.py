@@ -2566,15 +2566,19 @@ class Evaluator:
         ):
             # Only reached for a result the codec cannot encode, so results
             # of the known value types pay nothing for this check.
-            warnings.warn(
+            if (
+                frame.cycle_guess is not UNSET
+            ):  # pragma: no cover - guesses are encodable
+                self._discard_provisional(runtime, key)
+            failure = UnencodableValueError(
                 f"{store.key_to_str(key)} returned a {type(result).__name__}, "
-                "which can be read only once. The cached object is handed to "
-                "every later caller, who will find it already used up. Return "
-                "a list or a tuple instead (for example list(...)), or "
-                "register the query with memoize=False.",
-                RuntimeWarning,
-                stacklevel=2,
+                "which can be read only once: every caller after the first "
+                "would get it used up. Return a list or a tuple instead (for "
+                "example list(...)), or register the query with "
+                "memoize=False so that each call gets a new one."
             )
+            self._inherit_failed_deps(runtime.stack, frame, failure)
+            raise failure
         computed_at_time = time.time()
         expires_at = frame.expires_at
         ttl = store.lookup_query_ttl(key[1])
