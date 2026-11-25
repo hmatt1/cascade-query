@@ -440,6 +440,52 @@ def test_closure_value_change_rebuilds_state(engine):
     assert scaled() == 100
 
 
+def test_a_captured_log_that_keeps_growing_rebuilds_every_run(engine):
+    """Documented limit: a growing log in a helper turns per-element updates off.
+
+    The pipeline keys its stored per-element results on the contents of what
+    the element function captured, taken when each run starts. A list the
+    helper keeps appending to has other contents every time, so every run
+    starts over. The results stay right; only the saving is lost. A counter
+    the pipeline does not fingerprint (an attribute of the function) leaves
+    it incremental.
+    """
+    xs = CascadeList(engine, [1, 2, 3])
+    seen = []
+
+    def logged_double(x):
+        seen.append(x)
+        return x * 2
+
+    @engine.query
+    def total():
+        return sum(logged_double(x) for x in xs)
+
+    assert total() == 12
+    assert seen == [1, 2, 3]
+    xs.append(4)
+    assert total() == 20
+    assert seen == [1, 2, 3, 1, 2, 3, 4]  # every element again, not just 4
+
+    ys = CascadeList(engine, [1, 2, 3])
+
+    def counted_double(x):
+        counted_double.calls += 1
+        return x * 2
+
+    counted_double.calls = 0
+
+    @engine.query
+    def total_counted():
+        return sum(counted_double(x) for x in ys)
+
+    assert total_counted() == 12
+    ys.append(4)
+    before = counted_double.calls
+    assert total_counted() == 20
+    assert counted_double.calls - before == 1  # only the new element
+
+
 def test_tracked_read_inside_stage_marks_pipeline_impure(engine):
     xs = CascadeList(engine, [1, 2])
     offset = engine.input(lambda: 100)
