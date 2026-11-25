@@ -520,3 +520,141 @@ def test_overlapping_snapshots_trim_once_the_last_is_released() -> None:
     assert len(_versions(engine, source, "a")) == 6
     second.release()
     assert len(_versions(engine, source, "a")) == 1
+
+
+# --- the Snapshot object ---
+
+
+def test_snapshot_revision_cannot_be_changed() -> None:
+    engine = Engine()
+    with engine.snapshot() as snapshot:
+        revision = snapshot.revision
+        with pytest.raises(AttributeError, match="read-only"):
+            snapshot.revision = revision + 1  # type: ignore[misc]
+        assert snapshot.revision == revision
+
+
+def test_snapshots_are_equal_when_their_revisions_are() -> None:
+    engine = Engine()
+
+    @engine.input
+    def x() -> int:
+        return 0
+
+    with engine.snapshot() as first, engine.snapshot() as same:
+        x.set(1)
+        with engine.snapshot() as later:
+            assert first == same
+            assert hash(first) == hash(same)
+            assert first != later
+            assert first != first.revision
+            assert len({first, same, later}) == 2
+
+
+# --- pins taken and released by the engine itself ---
+
+
+def test_pin_taken_under_the_lock_keeps_history_until_it_is_released() -> None:
+    engine, source, double, _ = _counter_pipeline()
+    source.set("a", 1)
+    store = _store(engine)
+    with store.lock:
+        pinned = store.pin_current_locked()
+    assert pinned == engine.revision
+    source.set("a", 2)
+    source.set("a", 3)
+    # Like a snapshot, the pin keeps the value of its revision readable.
+    assert double("a", snapshot=Snapshot(revision=pinned)) == 2
+    assert len(_versions(engine, source, "a")) == 3
+    store.unpin(pinned)
+    assert len(_versions(engine, source, "a")) == 1
+    with pytest.raises(SnapshotExpiredError):
+        double("a", snapshot=Snapshot(revision=pinned))
+
+
+def test_releasing_a_snapshot_also_releases_the_collected_ones() -> None:
+    engine, source, _, _ = _counter_pipeline()
+    store = _store(engine)
+    source.set("a", 1)
+    dropped = engine.snapshot()
+    source.set("a", 2)
+    kept = engine.snapshot()
+    source.set("a", 3)
+    # A collected snapshot cannot take the lock, so its release is queued ...
+    del dropped
+    gc.collect()
+    assert len(_versions(engine, source, "a")) == 3
+    # ... and applied by the next release, with nothing else in between.
+    kept.release()
+    assert store._pins == {}  # noqa: SLF001
+    assert len(_versions(engine, source, "a")) == 1
+
+
+def test_call_that_ends_applies_the_releases_queued_while_it_ran() -> None:
+    engine, source, _, _ = _counter_pipeline()
+    store = _store(engine)
+    source.set("a", 1)
+    held = [engine.snapshot()]
+    source.set("a", 2)
+
+    @engine.query
+    def drops_the_snapshot() -> int:
+        held.clear()  # collected while the call holds a pin of its own
+        gc.collect()
+        return source("a")
+
+    assert len(_versions(engine, source, "a")) == 2
+    assert drops_the_snapshot() == 2
+    assert store._pins == {}  # noqa: SLF001
+    assert len(_versions(engine, source, "a")) == 1
+
+
+def test_async_call_closed_inside_a_critical_section_is_unpinned_later() -> None:
+    engine = Engine()
+    store = _store(engine)
+
+    @engine.input
+    def source() -> int:
+        return 1
+
+    @engine.query
+    async def waits() -> int:
+        await asyncio.sleep(0)
+        return source()
+
+    async def main() -> None:
+        call = waits()
+        call.send(None)  # runs up to the await in the body
+        assert store._pins == {engine.revision: 1}  # noqa: SLF001
+        with store.lock:
+            # What the garbage collector does to an abandoned coroutine, here
+            # while this thread is inside one of the store's critical
+            # sections: the pins must not change under that section.
+            call.close()
+            assert store._pins == {engine.revision: 1}  # noqa: SLF001
+            assert list(store._deferred_unpins) == [engine.revision]  # noqa: SLF001
+
+    asyncio.run(main())
+    source.set(2)
+    assert store._pins == {}  # noqa: SLF001
+    assert not store._deferred_unpins  # noqa: SLF001
+
+    async def call_again() -> int:
+        return await waits()
+
+    assert asyncio.run(call_again()) == 2
+    engine.shutdown()
+
+
+def test_no_pin_leaks_when_the_executor_refuses_the_job() -> None:
+    engine, source, double, _ = _counter_pipeline()
+    source.set("a", 1)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool.shutdown()
+    with pytest.raises(RuntimeError, match="after shutdown"):
+        engine.submit(double, "a", executor=pool)
+    assert _store(engine)._pins == {}  # noqa: SLF001
+    # Nothing holds the old revision, so history is trimmed as usual.
+    source.set("a", 2)
+    source.set("a", 3)
+    assert len(_versions(engine, source, "a")) == 1

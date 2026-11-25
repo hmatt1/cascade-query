@@ -22,6 +22,7 @@ import pytest
 
 import cascade
 from cascade import CascadeDict, CascadeList, CascadeSet, Engine, PersistentCacheError
+from cascade._disk_cache import DiskCache, _FileLock
 
 BACKENDS = ("mdbx", "sqlite")
 CHILD_TIMEOUT = 60
@@ -340,3 +341,70 @@ def test_a_crashed_holder_leaves_no_lock_behind(
     xs = CascadeList(engine, name="xs")
     xs.append("parent")
     assert list(xs) == ["child", "parent"]
+
+
+# --- who holds the lock, and who may give it up --------------------------------
+
+
+def test_refusing_an_out_of_date_twin_does_not_give_up_the_engines_lock(
+    tmp_path: Path, backend: str, engines: list[Engine]
+) -> None:
+    # Two objects for one name in one engine share the engine's lock (the
+    # lock does not tell them apart). The second one is behind the disk
+    # after the first one's change and is refused. That refusal must not
+    # release the lock: the engine still holds it for the first object.
+    first = _open(engines, tmp_path, backend)
+    xs = CascadeList(first, name="xs")
+    twin = CascadeList(first, name="xs")
+    xs.append(1)
+    with pytest.raises(PersistentCacheError, match="out of date"):
+        twin.append("lost")
+    assert list(twin) == []
+
+    second = _open(engines, tmp_path, backend)
+    other = CascadeList(second, name="xs")
+    assert list(other) == [1]
+    with pytest.raises(PersistentCacheError, match="another Engine"):
+        other.append("stolen")
+    xs.append(2)
+    for engine in engines:
+        engine.shutdown()
+    engines.clear()
+    assert _restored(tmp_path, backend) == [1, 2]
+
+
+def test_only_the_holder_of_a_collection_lock_can_release_it(
+    tmp_path: Path, backend: str
+) -> None:
+    holder = DiskCache(tmp_path, map_size=1 << 24, cache_backend=backend)
+    other = DiskCache(tmp_path, map_size=1 << 24, cache_backend=backend)
+    try:
+        assert holder.lock_collection("xs") is True
+        # Held already: nothing new was taken, so nothing is to be undone.
+        assert holder.lock_collection("xs") is False
+        # Unlocking what one does not hold is not an error and frees nothing.
+        other.unlock_collection("xs")
+        with pytest.raises(PersistentCacheError, match="another Engine"):
+            other.lock_collection("xs")
+        holder.unlock_collection("xs")
+        assert other.lock_collection("xs") is True
+    finally:
+        holder.close()
+        other.close()
+
+
+def test_file_lock_has_one_holder_and_release_is_safe_to_repeat(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "collection.lock")
+    holder = _FileLock(path)
+    refused = _FileLock(path)
+    assert holder.try_acquire() is True
+    assert refused.try_acquire() is False
+    # It holds nothing; releasing it must leave the holder's lock in place.
+    refused.release()
+    assert _FileLock(path).try_acquire() is False
+    holder.release()
+    holder.release()
+    assert refused.try_acquire() is True
+    refused.release()

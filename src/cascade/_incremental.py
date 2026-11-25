@@ -203,7 +203,7 @@ class _Reducer:
 
     def add(self, uid: Any, value: Any, appended: bool) -> None:
         """Take in an element. ``appended``: it is last in the collection."""
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover - every reducer overrides it
 
     def discard(self, uid: Any) -> Any:
         return self.contrib.pop(uid, None)
@@ -214,7 +214,7 @@ class _Reducer:
         self.add(uid, value, False)
 
     def result(self, ctx: _FinalizeCtx) -> Any:
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover - every reducer overrides it
 
     def _values(self, ctx: _FinalizeCtx) -> list[Any]:
         """The stored values in the order the plain expression yields them."""
@@ -489,7 +489,7 @@ class _OrderedKeyReducer(_Reducer):
             if item is None:
                 continue
             entry, value, key, _ = item
-            if entry is not None:
+            if entry is not None:  # pragma: no branch - no key is outside the tree here
                 entry = (key, sign * position, uid)
                 entries.append(entry)
             contrib[uid] = (entry, value, key, position)

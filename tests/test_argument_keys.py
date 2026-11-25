@@ -420,3 +420,173 @@ def test_call_passes_the_original_objects() -> None:
     ((args, kwargs),) = got
     assert args[2] is marker
     assert same_value(args, (1.5, True, marker, -0.0)) and kwargs == {"k": 2.0}
+
+
+# --- binding corners -------------------------------------------------------
+
+
+def test_passing_a_default_that_cannot_be_a_key_is_the_call_without_it() -> None:
+    # A default that cannot be part of a key is left out of it. Passing that
+    # very object, by position or by keyword, is then the same call.
+    engine = Engine()
+    missing = object()
+    calls: list[Any] = []
+
+    @engine.query
+    def q(x: int, default: Any = missing, *, flag: Any = missing) -> int:
+        calls.append((x, default is missing, flag is missing))
+        return x
+
+    assert q(1) == 1
+    assert q(1, missing) == 1
+    assert q(1, default=missing) == 1
+    assert q(1, flag=missing) == 1
+    assert q(1, missing, flag=missing) == 1
+    assert calls == [(1, True, True)]
+    assert q(1, flag=7) == 1
+    assert calls == [(1, True, True), (1, True, False)]
+
+
+def test_missing_keyword_only_argument_is_refused_before_the_body() -> None:
+    engine = Engine()
+    runs = {"n": 0}
+
+    @engine.query
+    def q(x: int, *, mode: str) -> str:
+        runs["n"] += 1
+        return f"{x}{mode}"
+
+    with pytest.raises(
+        TypeError, match="missing a required keyword-only argument: 'mode'"
+    ):
+        q(1)
+    assert runs["n"] == 0
+    assert q(1, mode="a") == "1a"
+    assert runs["n"] == 1
+
+
+def test_default_that_cannot_be_a_key_before_extra_positional_arguments() -> None:
+    # With *rest after it the default has to stay in its place: whatever
+    # follows it is positional.
+    engine = Engine()
+    missing = object()
+    calls: list[Any] = []
+
+    @engine.query
+    def q(x: int, opt: Any = missing, *rest: int) -> tuple[Any, ...]:
+        calls.append((x, opt is missing, rest))
+        return (x, opt is missing, rest)
+
+    assert q(1) == (1, True, ())
+    assert q(1, missing) == (1, True, ())
+    assert len(calls) == 1
+    assert q(1, missing, 5) == (1, True, (5,))
+    assert q(1, missing, 5) == (1, True, (5,))
+    assert len(calls) == 2
+    assert q(1, 2, 5) == (1, False, (5,))
+    assert len(calls) == 3
+
+
+def test_positional_only_parameters_with_defaults_that_cannot_be_keys() -> None:
+    engine = Engine()
+    missing = object()
+    calls: list[Any] = []
+
+    @engine.query
+    def q(a: Any = missing, b: int = 1, /) -> tuple[bool, int]:
+        calls.append((a is missing, b))
+        return (a is missing, b)
+
+    assert q() == (True, 1)
+    assert q(missing) == (True, 1)
+    assert q(missing, 1) == (True, 1)
+    assert len(calls) == 1
+    # A value after the gap cannot move to the keywords: b is positional-only.
+    assert q(missing, 2) == (True, 2)
+    assert q(missing, 2) == (True, 2)
+    assert len(calls) == 2
+    assert q(3) == (False, 1)
+    assert len(calls) == 3
+
+    mixed_calls: list[Any] = []
+
+    @engine.query
+    def mixed(
+        a: int, b: Any = missing, /, c: Any = missing, d: int = 4
+    ) -> tuple[Any, ...]:
+        mixed_calls.append((a, b is missing, c is missing, d))
+        return (a, b is missing, c is missing, d)
+
+    assert mixed(1) == (1, True, True, 4)
+    assert mixed(1, missing, missing, 4) == (1, True, True, 4)
+    assert mixed(1, d=4) == (1, True, True, 4)
+    assert len(mixed_calls) == 1
+    assert mixed(1, d=5) == (1, True, True, 5)
+    assert mixed(1, missing, missing, 5) == (1, True, True, 5)
+    assert len(mixed_calls) == 2
+    assert mixed(1, 2, d=5) == (1, False, True, 5)
+    assert len(mixed_calls) == 3
+
+
+def test_callable_without_a_signature_takes_positional_arguments_only() -> None:
+    # For some callables, mostly ones written in C, inspect cannot say which
+    # parameters they have. Their calls are keyed as written, and a keyword
+    # argument, which could be a second spelling of a positional one, is
+    # refused.
+    engine = Engine()
+    runs = {"n": 0}
+
+    def largest(*values: int) -> int:
+        runs["n"] += 1
+        return max(values)
+
+    largest.__signature__ = "nothing inspect can use"  # type: ignore[attr-defined]
+    handle = engine.query(largest)
+    assert handle(3, 5) == 5
+    assert handle(3, 5) == 5
+    assert runs["n"] == 1
+    assert handle(5, 3) == 5
+    assert runs["n"] == 2
+    with pytest.raises(TypeError, match="keyword arguments are not supported"):
+        handle(3, 5, key=None)
+    assert runs["n"] == 2
+
+
+# --- the key form itself ----------------------------------------------------
+
+
+def test_positional_tuple_that_looks_like_the_keywords_is_another_call() -> None:
+    # The keyword part of a key hashes like the tuple of its (name, value)
+    # pairs. A call that passes that very tuple by position therefore lands
+    # on the same hash as the keyword call, and only comparing the two keys
+    # keeps their results apart.
+    assert hash(_keys.KwArgs({"k": 1})) == hash((("k", 1),))
+    engine = Engine()
+    calls: list[Any] = []
+
+    @engine.query
+    def q(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        calls.append((args, kwargs))
+        return (args, kwargs)
+
+    assert q(k=1) == ((), {"k": 1})
+    assert q((("k", 1),)) == (((("k", 1),),), {})
+    assert q(k=1) == ((), {"k": 1})
+    assert q((("k", 1),)) == (((("k", 1),),), {})
+    assert calls == [((), {"k": 1}), (((("k", 1),),), {})]
+
+
+def test_key_form_prints_the_arguments_and_tags_what_equality_hides() -> None:
+    # A wrapped argument prints as the value it wraps; what `==` cannot tell
+    # apart is visible as a tag. `display` is the same key as the call was
+    # written, which is what traces and the graph show.
+    key = _keys.key_args((1, decimal.Decimal("1.0"), (2, 3.0), 0.0, -0.0)) + (
+        _keys.KwArgs({"k": True}),
+    )
+    assert repr(key) == (
+        "(1, Decimal('1.0'), (2, 3.0), (<class 'float'>, 0.0), "
+        "(NEGATIVE_ZERO, -0.0), **{'k': True})"
+    )
+    assert (
+        _keys.display(key) == "(1, Decimal('1.0'), (2, 3.0), 0.0, -0.0, **{'k': True})"
+    )

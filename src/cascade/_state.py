@@ -97,7 +97,7 @@ class Snapshot:
         if detached is not None:
             _, callback, args, _ = detached
             release_now = getattr(callback, "__self__", None)
-            if release_now is not None:
+            if release_now is not None:  # pragma: no branch - always the store's method
                 release_now.unpin(*args)
 
     def __enter__(self) -> Snapshot:

@@ -8,6 +8,7 @@ Hypothesis comparison in ``test_rewrite_differential.py``.
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from typing import Any
 
 import pytest
@@ -595,6 +596,85 @@ def test_sorted_runs_the_key_once_per_changed_element(engine: Engine) -> None:
     assert key.seen == [7, 8]
 
 
+def test_tie_that_is_gone_before_the_next_run_needs_no_reordering(
+    engine: Engine,
+) -> None:
+    # An element inserted in front of its equal makes a tie whose order has
+    # to be looked up in the list. Here the other one leaves before the query
+    # runs again, so there is nothing to look up, and nothing to run again.
+    values = [(k, "old") for k in range(20)]
+    pairs = CascadeList(engine, values)
+    key = _Calls(lambda p: p[0])
+
+    @engine.query
+    def ordered() -> list[Any]:
+        return sorted(pairs, key=key)
+
+    def check() -> None:
+        assert ordered() == sorted(values, key=lambda p: p[0])
+
+    check()
+    key.seen.clear()
+    for op in (
+        lambda c: c.insert(0, (5, "new")),
+        lambda c: c.remove((5, "old")),
+    ):
+        op(pairs)
+        op(values)
+    check()
+    pairs.append((5, "last"))  # a tie again, behind the inserted one
+    values.append((5, "last"))
+    check()
+    assert key.seen == [(5, "new"), (5, "last")]
+
+
+def test_bytes_keys_are_ordered_like_strings_and_apart_from_them(
+    engine: Engine,
+) -> None:
+    values: list[Any] = [b"pear", b"apple", b"fig"]
+    xs = CascadeList(engine, values)
+    seen = _Calls()
+
+    @engine.query(cache_exceptions=False)
+    def ordered() -> list[Any]:
+        return sorted(seen(x) for x in xs)
+
+    @engine.query(cache_exceptions=False)
+    def lowest() -> Any:
+        return min(x for x in xs)
+
+    def check() -> None:
+        assert ordered() == sorted(values)
+        assert lowest() == min(values)
+
+    check()
+    seen.seen.clear()
+    for op in (
+        lambda c: c.append(b"date"),
+        lambda c: c.insert(0, b"fig"),  # a tie, in front
+        lambda c: c.remove(b"apple"),
+    ):
+        op(xs)
+        op(values)
+        check()
+    assert seen.seen == [b"date", b"fig"]
+    # Bytes have a total order, so every key is in the reducers' sorted
+    # structure. (With keys outside it the results above are the same, by
+    # way of the builtin over all stored keys; only this tells the two apart.)
+    states = engine._incremental_rt._states.values()  # noqa: SLF001
+    assert [state.reducer.outside for state in states] == [0, 0]
+
+    xs.append("fig")  # bytes and str do not compare
+    for query, builtin in ((ordered, sorted), (lowest, min)):
+        with pytest.raises(TypeError) as got:
+            query()
+        with pytest.raises(TypeError) as want:
+            builtin([*values, "fig"])
+        assert str(got.value) == str(want.value)
+    xs.pop()
+    check()
+
+
 def test_sorted_with_keys_that_have_no_total_order(engine: Engine) -> None:
     nan = float("nan")
     values: list[Any] = [2.0, nan, 1.0, nan, 0.5]
@@ -912,3 +992,77 @@ def test_set_source_is_visited_in_insertion_order(engine: Engine) -> None:
     s.add(30)
     assert halves() == [0.5, 10.0, 3.5, 15.0]
     assert total() == sum(x / 3 for x in [1, 20, 7, 30])
+
+
+# --- at an older revision ------------------------------------------------------
+#
+# A query run through a snapshot reduces the collection as it was then, while
+# the collection itself has moved on. Where a result depends on the order of
+# the elements, that is the order at the snapshot's revision.
+
+
+def test_tie_order_through_a_snapshot_is_the_order_the_snapshot_saw(
+    engine: Engine,
+) -> None:
+    values = [(k, "old") for k in range(20)]
+    pairs = CascadeList(engine, values)
+
+    def first(p: Any) -> Any:
+        return p[0]
+
+    @engine.query
+    def ordered() -> list[Any]:
+        return sorted(pairs, key=first)
+
+    assert ordered() == sorted(values, key=first)
+    pairs.insert(0, (5, "new"))  # ties with (5, "old"), in front of it
+    values.insert(0, (5, "new"))
+    snapshot = engine.snapshot()
+    pairs.reverse()  # now behind it, which the snapshot does not see
+
+    then = ordered(snapshot=snapshot)
+    assert then == sorted(values, key=first)
+    assert then[5:7] == [(5, "new"), (5, "old")]
+    values.reverse()
+    now = ordered()
+    assert now == sorted(values, key=first)
+    assert now[5:7] == [(5, "old"), (5, "new")]
+    snapshot.release()
+
+
+def test_set_through_a_snapshot_is_reduced_in_the_order_it_had_then(
+    engine: Engine,
+) -> None:
+    # Fractions are sorted by the builtin over the elements in iteration
+    # order; the elements, and their order, are the snapshot's.
+    half, third, quarter = Fraction(1, 2), Fraction(1, 3), Fraction(1, 4)
+    tags = CascadeSet(engine, [half, third])
+
+    @engine.query
+    def ordered() -> list[Fraction]:
+        return sorted(tags)
+
+    assert ordered() == [third, half]
+    tags.add(Fraction(3, 4))
+    snapshot = engine.snapshot()
+    tags.discard(half)
+    tags.add(quarter)
+    assert ordered(snapshot=snapshot) == [third, half, Fraction(3, 4)]
+    assert ordered() == [quarter, third, Fraction(3, 4)]
+    snapshot.release()
+
+
+def test_dict_through_a_snapshot_keeps_the_order_it_had_then(engine: Engine) -> None:
+    d = CascadeDict(engine, {"a": 1, "b": -1, "c": 3})
+
+    @engine.query
+    def positives() -> list[int]:
+        return [v for v in d.values() if v > 0]
+
+    assert positives() == [1, 3]
+    d["b"] = 2  # passes the filter now, in its old place between a and c
+    snapshot = engine.snapshot()
+    del d["a"]
+    assert positives(snapshot=snapshot) == [1, 2, 3]
+    assert positives() == [2, 3]
+    snapshot.release()

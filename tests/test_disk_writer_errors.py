@@ -257,3 +257,127 @@ def test_writes_from_many_threads_with_intermittent_errors(tmp_path: Path) -> No
         assert runs["n"] == 800
     finally:
         assert _call(engine.shutdown) == ("ok", None)
+
+
+# --- errors MDBX itself raises -------------------------------------------------
+#
+# The tests above replace ``store_entry_many``. These go through it.
+
+_BLOCK = 256 * 1024
+_BLOCKS = 48  # 12 MiB of results
+
+
+def _open_blocks(tmp_path: Path, map_size: int, runs: dict[str, int]) -> Any:
+    engine = Engine(cache_dir=tmp_path, cache_backend="mdbx", cache_map_size=map_size)
+
+    @engine.query(name="block")
+    def block(i: int) -> bytes:
+        with _count_lock:
+            runs["n"] += 1
+        return bytes([i]) * _BLOCK
+
+    return engine, block
+
+
+def test_results_that_do_not_fit_the_map_are_reported_as_a_full_cache(
+    tmp_path: Path,
+) -> None:
+    runs = {"n": 0}
+    engine, block = _open_blocks(tmp_path, 1 << 22, runs)  # a map of 4 MiB
+    try:
+        for i in range(_BLOCKS):
+            block(i)
+        kind, exc = _call(engine.flush_disk)
+        assert kind == "raised"
+        assert isinstance(exc, PersistentCacheError)
+        assert "is full; pass a larger cache_map_size" in str(exc)
+        # Every result is still served from memory.
+        assert block(_BLOCKS - 1) == bytes([_BLOCKS - 1]) * _BLOCK
+        assert runs["n"] == _BLOCKS
+    finally:
+        assert _call(engine.shutdown) == ("ok", None)
+
+    # With the larger map the message asks for, the same directory takes
+    # them all, and a new engine loads every one.
+    engine, block = _open_blocks(tmp_path, 1 << 26, runs)
+    try:
+        for i in range(_BLOCKS):
+            block(i)
+        assert _call(engine.flush_disk) == ("ok", None)
+    finally:
+        assert _call(engine.shutdown) == ("ok", None)
+    computed = runs["n"]
+    engine, block = _open_blocks(tmp_path, 1 << 26, runs)
+    try:
+        for i in range(_BLOCKS):
+            assert block(i) == bytes([i]) * _BLOCK
+        assert runs["n"] == computed
+    finally:
+        assert _call(engine.shutdown) == ("ok", None)
+
+
+class _FailingMap:
+    """An MDBX map whose writes raise; everything else is the real map's."""
+
+    def __init__(self, real: Any, exc: BaseException) -> None:
+        self._real = real
+        self._exc = exc
+
+    def put(self, *args: Any, **kwargs: Any) -> None:
+        raise self._exc
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def _causes(exc: BaseException | None) -> list[BaseException]:
+    chain = []
+    while exc is not None:
+        chain.append(exc)
+        exc = exc.__cause__
+    return chain
+
+
+def test_mdbx_error_other_than_a_full_map_is_reported_as_what_it_is(
+    tmp_path: Path,
+) -> None:
+    """MDBX's own errors are not ``Exception``s: the class is a ``BaseException``.
+
+    The writer thread has to survive one all the same, and ``flush_disk()``
+    has to report it, without the advice that belongs to a full cache.
+    """
+    import mdbx
+
+    runs = {"n": 0}
+    engine, square = _open(tmp_path, "mdbx", runs)
+    disk = engine._disk  # noqa: SLF001
+    corrupted = mdbx.MDBXErrorExc(-30796, "MDBX_CORRUPTED: Database is corrupted")
+    assert not isinstance(corrupted, Exception)
+    real_meta = disk._meta  # noqa: SLF001
+    disk._meta = _FailingMap(real_meta, corrupted)  # noqa: SLF001
+    try:
+        assert square(2) == 4
+        kind, exc = _call(engine.flush_disk)
+        assert kind == "raised"
+        assert isinstance(exc, PersistentCacheError)
+        assert any(cause is corrupted for cause in _causes(exc))
+        assert "MDBX_CORRUPTED" in str(exc)
+        assert "is full" not in str(exc) and "cache_map_size" not in str(exc)
+        # The writer is still running, and writes the next result.
+        assert engine._evaluator._disk_thread.is_alive()  # noqa: SLF001
+        disk._meta = real_meta  # noqa: SLF001
+        assert square(3) == 9
+        assert _call(engine.flush_disk) == ("ok", None)
+    finally:
+        disk._meta = real_meta  # noqa: SLF001
+        assert _call(engine.shutdown) == ("ok", None)
+
+    # The write that failed left nothing behind; the later one loads.
+    engine, square = _open(tmp_path, "mdbx", runs)
+    try:
+        assert square(3) == 9
+        assert runs["n"] == 2
+        assert square(2) == 4
+        assert runs["n"] == 3
+    finally:
+        engine.shutdown()

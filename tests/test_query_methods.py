@@ -249,3 +249,27 @@ def test_methods_on_plain_instances_are_computed_but_not_stored(
     session().shutdown()
     session().shutdown()
     assert runs["n"] == 2
+
+
+def test_bound_method_handles_compare_by_instance_and_method() -> None:
+    engine = Engine()
+
+    class Shape:
+        @engine.query
+        def area(self) -> int:
+            return 1
+
+        @engine.query
+        def edges(self) -> int:
+            return 4
+
+    a, b = Shape(), Shape()
+    # Reading the attribute makes a new handle each time, as for a method.
+    assert a.area is not a.area
+    assert a.area == a.area
+    assert hash(a.area) == hash(a.area)
+    assert a.area != b.area
+    assert a.area != a.edges
+    assert a.area != Shape.area
+    assert len({a.area, a.area, b.area, a.edges}) == 3
+    assert a.area.raw is Shape.area.raw

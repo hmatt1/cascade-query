@@ -97,6 +97,51 @@ def test_repeated_runs_do_not_duplicate_nodes_or_edges(engine):
     assert len(graph["edges"]) == len(set(graph["edges"]))
 
 
+def test_two_pipelines_over_one_collection_share_its_node(engine):
+    xs = CascadeList(engine, [1, 2], name="orders")
+
+    @engine.query
+    def total():
+        return sum(x for x in xs)
+
+    @engine.query
+    def largest():
+        return max(x for x in xs)
+
+    assert (total(), largest()) == (3, 2)
+    graph = engine.inspect_graph()
+    source = "collection:list:orders"
+    assert graph["nodes"].count(source) == 1
+    readers = sorted(parent for parent, dep in graph["edges"] if dep == source)
+    assert [reader.split(":")[:2] for reader in readers] == [
+        ["reduce", "max"],
+        ["reduce", "sum"],
+    ]
+
+
+def test_pipeline_run_outside_any_query_has_no_consumer(engine):
+    xs = CascadeList(engine, [1, 2], name="xs")
+
+    @engine.query
+    def total():
+        return sum(x * 2 for x in xs)
+
+    # The rewritten function called by hand: no query is running, so there
+    # is no query node to draw an edge from.
+    assert total.raw() == 6
+    (pipe,) = engine.inspect_pipelines()
+    assert pipe["consumers"] == []
+    reduce_node = f"reduce:sum:{pipe['site']}"
+    graph = engine.inspect_graph()
+    assert reduce_node in graph["nodes"]
+    assert [parent for parent, dep in graph["edges"] if dep == reduce_node] == []
+
+    assert total() == 6  # run as a query, it is the pipeline's consumer
+    (pipe,) = engine.inspect_pipelines()
+    (consumer,) = pipe["consumers"]
+    assert (consumer, reduce_node) in engine.inspect_graph()["edges"]
+
+
 def test_two_consumers_share_one_pipeline_per_site(engine):
     xs = CascadeList(engine, [1, 2])
 

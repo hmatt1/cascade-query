@@ -273,6 +273,77 @@ def test_concurrent_writers_and_readers_see_no_false_alarm() -> None:
     assert sizes() == (len(xs), len(s), len(d)) == (675, 675, 675)
 
 
+def test_reader_that_looks_as_a_mutation_ends_sees_no_false_alarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read looks at the size twice; here the mutation ends in between.
+
+    The first look finds one element more than was recorded: an append on
+    another thread has stored it and not yet recorded it. That alone could
+    also be a bypass, so the read looks again. By then the append is done.
+    The hold points are in the size reads themselves, the only steps between
+    which this can happen.
+    """
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2])
+    core = xs._core  # noqa: SLF001
+    size = core.base_len
+    writer_part_way = threading.Event()
+    reader_looked_once = threading.Event()
+    writer_done = threading.Event()
+    reader_thread: list[int] = []
+    reader_saw: list[int] = []
+
+    def held_size(owner: Any) -> int:
+        if threading.get_ident() in reader_thread:
+            if reader_saw:
+                # The reader's second look: after the append has ended.
+                reader_looked_once.set()
+                assert writer_done.wait(10)
+            reader_saw.append(size(owner))
+            return reader_saw[-1]
+        if not writer_part_way.is_set() and size(owner) != core.tracked_len:
+            # The writer, with the element stored and not yet recorded.
+            writer_part_way.set()
+            assert reader_looked_once.wait(10)
+        return size(owner)
+
+    monkeypatch.setattr(core, "base_len", held_size)
+    outcomes: dict[str, Any] = {}
+
+    def writer() -> None:
+        try:
+            xs.append(3)
+            outcomes["writer"] = "done"
+        except BaseException as exc:  # noqa: BLE001
+            outcomes["writer"] = exc
+        finally:
+            writer_done.set()
+
+    def reader() -> None:
+        try:
+            assert writer_part_way.wait(10)
+            reader_thread.append(threading.get_ident())
+            outcomes["reader"] = len(xs)
+        except BaseException as exc:  # noqa: BLE001
+            outcomes["reader"] = exc
+
+    threads = [
+        threading.Thread(target=writer, daemon=True),
+        threading.Thread(target=reader, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not any(thread.is_alive() for thread in threads), "reader or writer hung"
+
+    # First look: the stored element, against two recorded. Second: settled.
+    assert reader_saw[:2] == [3, 3] and reader_looked_once.is_set()
+    assert outcomes == {"writer": "done", "reader": 3}
+    assert list(xs) == [1, 2, 3]
+
+
 # --- the limit ---------------------------------------------------------------
 
 SAME_SIZE_CHANGES: dict[str, tuple[Callable[[Engine], Any], Callable[[Any], Any]]] = {

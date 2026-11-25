@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from cascade import CascadeDict, CascadeList, CascadeSet, Engine
+from cascade import CascadeDict, CascadeList, CascadeSet, Engine, QueryCancelled
+
+TIMEOUT = 10.0  # for a thread that waits at a hold point
 
 
 @pytest.fixture
@@ -514,6 +518,129 @@ def test_error_in_stage_poisons_state_then_recovers(engine):
     assert q() == 15
     xs.append(5)
     assert q() == 17
+
+
+def test_recursive_stage_helper_keeps_the_pipeline_incremental(engine):
+    # The helper's closure holds the helper itself, and every run of the
+    # query makes a new one. The pipeline has to see that it is the same
+    # code each time, without following the closure round and round.
+    xs = CascadeList(engine, [3, 4])
+    calls = []
+
+    @engine.query
+    def total():
+        def factorial(n):
+            calls.append(n)
+            return 1 if n <= 1 else n * factorial(n - 1)
+
+        return sum(map(factorial, xs))
+
+    assert total() == 6 + 24
+    calls.clear()
+    xs.append(2)
+    assert total() == 6 + 24 + 2
+    assert calls == [2, 1]  # the new element only
+
+
+# --- a run that ends part way through the changes ---
+#
+# The pipeline takes in the collection's changes one by one. A run that is
+# stopped in the middle (cancelled, or by an exception that is not an
+# ``Exception``) has taken in some of them and not recorded how far it got.
+# The next run must not take those in a second time.
+#
+# The stage functions are objects, not closures: a closure over an Event (or
+# over a flag that changes) would make the pipeline rebuild its state on
+# every run, and then there would be no state to get wrong.
+
+
+class _WaitsThenReads:
+    """Stage function: big values wait at a gate, then read an input."""
+
+    def __init__(self, scale):
+        self.scale = scale
+        self.seen = []
+        self.reached = threading.Event()
+        self.open = threading.Event()
+
+    def __call__(self, x):
+        self.seen.append(x)
+        if x < 100:
+            return x
+        self.reached.set()
+        assert self.open.wait(TIMEOUT)
+        return x * self.scale()  # a read: where a cancelled run finds out
+
+
+@pytest.mark.parametrize("change", ["append", "replace"])
+def test_run_cancelled_inside_a_stage_leaves_no_half_updated_state(change):
+    engine = Engine()
+    scale = engine.input(lambda: 1, name="scale")
+    xs = CascadeList(engine, [1, 2])
+    weigh = _WaitsThenReads(scale)
+
+    @engine.query
+    def total():
+        return sum(weigh(x) for x in xs)
+
+    try:
+        assert total() == 3
+        weigh.seen.clear()
+        xs.append(7)  # taken in before the run is cancelled
+        if change == "append":
+            xs.append(500)
+        else:
+            xs[0] = 500
+        future = engine.submit(total)
+        assert weigh.reached.wait(TIMEOUT)
+        scale.set(2)  # the submitted run is out of date from here on
+        weigh.open.set()
+        with pytest.raises(QueryCancelled):
+            future.result(timeout=TIMEOUT)
+        # The cancelled run was working from the pipeline's state: it only
+        # looked at what had changed.
+        assert weigh.seen == [7, 500]
+        assert total() == sum(x * 2 if x >= 100 else x for x in list(xs))
+    finally:
+        weigh.open.set()
+        engine.shutdown()
+
+
+class _Interrupt(BaseException):
+    pass
+
+
+class _InterruptsOnce:
+    """Stage function: raises ``_Interrupt`` at the first big value it sees."""
+
+    def __init__(self):
+        self.seen = []
+        self.armed = True
+
+    def __call__(self, x):
+        self.seen.append(x)
+        if x >= 100 and self.armed:
+            self.armed = False
+            raise _Interrupt
+        return x
+
+
+def test_run_interrupted_inside_a_stage_leaves_no_half_updated_state(engine):
+    xs = CascadeList(engine, [1, 2])
+    checked = _InterruptsOnce()
+
+    @engine.query
+    def total():
+        return sum(checked(x) for x in xs)
+
+    assert total() == 3
+    checked.seen.clear()
+    xs.append(7)  # taken in before the interruption
+    xs.append(500)
+    with pytest.raises(_Interrupt):
+        total()
+    assert checked.seen == [7, 500]
+    assert total() == 510
 
 
 # --- fallback: plain sources keep exact python semantics ---

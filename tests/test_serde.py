@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
 import pytest
 
+from cascade import Engine, StaleHandleError
 from cascade._serde import _to_jsonable as to_j
 from cascade._serde import stable_value_digest
 
@@ -73,3 +75,26 @@ def test_to_jsonable_rejects_arbitrary_object() -> None:
 
     with pytest.raises(TypeError, match="unsupported type"):
         to_j(PlainClass())
+
+
+def test_callable_without_bytecode_is_a_query_and_version_marks_its_changes() -> None:
+    # A functools.partial has no bytecode of its own for the code hash. It
+    # is registered under a name and cached like any query, and `version=`
+    # is how the program says that it changed (G11).
+    engine = Engine()
+    runs: list[int] = []
+
+    def scaled(factor: int, x: int) -> int:
+        runs.append(factor)
+        return factor * x
+
+    triple = engine.query(functools.partial(scaled, 3), name="scale", version=1)
+    assert triple(5) == 15
+    assert triple(5) == 15
+    assert runs == [3]
+
+    quadruple = engine.query(functools.partial(scaled, 4), name="scale", version=2)
+    assert quadruple(5) == 20
+    assert runs == [3, 4]
+    with pytest.raises(StaleHandleError):
+        triple(5)

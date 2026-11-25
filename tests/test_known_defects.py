@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D34).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D35).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -1078,6 +1078,152 @@ def test_d34_sync_query_keeps_its_value_when_a_task_waiting_for_its_run_is_cance
     # The run ended after the cancelled task's loop was closed, and has to
     # cope with that quietly.
     assert not [r for r in caplog.records if r.name == "concurrent.futures"]
+
+
+def test_d35_two_threads_asking_for_a_dropped_cycle_member_both_get_its_value() -> None:
+    # The member of a fixed-point cycle has lost its result and an input has
+    # changed (D25). A caller that asks for the member runs it, reaches the
+    # member again through head(), and starts over by entering the cycle
+    # through head(). That went wrong when a second caller had taken over the
+    # member in between: the first one's head() waited for that run, which
+    # failed as the first one's own had (it reached itself). The head's run
+    # gave up there, as a verification does, head() was never brought up to
+    # date, and the first caller got CycleError for a cycle that converges.
+    #
+    # On a free-threaded build six threads got there by themselves about one
+    # time in ten. Three holds make it certain on any build.
+    engine = Engine()
+    first_running = threading.Event()
+    state = {"held": False}
+    runs = {"head": 0, "member": 0}
+    counting = threading.Lock()
+
+    def count(name: str) -> int:
+        with counting:
+            runs[name] += 1
+            return runs[name]
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    def poll(condition: Any) -> bool:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while not condition():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.002)
+        return True
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        if state["held"] and count("head") == 2:
+            # The first caller enters the cycle through head(): not before
+            # the second caller has taken over the member.
+            assert poll(lambda: runs["member"] == 2)
+        return member() + inp()
+
+    @engine.query
+    def member() -> int:
+        if state["held"]:
+            run = count("member")
+            if run == 1:
+                first_running.set()
+                assert poll(lambda: waiting() >= 1)  # the second caller joined
+            elif run == 2:
+                # The second caller's own run: not before the first one's
+                # head() waits for it.
+                assert poll(lambda: waiting() >= 1)
+        return head() // 2
+
+    assert (head(), member()) == (7, 3)
+    store = engine._internals._store  # noqa: SLF001
+    with store.lock:
+        store.drop_memo_locked(("query", member.id, ()))
+    inp.set(6)
+    state["held"] = True
+    outcomes: dict[str, Any] = {}
+
+    def call(name: str, after: threading.Event | None) -> None:
+        try:
+            if after is not None:
+                assert after.wait(HANG_TIMEOUT)
+            outcomes[name] = member()
+        except BaseException as exc:  # noqa: BLE001
+            outcomes[name] = exc
+
+    threads = [
+        threading.Thread(target=call, args=("first", None), daemon=True),
+        threading.Thread(target=call, args=("second", first_running), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(4 * HANG_TIMEOUT)
+    assert not any(thread.is_alive() for thread in threads), "threads hung"
+    # head = head // 2 + 6 converges to 11.
+    assert outcomes == {"first": 5, "second": 5}
+    assert (head(), member()) == (11, 5)
+
+
+def test_d35_two_tasks_asking_for_a_dropped_cycle_member_both_get_its_value() -> None:
+    # The same with two tasks on one loop.
+    engine = Engine()
+    state = {"held": False}
+    runs = {"head": 0, "member": 0}
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    async def poll(condition: Any) -> None:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.002)
+
+    @engine.input
+    def inp() -> int:
+        return 4
+
+    @engine.query(fixed_point=0)
+    async def head() -> int:
+        if state["held"]:
+            runs["head"] += 1
+            if runs["head"] == 2:
+                await poll(lambda: runs["member"] == 2)
+        return await member() + inp()
+
+    @engine.query
+    async def member() -> int:
+        if state["held"]:
+            runs["member"] += 1
+            if runs["member"] in (1, 2):
+                await poll(lambda: waiting() >= 1)
+        return await head() // 2
+
+    async def warm() -> tuple[int, int]:
+        return await head(), await member()
+
+    async def two_callers() -> list[Any]:
+        first = asyncio.create_task(member())
+        await poll(lambda: runs["member"] == 1)
+        second = asyncio.create_task(member())
+        return await asyncio.gather(first, second, return_exceptions=True)
+
+    assert asyncio.run(warm()) == (7, 3)
+    store = engine._internals._store  # noqa: SLF001
+    with store.lock:
+        store.drop_memo_locked(("query", member.id, ()))
+    inp.set(6)
+    state["held"] = True
+    outcomes = asyncio.run(asyncio.wait_for(two_callers(), 8 * HANG_TIMEOUT))
+    assert outcomes == [5, 5]
+    assert asyncio.run(warm()) == (11, 5)
 
 
 def _plain_object() -> Any:

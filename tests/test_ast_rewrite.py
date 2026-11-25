@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import operator
 import traceback
 
 import pytest
@@ -254,6 +257,153 @@ def test_unsupported_call_shapes_stay_native(engine):
     assert q() == (6, 3, 1, {"a": 1}, [3, 2, 1], {1, 2, 3})
 
 
+def test_sorted_with_keywords_the_rewriter_does_not_know_is_left_as_written(engine):
+    xs = CascadeList(engine, [3, 1, 2])
+    options = {"reverse": True}
+
+    @engine.query
+    def unpacked():
+        return sorted((x for x in xs), **options)
+
+    @engine.query(cache_exceptions=False)
+    def unknown():
+        return sorted((x for x in xs), cmp=None)
+
+    assert not rewritten(unpacked) and not rewritten(unknown)
+    # Dropping the keywords would sort ascending, and accept ``cmp``.
+    assert unpacked() == [3, 2, 1]
+    with pytest.raises(TypeError) as got:
+        unknown()
+    with pytest.raises(TypeError) as want:
+        sorted([3, 1, 2], cmp=None)
+    assert str(got.value) == str(want.value)
+    xs.append(5)
+    assert unpacked() == [5, 3, 2, 1]
+    assert engine.inspect_pipelines() == []
+
+
+def test_reducer_with_unpacked_arguments_is_left_as_written(engine):
+    xs = CascadeList(engine, [1, 2, 3])
+    with_start = (xs, 10)  # what ``*`` unpacks is only known when the query runs
+
+    @engine.query
+    def q():
+        return sum(*with_start)
+
+    assert not rewritten(q)
+    assert q() == 16
+    xs.append(4)
+    assert q() == 20
+
+
+def test_async_generator_expression_under_a_reducer_is_left_as_written(engine):
+    xs = CascadeList(engine, [2, 1])
+
+    def body():
+        # A TypeError in plain Python. As a pipeline it would sort xs.
+        return sorted(x async for x in xs)
+
+    q = engine.query(cache_exceptions=False)(body)
+    assert not rewritten(q)
+    with pytest.raises(TypeError) as got:
+        q()
+    with pytest.raises(TypeError) as want:
+        body()
+    assert str(got.value) == str(want.value)
+
+
+def test_map_over_several_iterables_is_left_as_written(engine):
+    xs = CascadeList(engine, [1, 2, 3])
+    ys = CascadeList(engine, [10, 20, 30])
+    both = (xs, ys)
+
+    @engine.query
+    def spelled_out():
+        return sum(map(operator.mul, xs, ys))
+
+    @engine.query
+    def unpacked():
+        return sum(map(operator.mul, *both))
+
+    assert not rewritten(spelled_out) and not rewritten(unpacked)
+    assert spelled_out() == unpacked() == 140
+    xs.append(4)
+    ys.append(40)
+    assert spelled_out() == unpacked() == 300
+    xs.insert(0, 0)  # every pair shifts
+    assert spelled_out() == unpacked() == 200
+
+
+def test_map_and_filter_over_enumerate_are_left_as_written(engine):
+    xs = CascadeList(engine, [10, 20])
+
+    @engine.query
+    def weighted():
+        return sum(map(lambda pair: pair[0] * pair[1], enumerate(xs)))
+
+    @engine.query
+    def odd_positions():
+        return [x for _, x in filter(lambda pair: pair[0] % 2, enumerate(xs))]
+
+    assert not rewritten(weighted) and not rewritten(odd_positions)
+    assert (weighted(), odd_positions()) == (20, [20])
+    xs.insert(0, 5)  # an insert at the front changes every index
+    assert (weighted(), odd_positions()) == (50, [10])
+
+
+def test_reversed_of_a_staged_pipeline_keeps_its_stages(engine):
+    xs = CascadeList(engine, [3, 1, 2])
+
+    @engine.query
+    def backwards():
+        # reversed() takes the finished list: only the comprehension inside
+        # it is a pipeline.
+        return list(reversed([x * 2 for x in xs]))
+
+    @engine.query(cache_exceptions=False)
+    def of_an_iterator():
+        return list(reversed(map(abs, xs)))
+
+    @engine.query(cache_exceptions=False)
+    def of_enumerate():
+        return list(reversed(enumerate(xs)))
+
+    assert backwards() == [4, 2, 6]
+    assert [(p["reducer"], p["stages"]) for p in engine.inspect_pipelines()] == [
+        ("list", ["map"])
+    ]
+    xs.append(5)
+    assert backwards() == [10, 4, 2, 6]
+
+    assert not rewritten(of_an_iterator) and not rewritten(of_enumerate)
+    for query, plain in (
+        (of_an_iterator, lambda: list(reversed(map(abs, [3, 1, 2])))),
+        (of_enumerate, lambda: list(reversed(enumerate([3, 1, 2])))),
+    ):
+        with pytest.raises(TypeError) as got:
+            query()
+        with pytest.raises(TypeError) as want:
+            plain()
+        assert str(got.value) == str(want.value)
+
+
+def test_async_function_nested_in_a_query_is_left_as_written(engine):
+    xs = CascadeList(engine, [1, 2, 3])
+
+    @engine.query
+    def q():
+        async def doubled():
+            return sum(x * 2 for x in xs)
+
+        return (len(xs), asyncio.run(doubled()))
+
+    assert rewritten(q)  # the len() site; nothing inside the async function
+    assert q() == (3, 12)
+    assert [p["reducer"] for p in engine.inspect_pipelines()] == ["len"]
+    xs.append(4)
+    assert q() == (4, 20)
+
+
 def test_join_on_non_literal_receiver_untouched(engine):
     class Frame:
         def join(self, other):
@@ -279,6 +429,47 @@ def test_shadowed_builtin_disables_rewriting(engine):
 
     assert not rewritten(q)
     assert q() == 99
+
+
+def test_import_that_binds_a_builtin_name_disables_rewriting(engine):
+    xs = CascadeList(engine, [2, 3, 4])
+
+    @engine.query
+    def q():
+        from math import prod as sum  # noqa: A004
+
+        return sum(x for x in xs)
+
+    assert not rewritten(q)
+    assert q() == 24
+    xs.append(5)
+    assert q() == 120
+
+
+def test_builtin_shadowed_in_the_module_disables_rewriting(engine, tmp_path):
+    # A module with a ``sum`` of its own: in its functions the name is that
+    # function, not the builtin.
+    path = tmp_path / "module_with_its_own_sum.py"
+    path.write_text(
+        "xs = None\n"
+        "\n\n"
+        "def sum(values):\n"
+        "    return ('module sum', list(values))\n"
+        "\n\n"
+        "def total():\n"
+        "    return sum([x for x in xs])\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("module_with_its_own_sum", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.xs = CascadeList(engine, [1, 2])
+
+    q = engine.query(module.total)
+    assert not rewritten(q)
+    assert q() == ("module sum", [1, 2])
+    module.xs.append(3)
+    assert q() == ("module sum", [1, 2, 3])
 
 
 def _shadowing_sum(engine, xs):

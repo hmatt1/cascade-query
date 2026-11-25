@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from unittest.mock import patch
 
-from cascade import Engine
+import pytest
+
+from cascade import Engine, QueryCancelled
 from tests.scale_helpers import assert_internal_dependents_consistent
 
 
@@ -178,3 +181,111 @@ def test_evict_rebuilds_lru_and_uses_min_fallback_when_pop_finds_no_victim() -> 
         with store.lock:
             store.evict_if_needed_locked()
     assert len(store.memos) == 1
+
+
+def test_internals_probe_shows_inputs_queries_and_the_entry_limit() -> None:
+    engine = Engine(max_entries=7)
+
+    @engine.input
+    def source(name: str) -> str:
+        return ""
+
+    @engine.query(incremental=False)
+    def shout(name: str) -> str:
+        return source(name).upper()
+
+    source.set("main", "a")
+    assert shout("main") == "A"
+    internals = engine._internals  # noqa: SLF001
+    assert [v.value for v in internals.inputs[(source.id, ("main",))]] == ["a"]
+    assert internals.queries[shout.id] is shout.raw
+    assert internals.queries[shout.id]("main") == "A"
+    assert internals.max_entries == 7
+
+
+@pytest.mark.parametrize("bump", [True, False])
+def test_private_set_input_cancels_running_queries_only_on_request(bump: bool) -> None:
+    engine = Engine()
+    started, release = threading.Event(), threading.Event()
+
+    @engine.input
+    def knob() -> int:
+        return 0
+
+    @engine.query
+    def leaf() -> int:
+        return 1
+
+    @engine.query
+    def slow() -> int:
+        started.set()
+        assert release.wait(20)
+        return leaf()  # every call of a query checks for cancellation first
+
+    try:
+        future = engine.submit(slow)
+        assert started.wait(20)
+        internals = engine._internals  # noqa: SLF001
+        epoch, revision = internals.cancel_epoch, engine.revision
+        returned = engine._set_input(  # noqa: SLF001
+            knob.id, (), 5, bump_cancel_epoch=bump
+        )
+        # The value changes either way, at a new revision.
+        assert returned == engine.revision == revision + 1
+        assert knob() == 5
+        assert internals.cancel_epoch == epoch + (1 if bump else 0)
+        release.set()
+        if bump:
+            with pytest.raises(QueryCancelled):
+                future.result(timeout=20)
+        else:
+            assert future.result(timeout=20) == 1
+    finally:
+        release.set()
+        engine.shutdown()
+
+
+def test_private_set_inputs_applies_a_batch_as_one_revision() -> None:
+    engine = Engine()
+    runs = {"total": 0}
+
+    @engine.input
+    def knob(name: str) -> int:
+        return 0
+
+    @engine.query
+    def total() -> int:
+        runs["total"] += 1
+        return knob("a") + knob("b")
+
+    knob.set("a", 1)
+    assert total() == 1
+    internals = engine._internals  # noqa: SLF001
+    revision, epoch = engine.revision, internals.cancel_epoch
+
+    returned = engine._set_inputs(  # noqa: SLF001
+        [(knob.id, ("a",), 1), (knob.id, ("b",), 2), (knob.id, ("b",), 3)]
+    )
+    # One revision for the batch; the later update of "b" wins, and "a",
+    # given the value it has, keeps its version.
+    assert returned == engine.revision == revision + 1
+    assert internals.cancel_epoch == epoch + 1
+    assert (knob("a"), knob("b")) == (1, 3)
+    assert internals.latest_input_version((knob.id, ("a",))).revision == revision
+    assert internals.latest_input_version((knob.id, ("b",))).revision == returned
+    assert total() == 4
+
+    # A batch that changes nothing is no revision at all.
+    same_values = [(knob.id, ("a",), 1), (knob.id, ("b",), 3)]
+    assert engine._set_inputs(same_values) == returned  # noqa: SLF001
+    assert (engine.revision, internals.cancel_epoch) == (returned, epoch + 1)
+    assert total() == 4
+    assert runs["total"] == 2
+
+    # The cancel epoch can be left alone here too.
+    quiet = engine._set_inputs(  # noqa: SLF001
+        [(knob.id, ("a",), 10)], bump_cancel_epoch=False
+    )
+    assert quiet == engine.revision == returned + 1
+    assert internals.cancel_epoch == epoch + 1
+    assert total() == 13

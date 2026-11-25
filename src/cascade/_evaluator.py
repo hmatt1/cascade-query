@@ -632,7 +632,9 @@ class Evaluator:
         this as a cycle; the caller's own call still does.
         """
         waiting = self._waiting_callers_var.get()
-        if waiting and key in waiting:
+        if (
+            waiting and key in waiting
+        ):  # pragma: no branch - only called when _enter_wait_locked returned None
             raise CycleError(
                 f"cycle detected: {self._store.key_to_str(key)} fans out to a "
                 "query that depends on it"
@@ -1693,8 +1695,16 @@ class Evaluator:
         entry = self._dependency_entry(key, snapshot)
         return _NEVER_CHANGED_AT if entry is None else entry.changed_at
 
-    def _dependency_entry(self, key: QueryKey, snapshot: Snapshot) -> MemoEntry | None:
+    def _dependency_entry(
+        self, key: QueryKey, snapshot: Snapshot, *, as_verification: bool = True
+    ) -> MemoEntry | None:
         """The memo of query ``key`` brought up to date at ``snapshot``.
+
+        ``as_verification`` says what the run is for. A verification gives
+        up on a joined run that ended in a ``CycleError`` (``_retry_after``):
+        the dependency counts as changed and the query being verified runs
+        for real. ``_enter_cycle_through_head`` passes False: nothing runs
+        for real after it, so the head has to get through here.
 
         None when the query has no settled result to compare against: it is
         running further up this context's stack, or its result here is
@@ -1725,7 +1735,9 @@ class Evaluator:
             return None
         token = self._verifying_var.set(verifying | {key})
         try:
-            return self._dependency_entry_shadowed(key, fn, snapshot, runtime)
+            return self._dependency_entry_shadowed(
+                key, fn, snapshot, runtime, as_verification
+            )
         finally:
             self._verifying_var.reset(token)
 
@@ -1735,6 +1747,7 @@ class Evaluator:
         fn: Callable[..., Any],
         snapshot: Snapshot,
         runtime: RuntimeState | None,
+        as_verification: bool = True,
     ) -> MemoEntry:
         if runtime is None:
             self._store.pin_snapshot(snapshot)
@@ -1747,7 +1760,7 @@ class Evaluator:
                     cancel_epoch=None,
                     snapshot_explicit=True,
                     pins=[snapshot.revision],
-                    verifying=True,
+                    verifying=as_verification,
                 ),
                 lambda: self._shadow_entry(key, fn, need_value=False),
             )
@@ -1764,7 +1777,7 @@ class Evaluator:
                 outer=(
                     runtime if runtime.stack or runtime.provisional else runtime.outer
                 ),
-                verifying=True,
+                verifying=as_verification,
             )
             entry = self._run_in_runtime(
                 shadow,
@@ -1787,7 +1800,7 @@ class Evaluator:
         return _NEVER_CHANGED_AT if entry is None else entry.changed_at
 
     async def _dependency_entry_async(
-        self, key: QueryKey, snapshot: Snapshot
+        self, key: QueryKey, snapshot: Snapshot, *, as_verification: bool = True
     ) -> MemoEntry | None:  # pragma: no cover
         fid = key[1]
         runtime = self._runtime_var.get()
@@ -1810,7 +1823,7 @@ class Evaluator:
         token = self._verifying_var.set(verifying | {key})
         try:
             return await self._dependency_entry_shadowed_async(
-                key, fn, snapshot, runtime
+                key, fn, snapshot, runtime, as_verification
             )
         finally:
             self._verifying_var.reset(token)
@@ -1821,6 +1834,7 @@ class Evaluator:
         fn: Callable[..., Any],
         snapshot: Snapshot,
         runtime: RuntimeState | None,
+        as_verification: bool = True,
     ) -> MemoEntry:  # pragma: no cover
         if runtime is None:
             self._store.pin_snapshot(snapshot)
@@ -1834,7 +1848,7 @@ class Evaluator:
                     snapshot_explicit=True,
                     is_async=True,
                     pins=[snapshot.revision],
-                    verifying=True,
+                    verifying=as_verification,
                 ),
                 lambda: self._shadow_entry_async(key, fn, need_value=False),
             )
@@ -1848,7 +1862,7 @@ class Evaluator:
                 snapshot_explicit=True,
                 is_async=True,
                 outer=self._shadow_outer(runtime),
-                verifying=True,
+                verifying=as_verification,
             )
             entry = await self._run_in_runtime_async(
                 shadow,
@@ -1899,7 +1913,9 @@ class Evaluator:
             owner = running.runtime
             if owner is not None and owner.provisional is None:
                 owner.provisional = overlay
-        if runtime.provisional is None:
+        if (
+            runtime.provisional is None
+        ):  # pragma: no cover - stack[index:] always includes runtime's frames
             runtime.provisional = overlay
         top = stack[-1]
         # The marker is replaced by the head's real one when the cycle
@@ -1965,11 +1981,18 @@ class Evaluator:
 
         Returns False when ``head`` runs in this runtime: the member is then
         part of that run. Errors are left for the member's own run to meet.
+
+        The head does not run as a verification here. Its run asks for the
+        member, which another caller may be running; if that run ends in a
+        ``CycleError`` (it reached itself, as this caller's did), the head
+        has to run the member itself. Giving up there left the head as it
+        was, and this caller with a ``CycleError`` for a cycle that
+        converges (D35).
         """
         if self._owns(runtime, head):
             return False
         try:
-            self._dependency_entry(head, runtime.snapshot)
+            self._dependency_entry(head, runtime.snapshot, as_verification=False)
         except CycleError:
             pass
         except _CONTROL_FLOW_ERRORS:
@@ -1984,7 +2007,9 @@ class Evaluator:
         if self._owns(runtime, head):
             return False
         try:
-            await self._dependency_entry_async(head, runtime.snapshot)
+            await self._dependency_entry_async(
+                head, runtime.snapshot, as_verification=False
+            )
         except CycleError:
             pass
         except _CONTROL_FLOW_ERRORS:
@@ -2070,7 +2095,9 @@ class Evaluator:
     @staticmethod
     def _note_cycle_heads(runtime: RuntimeState, heads: frozenset[QueryKey]) -> None:
         """The running query read a provisional result that depends on ``heads``."""
-        if runtime.stack:
+        if (
+            runtime.stack
+        ):  # pragma: no branch - provisional results only exist inside a running query
             frame = runtime.stack[-1]
             if frame.cycle_heads is None:
                 frame.cycle_heads = set(heads)
@@ -2133,8 +2160,10 @@ class Evaluator:
         # above the head either, only the run that converges counts (D26).
         stack = runtime.stack
         pos = len(stack) - 1  # the head's frame is on top; compare by identity
-        while pos >= 0 and stack[pos] is not frame:
-            pos -= 1
+        while (
+            pos >= 0 and stack[pos] is not frame
+        ):  # pragma: no branch - the head's frame is on top
+            pos -= 1  # pragma: no cover
         self._retract_effects(runtime, stack[: max(pos, 0)], frame.effects)
         frame.effects.clear()
         frame.expires_at = None
@@ -2562,10 +2591,13 @@ class Evaluator:
                     seen = deps.get(dep_key)
                     if seen is None or dep.observed_changed_at > seen:
                         deps[dep_key] = dep.observed_changed_at
-                if entry.expires_at is not None and (
-                    expires_at is None or entry.expires_at < expires_at
+                if (
+                    entry.expires_at is not None
+                    and (  # pragma: no branch - _note_expiry already propagated it
+                        expires_at is None or entry.expires_at < expires_at
+                    )
                 ):
-                    expires_at = entry.expires_at
+                    expires_at = entry.expires_at  # pragma: no cover
             cycle_nodes = (key, *member_keys)
             if error is not None:
                 # A cached error is final but it is not the guess the
@@ -2610,7 +2642,9 @@ class Evaluator:
                 outer_heads = frozenset(heads)  # type: ignore[arg-type]
                 full_memo.cycle_heads = outer_heads
                 overlay = runtime.provisional
-                if overlay is None:
+                if (
+                    overlay is None
+                ):  # pragma: no cover - _handle_cycle already created the overlay
                     overlay = runtime.provisional = {}
                 overlay[key] = full_memo
                 for _, entry in members:
@@ -3158,7 +3192,9 @@ class Evaluator:
         )
         return entry.value_hash, entry.changed_at, entry.expires_at
 
-    def _note_write_failure(self, exc: BaseException, lost: int) -> None:
+    def _note_write_failure(
+        self, exc: BaseException, lost: int
+    ) -> None:  # pragma: no cover - unused helper
         if self._writer is not None:
             self._writer.note_failure(exc, lost)
 
@@ -3241,7 +3277,9 @@ class Evaluator:
                 self._raise_write_failure()
 
     def _persist_entry(self, key: QueryKey, memo: MemoEntry) -> None:
-        if self._disk_queue is None:
+        if (
+            self._disk_queue is None
+        ):  # pragma: no cover - only called when self._disk is not None
             return
 
         deps_records = self._dep_fingerprint_rows(key, memo)

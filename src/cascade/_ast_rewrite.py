@@ -152,8 +152,8 @@ class _Rewriter(ast.NodeTransformer):
             new_stmt = self.visit(stmt)
             out.extend(self._pending.pop())
             if isinstance(new_stmt, list):
-                out.extend(new_stmt)
-            elif new_stmt is not None:
+                out.extend(new_stmt)  # pragma: no cover - no visitor returns a list
+            elif new_stmt is not None:  # pragma: no branch - no visitor returns None
                 out.append(new_stmt)
         return out
 
@@ -170,7 +170,7 @@ class _Rewriter(ast.NodeTransformer):
                             items.append(item)
                         elif isinstance(item, ast.AST):
                             items.append(self.visit(item))
-                        else:
+                        else:  # pragma: no cover - these lists hold only nodes
                             items.append(item)
                     setattr(node, name, items)
             elif isinstance(old, ast.AST):
@@ -191,10 +191,10 @@ class _Rewriter(ast.NodeTransformer):
         return node
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> ast.AST:
-        return node
+        return node  # pragma: no cover - only in an async def, which is not entered
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> ast.AST:
-        return self._visit_compound(node)
+        return self._visit_compound(node)  # pragma: no cover - only in an async def
 
     def visit_Lambda(self, node: ast.Lambda) -> ast.AST:
         # A lambda body has no statement list to hold synthesized stage
@@ -206,7 +206,7 @@ class _Rewriter(ast.NodeTransformer):
         if not isinstance(
             node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
         ):
-            return self.generic_visit(node)
+            return self.generic_visit(node)  # pragma: no cover - always a comprehension
         self._comp_scopes.append(frozenset(_loop_names(node)))
         try:
             return self.generic_visit(node)
@@ -562,4 +562,4 @@ def _find_code(container: types.CodeType, name: str) -> types.CodeType:
     for const in container.co_consts:
         if isinstance(const, types.CodeType) and const.co_name == name:
             return const
-    raise LookupError(name)
+    raise LookupError(name)  # pragma: no cover - the code was just compiled

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -282,3 +283,188 @@ def test_handles_are_tracked_weakly() -> None:
     del handle
     gc.collect()
     assert len(engine._store._handles[slot]) == 0  # noqa: SLF001
+
+
+# --- the same code with other captured objects is another function ---
+
+
+@pytest.mark.parametrize("keyword_only", [False, True])
+def test_factory_functions_that_differ_in_a_default_are_different(
+    keyword_only: bool,
+) -> None:
+    engine = Engine()
+    runs: list[Any] = []
+
+    def make(step: Any) -> Any:
+        if keyword_only:
+
+            @engine.query
+            def bump(x: int, *, by: Any = step) -> Any:
+                runs.append(by)
+                return (x, by)
+        else:
+
+            @engine.query
+            def bump(x: int, by: Any = step) -> Any:
+                runs.append(by)
+                return (x, by)
+
+        return bump
+
+    one, two = object(), object()
+    first = make(one)
+    assert first(1) == (1, one)
+    # The same default object: the same function, and its result is kept.
+    again = make(one)
+    assert again(1) == (1, one)
+    assert first(1) == (1, one)
+    assert runs == [one]
+    # Another default object: another function under the same name.
+    second = make(two)
+    assert second(1) == (1, two)
+    with pytest.raises(StaleHandleError):
+        first(1)
+    assert runs == [one, two]
+
+
+def test_the_same_code_in_other_globals_is_a_different_function() -> None:
+    import types
+
+    engine = Engine()
+
+    def answer() -> int:
+        return OFFSET + 1  # noqa: F821 - a global of whichever module runs it
+
+    here = types.FunctionType(answer.__code__, {"OFFSET": 10}, "answer")
+    there = types.FunctionType(answer.__code__, {"OFFSET": 20}, "answer")
+    first = engine.query(here, name="identity.answer")
+    assert first() == 11
+    second = engine.query(there, name="identity.answer")
+    assert second() == 21
+    with pytest.raises(StaleHandleError):
+        first()
+
+
+def test_function_whose_captured_variable_is_assigned_after_it() -> None:
+    engine = Engine()
+
+    def make(value: int) -> Any:
+        @engine.query
+        def later_bound() -> int:
+            return later
+
+        later = value
+        return later_bound
+
+    first = make(5)
+    assert first() == 5
+    second = make(6)
+    assert second() == 6
+    with pytest.raises(StaleHandleError):
+        first()
+
+
+@pytest.mark.parametrize("keyword_only", [False, True])
+def test_function_that_loses_its_default_is_a_different_function(
+    keyword_only: bool,
+) -> None:
+    engine = Engine()
+    namespace: dict[str, Any] = {}
+    star = "*, " if keyword_only else ""
+    old = engine.query(
+        _define(f"def scale(x, {star}by=2):\n    return x * by\n", namespace, "scale")
+    )
+    assert old(3) == 6
+    # The same body and bytecode as before: only the default is gone.
+    new = engine.query(
+        _define(f"def scale(x, {star}by):\n    return x * by\n", namespace, "scale")
+    )
+    assert new.id == old.id
+    with pytest.raises(StaleHandleError):
+        old(3)
+    assert new(3, by=5) == 15
+    with pytest.raises(TypeError, match="by"):
+        new(3)
+
+
+def test_functions_that_capture_another_number_of_variables_differ() -> None:
+    from cascade._store import _same_captures
+
+    shared = object()
+
+    def one() -> Any:
+        def q() -> Any:
+            return shared
+
+        return q
+
+    def two() -> Any:
+        zextra = object()
+
+        def q() -> Any:
+            return shared, zextra
+
+        return q
+
+    small, large = one(), two()
+    # The variable both capture comes first in each closure, so only the
+    # count tells them apart.
+    assert small.__closure__[0] is large.__closure__[0]
+    assert not _same_captures(small, large)
+    assert not _same_captures(large, small)
+    assert _same_captures(small, one())
+
+
+def test_stale_input_handle_says_so_in_its_repr() -> None:
+    engine = Engine()
+
+    def make(default: int) -> Any:
+        @engine.input
+        def setting() -> int:
+            return default
+
+        return setting
+
+    first = make(1)
+    assert repr(first) == f"<InputHandle {first.id}>"
+    second = make(2)
+    assert repr(first) == f"<InputHandle {first.id} (stale)>"
+    assert repr(second) == f"<InputHandle {second.id}>"
+
+
+def test_registration_overtaken_by_another_thread_gets_a_stale_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One thread registers a function and, before its handle is tracked,
+    # another registers a different function under the same name. The first
+    # handle was never on the list of handles to mark, so tracking it has to
+    # notice that its function is no longer the registered one.
+    engine = Engine()
+    store = engine._store  # noqa: SLF001
+    track = store.track_handle
+    registered, overtaken = threading.Event(), threading.Event()
+    handles: dict[str, Any] = {}
+
+    def hold_the_worker(*args: Any) -> None:
+        if threading.current_thread() is worker:
+            registered.set()
+            assert overtaken.wait(20)
+        track(*args)
+
+    def register_first() -> None:
+        handles["first"] = engine.query(lambda: 1, name="identity.race")
+
+    monkeypatch.setattr(store, "track_handle", hold_the_worker)
+    worker = threading.Thread(target=register_first, daemon=True)
+    worker.start()
+    assert registered.wait(20)
+    second = engine.query(lambda: 2, name="identity.race")
+    overtaken.set()
+    worker.join(20)
+    assert not worker.is_alive()
+
+    with pytest.raises(StaleHandleError):
+        handles["first"]()
+    # The first function did not run into the second one's cache.
+    assert second() == 2
+    assert "stale" not in repr(second)

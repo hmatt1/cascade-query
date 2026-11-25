@@ -1305,3 +1305,62 @@ def test_record_without_an_error_flag_is_loaded_as_a_value(
     assert _call(flavor, doubled_b) == 4
     assert runs == {}
     engine_b.shutdown()
+
+
+# --- the newest revision of a collection on disk ---
+
+
+def test_collection_head_is_the_newest_revision_on_disk(tmp_path: Path) -> None:
+    """What an engine compares its own copy with before it changes a collection."""
+    disk = disk_cache_mod.DiskCache(tmp_path / "cache", map_size=1 << 24)
+    try:
+        # Never stored: nothing an engine's copy could be behind.
+        assert disk.collection_head("xs") == 0
+        # A log and no snapshot, as written by another engine's appends.
+        disk.collection_append_many("xs", [(1, {"diff": 1}), (2, {"diff": 2})])
+        assert disk.collection_head("xs") == 2
+        # Another collection's log does not count.
+        assert disk.collection_head("other") == 0
+        # Compaction folds the log into the snapshot; the revision stays.
+        disk.collection_snapshot("xs", {"base_rev": 2}, upto_rev=2)
+        assert disk.collection_load("xs") == ({"base_rev": 2}, [])
+        assert disk.collection_head("xs") == 2
+        disk.collection_append_many("xs", [(3, {"diff": 3})])
+        assert disk.collection_head("xs") == 3
+    finally:
+        disk.close()
+
+
+# --- a directory MDBX cannot open ---
+
+
+def test_directory_whose_data_file_is_not_mdbx_is_refused_and_left_alone(
+    tmp_path: Path, engine_backend: str
+) -> None:
+    if engine_backend != "mdbx":
+        pytest.skip("mdbx internal test")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    # Larger than the pages MDBX reads to find its header.
+    not_mdbx = b"not an mdbx data file\n" * 50_000
+    (cache / "mdbx.dat").write_bytes(not_mdbx)
+
+    with pytest.raises(PersistentCacheError) as info:
+        Engine(cache_dir=cache)
+    message = str(info.value)
+    assert "failed to open persistent cache" in message
+    assert repr(str(cache)) in message
+    assert (cache / "mdbx.dat").read_bytes() == not_mdbx
+
+    # The failed open holds on to nothing: once the file is out of the way
+    # the same directory opens as a new cache.
+    (cache / "mdbx.dat").unlink()
+    (cache / "mdbx.lck").unlink(missing_ok=True)
+    engine = Engine(cache_dir=cache)
+
+    @engine.query
+    def answer() -> int:
+        return 42
+
+    assert answer() == 42
+    engine.shutdown()

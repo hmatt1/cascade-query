@@ -6,18 +6,21 @@ the TLC output that had been committed. This file says what each one
 established, what is unconfirmed, and what to do next. It is a snapshot;
 `docs/guarantees.md` stays the reference for what the engine promises.
 
-**None of the three checks failed on a defect in the engine. Writing tests
-for what the mutation runs showed found two**, both fixed since: D33, a
-query that ran twice at one revision, and D34, a cancelled task that
-failed the run it waited for and that run's other waiters (see the two
-sections named "Defect found on the way"). Apart from that the work found
-where the tests are thin, and one test that leaked state between runs.
+**None of the three checks failed on a defect in the engine. Three were
+found on the way, all fixed since.** Writing tests for what the mutation
+runs showed found D33, a query that ran twice at one revision, and D34, a
+cancelled task that failed the run it waited for and that run's other
+waiters. The free-threaded job of the first CI run found D35: of several
+threads asking for a dropped fixed-point member, one got `CycleError`. See
+the sections named "Defect found on the way". Apart from that the work
+found where the tests are thin, and one test that leaked state between
+runs.
 
 | Item | State |
 |---|---|
 | TLC output under `docs/formal/` | Deleted (255 files) and ignored. Done. |
 | State machine | Rewritten with the new rules, on three backends. Done. |
-| TLA+ model | Rewritten; both configurations pass. The on-demand workflow has never run on GitHub. |
+| TLA+ model | Rewritten; both configurations pass, and the CI job passed on GitHub on 2026-11-24. The on-demand workflow has not been started yet. |
 | Mutation testing | Tooling, a first baseline and a repeat over two modules exist; the runner is in the repository. Outside those two modules most kills come from one pass. Two defects were found while writing tests for its findings, D33 and D34; both are fixed. |
 
 ## State machine
@@ -51,10 +54,9 @@ and invariants to guarantees.
   this one on every push.
 - Thirteen bugs seeded into the model each violate an invariant.
 - Checked only with the `tla2tools.jar` committed at the root of the
-  repository. `.github/workflows/model-check.yml` and the changed
-  `tla_check` job in `workflow.yml` have not run on GitHub yet. The publish
-  job depends on `tla_check`, so the first push shows whether it passes
-  there.
+  repository, and by the changed `tla_check` job in `workflow.yml`, which
+  passed on GitHub on 2026-11-24 (the push of `a48c35d`).
+  `.github/workflows/model-check.yml` has not been started yet.
 
 ## Mutation testing
 
@@ -515,24 +517,143 @@ committed source, so it did not come from that fix.
   of those two tests or the three-task test above, which also checks that
   nothing is left for asyncio to report.
 
+### Defect found on the way: D35 (fixed)
+
+Found by CI. The push of `a48c35d` on 2026-11-24 was the first run of the
+suite on GitHub since this work began. Its free-threaded job (Python 3.14t)
+failed
+`test_fixed_point_dropped_members.py::test_threads_reading_a_dependent_of_a_dropped_member`:
+one of six threads got `CycleError` where 50 was due.
+
+- **Not from the two fixes above.** On a free-threaded 3.14.4 the test
+  failed in 36 of 400 runs on the source before them and in 40 of 400
+  after; on 3.12, in 0 of 400. The same job had passed it on the push
+  before, by chance.
+- **What.** The member of a fixed-point cycle has lost its result
+  (eviction, `prune`, `sweep_unaccessed`) and an input has changed.
+  Several threads ask for the member, or for a query that depends on it.
+  One of them gets `CycleError` for a cycle that converges. G13 says
+  dropping a result never changes what a later call returns.
+- **Why.** A member's run that reaches itself through its head starts over
+  by bringing the head up to date first (D25). The head's run asks for the
+  member. If a second caller has taken over the member by then, the head
+  waits for that run, which fails as the first caller's own did: it
+  reaches itself. The head was run the way a verification runs a
+  dependency, and a verification gives up on a joined run that ended in
+  `CycleError`, because the query being verified then runs for real. Here
+  nothing runs for real afterwards. The head stayed as it was, and the
+  member ran once more, reached itself again and raised.
+- **How often.** About one run in ten with six threads on the free-threaded
+  build; not once in 400 runs under the interpreter lock. With three holds
+  in the query bodies: every time on 3.12, with threads and with tasks.
+- **The fix.** `_enter_cycle_through_head` brings the head up to date with
+  `as_verification=False`. A joined run that ended in `CycleError` is
+  retried there, so the head runs the member on its own stack, where the
+  cycle converges.
+- **Tests.** `tests/test_known_defects.py::test_d35_two_threads_asking_for_a_dropped_cycle_member_both_get_its_value`
+  and `::test_d35_two_tasks_asking_for_a_dropped_cycle_member_both_get_its_value`.
+  The fix passes through three places for threads and three for tasks; it
+  was undone at each on a copy, and each time the matching test fails.
+- **After the fix.** The test that failed in CI passed 1,500 of 1,500 runs
+  on the free-threaded build, and the whole suite passes there (1,967
+  passed, 10 skipped).
+- **A slip on the way, and what it showed.** The first version of the fix
+  named its new parameter `verifying`, and a local variable of that name
+  overwrote it: no verification gave up on a joined `CycleError` any more.
+  Every test passed. It was noticed because undoing the fix by hand did
+  not make the new test fail. So nothing in the suite pins that a
+  verification does not retry. Tried directly: with `_retry_after` always
+  true, the cycle, fixed-point, defect, concurrency and engine test files
+  pass. That is a gap, and no test shows what goes wrong without the rule.
+
+### The first push: what CI showed
+
+The run for `a48c35d` on 2026-11-24.
+
+- **`tla_check` passed.**
+- **Both test jobs fail the coverage gate**: 94.24% on 3.12 and 94.23% on
+  3.14t against the required 95%. The push before (`59c3299`) had failed it
+  too, at 94.13%, so nothing has been published since `v0.3.28`. `numpy` is
+  not in the `dev` extra, so the four numpy tests are skipped in CI and
+  about 30 statements of `_canonical.py` and 8 of `_serde.py` are never
+  run. With numpy installed the same command gives 95.01% on Windows.
+- **The 3.14t job also failed the test behind D35**, above. The 3.12 job
+  passed all 1,965 tests it ran.
+- **Races show on the free-threaded build, slowly.** D35 failed one run in
+  ten there, so one run per push finds such a defect one push in ten. A
+  free-threaded interpreter is installed on the machine this was written
+  on; running the thread tests a few hundred times there takes minutes.
+
+### The coverage gate
+
+CI requires 95% of statements and branches together, and 90% of branches.
+Measured on Windows with CI's command (the performance tests left out), in
+statements and branch exits never run, of 8,469:
+
+| | Never run | Total | Branches |
+|---|---:|---:|---:|
+| Without the numpy tests, as CI ran | 479 | 94.34% | 91.03% |
+| With the numpy tests | 420 | 95.04% | 91.96% |
+| With the tests below as well | 344 | 95.94% | 93.46% |
+
+The gate allows 423. CI's own figure, 94.24%, is 488 never run: 9 more than
+the first row, which is code for the other platform (file locking in
+`_disk_cache.py` has a branch for each). So the estimate for CI is about
+353 never run, 95.8%. It has not run on GitHub yet.
+
+- **`numpy` is in the `dev` extra now**, so CI runs the four numpy tests.
+  numpy 2.5.5 has wheels for both interpreters CI uses (3.12 and the
+  free-threaded 3.14). It stays out of the package's own dependencies. The
+  numpy tests have not run on a free-threaded build here: numpy is not
+  installed for the one on this machine.
+- **Twenty-three tests for behaviour nothing ran**, in the files that cover
+  each area:
+  - `test_argument_keys.py`: a default that cannot be part of a key, passed
+    explicitly by position, keyword or keyword-only, is the call without
+    it; a missing keyword-only argument is refused before the body; such a
+    default before `*rest`; positional-only parameters with such defaults;
+    a callable whose signature cannot be inspected takes positional
+    arguments only.
+  - `test_unencodable_values.py`: the path to the part that cannot be
+    encoded, inside a deque, a set and a frozenset (on both backends).
+  - `test_subgraph_stats_export.py`: `condense=True` in `inspect_graph`,
+    `subgraph`, `export_dot` and `export_mermaid`; single calls and names
+    without arguments are left alone; edges with one end are skipped; a
+    dependency shared by two queries is followed once, in both directions.
+  - `test_query_methods.py`: handles read from an instance compare and hash
+    by instance and method.
+  - `test_query_identity.py`: the same code with another default object, in
+    other globals, or with a captured variable assigned after the function,
+    is a different function under the same name.
+  - `test_history_retention.py`: a snapshot's revision cannot be changed,
+    and snapshots are equal when their revisions are.
+- **They assert behaviour.** Seventeen of the lines they newly reach were
+  broken one at a time on a copy; a test fails for each.
+- **Still never run**, among others: the other platform's file locking, the
+  fallback in the handles for an interpreter without
+  `asyncio._get_running_loop`, and error paths of the disk cache.
+
 ## Next steps
 
 In order of value for the time they take.
 
-1. **Start `.github/workflows/mutation.yml` once**, and
+1. **Push, and read the coverage CI reports.** The estimate above is
+   95.8% against the 95% it requires. A run in which every job passes
+   publishes a release.
+2. **Start `.github/workflows/mutation.yml` once**, and
    `model-check.yml` once, to learn whether they work. One shard is enough
-   for the first try.
-2. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
-   from before the two fixes and the tests of the last three sections,
-   which were checked against changes made by hand only.
-3. **Look at the survivors in the async paths that change a condition or
+   for the first try. Both are on `main` now.
+3. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
+   from before the three fixes and the tests of the sections above, which
+   were checked against changes made by hand only.
+4. **Look at the survivors in the async paths that change a condition or
    an operator.** `compute_or_get_memo_async` still has 78 survivors
    against 42 in the sync function, and awaiting on a running loop is
    what made the difference in `try_mark_green_async`.
-4. **Decide whether mutation runs fix the Hypothesis seed.** With random
+5. **Decide whether mutation runs fix the Hypothesis seed.** With random
    examples a few verdicts change from run to run; a fixed seed makes the
    rate comparable over time, at the price of always trying the same
    examples. It does nothing for the verdicts that depend on threads.
-5. Leave the rest. Driving the overall rate down is not worth it: about a
+6. Leave the rest. Driving the overall rate down is not worth it: about a
    fifth of the survivors are strings, and many of the `None` arguments are
    tracing.

@@ -84,6 +84,17 @@ def _bodies(xs: Any, ys: Any, d: Any, s: Any) -> dict[str, Callable[[], Any]]:
     def nested_pipeline_over_a_set():
         return [len([v for v in s if v > x]) for x in xs for _ in (0,)]
 
+    # Pipelines in a comprehension that stays as written, whose helpers need
+    # none of its loop variables: these are rewritten.
+    def nested_map_call_in_a_two_for_comprehension():
+        return [sum(map(abs, ys)) + x for x in xs for _ in (0,)]
+
+    def nested_pipeline_that_ignores_the_loop_variables():
+        return [sum(y * 2 for y in ys) + x for x in xs for _ in (0,)]
+
+    def nested_pipeline_with_a_loop_variable_of_the_same_name():
+        return [sum(x * 2 for x in ys) + x for x in xs for _ in (0,)]
+
     return {
         fn.__name__: fn
         for fn in [
@@ -102,6 +113,9 @@ def _bodies(xs: Any, ys: Any, d: Any, s: Any) -> dict[str, Callable[[], Any]]:
             nested_pipeline_in_a_kept_generator,
             nested_pipeline_in_a_rewritten_comprehension,
             nested_pipeline_over_a_set,
+            nested_map_call_in_a_two_for_comprehension,
+            nested_pipeline_that_ignores_the_loop_variables,
+            nested_pipeline_with_a_loop_variable_of_the_same_name,
         ]
     }
 
@@ -150,3 +164,29 @@ def test_body_with_walrus_and_plain_comprehension_is_still_rewritten() -> None:
     )
     assert getattr(q.raw, "__cascade_rewritten__", False)
     assert q() == (2, [1, 2], [2, 4])
+
+
+@pytest.mark.parametrize(
+    "body_name",
+    [
+        "nested_map_call_in_a_two_for_comprehension",
+        "nested_pipeline_that_ignores_the_loop_variables",
+        "nested_pipeline_with_a_loop_variable_of_the_same_name",
+    ],
+)
+def test_nested_pipeline_that_needs_no_loop_variable_is_still_rewritten(
+    body_name: str,
+) -> None:
+    # Only a helper that would read the comprehension's loop variables keeps
+    # a nested pipeline from being rewritten (D32). These read none.
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2, 3])
+    ys = CascadeList(engine, [10, -20])
+    body = _bodies(xs, ys, None, None)[body_name]
+    q = engine.query(body, name=f"rw:{body_name}")
+    plain = engine.query(body, name=f"plain:{body_name}", incremental=False)
+    assert getattr(q.raw, "__cascade_rewritten__", False)
+    assert q() == plain()
+    assert [p["reducer"] for p in engine.inspect_pipelines()] == ["sum"]
+    ys.append(5)
+    assert q() == plain()

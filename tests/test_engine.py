@@ -771,3 +771,26 @@ def test_engine_transaction() -> None:
         with pytest.raises(RuntimeError, match="Nested transactions"):
             with engine.transaction():
                 pass
+
+
+def test_input_arguments_that_are_equal_but_of_other_types_are_other_inputs() -> None:
+    engine = Engine()
+
+    @engine.input
+    def label(key: object) -> str:
+        return "default"
+
+    @engine.query
+    def describe(key: object) -> str:
+        return f"{key!r}: {label(key)}"
+
+    # 1, 1.0 and True are equal and hash alike; each is still its own input.
+    label.set(1, "int")
+    label.set(1.0, "float")
+    assert (label(1), label(1.0), label(True)) == ("int", "float", "default")
+    assert describe(1.0) == "1.0: float"
+    label.set(True, "bool")
+    assert (label(1), label(1.0), label(True)) == ("int", "float", "bool")
+    # A tuple is told apart from an equal tuple with other item types.
+    label.set((1, 2), "ints")
+    assert (label((1, 2)), label((1.0, 2.0))) == ("ints", "default")

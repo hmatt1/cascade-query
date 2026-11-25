@@ -432,3 +432,125 @@ def test_compaction_due_inside_a_mutation_does_not_block_a_pipeline_reading() ->
     assert outcomes == {"reader": [3, 4], "writer": "done"}
     everything = [1, 2, *range(CHURN)]
     assert shifted() == [x + len(everything) for x in everything]
+
+
+# --- a compaction that passes a pipeline while it runs ---
+#
+# A pipeline that lags far behind is not waited for: compaction folds the
+# diffs it has not read, and the pipeline starts again from the contents. A
+# pipeline checks for that before it reads the log, but the compaction asked
+# for the pipelines' checkpoints before this one took the runtime's lock, and
+# can fold the diffs between the pipeline's check and its read.
+
+
+class _Seen:
+    """A stage function that records what it was called with."""
+
+    def __init__(self) -> None:
+        self.values: list[int] = []
+
+    def __call__(self, value: int) -> int:
+        self.values.append(value)
+        return value
+
+
+def test_compaction_between_a_pipelines_check_and_its_read_makes_it_start_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2])
+    seen = _Seen()
+
+    @engine.query
+    def total() -> int:
+        return sum(seen(x) for x in xs)
+
+    assert total() == 3
+    seen.values.clear()
+    log = _log(xs)
+    checkpoint = log.head  # how far the pipeline has read
+
+    writer_about_to_fold = threading.Event()
+    reader_checked = threading.Event()
+    folded = threading.Event()
+    base_when_checked: list[int] = []
+    reader_thread: list[int] = []
+
+    # Hold point in the writer: the first compaction that folds diffs the
+    # pipeline has not read waits until the pipeline has made its check.
+    fold = log.compact_to
+
+    def held_compact_to(target: int) -> bool:
+        if target <= checkpoint or writer_about_to_fold.is_set():
+            return fold(target)
+        writer_about_to_fold.set()
+        assert reader_checked.wait(TIMEOUT)
+        try:
+            return fold(target)
+        finally:
+            folded.set()
+
+    monkeypatch.setattr(log, "compact_to", held_compact_to)
+
+    # Hold point in the reader: the pipeline counts the query's reads right
+    # after its check, with nothing else in between. It goes on to read the
+    # log only when the writer has folded.
+    evaluator = engine._evaluator  # noqa: SLF001
+    read_count = evaluator.current_frame_read_count
+
+    def held_read_count() -> int:
+        if threading.get_ident() in reader_thread and not reader_checked.is_set():
+            base_when_checked.append(log.base_rev)
+            reader_checked.set()
+            assert folded.wait(TIMEOUT)
+        return read_count()
+
+    monkeypatch.setattr(evaluator, "current_frame_read_count", held_read_count)
+
+    outcomes: dict[str, Any] = {}
+
+    def writer() -> None:
+        try:
+            # Changes that leave the list short, so that the pipeline is
+            # soon further behind than the list is long. Far more of them
+            # than it takes; the loop ends at the hold point.
+            for value in range(10, 10 + 10 * CHURN):
+                if writer_about_to_fold.is_set():
+                    break
+                xs[0] = value
+            outcomes["writer"] = "done"
+        except BaseException as exc:  # noqa: BLE001
+            outcomes["writer"] = exc
+
+    def reader() -> None:
+        try:
+            assert writer_about_to_fold.wait(TIMEOUT)
+            reader_thread.append(threading.get_ident())
+            outcomes["reader"] = total()
+        except BaseException as exc:  # noqa: BLE001
+            outcomes["reader"] = exc
+
+    threads = [
+        threading.Thread(target=writer, daemon=True),
+        threading.Thread(target=reader, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + TIMEOUT
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    assert not any(t.is_alive() for t in threads), "reader or writer hung"
+
+    # The scenario is the one described: when the pipeline checked, the log
+    # still held everything after its checkpoint; when it read, it did not.
+    assert base_when_checked == [checkpoint]
+    assert log.base_rev > checkpoint
+    final = list(xs)
+    assert outcomes == {"writer": "done", "reader": sum(final)}
+    # It started again from the contents: every element, not the changes.
+    assert seen.values == final
+    # And what it left behind is a whole state: one change, one call.
+    seen.values.clear()
+    xs.append(5)
+    assert total() == sum(final) + 5
+    assert seen.values == [5]

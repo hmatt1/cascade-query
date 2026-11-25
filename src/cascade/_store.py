@@ -511,7 +511,7 @@ class GraphStore:
             self._drain_unpins_locked()
         if snapshot is None:
             rev = self.revision
-        else:
+        else:  # pragma: no cover - no caller passes one; pin_snapshot inlines this
             rev = snapshot.revision
             if rev < self.history_floor:
                 self._raise_expired(rev)
@@ -549,7 +549,7 @@ class GraphStore:
                 count = pins.get(rev, 0)
                 if count > 1:
                     pins[rev] = count - 1
-                elif count:
+                elif count:  # pragma: no branch - unbalanced unpin
                     del pins[rev]
                     if self._multi_version_keys:
                         self._after_last_unpin_locked(rev)
@@ -584,7 +584,9 @@ class GraphStore:
         pins = self._pins
         if pins and rev > min(pins):
             return
-        if self._trim_debt >= max(1, len(self._multi_version_keys) // 2):
+        if self._trim_debt >= max(  # pragma: no branch - at least one per such key
+            1, len(self._multi_version_keys) // 2
+        ):
             self._sweep_locked()
 
     def history_floor_locked(self) -> int:
@@ -594,13 +596,13 @@ class GraphStore:
 
     def _sweep_locked(self) -> None:
         floor = self.history_floor_locked()
-        if floor > self.history_floor:
+        if floor > self.history_floor:  # pragma: no branch - only run after it rose
             self.history_floor = floor
         inputs = self.inputs
         remaining = 0
         for key in list(self._multi_version_keys):
             versions = inputs.get(key)
-            if versions is None:
+            if versions is None:  # pragma: no cover - dropped inputs leave the set too
                 self._multi_version_keys.discard(key)
                 continue
             cut = bisect.bisect_right(versions, floor, key=_version_revision) - 1
@@ -1077,7 +1079,7 @@ class GraphStore:
             self._multi_version_keys.discard(key)
             return
         cut = bisect.bisect_right(versions, floor, key=_version_revision) - 1
-        if cut > 0:
+        if cut > 0:  # pragma: no cover - a sweep ran when the floor last rose
             if floor > self.history_floor:
                 self.history_floor = floor
             kept = versions[cut:]

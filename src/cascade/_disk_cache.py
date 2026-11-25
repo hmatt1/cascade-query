@@ -42,7 +42,7 @@ MDBX_INSTALL_HINT = (
 )
 
 _FREE_THREADED = False
-if hasattr(sys, "_is_gil_enabled"):
+if hasattr(sys, "_is_gil_enabled"):  # pragma: no cover - Python 3.13+, absent on 3.12
     _FREE_THREADED = not sys._is_gil_enabled()
 
 _FT_LOCK = threading.RLock()
@@ -177,7 +177,7 @@ class _FileLock:
         self._fd = fd
         return True
 
-    if sys.platform == "win32":
+    if sys.platform == "win32":  # pragma: no cover - Windows only
 
         @staticmethod
         def _lock(fd: int) -> None:
@@ -193,7 +193,7 @@ class _FileLock:
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
-    else:
+    else:  # pragma: no cover - POSIX only
 
         @staticmethod
         def _lock(fd: int) -> None:
@@ -324,7 +324,7 @@ def _acquire_env(path: str, map_size: int) -> tuple[str, Any]:
 def _release_env(registry_key: str) -> None:
     with _ENV_LOCK:
         shared = _ENV_REGISTRY.get(registry_key)
-        if shared is None:
+        if shared is None:  # pragma: no cover - a cache releases its environment once
             return
         shared.refs -= 1
         if shared.refs <= 0:
@@ -563,7 +563,9 @@ class MdbxDiskCache:
                 self._collections.put(txn, self._snap_key(name), blob)
                 drop: list[bytes] = []
                 with mdbx.Cursor(self._collections, txn) as curs:
-                    for key, _ in curs.iter(start_key=prefix):
+                    for key, _ in curs.iter(
+                        start_key=prefix
+                    ):  # pragma: no branch - ends on a break, at the latest at the snapshot key put above
                         kb = bytes(key)
                         if not kb.startswith(prefix):
                             break

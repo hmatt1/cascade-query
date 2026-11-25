@@ -19,6 +19,7 @@ dev = [
     "libmdbx",
     "msgpack",
     "mutmut",
+    "numpy",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",

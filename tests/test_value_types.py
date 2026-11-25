@@ -10,8 +10,10 @@ from __future__ import annotations
 import collections
 import datetime
 import decimal
+import enum
 import fractions
 import pathlib
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ import pytest
 
 from cascade import Engine, UnencodableValueError, register_type
 from cascade import _canonical as canonical
+from cascade import _types
 from cascade._serde import stable_value_digest
 
 from .value_helpers import Box, Color, Level, Mode, Pair, Perm, Point, same_value
@@ -442,3 +445,169 @@ def test_named_collection_restores_every_value_type(
         assert same_value(restored, {name: VALUES[name] for name in sorted(HASHABLE)})
     finally:
         engine.shutdown()
+
+
+# --- the name a registered type is stored under ---------------------------------
+
+
+class Kelvin:
+    def __init__(self, degrees: float) -> None:
+        self.degrees = degrees
+
+
+def _kelvin_degrees(k: Kelvin) -> float:
+    return k.degrees
+
+
+def test_type_registered_without_a_name_is_stored_as_module_and_qualname() -> None:
+    register_type(Kelvin, encode=_kelvin_degrees, decode=Kelvin)
+    name = f"{Kelvin.__module__}:Kelvin"
+    found = _types.registration_named(name)
+    assert found is not None and found.cls is Kelvin
+    assert _types.registration_for(Kelvin) is found
+    # That name is what a stored value carries, and what finds the decoder.
+    blob = canonical.encode(Kelvin(4.5))
+    assert name.encode() in blob
+    decoded = canonical.decode(blob)
+    assert type(decoded) is Kelvin and decoded.degrees == 4.5
+    assert _types.registration_named(f"{Kelvin.__module__}:NoSuchType") is None
+
+
+def test_register_type_refuses_a_name_that_cannot_identify_the_type() -> None:
+    class Unnamed:
+        pass
+
+    for bad in ("", 7):
+        with pytest.raises(TypeError, match="non-empty string"):
+            register_type(Unnamed, encode=str, decode=str, name=bad)  # type: ignore[arg-type]
+    # The refused calls registered nothing.
+    with pytest.raises(TypeError, match="register_type"):
+        canonical.encode(Unnamed())
+
+
+# --- an Enum whose class changed since it was stored -----------------------------
+
+
+class Shade(enum.Enum):
+    LIGHT = "light"
+    DARK = "dark"
+
+
+class Tint(enum.Flag):
+    WARM = 1
+    COOL = 2
+
+
+class _ShadeTable(dict):
+    """``Shade`` after an edit: not an Enum, but ``Shade["DARK"]`` still works."""
+
+    DARK = "dark"
+
+
+def test_enum_record_is_not_decoded_into_a_class_that_is_not_an_enum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    by_name = canonical.encode(Shade.DARK)
+    by_value = canonical.encode(Tint.WARM | Tint.COOL)
+    assert canonical.decode(by_name) is Shade.DARK
+    assert canonical.decode(by_value) == Tint.WARM | Tint.COOL
+    # Both stand-ins accept what is done with an Enum to look a member up:
+    # ``_ShadeTable["DARK"]`` is a generic alias and ``int(3)`` is 3. Neither
+    # is what was stored.
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "Shade", _ShadeTable)
+    monkeypatch.setattr(module, "Tint", int)
+    for blob in (by_name, by_value):
+        with pytest.raises(TypeError, match="is not an Enum"):
+            canonical.decode(blob)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_stored_enum_result_is_recomputed_once_its_class_is_not_an_enum(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = {"n": 0}
+
+    def session() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.query(name="value_types.pick")
+        def pick() -> Any:
+            runs["n"] += 1
+            return Shade.DARK
+
+        return engine, pick
+
+    engine, pick = session()
+    assert pick() is Shade.DARK
+    engine.shutdown()
+
+    monkeypatch.setattr(sys.modules[__name__], "Shade", _ShadeTable)
+    engine, pick = session()
+    try:
+        # The stored record names an Enum member; it is passed over, and the
+        # query runs with the class as it is now.
+        assert pick() == "dark"
+        assert runs["n"] == 2
+    finally:
+        engine.shutdown()
+
+
+# --- numpy values without a plain layout -------------------------------------------
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_numpy_array_of_a_zero_size_dtype_keeps_its_shape(
+    tmp_path: Path, backend: str
+) -> None:
+    np = pytest.importorskip("numpy")
+    # Such an array has a shape and no bytes; numpy cannot build one from a
+    # buffer, so the decoder has to make it from the shape alone.
+    for shape in ((3,), (2, 0, 3), ()):
+        value = np.zeros(shape, dtype="V0")
+        assert value.dtype.itemsize == 0
+        assert same_value(canonical.decode(canonical.encode(value)), value)
+    runs = {"n": 0}
+
+    def session() -> tuple[Engine, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.query(name="np.empty_items")
+        def make() -> Any:
+            runs["n"] += 1
+            return np.zeros((2, 3), dtype="V0")
+
+        return engine, make
+
+    engine, make = session()
+    make()
+    engine.shutdown()
+    engine, make = session()
+    try:
+        assert same_value(make(), np.zeros((2, 3), dtype="V0"))
+        assert runs["n"] == 1
+    finally:
+        engine.shutdown()
+
+
+def test_numpy_records_and_structured_arrays_are_not_encodable() -> None:
+    np = pytest.importorskip("numpy")
+    # The bytes of these are not their value: fields have names, and an
+    # object array holds pointers. Both codecs refuse the array and a
+    # single record taken from it.
+    table = np.zeros(2, dtype=[("a", "i4"), ("b", "f8")])
+    for value in (table, table[0], np.array([object()], dtype=object)):
+        with pytest.raises(TypeError, match="register_type"):
+            canonical.encode(value)
+        with pytest.raises(TypeError, match="register_type"):
+            stable_value_digest(value)
+
+    engine = Engine()
+
+    @engine.input
+    def setting() -> Any:
+        return 0
+
+    with pytest.raises(UnencodableValueError, match="value is a numpy.void,"):
+        setting.set(table[0])
+    assert setting() == 0

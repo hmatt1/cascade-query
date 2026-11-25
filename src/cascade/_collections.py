@@ -325,7 +325,7 @@ def _uid_index(pairs: list[tuple[Any, Any]], uid: Any) -> int:
     for i, (u, _) in enumerate(pairs):
         if u == uid:
             return i
-    raise KeyError(uid)
+    raise KeyError(uid)  # pragma: no cover - the log only names uids it holds
 
 
 class _CollectionCore:
@@ -410,7 +410,7 @@ class _CollectionCore:
                     )
                     self.next_uid = snapshot["next_uid"]
                     self._compacted_base = snapshot["base_rev"]
-                else:
+                else:  # pragma: no cover - a stored log always has its snapshot
                     self.log = DiffLog(kind)
                 for _rev, diff in tail:
                     self.log.entries.append(diff)
@@ -600,7 +600,7 @@ class _CollectionCore:
         if len(self.log.entries) >= self._next_memory_check:
             if getattr(self.mutating, "depth", 0):
                 self.compact_due = True
-            else:
+            else:  # pragma: no cover - emit is only called by a mutator
                 self.compact_memory()
 
     def _claim_writer(self) -> None:
@@ -679,7 +679,7 @@ class _CollectionCore:
                         f"collection {self.name!r} cannot be rolled back: its "
                         f"log was compacted past the transaction's start"
                     )
-                if log.head > head:
+                if log.head > head:  # pragma: no branch - emit always logged a diff
                     del log.entries[head - log.base_rev :]
                 # The same head number can now come to mean other contents.
                 self._snapshot_cache = None
@@ -690,7 +690,7 @@ class _CollectionCore:
     def _live_len(self) -> int:
         # The owner's own __len__ records a dependency inside a query.
         if self.owner is None:
-            return 0
+            return 0  # pragma: no cover - the owner is set before any change
         return _BASE_LEN[self.kind](self.owner)
 
     def compact_memory(self) -> None:
@@ -736,7 +736,7 @@ class _CollectionCore:
 
     def _rollback(self) -> None:
         """Reset the owner's python-level storage to the committed log state."""
-        if self.owner is not None:
+        if self.owner is not None:  # pragma: no branch - set before any change
             self.owner._reset_to(self.log.contents_at(self.log.head))
             self.tracked_len = self.base_len(self.owner)
 

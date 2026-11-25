@@ -323,3 +323,70 @@ def test_pipeline_over_restored_collection_is_incremental(cache_dir, tmp_path):
     assert q2() == 16
     assert seen2.count(10) == 1
     e2.shutdown()
+
+
+# --- a cache that is full (mdbx: cache_map_size) ------------------------------
+
+_SMALL_MAP = 1 << 22
+_CHUNK = 256 * 1024
+_FULL = "is full; pass a larger cache_map_size"
+
+
+def _chunk(i: int) -> bytes:
+    return bytes([i]) * _CHUNK
+
+
+def test_append_that_does_not_fit_the_cache_is_refused_and_changes_nothing(
+    cache_dir,
+):
+    e = Engine(cache_dir=cache_dir, cache_backend="mdbx", cache_map_size=_SMALL_MAP)
+    xs = CascadeList(e, name="xs", compact_every=10_000)
+
+    @e.query
+    def count() -> int:
+        return len(xs)
+
+    accepted = 0
+    with pytest.raises(PersistentCacheError, match=_FULL):
+        for i in range(64):  # 16 MiB for a map of 4
+            xs.append(_chunk(i))
+            accepted += 1
+    assert accepted >= 2
+    # The refused chunk is nowhere: not in the list, not in what a query sees.
+    assert list(xs) == [_chunk(i) for i in range(accepted)]
+    assert count() == accepted
+    e.shutdown()
+
+    # Nor on disk. With the larger map the message asks for, the directory
+    # restores what was accepted and takes the chunk that was refused.
+    e2 = Engine(cache_dir=cache_dir, cache_backend="mdbx", cache_map_size=1 << 26)
+    ys = CascadeList(e2, name="xs")
+    assert list(ys) == [_chunk(i) for i in range(accepted)]
+    ys.append(_chunk(accepted))
+    e2.shutdown()
+
+    e3 = Engine(cache_dir=cache_dir, cache_backend="mdbx", cache_map_size=1 << 26)
+    assert list(CascadeList(e3, name="xs")) == [_chunk(i) for i in range(accepted + 1)]
+    e3.shutdown()
+
+
+def test_compaction_that_does_not_fit_the_cache_is_refused_and_keeps_the_log(
+    cache_dir,
+):
+    e = Engine(cache_dir=cache_dir, cache_backend="mdbx", cache_map_size=_SMALL_MAP)
+    xs = CascadeList(e, name="xs", compact_every=10_000)
+    chunks = [_chunk(i) for i in range(10)]  # 2.5 MiB: fits as a log
+    for chunk in chunks:
+        xs.append(chunk)
+    # The snapshot is a second copy of the contents, written before the log
+    # entries it replaces are dropped. There is no room for 2.5 MiB more.
+    with pytest.raises(PersistentCacheError, match=_FULL):
+        xs.compact()
+    assert list(xs) == chunks
+    # The log is as it was: it takes another change, and a restart replays it.
+    xs.append(b"tail")
+    e.shutdown()
+
+    e2 = Engine(cache_dir=cache_dir, cache_backend="mdbx", cache_map_size=_SMALL_MAP)
+    assert list(CascadeList(e2, name="xs")) == chunks + [b"tail"]
+    e2.shutdown()

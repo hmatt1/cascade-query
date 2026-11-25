@@ -128,7 +128,7 @@ class EngineTransaction:
         # its collections stay reserved until their new heads are published.
         self._open = False
         self._task = None
-        if self._token is not None:
+        if self._token is not None:  # pragma: no branch - __enter__ set it
             _active_transaction.reset(self._token)
         try:
             if exc_type is not None:
@@ -995,7 +995,7 @@ class Engine:
                 if (query.id, args) in seen:
                     continue
                 seen.add((query.id, args))
-            except TypeError:
+            except TypeError:  # pragma: no cover - _keyed_calls hashed every argument
                 continue  # unhashable arguments: the caller's call reports it
             if not self._store.lookup_query_memoize(query.id):
                 continue

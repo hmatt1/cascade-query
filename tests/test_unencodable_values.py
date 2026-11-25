@@ -12,13 +12,19 @@ guesses must be encodable on every engine.
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
+import decimal
+import enum
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 
-from cascade import Engine, UnencodableValueError
+from cascade import Engine, UnencodableValueError, register_type
+from cascade._serde import _children
+
+from .value_helpers import Point
 
 BACKENDS = ("mdbx", "sqlite")
 
@@ -66,6 +72,9 @@ def disk_engine(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
         (Pair(1, {"k": Plain()}), "result.right['k'] "),
         ({Plain(): 1}, "result key "),
         (ValueError(Plain()), "result.args[0] "),
+        (collections.deque([1, Plain()]), "result[1] "),
+        (frozenset({Plain()}), "result element "),
+        ({1, Plain()}, "result element "),
     ],
 )
 def test_unencodable_result_names_the_query_path_and_type(
@@ -275,3 +284,166 @@ def test_a_caught_unencodable_guess_leaves_the_caller_consistent() -> None:
     # The second call must be refused the same way, not see the first run
     # still on the stack and get its guess back.
     assert outer() == ["refused", "refused"]
+
+
+# --- which part of a value an error names ------------------------------------
+
+
+class Ring(collections.deque):
+    """The codecs take exactly ``deque``, not a subclass of it."""
+
+
+class Sensor(enum.Enum):
+    """Takes any reading: one it has no member for becomes an unnamed member.
+
+    An unnamed member has no name to store, so the codecs store its value.
+    """
+
+    OFF = 0
+
+    @classmethod
+    def _missing_(cls, value: object) -> Sensor:
+        member = object.__new__(cls)
+        member._name_ = None
+        member._value_ = value
+        return member
+
+
+class Moody:
+    """Registered with an encode function that fails ``refusals`` times."""
+
+    def __init__(self, refusals: int) -> None:
+        self.refusals = refusals
+
+
+def _encode_moody(obj: Moody) -> str:
+    if obj.refusals:
+        obj.refusals -= 1
+        raise RuntimeError("not now")
+    return "moody"
+
+
+def _decode_moody(_: str) -> Moody:
+    return Moody(0)
+
+
+register_type(
+    Moody,
+    encode=_encode_moody,
+    decode=_decode_moody,
+    name="tests.test_unencodable_values:Moody",
+)
+
+
+def test_refused_container_whose_items_are_fine_is_named_itself(
+    disk_engine: Engine,
+) -> None:
+    engine = disk_engine
+
+    @engine.query
+    def make() -> Any:
+        return {"ring": Ring([1, 2])}
+
+    with pytest.raises(UnencodableValueError) as info:
+        make()
+    # Not an item: every item can be encoded. The container is what to fix.
+    assert f"result['ring'] is a {Ring.__module__}.Ring," in str(info.value)
+
+
+def test_enum_member_stored_by_value_names_its_value(disk_engine: Engine) -> None:
+    engine = disk_engine
+
+    @engine.query
+    def make() -> Any:
+        return [Sensor.OFF, Sensor(Plain())]
+
+    with pytest.raises(UnencodableValueError) as info:
+        make()
+    assert f"result[1].value is a {Plain.__module__}.Plain," in str(info.value)
+
+
+def test_part_that_fails_for_another_reason_is_not_the_one_named(
+    engine: Engine,
+) -> None:
+    # A lone surrogate cannot be written as UTF-8, so encoding the first
+    # item fails too, with a UnicodeEncodeError. That is not a type the
+    # codec refuses, and it is not what made the call raise.
+    @engine.input
+    def setting() -> Any:
+        return 0
+
+    with pytest.raises(UnencodableValueError) as info:
+        setting.set(["\ud800", Plain()])
+    assert f"value[1] is a {Plain.__module__}.Plain," in str(info.value)
+    assert setting() == 0
+
+
+def test_refusal_that_does_not_repeat_is_reported_for_the_whole_value(
+    engine: Engine,
+) -> None:
+    # The error is built by encoding the value again, part by part. When
+    # that second attempt succeeds there is no part to name; the error still
+    # says which input, and why the first attempt failed.
+    @engine.input
+    def setting() -> Any:
+        return 0
+
+    moody = Moody(refusals=1)
+    with pytest.raises(UnencodableValueError) as info:
+        setting.set(moody)
+    message = str(info.value)
+    assert setting.id in message
+    assert "value cannot be encoded" in message
+    assert "RuntimeError: not now" in message
+    assert setting() == 0
+    # Nothing was left half set: the same object is accepted now.
+    setting.set(moody)
+    assert setting() is moody
+
+
+def test_unencodable_input_value_names_the_arguments_of_the_input(
+    engine: Engine,
+) -> None:
+    @engine.input
+    def rate(currency: str, amount: Any) -> Any:
+        return 0
+
+    with pytest.raises(UnencodableValueError) as info:
+        rate.set("EUR", decimal.Decimal("1.50"), Plain())
+    # As the call was written, though the key holds the Decimal wrapped.
+    assert f"input {rate.id}('EUR', Decimal('1.50')) " in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("value", "parts"),
+    [
+        pytest.param(Pair(1, "b"), [(".left", 1), (".right", "b")], id="namedtuple"),
+        pytest.param(
+            Box("x", [2]), [(".label", "x"), (".payload", [2])], id="dataclass"
+        ),
+        pytest.param([5, 6], [("[0]", 5), ("[1]", 6)], id="list"),
+        pytest.param((5, 6), [("[0]", 5), ("[1]", 6)], id="tuple"),
+        pytest.param(collections.deque([7, 8]), [("[0]", 7), ("[1]", 8)], id="deque"),
+        pytest.param({"k": 1}, [(" key 'k'", "k"), ("['k']", 1)], id="dict"),
+        pytest.param({9}, [(" element 9", 9)], id="set"),
+        pytest.param(frozenset({"s"}), [(" element 's'", "s")], id="frozenset"),
+        pytest.param(
+            KeyError("k", 3), [(".args[0]", "k"), (".args[1]", 3)], id="exception"
+        ),
+        # A named member is stored by its name: there is no part to look in.
+        pytest.param(Sensor.OFF, [], id="enum-by-name"),
+        pytest.param(Sensor(5), [(".value", 5)], id="enum-by-value"),
+        pytest.param(Point(1, "y"), [(" (as encoded)", (1, "y"))], id="registered"),
+        pytest.param(Plain(), [], id="unknown-class"),
+        pytest.param("text", [], id="scalar"),
+    ],
+)
+def test_parts_of_a_value_and_how_a_message_names_them(
+    value: Any, parts: list[tuple[str, Any]]
+) -> None:
+    """Every kind of container, and the path suffix of each of its parts.
+
+    The suffixes are joined to ``result`` or ``value`` in the message, so
+    ``result.payload[0]`` is field ``payload`` and then index 0.
+    """
+    assert list(_children(value)) == parts

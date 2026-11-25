@@ -603,6 +603,8 @@ Enforced by: `test_dirty_propagation.py::test_lru_eviction_never_serves_stale_re
 `test_scale_behavior.py::test_prune_stress_keeps_consistent_reachable_subgraph`,
 `test_iterative_verification.py::test_deep_chain_with_evicted_middle_memo`,
 `test_known_defects.py::test_d25_evicting_a_cycle_member_does_not_change_the_outcome`,
+`::test_d35_two_threads_asking_for_a_dropped_cycle_member_both_get_its_value`,
+`::test_d35_two_tasks_asking_for_a_dropped_cycle_member_both_get_its_value`,
 `test_fixed_point_dropped_members.py` (each way of dropping a member,
 members and head dropped together, input values where the head raises or
 leaves the cycle, a snapshot, six threads, async queries, a three-member
@@ -1315,7 +1317,8 @@ D27 while fixing D17; D28 while fixing D5; D29 to D31 while fixing D7; D32
 while fixing D30. All
 of those were already present at the audit commit. D33 and D34 were found
 on 2026-11-24, while writing tests for what mutation testing showed; D33
-came with the fix for D24.
+came with the fix for D24. D35 was found the same day by the free-threaded
+CI job; it came with the fix for D25.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
@@ -1362,6 +1365,7 @@ without an expected-failure marker.
 | D28 | C code that changed the storage of a list, set or dict subclass directly bypassed the collection: `heapq.heappush(xs, 1)` on a `CascadeList` logged no diff, left `len(xs)` inside a query at its old value and the list's element ids out of step with its contents. It cannot be intercepted. The collection now records its size at every change it makes; the next use of it (a read, a mutation, a rewritten pipeline) that finds another size undoes the change and raises `CollectionBypassedError`. Changes that keep the size (`heapq.heapify`, `heapreplace`, `heappushpop`, by-hand `list.sort`, `list.reverse`, item assignment) are not noticed; that limit is documented and pinned (G21). | `fix: C code such as heapq.heappush changed a collection without a trace` |
 | D33 | The body of a query ran twice at one revision, on two threads, with no cycle anywhere, and the trace showed `dedup_cycle` (G5). Thread B ran `total()`, which needs `part()`, and waited for thread A's run of `part()`; A finished `part()` and asked for `total()`. B had its answer but was still recorded as waiting for A, because a waiter removed its record itself, after it had taken the engine's lock again. A took the record for two threads waiting for each other (D24) and ran `total()` on its own stack: 300 of 300 trials with nothing patched. Both runs returned the right value; with `fixed_point=`, both threads iterated the fixed point. A run that is released now drops the records of the callers that waited for it. | `fix: a query ran twice, and a cancelled waiter failed the run it waited for` |
 | D34 | Cancelling one task that waited for a run of an async query failed the run's owner and its other waiters. With three tasks asking for one query, one running it and two waiting, and one waiter cancelled (`task.cancel()`, or `asyncio.wait_for` running out), the task that ran it got `concurrent.futures.InvalidStateError` where 42 was due and the other waiter got `CancelledError`. A thread that calls an async query from sync code runs it in a task of its own: a sync query `outer()` that calls async `slow()` raised `InvalidStateError` when a task elsewhere had waited for that run and been cancelled, and the error was cached, so later calls raised it again without running anything. The callers that join a run share one future, and a task that stopped waiting for it cancelled it for all of them. A task now waits on a future of its own, which the shared one settles; one that has stopped waiting, or whose loop is closed, is left alone. | `fix: a query ran twice, and a cancelled waiter failed the run it waited for` |
+| D35 | With several threads or tasks asking for a fixed-point cycle member whose result had been dropped, or for a query that depends on it, after an input changed, one of them could get `CycleError` for a cycle that converges: one of six threads in about one run in ten on a free-threaded build, where CI met it, and never seen under the interpreter lock. A member's run that reaches itself through its head starts over by bringing the head up to date (D25). The head's run asks for the member; if another caller had taken over the member by then, that caller's run failed as the first one's had, and the head's run gave up on it the way a verification does. Nothing ran the head for real afterwards, so it stayed as it was, and the member ran once more, reached itself and raised. Entering a cycle through its head now retries a joined run that ended in `CycleError`: the head runs the member on its own stack, where the cycle converges. | `fix: a dropped fixed-point member asked for by two threads raised CycleError` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
@@ -1440,17 +1444,18 @@ actions to the code and the invariants to the guarantees.
   history retention. Change stamps are reused once nobody holds them, where
   the code counts up; the outcome of a walk over input dependencies is fixed
   in the step that looks the row up.
-- None of D1–D34 is reachable in the model: each is in a feature it leaves
+- None of D1–D35 is reachable in the model: each is in a feature it leaves
   out (for D33 the record of who waits for whom, for D34 tasks and their
-  cancellation). The state machine (test gap 3) is what covers the others;
-  it has no threads or tasks, so neither of these two.
+  cancellation, for D35 fixed points). The state machine (test gap 3) is
+  what covers the others; it has no threads or tasks, so none of these
+  three.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Every defect has a regression test, and none is open.**
-   `tests/test_known_defects.py` has a test for each defect (D1-D34), each
+   `tests/test_known_defects.py` has a test for each defect (D1-D35), each
    asserting the correct behaviour; a defect found from now on gets one
    under `xfail(strict=True)` until it is fixed.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
@@ -1511,3 +1516,7 @@ Ordered by the risk they leave open.
     it is done on demand, on a machine with many cores (on Windows through
     `scripts/mutation_windows.py`) or through
     `.github/workflows/mutation.yml`.
+11. **A race gets through most pushes.** CI runs the suite once per push on
+    the free-threaded build. D35 failed one run in ten there and never
+    under the interpreter lock, so the push before it passed. Nothing runs
+    the thread tests repeatedly.
