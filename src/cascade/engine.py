@@ -609,6 +609,19 @@ class _EngineInternals:
 
 
 class Engine:
+    """Caches query results and re-runs only what a change affects.
+
+    Results are correct only if queries are pure: they read nothing but
+    their arguments, inputs, other queries and Cascade collections, and
+    nobody mutates a value a query or input returned. A broken rule gives a
+    wrong result without an error; see "The rules your code must follow" in
+    the README.
+
+    ``cache_dir`` keeps results across runs. An edit to a query's own body
+    is noticed; an edit to a helper it calls, a constant or a default is
+    not, so bump that query's ``version=`` (or ``cache_version`` here).
+    """
+
     # Explicit private-policy contract for tests/introspection.
     # Invariant-oriented access should flow through the _internals probe.
     _INTERNAL_TEST_API: tuple[str, ...] = ("_internals",)
@@ -764,6 +777,19 @@ class Engine:
         version: str | int | None = None,
     ) -> Any:
         """Register a query. Use as ``@engine.query`` or ``@engine.query(...)``.
+
+        The result is cached and reused until something the query read
+        changes. That is only correct if the function follows the rules in
+        the README ("The rules your code must follow"); breaking one gives
+        a stale or wrong result without an error:
+
+        * read only arguments, inputs, other queries and Cascade
+          collections: not files, the clock, globals or object attributes;
+        * never mutate a value returned by a query or an input: it is the
+          cached object itself;
+        * return a list or tuple, not a generator or other iterator;
+        * side effects do not happen again on a cache hit: use an
+          ``Accumulator``.
 
         ``version`` marks a change the code hash cannot see (a helper the
         query calls, a global, a default, a data file): give it a new value

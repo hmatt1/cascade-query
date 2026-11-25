@@ -59,6 +59,67 @@ user_id.set("user_2")
 print(get_result())
 ```
 
+### The rules your code must follow
+
+Cascade returns correct results only if queries follow these rules. Breaking one usually gives **a plausible wrong answer with no error**, so read them before you write your first query.
+
+1. **A query reads only its arguments, inputs, other queries and Cascade collections.** Anything else is invisible to Cascade: a file, an environment variable, the clock, randomness, a global, an attribute of an object. If it changes, the old result is still served.
+
+    ```python
+    CONFIG = {"factor": 1}
+
+    @engine.query
+    def scaled():
+        return n() * CONFIG["factor"]   # wrong: CONFIG is not tracked
+
+    scaled()                # 2
+    CONFIG["factor"] = 10
+    scaled()                # still 2; a fresh run gives 20
+    ```
+
+    Put outside data in an `@engine.input` and change it with `.set()`. For data you cannot push in (a web request), give the query a `ttl=`.
+
+2. **Never change a value you got from a query or an input.** You get the cached object itself, not a copy. This applies to callers and to other queries alike.
+
+    ```python
+    rows = items()
+    rows.append(99)         # wrong: items() now returns the extra row too
+    rows = [*items(), 99]   # right: build a new list
+    ```
+
+    The same goes for input values: `cfg()["k"] = 1` changes nothing Cascade can see. Call `cfg.set(new_value)`.
+
+3. **Return values, not iterators.** A generator, `map` or `zip` can be read once; the second caller gets it empty. Return `list(...)` or a tuple. Cascade warns when a query caches one (and raises `UnencodableValueError` with `cache_dir`).
+
+4. **Do not rely on side effects.** On a cache hit the body does not run, so a `print`, a log line or a write does not happen again. Use an `Accumulator` for effects that must be replayed ([Side-Effect Accumulators](#side-effect-accumulators)).
+
+5. **With `cache_dir`, bump `version=` when you edit code a query uses but does not contain.** Cascade notices an edit to the query's own body. It does not notice an edit to a helper function it calls, a module constant, a default argument or a closure value, and keeps serving the stored result across runs ([What the code hash sees](#what-the-code-hash-sees-and-version)).
+
+    ```python
+    @engine.query(version=2)    # bumped: normalize() changed
+    def tokens(path: str) -> list[str]:
+        return normalize(read_file(path)).split()
+    ```
+
+6. **Change and read Cascade collections through their own methods.** `frozenset(s)`, `{*s}` and `plain | s` on a `CascadeSet` are not tracked; write `s.copy()` or `s | plain`. `heapq.heapify(xs)` and `list.sort(xs)` on a `CascadeList` are not seen; write `xs.sort()` ([What gets rewritten](#what-gets-rewritten)).
+
+7. **A method query's `self` is part of the key, so make it an immutable value** (a frozen dataclass or `NamedTuple`). Changing an attribute of an ordinary object does not invalidate results computed from it.
+
+If a result looks stale, compare it with a run on an engine that has no cache: a new `Engine()` without `cache_dir`, or after `engine.clear_disk_cache()`.
+
+### How well each part is tested
+
+Not every feature is tested to the same depth. `docs/guarantees.md` has the details, the limits of each guarantee and the list of known test gaps.
+
+| Area | Test strength | What that means for you |
+|------|---------------|-------------------------|
+| Synchronous queries, inputs, snapshots, eviction | Strong: a formal model, a randomized state machine and differential tests | The best-tested path |
+| Disk cache, one process | Strong on the sync path, good for async | Rule 5 is the main risk |
+| Collections and rewritten comprehensions | Strong for reducers; generated whole-query tests use small numbers only | Two wrong-result bugs were fixed in November 2026 (D36, D37). Pass `incremental=False` if you would rather not depend on rewriting |
+| `async def` queries | Medium: fewer assertions than the sync path | Test your own async graphs |
+| Threads on free-threaded Python | Stress-tested; races are found by chance, not exhaustively | One race took about ten runs to show |
+| Several processes writing one `cache_dir` | Tested around named collections only, not under load | Give parallel jobs their own directories |
+
 ---
 
 ## 2. Core Concepts
@@ -100,7 +161,7 @@ A few rules apply to every engine, with or without `cache_dir`:
     ```
 
     Two values whose `encode` results are equal are treated as the same value (no re-run of dependents, a no-op `set`), so `encode` must capture everything a query can observe. Bump `name` when the encoding changes. The registry is process-wide (`Engine.register_type` is the same function): register next to the class, before an engine reads its values. Cascade never pickles; a cache directory can only produce values through the registered `decode`.
-*   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache.
+*   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache (rule 2 above). A query that returns a generator or another one-shot iterator gets a `RuntimeWarning` when the result is cached, since every later caller would find it used up.
 *   **A query's or input's identity is a name: its `module:qualname` by default.** One name holds one function. Registering a different function under a name in use replaces the earlier one: its cached results are dropped, and its handle raises `StaleHandleError` when called. That is what you want from a hot reload (pick up the new handle by importing it again), but it also happens when several functions are made from one body, as in a factory, a loop, or lambdas in one module. Give those their own identities with `name=`:
 
     ```python
@@ -285,7 +346,7 @@ def mapped_data() -> list[int]:
 ## 5. State, Side-Effects & Persistence
 
 ### Side-Effect Accumulators
-Queries must be pure functions. Use `Accumulator` to record side-effects (like logs or warnings) that must be replayed when a result is served from the cache.
+Queries must be pure functions (see [the rules](#the-rules-your-code-must-follow)). Use `Accumulator` to record side-effects (like logs or warnings) that must be replayed when a result is served from the cache.
 
 ```python
 warnings = engine.accumulator("warnings")

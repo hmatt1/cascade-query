@@ -81,7 +81,12 @@ Limits, by design:
 - **Queries must be pure.** Anything read that is not an input, a query or a
   tracked collection read is invisible to the engine.
 - **Returned values are shared.** The caller gets the cached object itself, so
-  mutating a returned list changes the cache.
+  mutating a returned list changes the cache. A one-shot iterator (a
+  generator, `map`, `zip`, `iter(...)`) is used up by its first caller: on
+  an engine without `cache_dir` the query gets a `RuntimeWarning` when such
+  a result is cached (`test_opaque_values.py::test_one_shot_iterator_result_warns`);
+  with `cache_dir` it is an `UnencodableValueError`. `memoize=False` queries
+  keep no value and are not warned.
 - **Identity is a name: `module:qualname`, or `name=`.** One name holds one
   function. Registering a different function under a name in use replaces
   it: the old function's cached results are dropped and its handles go
