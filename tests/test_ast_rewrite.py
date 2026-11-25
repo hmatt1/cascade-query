@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import operator
 import traceback
@@ -100,6 +101,7 @@ def test_closure_late_binding_preserved(engine):
 def test_method_in_class_rewrites(engine):
     xs = CascadeList(engine, [1, 2, 3])
 
+    @dataclasses.dataclass(frozen=True)
     class Service:
         def total(self):
             return sum(x for x in xs)

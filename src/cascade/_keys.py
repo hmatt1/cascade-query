@@ -38,6 +38,7 @@ import datetime
 import decimal
 import inspect
 import math
+import types
 import pathlib
 from typing import Any, Callable
 
@@ -71,6 +72,21 @@ class _NegativeZero:
 
 NEGATIVE_ZERO = _NegativeZero()
 _SCALAR_TAGS = (float, bool, NEGATIVE_ZERO)
+
+
+class IdentityKeyError(TypeError):
+    """An argument is hashed by identity, so the key says nothing about its state."""
+
+
+def _identity_key_message(t: type) -> str:
+    return (
+        f"a {t.__module__}.{t.__qualname__} cannot be a query or input "
+        "argument: the class has no __eq__ and __hash__ of its own, so the "
+        "object would be keyed by identity, and changing one of its "
+        "attributes would not invalidate results computed from it. Make the "
+        "class a value (a frozen dataclass or a NamedTuple does), or pass "
+        "the state the query reads as arguments."
+    )
 
 
 def shape(value: Any) -> Any:
@@ -119,6 +135,14 @@ def shape(value: Any) -> Any:
             dict,
             frozenset([(shape(k), k, shape(v)) for k, v in value.items()]),
         )
+    if t.__hash__ is object.__hash__ and not (
+        # A bare object() is a sentinel: it has no state to go stale.
+        t is object
+        or isinstance(value, type)
+        or callable(value)
+        or t is types.ModuleType
+    ):
+        raise IdentityKeyError(_identity_key_message(t))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return (
             t,

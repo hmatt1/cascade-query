@@ -82,11 +82,11 @@ Limits, by design:
   tracked collection read is invisible to the engine.
 - **Returned values are shared.** The caller gets the cached object itself, so
   mutating a returned list changes the cache. A one-shot iterator (a
-  generator, `map`, `zip`, `iter(...)`) is used up by its first caller: on
-  an engine without `cache_dir` the query gets a `RuntimeWarning` when such
-  a result is cached (`test_opaque_values.py::test_one_shot_iterator_result_warns`);
-  with `cache_dir` it is an `UnencodableValueError`. `memoize=False` queries
-  keep no value and are not warned.
+  generator, `map`, `zip`, `iter(...)`) would be used up by its first caller,
+  so a query that returns one raises `UnencodableValueError` on every
+  engine and is not cached
+  (`test_opaque_values.py::test_one_shot_iterator_result_is_refused`).
+  `memoize=False` queries keep no value and may return one.
 - **Identity is a name: `module:qualname`, or `name=`.** One name holds one
   function. Registering a different function under a name in use replaces
   it: the old function's cached results are dropped and its handles go
@@ -104,10 +104,17 @@ Limits, by design:
   `obj.method(x)`). `self` is part of the key like any argument: it must
   be hashable (otherwise the call raises `TypeError` saying so, before the
   body runs), two instances share results when they are equal and of one
-  class, and the memo holds a reference to it. Instances with the default
-  identity hash get results of their own, kept in memory only, since they
-  cannot be encoded; a frozen dataclass, a `NamedTuple` or a registered
-  type is stored on disk like any argument. `@staticmethod` and
+  class, and the memo holds a reference to it. An object hashed by
+  identity (a class with no `__eq__` and `__hash__` of its own) is refused
+  with `TypeError` before the body runs, as `self` and as any other
+  argument of a query or input: its key would say nothing about its state,
+  so a changed attribute would leave old results in place. This holds
+  inside tuples and dataclass fields too. Classes, functions, modules and
+  a bare `object()` sentinel are exempt. A class with its own `__eq__` and
+  `__hash__` is accepted, and kept in memory only unless it can be encoded;
+  a frozen dataclass, a `NamedTuple` or a registered type is stored on
+  disk like any argument
+  (`test_query_methods.py::test_object_keyed_by_identity_is_refused_as_any_argument`). `@staticmethod` and
   `@classmethod` go above `@engine.query` (the class is then the first
   argument); below it they are refused when the class is defined. A query
   defined outside a class and assigned to a class attribute is not bound.

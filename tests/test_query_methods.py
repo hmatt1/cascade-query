@@ -23,9 +23,9 @@ def test_method_binds_self_and_caches_per_instance() -> None:
     engine = Engine()
     runs: list[Any] = []
 
+    @dataclasses.dataclass(frozen=True)
     class Scaler:
-        def __init__(self, k: int) -> None:
-            self.k = k
+        k: int
 
         @engine.query
         def scale(self, x: int, offset: int = 0) -> int:
@@ -227,7 +227,7 @@ def test_methods_on_encodable_instances_are_reused_from_disk(
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_methods_on_plain_instances_are_computed_but_not_stored(
+def test_methods_on_instances_that_cannot_be_encoded_are_computed_but_not_stored(
     tmp_path: Path, backend: str
 ) -> None:
     runs = {"n": 0}
@@ -236,6 +236,14 @@ def test_methods_on_plain_instances_are_computed_but_not_stored(
         engine = Engine(cache_dir=tmp_path, cache_backend=backend)
 
         class Counter:
+            # Its own __eq__ and __hash__, so it may be a key; no encoding,
+            # so its results stay in memory.
+            def __eq__(self, other: object) -> bool:
+                return self is other
+
+            def __hash__(self) -> int:
+                return id(self)
+
             @engine.query(name="methods.count")
             def count(self) -> int:
                 runs["n"] += 1
@@ -273,3 +281,55 @@ def test_bound_method_handles_compare_by_instance_and_method() -> None:
     assert a.area != Shape.area
     assert len({a.area, a.area, b.area, a.edges}) == 3
     assert a.area.raw is Shape.area.raw
+
+
+def test_method_on_an_object_keyed_by_identity_is_refused() -> None:
+    """Its attributes could change without the key changing (a stale result)."""
+    engine = Engine()
+    runs: list[int] = []
+
+    class Doc:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        @engine.query
+        def words(self) -> int:
+            runs.append(1)
+            return len(self.text.split())
+
+    doc = Doc("a b")
+    with pytest.raises(TypeError, match="keyed by identity"):
+        doc.words()
+    with pytest.raises(TypeError, match="keyed by identity"):
+        Doc.words(doc)  # through the class: an ordinary argument
+    assert runs == []
+
+
+def test_object_keyed_by_identity_is_refused_as_any_argument() -> None:
+    engine = Engine()
+
+    class Config:
+        factor = 2
+
+    @engine.query
+    def scaled(config: Any, x: int) -> int:
+        return config.factor * x
+
+    @engine.input
+    def setting(config: Any) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="keyed by identity"):
+        scaled(Config(), 3)
+    with pytest.raises(TypeError, match="keyed by identity"):
+        scaled(x=3, config=Config())
+    with pytest.raises(TypeError, match="keyed by identity"):
+        setting(Config())
+    with pytest.raises(TypeError, match="keyed by identity"):
+        setting.set(Config(), 1)
+    with pytest.raises(TypeError, match="keyed by identity"):
+        scaled((1, Config()), 3)  # also inside a tuple
+    # Classes and functions are what they are: fine as arguments. So is a
+    # bare object() used as a sentinel, which has no state.
+    assert scaled(Config, 3) == 6
+    assert setting(object()) == 0

@@ -465,6 +465,21 @@ class _BoundQueryHandle:
         self._self = obj
 
     def _check_hashable(self) -> None:
+        cls = type(self._self)
+        if cls.__hash__ is object.__hash__ and not isinstance(self._self, type):
+            # Hashed by identity: the key says nothing about the object's
+            # state, so a change to an attribute the query read would leave
+            # the old result in place.
+            raise TypeError(
+                f"query {self._handle._id} is a method, and its self (a "
+                f"{cls.__module__}.{cls.__qualname__}) is part of the cache "
+                "key, but the class has no __eq__ and __hash__ of its own: "
+                "the object is keyed by identity, and changing one of its "
+                "attributes would not invalidate results computed from it. "
+                "Make the class a value (a frozen dataclass or a NamedTuple "
+                "does), or make the query a function that takes the state "
+                "it reads as arguments."
+            )
         try:
             hash(self._self)
         except TypeError:

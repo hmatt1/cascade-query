@@ -89,7 +89,7 @@ Cascade returns correct results only if queries follow these rules. Breaking one
 
     The same goes for input values: `cfg()["k"] = 1` changes nothing Cascade can see. Call `cfg.set(new_value)`.
 
-3. **Return values, not iterators.** A generator, `map` or `zip` can be read once; the second caller gets it empty. Return `list(...)` or a tuple. Cascade warns when a query caches one (and raises `UnencodableValueError` with `cache_dir`).
+3. **Return values, not iterators.** A generator, `map` or `zip` can be read once; the second caller gets it empty. Return `list(...)` or a tuple. Cascade raises `UnencodableValueError` when a query returns one (a `memoize=False` query may, since it keeps no value).
 
 4. **Do not rely on side effects.** On a cache hit the body does not run, so a `print`, a log line or a write does not happen again. Use an `Accumulator` for effects that must be replayed ([Side-Effect Accumulators](#side-effect-accumulators)).
 
@@ -103,7 +103,7 @@ Cascade returns correct results only if queries follow these rules. Breaking one
 
 6. **Change and read Cascade collections through their own methods.** `frozenset(s)`, `{*s}` and `plain | s` on a `CascadeSet` are not tracked; write `s.copy()` or `s | plain`. `heapq.heapify(xs)` and `list.sort(xs)` on a `CascadeList` are not seen; write `xs.sort()` ([What gets rewritten](#what-gets-rewritten)).
 
-7. **A method query's `self` is part of the key, so make it an immutable value** (a frozen dataclass or `NamedTuple`). Changing an attribute of an ordinary object does not invalidate results computed from it.
+7. **Arguments are values, `self` included.** Pass a frozen dataclass, a `NamedTuple` or plain data. An ordinary object (no `__eq__` and `__hash__` of its own) is refused with `TypeError`, because changing one of its attributes would not invalidate results computed from it. A class that defines its own `__eq__` and `__hash__` is accepted: keep the state they cover immutable.
 
 If a result looks stale, compare it with a run on an engine that has no cache: a new `Engine()` without `cache_dir`, or after `engine.clear_disk_cache()`.
 
@@ -162,7 +162,7 @@ A few rules apply to every engine, with or without `cache_dir`:
     ```
 
     Two values whose `encode` results are equal are treated as the same value (no re-run of dependents, a no-op `set`), so `encode` must capture everything a query can observe. Bump `name` when the encoding changes. The registry is process-wide (`Engine.register_type` is the same function): register next to the class, before an engine reads its values. Cascade never pickles; a cache directory can only produce values through the registered `decode`.
-*   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache (rule 2 above). A query that returns a generator or another one-shot iterator gets a `RuntimeWarning` when the result is cached, since every later caller would find it used up.
+*   **Results are returned by reference.** The caller gets the cached object itself; mutating it changes the cache (rule 2 above). A query that returns a generator or another one-shot iterator raises `UnencodableValueError`, since every later caller would find it used up.
 *   **A query's or input's identity is a name: its `module:qualname` by default.** One name holds one function. Registering a different function under a name in use replaces the earlier one: its cached results are dropped, and its handle raises `StaleHandleError` when called. That is what you want from a hot reload (pick up the new handle by importing it again), but it also happens when several functions are made from one body, as in a factory, a loop, or lambdas in one module. Give those their own identities with `name=`:
 
     ```python
@@ -191,7 +191,7 @@ A few rules apply to every engine, with or without `cache_dir`:
     Document("a.txt").word_count()   # equal documents share one result
     ```
 
-    `self` must be hashable; two instances share results when they are equal and of the same class. A frozen dataclass, a `NamedTuple` or a type registered with `register_type` is also stored on disk; an ordinary object (identity hash) gets results of its own, in memory only. Put `@staticmethod` or `@classmethod` above `@engine.query`.
+    `self` must be hashable; two instances share results when they are equal and of the same class. A frozen dataclass, a `NamedTuple` or a type registered with `register_type` is also stored on disk; an ordinary object, which Python hashes by identity, is refused with `TypeError`, as `self` and as any other argument: changing one of its attributes would not invalidate the results computed from it. Put `@staticmethod` or `@classmethod` above `@engine.query`.
 *   **Arguments are hashable, and keyed by type.** Calls are bound to the function's parameters, so keyword arguments work and `q(1)`, `q(x=1)` and `q(1, y=2)` (when `y=2` is the default) share one cached result. Arguments are compared by value and type, so `q(1)`, `q(True)` and `q(1.0)` each get their own, as do `q((1, 2))` and `q((1, 2.0))`. A dict or list cannot be an argument; pass a tuple or a frozen dataclass. `snapshot=` and `effects=` are the handle's own keywords: pass a parameter with one of those names positionally.
 
 ### Snapshots & Transactions (Input Debouncing)
