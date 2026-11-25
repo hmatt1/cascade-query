@@ -637,9 +637,10 @@ class Engine:
     wrong result without an error; see "The rules your code must follow" in
     the README.
 
-    ``cache_dir`` keeps results across runs. An edit to a query's own body
-    is noticed; an edit to a helper it calls, a constant or a default is
-    not, so bump that query's ``version=`` (or ``cache_version`` here).
+    ``cache_dir`` keeps results across runs. An edit to a query's body, or
+    to a helper, class, constant or default of the program that it uses,
+    is noticed. A library upgrade or a method called on an object is not:
+    bump that query's ``version=`` (or ``cache_version`` here).
 
     ``incremental_per_element`` (on by default) makes comprehensions and
     reducers over Cascade collections redo only the elements that changed;
@@ -827,8 +828,9 @@ class Engine:
         result is the same, and the query is cached and invalidated the
         same way, either way.
 
-        ``version`` marks a change the code hash cannot see (a helper the
-        query calls, a global, a default, a data file): give it a new value
+        ``version`` marks a change the code hash cannot see (an upgraded
+        library, a method called on an object, a mutable global, a data
+        file): give it a new value
         and results computed under the old one are not used again, in
         memory or on disk. See "What the code hash sees" in the README.
         """

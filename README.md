@@ -93,12 +93,12 @@ Cascade returns correct results only if queries follow these rules. Breaking one
 
 4. **Do not rely on side effects.** On a cache hit the body does not run, so a `print`, a log line or a write does not happen again. Use an `Accumulator` for effects that must be replayed ([Side-Effect Accumulators](#side-effect-accumulators)).
 
-5. **With `cache_dir`, bump `version=` when you edit code a query uses but does not contain.** Cascade notices an edit to the query's own body. It does not notice an edit to a helper function it calls, a module constant, a default argument or a closure value, and keeps serving the stored result across runs ([What the code hash sees](#what-the-code-hash-sees-and-version)).
+5. **With `cache_dir`, bump `version=` when a library or a method changes what a query computes.** Cascade notices an edit to the query's body, to the helper functions and classes of your program it names, and to the constants, closure values and defaults it uses. It does not notice an upgraded library, or a method reached through an object (`obj.method()`), and keeps serving the stored result across runs ([What the code hash sees](#what-the-code-hash-sees-and-version)).
 
     ```python
-    @engine.query(version=2)    # bumped: normalize() changed
+    @engine.query(version=2)    # bumped: the tokenizer library was upgraded
     def tokens(path: str) -> list[str]:
-        return normalize(read_file(path)).split()
+        return tokenizer.split(read_file(path))
     ```
 
 6. **Change and read Cascade collections through their own methods.** `frozenset(s)`, `{*s}` and `plain | s` on a `CascadeSet` are not tracked; write `s.copy()` or `s | plain`. `heapq.heapify(xs)` and `list.sort(xs)` on a `CascadeList` are not seen; write `xs.sort()` ([What gets rewritten](#what-gets-rewritten)).
@@ -275,19 +275,26 @@ Cascade automatically inspects the Python bytecode of your `@engine.query` and `
 
 #### What the code hash sees, and `version=`
 
-The hash covers the query function's own code: its bytecode, the constants and names in it, its local variable names, and functions and comprehensions written inside it. It does **not** cover:
+The hash a stored result is kept under covers:
 
-*   helper functions the query calls (their code lives in another function);
-*   global variables, module-level constants and imported modules;
-*   closure values and default arguments;
-*   files, environment variables, library versions, or anything else read without an `@engine.input`.
+*   the query function's own code: its bytecode, the constants and names in it, its local variable names, and functions and comprehensions written inside it;
+*   the functions and classes of your program it names, and what those name in turn: a helper, a helper of that helper, a class's methods and those of its base classes, a function reached as `module.name` in a module of your program;
+*   the immutable values it names: module constants such as `LIMIT = 10` or `UNITS = ("m", "cm")`, frozen dataclasses, enum members;
+*   its closure values and default arguments, when they are immutable values or functions.
 
-Editing one of those leaves old results in place, also on disk across runs. Declare the change with `version=` on each query that calls the edited helper (or reads the edited constant) directly:
+So editing a helper or a constant between runs recomputes the stored results that used it, with nothing to declare. The hash does **not** cover:
+
+*   the standard library and installed packages: upgrading one does not change the hash;
+*   a method called on an object (`obj.method()`), since the class is only known when the query runs;
+*   mutable objects a query reads (a module-level `dict` or `list`, an object's attributes), and names the query assigns itself (a `global` or `nonlocal` counter);
+*   files, environment variables, or anything else read without an `@engine.input`.
+
+For those, declare the change with `version=` on the query:
 
 ```python
-@engine.query(version=2)          # bumped: normalize() changed
+@engine.query(version=2)          # bumped: the tokenizer library was upgraded
 def tokens(path: str) -> list[str]:
-    return normalize(read_file(path)).split()
+    return tokenizer.split(read_file(path))
 ```
 
 Any new value works (`str` or `int`). Results computed under another version are not used: the query runs again, and queries that depend on it run again if its result changed. Queries that only call `tokens()` need no bump. To discard every stored result at once, change `Engine(cache_version=...)`, or call `engine.clear_disk_cache()`. Old results are replaced as their queries are recomputed; `engine.prune(roots, vacuum_disk=True)` removes the ones nothing reaches.

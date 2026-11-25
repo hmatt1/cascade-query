@@ -234,7 +234,10 @@ def test_effects_replayed_from_disk_are_the_final_run(
     expected = (7, [("top", "start"), *FINAL_RUN, ("top", 7)])
     engine = Engine(cache_dir=tmp_path, cache_backend=backend)
     try:
-        assert _call(_build(engine)["top"]) == expected
+        # A list here too: ``runs`` is a value the queries capture, and a
+        # captured None in one session and a list in the next would be
+        # different code to the stored hash.
+        assert _call(_build(engine, [])["top"]) == expected
     finally:
         engine.shutdown()
     runs: list[str] = []

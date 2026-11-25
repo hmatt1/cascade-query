@@ -8,6 +8,7 @@ from collections import OrderedDict, defaultdict, deque
 from collections.abc import Sequence
 from typing import Any, Callable
 
+from ._code_refs import refs_hash
 from ._errors import SnapshotExpiredError
 from ._keys import display as display_args
 from ._serde import hash_bytecode, stable_value_digest, unencodable_error
@@ -74,6 +75,47 @@ def _same_captures(old: Callable[..., Any], new: Callable[..., Any]) -> bool:
     if old_kw.keys() != new_kw.keys():
         return False
     return all(old_kw[k] is new_kw[k] for k in old_kw)
+
+
+class _StoredHashes(dict):  # type: ignore[type-arg]
+    """Hash each function's persisted results are stored and checked under.
+
+    What is assigned is the hash known at registration: the function's own
+    bytecode, ``version=`` and the salts. What is read adds the hash of what
+    the function refers to (``_code_refs.refs_hash``: helpers, constants,
+    closure values, defaults). That part is worked out on first use and not
+    at registration, because a helper defined below a query in its module
+    does not exist yet when the query is decorated. It is then kept until
+    the function is registered again.
+    """
+
+    def __init__(self, functions: dict[str, Callable[..., Any]]) -> None:
+        super().__init__()
+        self._functions = functions
+        self._full: dict[str, str] = {}
+
+    def __setitem__(self, fid: str, base: str) -> None:
+        super().__setitem__(fid, base)
+        self._full.pop(fid, None)
+
+    def get(self, fid: str, default: Any = None) -> Any:  # type: ignore[override]
+        full = self._full.get(fid)
+        if full is not None:
+            return full
+        base = super().get(fid)
+        if base is None:
+            return default
+        fn = self._functions.get(fid)
+        refs = refs_hash(fn) if fn is not None else ""
+        full = f"{base}+{refs}" if refs else base
+        self._full[fid] = full
+        return full
+
+    def __getitem__(self, fid: str) -> str:
+        full = self.get(fid)
+        if full is None:
+            raise KeyError(fid)
+        return full
 
 
 class GraphStore:
@@ -149,9 +191,10 @@ class GraphStore:
         # Keys holding more than one version, and appends since the last sweep.
         self._multi_version_keys: set[InputKey] = set()
         self._trim_debt = 0
-        self.input_hashes: dict[str, str] = {}
         self.queries: dict[str, Callable[..., Any]] = {}
-        self.query_hashes: dict[str, str] = {}
+        self.input_fns: dict[str, Callable[..., Any]] = {}
+        self.input_hashes: dict[str, str] = _StoredHashes(self.input_fns)
+        self.query_hashes: dict[str, str] = _StoredHashes(self.queries)
         self.query_memoize: dict[str, bool] = {}
         self.query_fixed_points: dict[str, Any] = {}
         self.query_fixed_point_limits: dict[str, int] = {}
@@ -159,7 +202,6 @@ class GraphStore:
             str, bool | tuple[type[BaseException], ...]
         ] = {}
         self.query_ttl: dict[str, float | None] = {}
-        self.input_fns: dict[str, Callable[..., Any]] = {}
         # Bytecode hash of the registered function, before any salt (see
         # ``_supersede_locked``). ``query_hashes`` / ``input_hashes`` hold the
         # value stored with, and compared against, persisted results.

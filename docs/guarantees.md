@@ -497,16 +497,44 @@ dropped and re-run.
 
 The hash covers the function's bytecode, constants, names and local variable
 names. It does not cover closure values, default arguments, globals, or any
-helper function the query calls. Editing those leaves stale results in place.
+helper function the query calls, so editing those inside a process (a
+notebook cell that redefines a helper) leaves stale results in memory.
+
+**Persisted results also follow what the function refers to.** The hash a
+result is stored and checked under (G16) adds a digest of what the
+function reaches by name, worked out on first use after registration (a
+helper defined below the query does not exist when it is decorated):
+
+- functions and classes of the program that it names, followed through
+  their own references, a class through its methods, static and class
+  methods and properties, and those of its base classes; `module.name` for
+  a module of the program;
+- immutable values it names, in globals, closure cells or defaults:
+  numbers, strings, bytes, tuples and frozensets of them, enum members,
+  frozen dataclasses of them, dates, paths, `Decimal`, `UUID`.
+
+Not followed: the standard library, `cascade` and installed packages
+(`site-packages`), methods called on objects, mutable objects, names the
+function assigns itself (`global` and `nonlocal`), and immutable values the
+codec cannot encode. A failure while following never fails the query; the
+hash is then a fixed marker. So a helper or constant edited between runs
+recomputes the results that used it, and their dependents follow the new
+result as for any code change
+(`test_code_refs.py`: helpers, helpers of helpers, constants, closure values
+and defaults, classes and base classes, a module function, input defaults,
+counters that must not disturb the hash; both backends).
+
 One exception inside a process: a function registered over one with equal
 bytecode but different captured objects is treated as different code. Its
 results are dropped, and for the rest of the process its persisted results
 are stored under a salted hash, so it cannot load what the earlier function
-wrote. Across runs the blind spot remains: two closures of one body
-registered under one name in different runs can serve each other's persisted
-results. `name=` avoids that.
+wrote. Across runs the blind spot is narrower: two closures of one body
+registered under one name in different runs share persisted results only
+when what they captured is not followed (a mutable object, a library
+function). `name=` avoids that.
 
-**Manual versions.** What the hash cannot see, the program can declare:
+**Manual versions.** What the hash cannot see (a library upgrade, a method
+called on an object, a data file), the program can declare:
 
 - `engine.query(version=v)` (a `str` or an `int`) is part of the query's
   code hash. Registering the query with another `version` is a code change:
@@ -1410,7 +1438,7 @@ without `cache_dir` keeps results it cannot encode (G1, G18).
 | Limit | Who it stops | Why it conflicts with the aim |
 |---|---|---|
 | **Query identity.** A query is its `module:qualname` unless `name=` is passed. Factories and lambdas must pass `name=`; without it each registration replaces the last and the earlier handle raises `StaleHandleError`. After a reload, callers must pick up the new handle. (Methods can now be queries, with `self` as an argument: G1.) | Libraries that generate queries (one extra argument). | No longer a silent wrong answer inside a process. Across runs, closures of one body under one name can still share persisted results (G11). |
-| **Persistence across code edits needs a declared version.** Code invalidation sees only the query's own bytecode. `version=` per query and `cache_version=` per engine now force invalidation (G11), but an edit to a helper, a global or a default that no version declares still leaves the old result in place. (Results are written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache who forgets to bump a version after editing a helper. | "Zero-config persistence" implies it works without the user knowing about it; it now works with one declared number. |
+| **Persistence across code edits needs a declared version for what the hash cannot follow.** Persisted results follow the query's own code and the helpers, classes, constants, closure values and defaults of the program it names (G11). A library upgrade, a method called on an object, or a mutable global still needs `version=` or `cache_version=`. (Results are written at a normal exit; a killed process still loses what was queued.) | Anyone using `cache_dir` as a build cache who forgets to bump a version after editing a helper. | "Zero-config persistence" implies it works without the user knowing about it; it now works with one declared number. |
 
 Limits that narrow use without stopping it:
 
