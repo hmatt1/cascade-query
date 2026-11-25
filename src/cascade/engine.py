@@ -648,6 +648,12 @@ class Engine:
     reducers over Cascade collections redo only the elements that changed;
     off, they run as plain Python over every element, with the same result.
     Queries are cached and invalidated the same way with either setting.
+
+    ``check_mutations`` (off by default) makes each query check, when its
+    body finishes, that the values it read were not changed in place, and
+    raise ``MutatedValueError`` if one was. It costs one digest of each value
+    read, per run: turn it on in tests and development. ``check_mutations()``
+    checks everything the engine holds, on demand.
     """
 
     # Explicit private-policy contract for tests/introspection.
@@ -667,8 +673,11 @@ class Engine:
         cache_backend: str = "mdbx",
         incremental_per_element: bool = True,
         cache_version: str | int | None = None,
+        check_mutations: bool = False,
     ) -> None:
         _check_version("cache_version", cache_version)
+        if not isinstance(check_mutations, bool):
+            raise TypeError("check_mutations must be a bool")
         self._trace_limit = trace_limit
         # Engine-wide default for rewriting comprehensions and reducers over
         # collections into per-element pipelines; incremental_per_element=
@@ -696,6 +705,7 @@ class Engine:
             value_digest=value_digest,
             allow_opaque=cache_dir is None,
             cache_version=cache_version,
+            check_mutations=check_mutations,
         )
         self._evaluator = Evaluator(
             self._store, disk=self._disk, get_executor=self._ensure_submit_executor
@@ -1343,13 +1353,12 @@ class Engine:
     def check_mutations(self) -> None:
         """Raise ``MutatedValueError`` if any cached value was changed in place.
 
-        A query checks the values it read when its body finishes. A value
-        changed by code outside any query, and read only by cached results
-        that do not run again, is not seen by that check. This one hashes
-        every cached query result and the current value of every input, so
-        its cost grows with what the engine holds: call it in tests, or at
-        points where you want to be sure. Changed query results are dropped,
-        so their next use computes them again.
+        It hashes every cached query result and the current value of every
+        input, so its cost grows with what the engine holds: call it in
+        tests, or at points where you want to be sure. Changed query results
+        are dropped, so their next use computes them again.
+        ``Engine(check_mutations=True)`` also checks, each time a query's body
+        finishes, the values that body read.
         """
         found = self._store.check_mutations()
         if found:

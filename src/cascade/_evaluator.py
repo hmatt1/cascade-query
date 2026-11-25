@@ -2557,7 +2557,11 @@ class Evaluator:
             except TypeError as exc:
                 raise self._fail_unencodable(key, frame, runtime, result, exc) from exc
 
-        mutated = store.mutated_values(frame.deps, revision)
+        mutated = (
+            store.mutated_values(frame.deps, revision)
+            if store.check_mutations_on_run
+            else None
+        )
         if mutated:
             if frame.cycle_guess is not UNSET:
                 self._discard_provisional(runtime, key)

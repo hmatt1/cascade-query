@@ -89,7 +89,7 @@ Cascade returns correct results only if queries follow these rules. Breaking one
 
     The same goes for input values: `cfg()["k"] = 1` changes nothing Cascade can see. Call `cfg.set(new_value)`.
 
-    Cascade checks for this. When a query's body finishes, every value it read must still have the digest it was stored with; if one was changed in place, the query raises `MutatedValueError` naming it. A changed query result is dropped and computed again on its next use; a changed input value keeps raising until `set()` gives it a new one. A value changed by code outside any query is caught when something that reads it runs again, or at once by `engine.check_mutations()`, which checks everything the engine holds (useful in tests). The check costs one digest of each value a query reads, per run of that query.
+    Cascade can check for this, in tests and during development. `engine.check_mutations()` hashes every cached result and input value again and raises `MutatedValueError` naming any that changed in place; a changed result is dropped and computed again on its next use. `Engine(check_mutations=True)` also makes each query check the values it read when its body finishes. Both are off in normal runs, because they cost one digest of each value checked (about 0.75 ms for a list of 10,000 ints).
 
 3. **Return values, not iterators.** A generator, `map` or `zip` can be read once; the second caller gets it empty. Return `list(...)` or a tuple. Cascade raises `UnencodableValueError` when a query returns one (a `memoize=False` query may, since it keeps no value).
 
@@ -130,11 +130,12 @@ Not every feature is tested to the same depth. `docs/guarantees.md` has the deta
 
 The `Engine` manages caching, execution, and state tracking.
 
-*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental_per_element=True, cache_version=None)`**: Initializes the engine. 
+*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental_per_element=True, cache_version=None, check_mutations=False)`**: Initializes the engine. 
     *   `max_entries` sets the limit for the Least Recently Used (LRU) in-memory cache. 
     *   Passing `cache_dir` enables persistent disk caching.
     *   `cache_backend` allows you to select the storage engine for persistence (`"mdbx"` or `"sqlite"`).
     *   `incremental_per_element` decides how much work a query over a Cascade collection does when the collection changes: only the changed elements (the default), or every element as plain Python. The result is the same; see [What gets rewritten](#what-gets-rewritten).
+    *   `check_mutations=True` makes each query check, when its body finishes, that the values it read were not changed in place (rule 2 above). For tests and development: it costs one digest of each value read, per run.
     *   `cache_version` (a `str` or `int`) salts every result this engine stores; results stored under another salt are not used. Change it to throw away the whole result cache, for example after upgrading a library your queries use.
 
 ### Defining Nodes: `@engine.input` and `@engine.query`

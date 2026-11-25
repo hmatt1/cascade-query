@@ -80,23 +80,26 @@ Limits, by design:
 
 - **Queries must be pure.** Anything read that is not an input, a query or a
   tracked collection read is invisible to the engine.
-- **Returned values are shared, and checked.** The caller gets the cached
-  object itself, so mutating a returned list changes the cache. When a
-  query's body finishes, each value it read (a query result as cached, an
-  input value as of the run's revision) is digested again and compared
-  with the digest it was stored with; a difference raises
-  `MutatedValueError`, never cached, naming the changed query or input. A
+- **Returned values are shared, and can be checked.** The caller gets the
+  cached object itself, so mutating a returned list changes the cache.
+  `Engine.check_mutations()` digests every cached result and current input
+  value again and compares each with the digest it was stored with. With
+  `Engine(check_mutations=True)`, when a query's body finishes, each value
+  it read (a query result as cached, an input value as of the run's
+  revision) is checked the same way. A difference raises
+  `MutatedValueError`, never cached, naming the changed query or input.
+  Both are off by default, so a normal run pays nothing and serves a value
+  changed in place as it is. A
   changed query result is dropped, so its next use computes it again; a
   changed input value raises until `set()` gives it another value. A
   same-value `set()` (equal digest) swaps in the given object without a
   new revision, which repairs an input changed in place. A query that
   catches the error for a changed input still depends on that input and is
-  stopped by its own check. `Engine.check_mutations()` checks every cached
-  result and current input value. Not checked: results that are never
+  stopped by its own check. Not checked: results that are never
   compared by content (opaque, G1), `memoize=False` queries, and a change
   that nothing reads again before `check_mutations()`
-  (`test_mutated_values.py`). Cost: one digest per value read, per run;
-  about 0.75 ms for a list of 10,000 ints. A one-shot iterator (a
+  (`test_mutated_values.py`). Cost, when on: one digest per value read, per
+  run; about 0.75 ms for a list of 10,000 ints. A one-shot iterator (a
   generator, `map`, `zip`, `iter(...)`) would be used up by its first caller,
   so a query that returns one raises `UnencodableValueError` on every
   engine and is not cached
@@ -1477,7 +1480,8 @@ Limits that narrow use without stopping it:
 - **Dict order counts.** A result or input value whose dict order varies
   without meaning defeats early bail-out and reuse across runs (G2).
 - **Returned values are shared with the cache.** A change in place is reported
-  (`MutatedValueError`) when a reader runs, or by `check_mutations()`.
+  (`MutatedValueError`) by `check_mutations()`, and with
+  `Engine(check_mutations=True)` when a reader runs.
 - **Alternating snapshot and head reads of one query recompute each time**,
   because one result is kept per query and arguments.
 

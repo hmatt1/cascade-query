@@ -131,6 +131,7 @@ class GraphStore:
         value_digest: Callable[[Any], str] | None = None,
         allow_opaque: bool = False,
         cache_version: str | int | None = None,
+        check_mutations: bool = False,
     ) -> None:
         self.lock = threading.RLock()
         # Engine-wide salt of the hashes persisted results are stored under
@@ -142,6 +143,10 @@ class GraphStore:
         # or input value the codec cannot encode is kept as it is, under a
         # digest no other value ever has (``digest_or_opaque``).
         self._allow_opaque = allow_opaque
+        # Whether a query checks, when its body finishes, that the values it
+        # read were not changed in place (``mutated_values``). Off by default:
+        # it costs one digest of each value read, per run.
+        self.check_mutations_on_run = check_mutations
         self._opaque_lock = threading.Lock()
         self._opaque_count = 0
         self.revision = 0

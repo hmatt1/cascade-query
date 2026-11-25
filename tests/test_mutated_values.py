@@ -2,10 +2,11 @@
 
 Queries hand out their cached object and inputs the value they were given.
 Changing one in place changes what every later reader gets, and Cascade
-cannot see it happen. A query checks, when its body finishes, that each
-value it read still has the digest it was stored with; a changed one raises
-``MutatedValueError``. ``Engine.check_mutations()`` checks everything the
-engine holds.
+cannot see it happen. ``Engine.check_mutations()`` checks everything the
+engine holds. With ``Engine(check_mutations=True)`` a query also checks,
+when its body finishes, that each value it read still has the digest it was
+stored with; a changed one raises ``MutatedValueError``. Off by default, it
+costs nothing then.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def _graph(engine: Engine) -> dict[str, Any]:
 
 
 def test_a_query_that_changes_another_querys_result_is_stopped() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
 
     @engine.query
     def base() -> list[int]:
@@ -80,7 +81,7 @@ def test_a_query_that_changes_another_querys_result_is_stopped() -> None:
 def test_a_caller_that_changed_a_result_is_caught_by_the_next_reader_that_runs() -> (
     None
 ):
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
     assert q["report"]() == "1:0"
     q["rows"]().append(99)  # outside any query
@@ -96,7 +97,7 @@ def test_a_caller_that_changed_a_result_is_caught_by_the_next_reader_that_runs()
 
 
 def test_an_input_value_changed_without_set_raises_until_it_is_set() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
     assert q["total"]() == 1
     q["cfg"]()["factor"] = 10  # instead of cfg.set(...)
@@ -110,7 +111,7 @@ def test_an_input_value_changed_without_set_raises_until_it_is_set() -> None:
 
 
 def test_check_mutations_finds_what_no_query_has_read_since() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
     engine.check_mutations()  # empty engine
     assert q["report"]() == "1:0"
@@ -132,7 +133,7 @@ def test_check_mutations_finds_what_no_query_has_read_since() -> None:
 
 
 def test_a_query_that_catches_the_error_for_a_changed_result_recovers() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
 
     @engine.query
@@ -156,7 +157,7 @@ def test_a_query_that_catches_the_error_for_a_changed_result_recovers() -> None:
 
 def test_a_changed_input_cannot_be_caught_away() -> None:
     """Whatever read it, directly or through a caught error, is stopped."""
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
 
     @engine.query
@@ -177,7 +178,7 @@ def test_a_changed_input_cannot_be_caught_away() -> None:
 
 def test_setting_the_original_value_repairs_a_changed_input() -> None:
     """The digest is unchanged, so nothing reruns, but the object is replaced."""
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
     assert q["total"]() == 1
     revision = engine.revision
@@ -194,7 +195,7 @@ def test_setting_the_original_value_repairs_a_changed_input() -> None:
 
 
 def test_values_that_are_never_compared_by_content_are_not_checked() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
 
     class Node:  # cannot be encoded: compared by identity, kept as it is
         def __init__(self) -> None:
@@ -225,7 +226,7 @@ def test_values_that_are_never_compared_by_content_are_not_checked() -> None:
 
 
 def test_a_snapshot_read_checks_the_value_as_of_the_snapshot() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
 
     @engine.input
     def items() -> list[int]:
@@ -245,7 +246,7 @@ def test_a_snapshot_read_checks_the_value_as_of_the_snapshot() -> None:
 
 
 def test_async_queries_check_what_they_read() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
 
     @engine.query
     async def base() -> list[int]:
@@ -268,7 +269,7 @@ def test_async_queries_check_what_they_read() -> None:
 @pytest.mark.parametrize("backend", ["mdbx", "sqlite"])
 def test_a_result_loaded_from_disk_is_checked_too(tmp_path: Any, backend: str) -> None:
     def session() -> tuple[Engine, dict[str, Any]]:
-        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend, check_mutations=True)
         return engine, _graph(engine)
 
     engine, q = session()
@@ -287,7 +288,7 @@ def test_a_result_loaded_from_disk_is_checked_too(tmp_path: Any, backend: str) -
 
 
 def test_an_input_set_to_an_object_that_is_later_changed_is_caught() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     data = [1, 2]
 
     @engine.input
@@ -308,7 +309,7 @@ def test_an_input_set_to_an_object_that_is_later_changed_is_caught() -> None:
 def test_something_that_cannot_be_encoded_put_into_a_result_counts_as_a_change() -> (
     None
 ):
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
     assert q["total"]() == 1
     q["rows"]().append(object())
@@ -317,7 +318,7 @@ def test_something_that_cannot_be_encoded_put_into_a_result_counts_as_a_change()
 
 
 def test_stored_hashes_of_unknown_names() -> None:
-    engine = Engine()
+    engine = Engine(check_mutations=True)
     q = _graph(engine)
     hashes = engine._store.query_hashes
     assert hashes.get("no:such-query") is None
@@ -325,3 +326,49 @@ def test_stored_hashes_of_unknown_names() -> None:
     with pytest.raises(KeyError):
         hashes["no:such-query"]
     assert hashes[q["rows"].id] == hashes.get(q["rows"].id)
+
+
+def test_by_default_queries_do_not_check_but_check_mutations_does() -> None:
+    engine = Engine()
+    with pytest.raises(TypeError, match="must be a bool"):
+        Engine(check_mutations=1)  # type: ignore[arg-type]
+
+    @engine.query
+    def base() -> list[int]:
+        return [1, 2]
+
+    @engine.query
+    def with_total() -> list[int]:
+        values = base()
+        values.append(sum(values))
+        return values
+
+    assert with_total() == [1, 2, 3]  # not checked: served as computed
+    assert base() == [1, 2, 3]
+    with pytest.raises(MutatedValueError, match="base"):
+        engine.check_mutations()
+    assert base() == [1, 2]  # dropped and computed again
+
+
+def test_a_dependency_that_raised_has_no_value_to_check() -> None:
+    engine = Engine(check_mutations=True)
+
+    @engine.input
+    def n() -> int:
+        return 0
+
+    @engine.query
+    def failing() -> int:
+        raise ValueError("cached")
+
+    @engine.query
+    def reader() -> str:
+        try:
+            failing()
+        except ValueError:
+            pass
+        return f"ran at {n()}"
+
+    assert reader() == "ran at 0"
+    n.set(1)
+    assert reader() == "ran at 1"
