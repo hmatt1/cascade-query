@@ -352,14 +352,14 @@ jobs:
           except Exception as exc:  # pragma: no cover - best effort in CI
               print(f"Warning: unable to query PyPI releases: {exc}")
 
-          baselines = [pyproject_version]
-          if git_versions:
-              baselines.append(max(git_versions))
-          if published_versions:
-              baselines.append(max(published_versions))
-          major, minor, patch = max(baselines)
-
-          next_tuple = (major, minor, patch + 1)
+          released = list(git_versions) + list(published_versions)
+          if not released or pyproject_version > max(released):
+              # pyproject.toml names a version not released yet (a minor or
+              # major bump made by hand): release exactly that one.
+              next_tuple = pyproject_version
+          else:
+              major, minor, patch = max(released)
+              next_tuple = (major, minor, patch + 1)
           while next_tuple in published_versions:
               major, minor, patch = next_tuple
               next_tuple = (major, minor, patch + 1)
