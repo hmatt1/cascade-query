@@ -30,17 +30,51 @@ compares every read of the engine with a plain function of it. It covers
 inputs, a dynamic dependency, snapshots, TTL, re-registered code, a fixed
 point (also through a snapshot), a collection under transactions that commit
 or roll back, compaction while snapshots are held, and reopening from disk.
-It runs in memory, on mdbx and on sqlite, 100 examples of 40 steps each, in
-about 12 seconds.
+It runs in memory, on mdbx and on sqlite, 100 examples of 40 steps each.
 
 - The engine passes on all three.
 - Thirteen faults seeded into the engine one at a time each make it fail, so
   a pass is evidence and not silence.
-- It is sequential: no threads, errors, eviction, async queries, effects or
-  `compute_many`, one collection, one writer (test gap 3 in
-  `docs/guarantees.md`).
 - Its examples are random. One mutant was killed by it in two runs and
   survived a third (see below).
+
+### Widened beyond one thread (2026-11-25)
+
+The rules now also cover cached errors and a query that catches them,
+accumulator effects (compared on every read), eviction (`prune`,
+`sweep_unaccessed`, and an LRU bound of 3, 8 or 10,000 drawn per example),
+async queries awaited as several tasks on one loop, `compute_many` live and
+through a snapshot, and a rule with up to four reader threads (live,
+through a snapshot, async, `compute_many`) beside a writer that sets
+inputs, changes the list and evicts. A live read on a reader thread must
+match one of the states the writer passed through; once the threads have
+joined, a read must match the final state. The three machines take about
+25 seconds on 3.12 and 35 on the free-threaded 3.14t, where they pass too.
+
+Faults seeded on a copy, one at a time, against all three machines (3.12):
+
+| Fault | Machines failing |
+|---|---|
+| Effects of a cached result not replayed, sync path | 3 of 3 |
+| The same, async path only | 3 of 3 |
+| Async verification ignores a changed dependency | 3 of 3 |
+| `compute_many` ignores its snapshot | 3 of 3 |
+| Dropping a result leaves its dependents clean | 2 of 3 |
+| An error hashed by its type, not its args | 1 of 3, then 3 of 3 with the rule below |
+| The LRU evicts a row that is being verified | 0 of 3, also on 3.14t |
+| The D35 fix reverted | 0 of 3, also on 3.14t |
+
+A ninth seed did not count: `sweep_unaccessed` dropping every result is
+not a fault, since G13 allows dropping anything. The error fault was first
+caught only by chance, so `changed_error_reaches_its_catcher` now walks
+into it: an error that changes only in its value must reach the query that
+catches it. Whether an LRU that evicts a pinned row gives a wrong result
+at all is not known; this machine does not show one. Reverting D35 needs
+two callers to meet inside a fixed point whose member was dropped; the
+readers here meet only by chance, so the machine does not replace the D35
+tests. Still outside it: several writers,
+cancellation and `submit`, transactions on threads and more than one
+collection (test gap 3 in `docs/guarantees.md`).
 
 ## TLA+ model
 
@@ -706,6 +740,19 @@ the first row, which is code for the other platform (file locking in
   are at parity (13 each), and `_retry_after` (2/2), `_wait_for_joined_run`
   (8/8), and `_release_in_flight` (10/10) have 0 survivors.
 
+  Three things to know when reading it:
+
+  - The source it ran on was `9c757f1`, which differs from `1b2e596` only
+    by the deletion of `_note_write_failure`, a method excluded from
+    coverage; the mutants are the same.
+  - `try_mark_green_async` went from 21 survivors to 28, from 65 mutants to
+    76: the 11 new ones are on lines the pragmas hid. Mutants cannot be
+    compared one by one with the earlier runs where the function changed,
+    because mutmut numbers them in order (`compute_or_get_memo_async` had
+    222, now 243).
+  - It ran with the sequential state machine; the widened one (see "Widened
+    beyond one thread" above) came after it.
+
 ## Next steps
 
 In order of value for the time they take.
@@ -719,7 +766,10 @@ In order of value for the time they take.
    `trace_event` arguments, pin/unpin calls, or the `_finished_meanwhile_locked`
    race window; the main behavioral ones left are provisional-hit and
    `cache_green` effect replay (`return pending, True` / `return existing, True`)
-   and `_refuse_reentry` under async shadow verification.
+   and `_refuse_reentry` under async shadow verification. Re-running the
+   module with the widened state machine first may kill some of them: it
+   replays effects of cached results on every read and awaits async
+   queries as several tasks at once.
 4. **Decide whether mutation runs fix the Hypothesis seed.** With random
    examples a few verdicts change from run to run; a fixed seed makes the
    rate comparable over time, at the price of always trying the same

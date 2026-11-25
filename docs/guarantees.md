@@ -1447,8 +1447,8 @@ actions to the code and the invariants to the guarantees.
 - None of D1–D35 is reachable in the model: each is in a feature it leaves
   out (for D33 the record of who waits for whom, for D34 tasks and their
   cancellation, for D35 fixed points). The state machine (test gap 3) is
-  what covers the others; it has no threads or tasks, so none of these
-  three.
+  what covers the others. It runs threads and tasks since, but only as
+  readers beside one writer, and it cancels nothing.
 
 ## Test gaps
 
@@ -1464,19 +1464,33 @@ Ordered by the risk they leave open.
    `test_collection_write_lock.py` puts two engines, and two processes, on
    one `cache_dir`, but only around named collections; nothing runs two
    processes writing results to one directory under load.
-3. **The Hypothesis state machine is sequential.** It keeps a plain-Python
-   model (input values, a list, a clock, the revision) and compares every
-   read with a plain function of it: inputs, a dynamic dependency,
-   snapshots, a TTL query and a dependent, re-registered code, a fixed
-   point, a collection under transactions that commit or roll back,
-   compaction while snapshots are held, and a new engine on the same
-   directory, in memory and on both backends, 100 examples of 40 steps
-   each. Thirteen faults seeded into the engine one at a time (faults of
-   the kind of D2, D3, D12 and D22, a rollback that undoes nothing, a
-   persisted result loaded without comparing its dependencies, and so on)
-   each fail it. It has no threads, errors, eviction, async queries,
-   accumulator effects or `compute_many`, one collection (a list), and one
-   writer.
+3. **The Hypothesis state machine has one writer and leaves races to
+   chance.** It keeps a plain-Python model (input values, a list, a clock,
+   the revision) and compares every read with a plain function of it:
+   inputs, a dynamic dependency, snapshots, a TTL query and a dependent,
+   re-registered code, a fixed point, a collection under transactions that
+   commit or roll back, compaction while snapshots are held, a new engine
+   on the same directory, cached errors and a query that catches them,
+   accumulator effects on every read, `prune`, `sweep_unaccessed` and an
+   LRU bound of 3, 8 or 10,000 drawn per example, async queries awaited as
+   several tasks on one loop, and `compute_many`, live and through a
+   snapshot. One rule runs up to four reader threads (live, through a
+   snapshot, async on a loop of their own, `compute_many`) beside a writer
+   that sets inputs, changes the list and evicts: a live read must match
+   one of the states the writer passed through, and once all have
+   finished, a read must match the final state. In memory and on both
+   backends, 100 examples of 40 steps each. Thirteen faults seeded into
+   the engine one at a time (faults of the kind of D2, D3, D12 and D22, a
+   rollback that undoes nothing, a persisted result loaded without
+   comparing its dependencies, and so on) failed it before these rules
+   were added; six more fail it since (effects not replayed on the sync or
+   the async path, async verification that ignores a changed dependency,
+   an error hashed without its args, `compute_many` ignoring its snapshot,
+   a dropped result that leaves its dependents clean). Still outside it:
+   several writers, cancellation and `submit`, transactions on threads,
+   more than one collection, and any control of how threads interleave:
+   reverting the D35 fix, which needs two callers to meet inside a fixed
+   point, does not fail it.
 4. **Rewrite equivalence is tested per reducer, not per program.**
    `test_rewrite_differential.py` compares each rewritten reducer with the
    builtin over ints, floats, strings, tuples and mixtures. It does not

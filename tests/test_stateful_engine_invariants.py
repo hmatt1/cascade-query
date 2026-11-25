@@ -16,12 +16,36 @@ Each of those has plain rules, which Hypothesis interleaves with everything
 else, and one rule that walks through the scenario that was broken, from
 whatever state the machine is in. The machine runs in memory and on each
 disk backend.
+
+Beyond one thread, each example draws an LRU bound (``max_entries``) and the
+rules add, all compared with the same plain functions:
+
+- errors: ``strict`` raises for a negative value and ``safe`` catches it
+  (G8); the outcome of a raising call is compared as ``("raise", value)``;
+- accumulator effects: ``noted`` pushes for a negative value, and every read
+  compares the effects it collected with the pushes plain Python makes, in
+  order, whether the result was computed, loaded or joined (G12);
+- eviction: ``prune`` and ``sweep_unaccessed`` at any point, and a bound
+  small enough that the LRU drops results while a query runs (G13);
+- async queries awaited on a running loop, several tasks at once (G14);
+- ``compute_many``, live and through a snapshot;
+- threads: readers (live, through a snapshot, async on a loop of their own,
+  ``compute_many``) run beside a writer that sets inputs, changes the list
+  and evicts. A live read must equal the plain function of one of the states
+  the writer passed through, a read through a snapshot the snapshot's state
+  exactly; once all have finished, a read on one thread must give the final
+  state's value, so a race cannot leave a wrong result behind (G4, G5).
+  Results of this rule depend on how the threads interleave, so a failure
+  in it may not shrink or repeat.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import shutil
 import tempfile
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -32,6 +56,7 @@ import pytest
 from hypothesis import HealthCheck, settings, strategies as st
 from hypothesis.stateful import (
     RuleBasedStateMachine,
+    initialize,
     invariant,
     precondition,
     rule,
@@ -60,7 +85,20 @@ QUERIES = (
     "reach",
     "total",
     "above_bias",
+    "strict",
+    "safe",
+    "noted",
+    "noted_pair",
+    "achoose",
+    "amix",
 )
+# Queries without arguments, and those defined with ``async def``.
+NO_ARGS = ("sensor", "total", "above_bias")
+ASYNC_QUERIES = ("achoose", "amix")
+# compute_many returns values only; a raising call would end the batch.
+MANY_QUERIES = tuple(q for q in QUERIES if q not in ("strict", *ASYNC_QUERIES))
+# How long a thread of the concurrent rule may take before it counts as hung.
+JOIN_TIMEOUT = 60.0
 
 INDEXES = st.integers(min_value=0, max_value=4)
 NODE = st.integers(min_value=0, max_value=NODES - 1)
@@ -84,6 +122,21 @@ TRANSACTION_STEP = st.one_of(
     st.tuples(st.just("pop")),
     st.tuples(st.just("read"), st.sampled_from(QUERIES), INDEXES),
 )
+EVICTION = st.one_of(
+    st.tuples(st.just("sweep"), st.integers(min_value=0, max_value=30)),
+    st.tuples(
+        st.just("prune"),
+        st.lists(st.tuples(st.sampled_from(QUERIES), INDEXES), max_size=3),
+    ),
+)
+# What the writer of the concurrent rule does while readers read.
+WRITER_STEP = st.one_of(
+    SET_INPUT,
+    st.tuples(st.just("append"), SMALL_INTS),
+    st.tuples(st.just("pop")),
+    EVICTION,
+)
+READER = st.tuples(st.sampled_from(("live", "snapshot", "async", "many")), READS)
 
 # --- the plain-Python model ---------------------------------------------------
 
@@ -140,6 +193,12 @@ def plain_above_bias(world: World) -> int:
     return len([x for x in world.items if x > bias])
 
 
+def plain_noted(world: World, index: int) -> tuple[int, tuple[Any, ...]]:
+    """``noted``: the value and what it pushes to ``notes``."""
+    value = plain_choose(world, index)
+    return value, (((index, value),) if value < 0 else ())
+
+
 class _Clock:
     """Stands in for the ``time`` module inside the evaluator (G9)."""
 
@@ -177,6 +236,8 @@ class EngineStateMachine(RuleBasedStateMachine):
         self.sensor_history: list[tuple[float, int]] = []
         self.cache_dir = None if self.backend is None else tempfile.mkdtemp()
         self.engine: Engine | None = None
+        self.max_entries = 10_000
+        self.loop = asyncio.new_event_loop()
         self._patches = [
             mock.patch.object(evaluator_module, "time", self.clock),
             # Small enough for the machine's handful of changes to reach
@@ -185,20 +246,25 @@ class EngineStateMachine(RuleBasedStateMachine):
         ]
         for patch in self._patches:
             patch.start()
-        try:
-            self._build_engine()
-        except BaseException:
-            self.teardown()
-            raise
+
+    @initialize(max_entries=st.sampled_from((10_000, 3, 8)))
+    def start(self, max_entries: int) -> None:
+        """Build the engine; a small bound makes the LRU drop results (G13)."""
+        self.max_entries = max_entries
+        self._build_engine()
 
     # --- the engine under test -----------------------------------------------
 
     def _build_engine(self) -> None:
         if self.cache_dir is None:
-            engine = Engine()
+            engine = Engine(max_entries=self.max_entries)
         else:
             assert self.backend is not None
-            engine = Engine(cache_dir=self.cache_dir, cache_backend=self.backend)
+            engine = Engine(
+                max_entries=self.max_entries,
+                cache_dir=self.cache_dir,
+                cache_backend=self.backend,
+            )
         # The current handles. A query looks ``scaled`` up here on every
         # run, because registering new code makes the old handle stale.
         h = SimpleNamespace()
@@ -266,9 +332,48 @@ class EngineStateMachine(RuleBasedStateMachine):
         def above_bias() -> int:
             return len([x for x in items if x > bias()])
 
+        notes = engine.accumulator("notes")
+
+        @engine.query(name="strict")
+        def strict(index: int) -> int:
+            value = choose(index)
+            if value < 0:
+                raise ValueError(value)
+            return value
+
+        @engine.query(name="safe")
+        def safe(index: int) -> int:
+            try:
+                return strict(index)
+            except ValueError as exc:
+                return 100 + exc.args[0]
+
+        @engine.query(name="noted")
+        def noted(index: int) -> int:
+            value = choose(index)
+            if value < 0:
+                notes.push((index, value))
+            return value
+
+        @engine.query(name="noted_pair")
+        def noted_pair(index: int) -> int:
+            return noted(index) + noted(index + 1)
+
+        @engine.query(name="achoose")
+        async def achoose(index: int) -> int:
+            await asyncio.sleep(0)
+            return choose(index)
+
+        @engine.query(name="amix")
+        async def amix(index: int) -> int:
+            first = await achoose(index)
+            return first - noted(index + 1)
+
         h.mode, h.left, h.right, h.bias, h.edge = mode, left, right, bias, edge
         h.choose, h.pair, h.sensor, h.reading = choose, pair, sensor, reading
         h.reach, h.total, h.above_bias = reach, total, above_bias
+        h.strict, h.safe, h.noted, h.noted_pair = strict, safe, noted, noted_pair
+        h.achoose, h.amix = achoose, amix
         self.engine = engine
         self.h = h
         self.items = items
@@ -295,6 +400,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         try:
             self._close_engine()
         finally:
+            self.loop.close()
             for patch in self._patches:
                 patch.stop()
             if self.cache_dir is not None:
@@ -332,23 +438,89 @@ class EngineStateMachine(RuleBasedStateMachine):
             return {plain_reach(world, index % NODES)}
         if query == "total":
             return {sum(world.items)}
-        assert query == "above_bias"
-        return {plain_above_bias(world)}
+        if query == "above_bias":
+            return {plain_above_bias(world)}
+        return {value for value, _ in self._outcomes(world, query, index)}
+
+    def _outcomes(self, world: World, query: str, index: int) -> set[Any]:
+        """Each correct ``(outcome, notes)`` of a call.
+
+        The outcome is the value, or ``("raise", value)`` for the
+        ``ValueError`` of ``strict``; ``notes`` is what the call collects in
+        ``effects["notes"]``, in order (G12).
+        """
+        if query in ("strict", "safe", "achoose"):
+            value = plain_choose(world, index)
+            if query == "strict" and value < 0:
+                return {(("raise", value), ())}
+            if query == "safe" and value < 0:
+                return {(100 + value, ())}
+            return {(value, ())}
+        if query == "noted":
+            return {plain_noted(world, index)}
+        if query == "noted_pair":
+            (first, a), (second, b) = (
+                plain_noted(world, index),
+                plain_noted(world, index + 1),
+            )
+            return {(first + second, a + b)}
+        if query == "amix":
+            second, notes = plain_noted(world, index + 1)
+            return {(plain_choose(world, index) - second, notes)}
+        return {(value, ()) for value in self._expected(world, query, index)}
+
+    def _args(self, query: str, index: int) -> tuple[int, ...]:
+        if query in NO_ARGS:
+            return ()
+        if query == "reach":
+            return (index % NODES,)
+        return (index,)
+
+    @staticmethod
+    def _outcome(effects: dict[str, list[Any]], call: Any) -> Any:
+        """Run ``call``; give its outcome and the notes it collected."""
+        try:
+            value = call()
+        except ValueError as exc:
+            value = ("raise", *exc.args)
+        return value, tuple(effects.get("notes", ()))
 
     def _call(self, query: str, index: int, snapshot: Snapshot | None) -> Any:
+        if query in ASYNC_QUERIES:
+            # Called from plain code an async query takes the sync path; the
+            # async one is taken by awaiting on a loop (``_acall``); a reader
+            # thread of the concurrent rule runs a loop of its own.
+            call = self._acall(query, index, snapshot)
+            if threading.current_thread() is threading.main_thread():
+                return self.loop.run_until_complete(call)
+            return asyncio.run(call)
         handle = getattr(self.h, query)
-        options = {} if snapshot is None else {"snapshot": snapshot}
-        if query in ("sensor", "total", "above_bias"):
-            return handle(**options)
-        if query == "reach":
-            return handle(index % NODES, **options)
-        return handle(index, **options)
+        effects: dict[str, list[Any]] = {}
+        options: dict[str, Any] = {"effects": effects}
+        if snapshot is not None:
+            options["snapshot"] = snapshot
+        args = self._args(query, index)
+        return self._outcome(effects, lambda: handle(*args, **options))
+
+    async def _acall(self, query: str, index: int, snapshot: Snapshot | None) -> Any:
+        handle = getattr(self.h, query)
+        effects: dict[str, list[Any]] = {}
+        options: dict[str, Any] = {"effects": effects}
+        if snapshot is not None:
+            options["snapshot"] = snapshot
+        try:
+            result = handle(*self._args(query, index), **options)
+            if inspect.isawaitable(result):
+                result = await result
+        except ValueError as exc:
+            result = ("raise", *exc.args)
+        return result, tuple(effects.get("notes", ()))
 
     def _read(
         self, query: str, index: int, world: World, snapshot: Snapshot | None = None
     ) -> None:
         actual = self._call(query, index, snapshot)
-        expected = self._expected(world, query, index)
+        expected = self._outcomes(world, query, index)
         assert actual in expected, (query, index, actual, expected, snapshot)
 
     # --- the revision, modelled (G3, G25) ------------------------------------
@@ -399,6 +571,235 @@ class EngineStateMachine(RuleBasedStateMachine):
     def read_live(self, reads: list[tuple[str, int]]) -> None:
         for query, index in reads:
             self._read(query, index, self.world)
+
+    @rule(reads=READS, pick=PICK, through_snapshot=st.booleans())
+    def read_async(
+        self, reads: list[tuple[str, int]], pick: int, through_snapshot: bool
+    ) -> None:
+        """Every read as a task on one running loop, all at once."""
+        held = None
+        if through_snapshot:
+            live = [held for held in self.snapshots if not held.released]
+            held = live[pick % len(live)] if live else None
+        world = self.world if held is None else held.world
+        snapshot = None if held is None else held.snapshot
+
+        async def gather() -> list[Any]:
+            return await asyncio.gather(
+                *(self._acall(query, index, snapshot) for query, index in reads)
+            )
+
+        results = self.loop.run_until_complete(gather())
+        for (query, index), actual in zip(reads, results, strict=True):
+            expected = self._outcomes(world, query, index)
+            assert actual in expected, (query, index, actual, expected, snapshot)
+
+    def _many(
+        self, reads: list[tuple[str, int]], snapshot: Snapshot | None
+    ) -> list[tuple[tuple[str, int], Any]]:
+        assert self.engine is not None
+        calls = [(q, i) for q, i in reads if q in MANY_QUERIES]
+        if not calls:
+            return []
+        values = self.engine.compute_many(
+            [(getattr(self.h, q), self._args(q, i)) for q, i in calls],
+            snapshot=snapshot,
+        )
+        return list(zip(calls, values, strict=True))
+
+    @rule(reads=READS, pick=PICK, through_snapshot=st.booleans())
+    def read_many(
+        self, reads: list[tuple[str, int]], pick: int, through_snapshot: bool
+    ) -> None:
+        """``compute_many`` runs the calls on worker threads."""
+        live = [held for held in self.snapshots if not held.released]
+        held = live[pick % len(live)] if through_snapshot and live else None
+        world = self.world if held is None else held.world
+        snapshot = None if held is None else held.snapshot
+        for (query, index), value in self._many(reads, snapshot):
+            assert value in self._expected(world, query, index), (query, index, value)
+
+    @rule(
+        index=INDEXES,
+        first=st.integers(min_value=-8, max_value=-1),
+        second=st.integers(min_value=-8, max_value=-1),
+    )
+    def changed_error_reaches_its_catcher(
+        self, index: int, first: int, second: int
+    ) -> None:
+        """G8: an error that changes only in its args is a change.
+
+        ``strict`` keeps raising, with another value; ``safe``, which
+        catches it, must follow.
+        """
+        bias = self.world.get("bias")
+        assert bias is not None
+        branch = "left" if self.world.get("mode") == 0 else "right"
+        self._set(branch, (index,), first - bias)
+        self._read("safe", index, self.world)
+        self._set(branch, (index,), second - bias)
+        self._read("safe", index, self.world)
+        self._read("strict", index, self.world)
+
+    # --- rules: eviction (G13) -----------------------------------------------
+
+    def _evict(self, step: tuple[Any, ...]) -> None:
+        """Drop results: what a later read returns must not change."""
+        assert self.engine is not None
+        if step[0] == "sweep":
+            # Everything not used in roughly the last ``step[1]`` accesses.
+            self.engine.sweep_unaccessed(self.engine.access_id - step[1])
+            return
+        assert step[0] == "prune"
+        self.engine.prune(
+            [("query", query, self._args(query, index)) for query, index in step[1]]
+        )
+
+    @rule(step=EVICTION)
+    def evict(self, step: tuple[Any, ...]) -> None:
+        self._evict(step)
+
+    @rule(step=EVICTION, reads=READS)
+    def evict_between_reads(
+        self, step: tuple[Any, ...], reads: list[tuple[str, int]]
+    ) -> None:
+        """G13: the same reads give the same answers after a drop."""
+        for query, index in reads:
+            self._read(query, index, self.world)
+        self._evict(step)
+        for query, index in reads:
+            self._read(query, index, self.world)
+
+    # --- rules: threads ------------------------------------------------------
+
+    def _write(self, step: tuple[Any, ...], worlds: list[World]) -> Any:
+        """One step of the concurrent writer; give its revision verdict."""
+        assert self.engine is not None
+        world = worlds[-1].copy()
+        kind = step[0]
+        if kind in ("sweep", "prune"):
+            self._evict(step)
+            return False
+        if kind == "append":
+            self.items.append(step[1])
+            world.items.append(step[1])
+            verdict: Any = True
+        elif kind == "pop":
+            if not world.items:
+                return False
+            assert self.items.pop() == world.items.pop()
+            verdict = True
+        else:
+            name, *args, value = step
+            verdict = self._changes(world, (name, tuple(args)), value)
+            getattr(self.h, name).set(*args, value=value)
+            world.inputs[(name, tuple(args))] = value
+        worlds.append(world)
+        return verdict
+
+    def _reader(
+        self, kind: str, reads: list[tuple[str, int]], snapshot: Snapshot | None
+    ) -> list[tuple[tuple[str, int], Any]]:
+        if kind == "async":
+
+            async def gather() -> list[Any]:
+                return await asyncio.gather(
+                    *(self._acall(q, i, snapshot) for q, i in reads)
+                )
+
+            return list(zip(reads, asyncio.run(gather()), strict=True))
+        if kind == "many":
+            return [(call, (value,)) for call, value in self._many(reads, snapshot)]
+        return [((q, i), self._call(q, i, snapshot)) for q, i in reads]
+
+    @rule(
+        readers=st.lists(READER, min_size=1, max_size=4),
+        writes=st.lists(WRITER_STEP, max_size=5),
+        pick=PICK,
+    )
+    def concurrent(
+        self,
+        readers: list[tuple[str, list[tuple[str, int]]]],
+        writes: list[tuple[Any, ...]],
+        pick: int,
+    ) -> None:
+        """Readers on threads of their own beside one writer.
+
+        A live read runs at one revision, so it must equal the plain
+        function of one of the states the writer passed through; a read
+        through a snapshot gives the snapshot's state exactly. The engine's
+        own loops are not shared: an async reader runs a loop of its own.
+        """
+        assert self.engine is not None
+        before = self.engine.revision
+        worlds = [self.world.copy()]
+        verdicts: list[Any] = []
+        live = [held for held in self.snapshots if not held.released]
+        start = threading.Barrier(len(readers) + 1)
+        results: list[Any] = [None] * len(readers)
+        failures: list[BaseException] = []
+
+        def run_reader(slot: int, kind: str, reads: list[tuple[str, int]]) -> None:
+            try:
+                held = None
+                if kind == "snapshot" and live:
+                    held = live[(pick + slot) % len(live)]
+                start.wait(timeout=JOIN_TIMEOUT)
+                snapshot = None if held is None else held.snapshot
+                results[slot] = (held, self._reader(kind, reads, snapshot))
+            except BaseException as exc:  # noqa: BLE001  (re-raised below)
+                failures.append(exc)
+
+        def run_writer() -> None:
+            try:
+                start.wait(timeout=JOIN_TIMEOUT)
+                for step in writes:
+                    verdicts.append(self._write(step, worlds))
+            except BaseException as exc:  # noqa: BLE001  (re-raised below)
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=run_reader, args=(slot, kind, reads), daemon=True)
+            for slot, (kind, reads) in enumerate(readers)
+        ]
+        threads.append(threading.Thread(target=run_writer, daemon=True))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=JOIN_TIMEOUT)
+        assert not any(t.is_alive() for t in threads), "a thread hung"
+        if failures:
+            raise failures[0]
+
+        for held, reads in results:
+            for (query, index), actual in reads:
+                if held is not None:
+                    candidates = [held.world]
+                else:
+                    candidates = worlds
+                if len(actual) == 1:  # compute_many: the value alone
+                    allowed = {
+                        v for w in candidates for v in self._expected(w, query, index)
+                    }
+                    assert actual[0] in allowed, (query, index, actual, allowed)
+                else:
+                    allowed = {
+                        o for w in candidates for o in self._outcomes(w, query, index)
+                    }
+                    assert actual in allowed, (query, index, actual, allowed, held)
+
+        # The writer's steps follow one another, so the revision moved once
+        # for each that changed something.
+        moved = self.engine.revision - before
+        must = sum(1 for v in verdicts if v is True)
+        may = sum(1 for v in verdicts if v is None)
+        assert must <= moved <= must + may, (moved, verdicts)
+        self.revision += moved
+        self.world = worlds[-1]
+        # Nothing the race left behind may be served from here on.
+        for _, reads in readers:
+            for query, index in reads:
+                self._read(query, index, self.world)
 
     @rule(index=INDEXES, value=MAYBE_INT)
     def inactive_branch_write_does_not_rerun_choose(
