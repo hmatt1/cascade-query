@@ -248,6 +248,10 @@ class Unregistered:
     pass
 
 
+def _celsius_degrees(c: Celsius) -> float:
+    return c.degrees
+
+
 def test_register_type_refuses_native_types_and_conflicts() -> None:
     with pytest.raises(ValueError, match="natively"):
         register_type(decimal.Decimal, encode=str, decode=decimal.Decimal)
@@ -256,18 +260,17 @@ def test_register_type_refuses_native_types_and_conflicts() -> None:
     with pytest.raises(TypeError, match="callable"):
         register_type(Celsius, encode=None, decode=None)  # type: ignore[arg-type]
 
-    def enc(c: Celsius) -> float:
-        return c.degrees
-
-    register_type(Celsius, encode=enc, decode=Celsius, name="test:Celsius")
+    register_type(Celsius, encode=_celsius_degrees, decode=Celsius, name="test:Celsius")
     # The same registration again is fine (a module imported twice).
-    register_type(Celsius, encode=enc, decode=Celsius, name="test:Celsius")
+    register_type(Celsius, encode=_celsius_degrees, decode=Celsius, name="test:Celsius")
     with pytest.raises(ValueError, match="already registered"):
         register_type(Celsius, encode=lambda c: c.degrees, decode=Celsius)
     with pytest.raises(ValueError, match="already registered for"):
         register_type(Unregistered, encode=str, decode=str, name="test:Celsius")
     # Engine.register_type is the same process-wide registry.
-    Engine.register_type(Celsius, encode=enc, decode=Celsius, name="test:Celsius")
+    Engine.register_type(
+        Celsius, encode=_celsius_degrees, decode=Celsius, name="test:Celsius"
+    )
     assert same_value(
         canonical.decode(canonical.encode([Celsius(21.5)]))[0].degrees, 21.5
     )
@@ -312,6 +315,8 @@ def test_failing_encode_function_is_reported_as_unencodable(tmp_path: Path) -> N
             make()
     finally:
         engine.shutdown()
+        _types._BY_NAME.pop("test:Fragile", None)  # noqa: SLF001
+        _types._BY_TYPE.pop(Fragile, None)  # noqa: SLF001
 
 
 def test_value_stored_under_an_unregistered_name_is_not_decoded() -> None:
@@ -348,16 +353,14 @@ def test_result_stored_under_an_unregistered_name_is_recomputed(
     # The first session can encode Later only once it is registered; the
     # second reads a record whose name it cannot resolve (simulated by
     # registering Later under a name that is then edited in the record).
-    register_type(
-        Later, encode=lambda x: x.v, decode=lambda v: Later(v), name=f"later/{backend}"
-    )
-    engine, make = session()
-    assert make() == Later(5)
-    engine.shutdown()
-    from cascade import _types
-
-    reg = _types._BY_NAME.pop(f"later/{backend}")  # noqa: SLF001
+    name = f"later/{backend}"
+    register_type(Later, encode=lambda x: x.v, decode=lambda v: Later(v), name=name)
     try:
+        engine, make = session()
+        assert make() == Later(5)
+        engine.shutdown()
+
+        _types._BY_NAME.pop(name, None)  # noqa: SLF001
         engine, make = session()
         try:
             assert make() == Later(5)
@@ -365,7 +368,8 @@ def test_result_stored_under_an_unregistered_name_is_recomputed(
         finally:
             engine.shutdown()
     finally:
-        _types._BY_NAME[f"later/{backend}"] = reg  # noqa: SLF001
+        _types._BY_NAME.pop(name, None)  # noqa: SLF001
+        _types._BY_TYPE.pop(Later, None)  # noqa: SLF001
 
 
 # --- numpy ---------------------------------------------------------------------

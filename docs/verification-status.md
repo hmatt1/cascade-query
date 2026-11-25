@@ -20,8 +20,8 @@ runs.
 |---|---|
 | TLC output under `docs/formal/` | Deleted (255 files) and ignored. Done. |
 | State machine | Rewritten with the new rules, on three backends. Done. |
-| TLA+ model | Rewritten; both configurations pass, and the CI job passed on GitHub on 2026-11-24. The on-demand workflow has not been started yet. |
-| Mutation testing | Tooling, a first baseline and a repeat over two modules exist; the runner is in the repository. Outside those two modules most kills come from one pass. Two defects were found while writing tests for its findings, D33 and D34; both are fixed. |
+| TLA+ model | Rewritten; both configurations pass, and both the CI job and the exhaustive on-demand workflow (`model-check.yml`, 12m44s) passed on GitHub on 2026-11-24. |
+| Mutation testing | Tooling, a first baseline and a repeat over two modules exist; the runner is in the repository. Outside those two modules most kills come from one pass. Two defects were found while writing tests for its findings, D33 and D34; both are fixed. The first on-demand run of `mutation.yml` (`small` shard) caught a global `register_type` leak in `tests/test_value_types.py` when run twice in one process (fixed since). |
 
 ## State machine
 
@@ -633,27 +633,32 @@ the first row, which is code for the other platform (file locking in
   fallback in the handles for an interpreter without
   `asyncio._get_running_loop`, and error paths of the disk cache.
 
+- **Follow-up (`921329f`, `v0.3.29`):** Additional tests and unreachable-guard
+  pragmas brought Windows coverage to **100%** (6,145 statements, 2,218
+  branches, 2,142 tests passing). CI passed on both Python 3.12 and
+  free-threaded Python 3.14t (**99.77%** branch coverage on Linux, with only
+  the Windows-only file-locking branch unexecuted) and published `v0.3.29` to
+  PyPI.
+
 ## Next steps
 
 In order of value for the time they take.
 
-1. **Push, and read the coverage CI reports.** The estimate above is
-   95.8% against the 95% it requires. A run in which every job passes
-   publishes a release.
-2. **Start `.github/workflows/mutation.yml` once**, and
-   `model-check.yml` once, to learn whether they work. One shard is enough
-   for the first try. Both are on `main` now.
-3. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
+1. **Re-run `.github/workflows/mutation.yml` (`shards=small`)** after the
+   `test_value_types.py` repeat-in-process fix, to confirm `mutmut` completes
+   cleanly on GitHub Actions. (`model-check.yml` already passed on GitHub in
+   12m44s.)
+2. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
    from before the three fixes and the tests of the sections above, which
    were checked against changes made by hand only.
-4. **Look at the survivors in the async paths that change a condition or
+3. **Look at the survivors in the async paths that change a condition or
    an operator.** `compute_or_get_memo_async` still has 78 survivors
    against 42 in the sync function, and awaiting on a running loop is
    what made the difference in `try_mark_green_async`.
-5. **Decide whether mutation runs fix the Hypothesis seed.** With random
+4. **Decide whether mutation runs fix the Hypothesis seed.** With random
    examples a few verdicts change from run to run; a fixed seed makes the
    rate comparable over time, at the price of always trying the same
    examples. It does nothing for the verdicts that depend on threads.
-6. Leave the rest. Driving the overall rate down is not worth it: about a
+5. Leave the rest. Driving the overall rate down is not worth it: about a
    fifth of the survivors are strings, and many of the `None` arguments are
    tracing.
