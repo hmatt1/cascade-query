@@ -295,7 +295,7 @@ def _table(totals: dict[str, int], checked: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def summary(results_dir: Path, json_out: Path | None) -> int:
+def summary(results_dir: Path, json_out: Path | None, only: list[str]) -> int:
     totals: dict[str, int] = {}
     checked: dict[str, str] = {}
     files = sorted(results_dir.rglob("results.json"))
@@ -333,11 +333,17 @@ def summary(results_dir: Path, json_out: Path | None) -> int:
             "survival_rate": _rate(counts),
         }
         json_out.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-    # A module none of whose mutants was checked means a shard died early.
+    # A module none of whose mutants was checked means a shard died early,
+    # unless the run was asked for some shards only and it is in none of them.
     seen = {_module_of(m) for m in checked}
     unchecked = sorted(m for m, total in totals.items() if total and m not in seen)
-    if unchecked:
-        print(f"\nNot checked at all: {', '.join(f'`{m}`' for m in unchecked)}.")
+    asked = {f"cascade.{m}" for name in only for m in SHARDS[name]}
+    left_out = [m for m in unchecked if only and m not in asked]
+    died = [m for m in unchecked if m not in left_out]
+    if left_out:
+        print(f"\nNot part of this run: {', '.join(f'`{m}`' for m in left_out)}.")
+    if died:
+        print(f"\nNot checked at all: {', '.join(f'`{m}`' for m in died)}.")
         return 1
     return 0
 
@@ -363,13 +369,22 @@ def main(argv: list[str]) -> int:
     p = commands.add_parser("summary", help="merge collected results into a report")
     p.add_argument("results_dir", type=Path, nargs="?", default=RESULTS)
     p.add_argument("--json", type=Path, default=None)
+    p.add_argument(
+        "--only",
+        nargs="*",
+        default=[],
+        choices=sorted(SHARDS),
+        metavar="SHARD",
+        help="the shards this run was asked for; modules of other "
+        "shards may then be unchecked (default: every shard ran)",
+    )
     args = parser.parse_args(argv)
     if args.command == "shards":
         return shards(args.only)
     if args.command == "collect":
         out = args.out or RESULTS / args.shard
         return collect(args.shard, out, args.mutants_dir, args.diff_limit)
-    return summary(args.results_dir, args.json)
+    return summary(args.results_dir, args.json, args.only)
 
 
 if __name__ == "__main__":

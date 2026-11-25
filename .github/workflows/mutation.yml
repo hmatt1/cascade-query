@@ -122,10 +122,14 @@ jobs:
           merge-multiple: true
 
       - name: Summarise
+        env:
+          ONLY: ${{ inputs.shards }}
         run: |
           set -o pipefail
+          # With shards named, the modules of the others are not expected.
           python scripts/mutation.py summary mutation-results \
-            --json mutation-results/summary.json | tee -a "$GITHUB_STEP_SUMMARY"
+            --json mutation-results/summary.json --only $ONLY \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report
         if: always()

@@ -1066,3 +1066,49 @@ def test_dict_through_a_snapshot_keeps_the_order_it_had_then(engine: Engine) -> 
     assert positives(snapshot=snapshot) == [1, 2, 3]
     assert positives() == [2, 3]
     snapshot.release()
+
+
+def _first(pair: Any) -> Any:
+    return pair[0]
+
+
+def test_ordered_reducers_take_in_an_element_that_starts_to_pass_the_filter(
+    engine: Engine,
+) -> None:
+    # An element the filter kept out has no place in the order yet. When it
+    # is replaced by one that passes, with a key that is already there, it
+    # has to land where the plain expression puts it: after its twin, since
+    # it comes later in the list.
+    xs = CascadeList(engine, [(1, "a"), (0, "out"), (2, "b"), (0, "out too")])
+
+    @engine.query
+    def kept() -> list[Any]:
+        return sorted((p for p in xs if p[0] > 0), key=_first)
+
+    @engine.query
+    def smallest() -> Any:
+        return min((p for p in xs if p[0] > 0), key=_first)
+
+    @engine.query
+    def largest() -> Any:
+        return max((p for p in xs if p[0] > 0), key=_first)
+
+    def plain() -> tuple[Any, Any, Any]:
+        passing = [p for p in list(xs) if p[0] > 0]
+        return (
+            sorted(passing, key=_first),
+            min(passing, key=_first),
+            max(passing, key=_first),
+        )
+
+    assert kept.raw.__cascade_rewritten__
+    assert (kept(), smallest(), largest()) == plain()
+    xs[1] = (1, "z")
+    assert kept() == [(1, "a"), (1, "z"), (2, "b")]
+    assert (kept(), smallest(), largest()) == plain()
+    xs[3] = (2, "y")
+    assert kept() == [(1, "a"), (1, "z"), (2, "b"), (2, "y")]
+    assert (kept(), smallest(), largest()) == plain()
+    # And out again.
+    xs[1] = (0, "out")
+    assert (kept(), smallest(), largest()) == plain()

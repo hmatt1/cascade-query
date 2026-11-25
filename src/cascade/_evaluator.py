@@ -809,7 +809,7 @@ class Evaluator:
         self._store.trace_event("input_read", key)
         return version.value
 
-    async def read_input_async(  # pragma: no cover
+    async def read_input_async(
         self,
         input_id: str,
         fn: Callable[..., Any],
@@ -901,7 +901,7 @@ class Evaluator:
             raise entry.error
         return entry.value
 
-    async def query_call_async(  # pragma: no cover
+    async def query_call_async(
         self,
         query_id: str,
         fn: Callable[..., Any],
@@ -1099,7 +1099,7 @@ class Evaluator:
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
 
-    async def compute_or_get_memo_async(  # pragma: no cover
+    async def compute_or_get_memo_async(
         self,
         key: QueryKey,
         fn: Callable[..., Any],
@@ -1363,7 +1363,7 @@ class Evaluator:
 
     async def _run_instead_of_waiting_async(
         self, key: QueryKey, fn: Callable[..., Any], runtime: RuntimeState
-    ) -> MemoEntry:  # pragma: no cover
+    ) -> MemoEntry:
         return await self.recompute_async(key, fn, runtime)
 
     def _commit_green(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
@@ -1608,7 +1608,7 @@ class Evaluator:
 
     async def try_mark_green_async(
         self, key: QueryKey, entry: MemoEntry, snapshot: Snapshot
-    ) -> bool:  # pragma: no cover
+    ) -> bool:
         ttl = self._store.lookup_query_ttl(key[1])
         if ttl is not None and time.time() - entry.computed_at_time > ttl:
             self._store.trace_event("cache_red_ttl", key)
@@ -1677,7 +1677,7 @@ class Evaluator:
 
     async def _shadow_entry_async(
         self, key: QueryKey, fn: Callable[..., Any], *, need_value: bool
-    ) -> MemoEntry:  # pragma: no cover
+    ) -> MemoEntry:
         runtime = self._runtime_var.get()
         assert runtime is not None
         self.check_cancelled(runtime.cancel_epoch)
@@ -1791,7 +1791,7 @@ class Evaluator:
 
     async def dependency_changed_at_async(
         self, key: QueryKey, snapshot: Snapshot
-    ) -> int:  # pragma: no cover
+    ) -> int:
         kind, fid, args = key
         if kind == "input":
             version = self._store.input_version_at((fid, args), snapshot.revision)
@@ -1801,7 +1801,7 @@ class Evaluator:
 
     async def _dependency_entry_async(
         self, key: QueryKey, snapshot: Snapshot, *, as_verification: bool = True
-    ) -> MemoEntry | None:  # pragma: no cover
+    ) -> MemoEntry | None:
         fid = key[1]
         runtime = self._runtime_var.get()
         if runtime is not None:
@@ -1835,7 +1835,7 @@ class Evaluator:
         snapshot: Snapshot,
         runtime: RuntimeState | None,
         as_verification: bool = True,
-    ) -> MemoEntry:  # pragma: no cover
+    ) -> MemoEntry:
         if runtime is None:
             self._store.pin_snapshot(snapshot)
             entry = await self._run_in_runtime_async(
@@ -2003,7 +2003,7 @@ class Evaluator:
 
     async def _enter_cycle_through_head_async(
         self, head: QueryKey, runtime: RuntimeState
-    ) -> bool:  # pragma: no cover
+    ) -> bool:
         if self._owns(runtime, head):
             return False
         try:
@@ -2239,7 +2239,7 @@ class Evaluator:
 
     async def _await_cycle_heads_async(
         self, heads: frozenset[QueryKey], runtime: RuntimeState
-    ) -> None:  # pragma: no cover
+    ) -> None:
         for head in heads:
             try:
                 fn = self._store.lookup_query(head[1])
@@ -2438,7 +2438,7 @@ class Evaluator:
             key, frame, runtime, result, error, start, value_hash
         )
 
-    async def recompute_async(  # pragma: no cover
+    async def recompute_async(
         self,
         key: QueryKey,
         fn: Callable[..., Any],
@@ -2958,7 +2958,7 @@ class Evaluator:
 
     async def _try_hydrate_from_disk_async(
         self, key: QueryKey, runtime: RuntimeState
-    ) -> MemoEntry | None:  # pragma: no cover
+    ) -> MemoEntry | None:
         disk = self._disk
         if disk is None:
             return None  # pragma: no cover
@@ -3068,7 +3068,7 @@ class Evaluator:
         self._store.record_disk_hit()
         return memo
 
-    async def _verify_disk_deps_async(  # pragma: no cover
+    async def _verify_disk_deps_async(
         self,
         key: QueryKey,
         record: dict[str, Any],
@@ -3135,7 +3135,7 @@ class Evaluator:
                 return None  # pragma: no cover
         return observed, expires_at
 
-    async def _current_input_version_async(  # pragma: no cover
+    async def _current_input_version_async(
         self,
         input_id: str,
         args: tuple[Any, ...],
@@ -3163,7 +3163,7 @@ class Evaluator:
             value=value,
         )
 
-    async def _current_query_state_async(  # pragma: no cover
+    async def _current_query_state_async(
         self,
         query_id: str,
         args: tuple[Any, ...],

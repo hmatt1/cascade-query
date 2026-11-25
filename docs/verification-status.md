@@ -636,18 +636,65 @@ the first row, which is code for the other platform (file locking in
 - **Follow-up (`921329f`, `v0.3.29`):** Additional tests and unreachable-guard
   pragmas brought Windows coverage to **100%** (6,145 statements, 2,218
   branches, 2,142 tests passing). CI passed on both Python 3.12 and
-  free-threaded Python 3.14t (**99.77%** branch coverage on Linux, with only
-  the Windows-only file-locking branch unexecuted) and published `v0.3.29` to
-  PyPI.
+  free-threaded Python 3.14t (**99.77%** branch coverage on Linux; the next
+  point says what it missed) and published `v0.3.29` to PyPI.
+- **What CI still missed, and why.** For `08e08f8` CI reported 99.89% on
+  3.12 and 99.84% on 3.14t. The lines were not the file locking, which is
+  excluded on both platforms. They were the exit hook in `_evaluator.py`:
+  `_flush_all_at_exit` and the wait loop of `flush_at_exit`. Only the child
+  processes of `test_durability_at_exit.py` ran them. pytest-cov 6, which
+  is installed on this machine, follows child processes; pytest-cov 7,
+  which CI installs, does not. Two tests now call the hook in the test
+  process: one holds a write and checks that the hook waits for it and that
+  the result is on disk afterwards, one stops the writer and checks that
+  the flush gives up. Run alone under pytest-cov 7 they execute every one
+  of those lines.
+- **Two spots were covered by chance.** A run of the committed tree on this
+  machine missed one branch of `_commit_green` (a result dropped while it
+  is being verified, which took another thread dropping it at that moment)
+  and one line of the ordered reducers (an element that starts to pass the
+  filter, which only random examples produced). CI had happened to run
+  both. Each has a fixed test now:
+  `test_dirty_propagation.py::test_result_dropped_while_it_is_being_verified_is_returned_but_not_kept`
+  and
+  `test_rewrite_reducers_exact.py::test_ordered_reducers_take_in_an_element_that_starts_to_pass_the_filter`.
+- **Measured five more times with those four tests.** Three runs on 3.12:
+  100% each, 6,145 statements and 2,218 branches. Two runs on the
+  free-threaded 3.14 with pytest-cov 7: everything but the numpy code, and
+  numpy is not installed for that interpreter here. Not yet confirmed on
+  GitHub.
+- **The 40 lines marked as not coverable in `921329f` were read** (26
+  `no cover`, 14 `no branch`). Each has a reason, or sits next to one. One
+  was tested rather than believed: the trimming block of
+  `_append_version_locked`, which three pins released one at a time did
+  not reach. `Evaluator._note_write_failure` is marked as an unused helper
+  and has no caller: it could be deleted.
+- **Async coverage and 3.14t soak added.** Function-level `# pragma: no cover`
+  exclusions were removed from all 16 async evaluator methods in
+  `src/cascade/_evaluator.py`, and 19 event-loop-awaited async parity tests
+  were added in `tests/test_async_parity.py` (accumulator replay/rollback/waiters,
+  early bail-out & `memoize=False`, `max_entries`/`prune`/`sweep_unaccessed` with
+  async fixed points, async snapshots under concurrent writes, mixed sync↔async
+  fan-out, sync+async `_retry_after` verification rules, and `compute_or_get_memo_async`
+  condition/operator branches). Multi-writer collection concurrency stress tests
+  (`tests/test_collection_concurrency.py`) and an on-demand 3.14t soak workflow
+  (`.github/workflows/concurrency-soak.yml`) were added. On 3.12 the full suite
+  reaches 99.35% total coverage (99.53% branch coverage); on 3.14t with
+  `PYTHON_GIL=0`, the full suite passes and 50/50 local soak rounds pass.
 
 ## Next steps
 
 In order of value for the time they take.
 
-1. **Re-run `.github/workflows/mutation.yml` (`shards=small`)** after the
-   `test_value_types.py` repeat-in-process fix, to confirm `mutmut` completes
-   cleanly on GitHub Actions. (`model-check.yml` already passed on GitHub in
-   12m44s.)
+1. **Re-run `.github/workflows/mutation.yml` (`shards=small`) once more.**
+   In the run for `08e08f8` mutmut did complete: the `small` shard ran to
+   the end. The run was shown as failed because the summary step exits
+   with an error when a module has no checked mutant, and with one shard
+   asked for that is every module of the others. `scripts/mutation.py
+   summary --only SHARD...` now takes the shards that were asked for, and
+   the workflow passes them: the rest is listed as not part of the run. A
+   full run still fails if a shard died. (`model-check.yml` already passed
+   on GitHub in 12m44s.)
 2. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
    from before the three fixes and the tests of the sections above, which
    were checked against changes made by hand only.

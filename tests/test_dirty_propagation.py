@@ -532,3 +532,48 @@ def test_concurrent_writers_and_readers_only_see_real_states() -> None:
     final = engine._internals._store.inputs[(src.id, (0,))][-1].value  # noqa: SLF001
     assert total() == final * 8
     assert_clean_invariants(engine)
+
+
+def test_result_dropped_while_it_is_being_verified_is_returned_but_not_kept() -> None:
+    # Verifying a stored result walks its dependencies without the engine's
+    # lock, so the result can be dropped in the meantime (eviction, prune).
+    # It is still the right answer for this caller. What must not happen is
+    # that the dropped row is marked clean or touched as if it were stored.
+    engine = Engine()
+    runs = {"dep": 0, "parent": 0}
+    drop_parent = {"now": False}
+
+    @engine.input
+    def inp() -> int:
+        return 10
+
+    @engine.query
+    def dep() -> int:
+        runs["dep"] += 1
+        if drop_parent["now"]:
+            # The walk for parent() is here: drop its result under it.
+            store = _store(engine)
+            with store.lock:
+                store.drop_memo_locked(("query", parent.id, ()))
+        return inp() // 10
+
+    @engine.query
+    def parent() -> int:
+        runs["parent"] += 1
+        return dep() + 100
+
+    parent_key = ("query", parent.id, ())
+    assert parent() == 101
+    inp.set(11)  # dep() runs again and returns what it returned before
+    drop_parent["now"] = True
+    assert parent() == 101
+    drop_parent["now"] = False
+    # Verified unchanged, so the body did not run, and the row stays dropped.
+    assert runs == {"dep": 2, "parent": 1}
+    assert parent_key not in _store(engine).memos
+    assert_clean_invariants(engine)
+    # The next call computes it again.
+    assert parent() == 101
+    assert runs == {"dep": 2, "parent": 2}
+    assert parent_key in _store(engine).memos
+    assert_clean_invariants(engine)

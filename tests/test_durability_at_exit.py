@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -131,3 +133,88 @@ def test_exit_hook_tracks_only_engines_with_a_running_writer(tmp_path: Path) -> 
     assert evaluator not in _evaluator._live_disk_writers  # noqa: SLF001
     # After shutdown the writer is gone; the exit flush must return at once.
     evaluator.flush_disk_at_exit()
+
+
+# --- the exit hook itself, in this process ---
+#
+# The children above show what an exit does, but a coverage tool that does
+# not follow child processes sees none of it. These call the hook here,
+# where its two waits can be forced: for a write that is under way, and for
+# a writer that is gone.
+
+
+def _squares(cache_dir: Path, runs: list[int]) -> tuple[Any, Any]:
+    from cascade import Engine
+
+    engine = Engine(cache_dir=cache_dir, cache_backend="sqlite")
+
+    @engine.query
+    def square(i: int) -> int:
+        runs[0] += 1
+        return i * i
+
+    return engine, square
+
+
+def test_exit_hook_waits_for_a_write_that_is_under_way(tmp_path: Path) -> None:
+    from cascade import _evaluator
+
+    runs = [0]
+    engine, square = _squares(tmp_path, runs)
+    writing = threading.Event()
+    release = threading.Event()
+    store = engine._disk.store_entry_many  # noqa: SLF001
+
+    def held_store(entries: Any) -> None:
+        writing.set()
+        assert release.wait(CHILD_TIMEOUT)
+        store(entries)
+
+    engine._disk.store_entry_many = held_store  # noqa: SLF001
+    try:
+        assert square(7) == 49
+        assert writing.wait(30), "the writer never took the result"
+        hook = threading.Thread(target=_evaluator._flush_all_at_exit, daemon=True)  # noqa: SLF001
+        hook.start()
+        hook.join(0.3)
+        assert hook.is_alive(), "the exit hook did not wait for the write"
+        release.set()
+        hook.join(30)
+        assert not hook.is_alive(), "the exit hook did not return after the write"
+    finally:
+        release.set()
+        engine.shutdown()
+
+    # What the hook waited for is on disk: a new engine does not run the body.
+    engine, square = _squares(tmp_path, runs)
+    try:
+        assert square(7) == 49
+        assert runs == [1]
+    finally:
+        engine.shutdown()
+
+
+def test_exit_flush_gives_up_on_a_writer_that_is_gone(tmp_path: Path) -> None:
+    runs = [0]
+    engine, square = _squares(tmp_path, runs)
+    evaluator = engine._evaluator  # noqa: SLF001
+    # Stop the writer from outside, as the "dead-writer" child does.
+    evaluator._disk_queue.put(None)  # noqa: SLF001
+    evaluator._disk_thread.join(30)  # noqa: SLF001
+    assert not evaluator._disk_thread.is_alive()  # noqa: SLF001
+    try:
+        assert square(3) == 9  # queued, with nothing left to write it
+        assert evaluator._disk_queue.unfinished_tasks == 1  # noqa: SLF001
+        returned = threading.Event()
+
+        def flush() -> None:
+            evaluator.flush_disk_at_exit()
+            returned.set()
+
+        threading.Thread(target=flush, daemon=True).start()
+        assert returned.wait(30), "the exit flush waited for a writer that is gone"
+    finally:
+        try:
+            engine.shutdown()
+        except Exception:  # noqa: BLE001 - it reports the write that was lost
+            pass
