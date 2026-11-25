@@ -693,3 +693,60 @@ def test_rewritten_function_reregisters_cleanly(engine):
     q1 = engine.query(body)
     q2 = engine.query(incremental=False)(body)
     assert q1() == q2() == 3
+
+
+def _element_runs(engine_options=None, **query_options):
+    """Runs of the element function on the first call, and after one append."""
+    engine = Engine(**(engine_options or {}))
+    xs = CascadeList(engine, [1, 2, 3])
+    runs = []
+
+    def double(x):
+        runs.append(x)
+        return x * 2
+
+    @engine.query(**query_options)
+    def total():
+        return sum(double(x) for x in xs)
+
+    assert total() == 12
+    first = len(runs)
+    # Emptied, not left to grow: a pipeline is rebuilt when a value its
+    # element function captured has changed, and ``runs`` is one.
+    runs.clear()
+    xs.append(4)
+    assert total() == 20
+    return first, len(runs)
+
+
+def test_incremental_per_element_default_redoes_only_the_changed_element():
+    assert _element_runs() == (3, 1)
+
+
+def test_incremental_per_element_false_runs_plain_python_and_still_invalidates():
+    assert _element_runs(incremental_per_element=False) == (3, 4)
+    assert _element_runs({"incremental_per_element": False}) == (3, 4)
+
+
+def test_incremental_per_element_on_a_query_overrides_the_engine():
+    assert _element_runs(
+        {"incremental_per_element": False}, incremental_per_element=True
+    ) == (3, 1)
+
+
+def test_incremental_per_element_old_name_is_an_alias():
+    assert _element_runs(incremental=False) == (3, 4)
+    assert _element_runs({"incremental": False}) == (3, 4)
+    assert _element_runs({"incremental": False}, incremental=True) == (3, 1)
+    # Both names with the same value are fine.
+    assert _element_runs(incremental=False, incremental_per_element=False) == (3, 4)
+
+
+def test_incremental_per_element_conflicting_names_are_refused():
+    with pytest.raises(TypeError, match="incremental_per_element"):
+        Engine(incremental=True, incremental_per_element=False)
+    engine = Engine()
+    with pytest.raises(TypeError, match="incremental_per_element"):
+        engine.query(incremental=False, incremental_per_element=True)
+    with pytest.raises(TypeError, match="must be a bool"):
+        Engine(incremental_per_element="no")

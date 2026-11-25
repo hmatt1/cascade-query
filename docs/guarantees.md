@@ -1020,6 +1020,14 @@ Rewritten: single-`for` comprehensions, `map`, `filter`, `reversed`, and the
 reducers `sum`, `len`, `min`, `max`, `any`, `all`, `sorted`, `list`, `set`,
 `dict` and `str.join`.
 
+`incremental_per_element=False`, on `engine.query` for one query or on
+`Engine` as the default for all, leaves a query as written: its
+comprehensions and reducers run as plain Python over every element. It
+changes cost only; caching, dependency tracking and results are the same.
+`incremental=` is the old name of the option and is accepted as an alias;
+both passed with different values raise `TypeError`
+(`test_ast_rewrite.py::test_incremental_per_element_*`).
+
 Not rewritten, running as plain Python: comprehensions with more than one
 `for`, `enumerate`, `zip`, `min`/`max` with `key=` or `default=`, `sum` with a
 start value, `len` of anything but a list comprehension or a bare collection

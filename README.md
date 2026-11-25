@@ -115,7 +115,7 @@ Not every feature is tested to the same depth. `docs/guarantees.md` has the deta
 |------|---------------|-------------------------|
 | Synchronous queries, inputs, snapshots, eviction | Strong: a formal model, a randomized state machine and differential tests | The best-tested path |
 | Disk cache, one process | Strong on the sync path, good for async | Rule 5 is the main risk |
-| Collections and rewritten comprehensions | Strong for reducers; generated whole-query tests use small numbers only | Two wrong-result bugs were fixed in November 2026 (D36, D37). Pass `incremental=False` if you would rather not depend on rewriting |
+| Collections and rewritten comprehensions | Strong for reducers; generated whole-query tests use small numbers only | Two wrong-result bugs were fixed in November 2026 (D36, D37). If such a query gives a result you do not expect, `incremental_per_element=False` on it runs the same code as plain Python; please report any difference |
 | `async def` queries | Medium: fewer assertions than the sync path | Test your own async graphs |
 | Threads on free-threaded Python | Stress-tested; races are found by chance, not exhaustively | One race took about ten runs to show |
 | Several processes writing one `cache_dir` | Tested around named collections only, not under load | Give parallel jobs their own directories |
@@ -128,10 +128,11 @@ Not every feature is tested to the same depth. `docs/guarantees.md` has the deta
 
 The `Engine` manages caching, execution, and state tracking.
 
-*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental=True, cache_version=None)`**: Initializes the engine. 
+*   **`Engine(*, max_entries=10000, trace_limit=50000, stats=False, cache_dir=None, cache_map_size=2**30, cache_backend="mdbx", incremental_per_element=True, cache_version=None)`**: Initializes the engine. 
     *   `max_entries` sets the limit for the Least Recently Used (LRU) in-memory cache. 
     *   Passing `cache_dir` enables persistent disk caching.
     *   `cache_backend` allows you to select the storage engine for persistence (`"mdbx"` or `"sqlite"`).
+    *   `incremental_per_element` decides how much work a query over a Cascade collection does when the collection changes: only the changed elements (the default), or every element as plain Python. The result is the same; see [What gets rewritten](#what-gets-rewritten). `incremental=` is the old name and still works.
     *   `cache_version` (a `str` or `int`) salts every result this engine stores; results stored under another salt are not used. Change it to throw away the whole result cache, for example after upgrading a library your queries use.
 
 ### Defining Nodes: `@engine.input` and `@engine.query`
@@ -470,7 +471,7 @@ A rewritten expression returns exactly what the same Python returns: the same va
 *   `copy.copy(xs)` and `xs.copy()` give plain builtins; collections cannot be pickled.
 *   C code that writes a collection's storage directly, such as `heapq.heappush(xs, v)`, `heapq.heappop(xs)` or `list.append(xs, v)` called by hand, cannot be intercepted. The next use of the collection notices that its size changed without a recorded change, undoes it and raises `CollectionBypassedError`. Changes that keep the size (`heapq.heapify`, `heapq.heapreplace`, `list.sort(xs)`) are not noticed and leave queries on the old contents: use the collection's own methods (`xs.sort()`), or a plain copy for heap work. `bisect.insort` goes through `insert` and is fine.
 *   A comprehension whose element expression, `if` clause or `key=` function itself reads an input, a query or another collection is recomputed in full each time its query re-runs. Read the value once before the comprehension (`f = factor()`) to keep it incremental.
-*   Opt out globally via `Engine(incremental=False)` or per-query `@engine.query(incremental=False)`.
+*   **Turning it off: `incremental_per_element=False`.** Every query is incremental: it re-runs only when something it read changes. This option is about what such a re-run costs for a query over a collection. In the example above, after `docs.append("delta")` the default runs `len(d) > 4` once, for the new element; with `@engine.query(incremental_per_element=False)` the comprehension runs as plain Python over all four. Both return the same value, and both are cached and invalidated the same way. Turn it off for one query when its result surprises you (to tell your code from Cascade's rewriting), or for every query with `Engine(incremental_per_element=False)`. `incremental=` is the old name of the option and still works; passing both with different values raises `TypeError`.
 
 ### Batching Mutations for Disk Performance
 

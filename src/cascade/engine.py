@@ -201,6 +201,19 @@ def _current_transaction() -> EngineTransaction | None:
     return tx
 
 
+def _per_element(new: bool | None, old: bool | None) -> bool | None:
+    """The value of ``incremental_per_element=``, or of its old name ``incremental=``."""
+    for what, value in (("incremental_per_element", new), ("incremental", old)):
+        if value is not None and not isinstance(value, bool):
+            raise TypeError(f"{what} must be a bool")
+    if new is not None and old is not None and new != old:
+        raise TypeError(
+            "incremental= is the old name of incremental_per_element=: "
+            "pass only incremental_per_element="
+        )
+    return old if new is None else new
+
+
 def _check_version(what: str, version: Any) -> None:
     if version is None:
         return
@@ -620,6 +633,12 @@ class Engine:
     ``cache_dir`` keeps results across runs. An edit to a query's own body
     is noticed; an edit to a helper it calls, a constant or a default is
     not, so bump that query's ``version=`` (or ``cache_version`` here).
+
+    ``incremental_per_element`` (on by default) makes comprehensions and
+    reducers over Cascade collections redo only the elements that changed;
+    off, they run as plain Python over every element, with the same result.
+    Queries are cached and invalidated the same way with either setting.
+    ``incremental`` is the old name of this option.
     """
 
     # Explicit private-policy contract for tests/introspection.
@@ -637,14 +656,18 @@ class Engine:
         cache_dir: str | os.PathLike[str] | None = None,
         cache_map_size: int = 1 << 30,
         cache_backend: str = "mdbx",
-        incremental: bool = True,
+        incremental_per_element: bool | None = None,
         cache_version: str | int | None = None,
+        incremental: bool | None = None,
     ) -> None:
         _check_version("cache_version", cache_version)
         self._trace_limit = trace_limit
-        # Global opt-out for the map/reduce AST interception; per-query
-        # incremental= on @engine.query overrides it in either direction.
-        self._incremental_default = incremental
+        # Engine-wide default for rewriting comprehensions and reducers over
+        # collections into per-element pipelines; incremental_per_element=
+        # on @engine.query overrides it in either direction. incremental=
+        # is the old name of the same option.
+        per_element = _per_element(incremental_per_element, incremental)
+        self._incremental_default = True if per_element is None else per_element
         # Passing cache_dir switches on zero-config persistence (MDBX by default,
         # or sqlite), deterministic msgpack serialization, and content
         # fingerprints as the cross-session revision markers. Missing dependencies
@@ -772,9 +795,10 @@ class Engine:
         fixed_point: Any = _UNSET,
         cache_exceptions: bool | tuple[type[BaseException], ...] = True,
         ttl: float | None = None,
-        incremental: bool | None = None,
+        incremental_per_element: bool | None = None,
         max_iterations: int | None = None,
         version: str | int | None = None,
+        incremental: bool | None = None,
     ) -> Any:
         """Register a query. Use as ``@engine.query`` or ``@engine.query(...)``.
 
@@ -791,12 +815,22 @@ class Engine:
         * side effects do not happen again on a cache hit: use an
           ``Accumulator``.
 
+        ``incremental_per_element`` (default: the engine's setting, which
+        is on) decides how much work a re-run does after a Cascade
+        collection changed. On, a comprehension or reducer over the
+        collection (``sum(f(x) for x in xs)``) redoes only the elements
+        that changed. Off, it runs as plain Python over every element. The
+        result is the same, and the query is cached and invalidated the
+        same way, either way. ``incremental`` is the old name of this
+        option.
+
         ``version`` marks a change the code hash cannot see (a helper the
         query calls, a global, a default, a data file): give it a new value
         and results computed under the old one are not used again, in
         memory or on disk. See "What the code hash sees" in the README.
         """
         _check_version("version", version)
+        per_element = _per_element(incremental_per_element, incremental)
         if max_iterations is not None:
             if fixed_point is _UNSET:
                 raise TypeError("max_iterations= needs fixed_point=")
@@ -816,7 +850,7 @@ class Engine:
             query_id = self._resolve_id(f, name)
             spec = ArgSpec(f, f"query {query_id}")
             _check_reserved(spec, "query", ("snapshot", "effects"))
-            enabled = self._incremental_default if incremental is None else incremental
+            enabled = self._incremental_default if per_element is None else per_element
             run_fn = f
             if enabled:
                 rewritten = rewrite_query(
