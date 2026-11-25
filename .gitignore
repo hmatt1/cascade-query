@@ -18,3 +18,10 @@ states/
 */mdbx.dat
 */mdbx.lck
 */locks/collection-*.lock
+
+# Build and coverage output (CI produces its own)
+/dist/
+.coverage
+.coverage.*
+coverage.json
+/cascade-feature.zip

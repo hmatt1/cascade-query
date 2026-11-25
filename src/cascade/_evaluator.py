@@ -3192,12 +3192,6 @@ class Evaluator:
         )
         return entry.value_hash, entry.changed_at, entry.expires_at
 
-    def _note_write_failure(
-        self, exc: BaseException, lost: int
-    ) -> None:  # pragma: no cover - unused helper
-        if self._writer is not None:
-            self._writer.note_failure(exc, lost)
-
     def _take_write_failure(self) -> tuple[BaseException, int] | None:
         return None if self._writer is None else self._writer.take_failure()
 

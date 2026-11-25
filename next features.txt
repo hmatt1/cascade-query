@@ -22,11 +22,7 @@ A priority queue dictates the execution order when multiple nodes are ready for 
   mapping queries into a single execution step to reduce Python function call overhead. It's kind of like "inlining" pass-through quyeries?
 
 
-  14. Incremental Collections: Provide specialized CascadeList, CascadeDict, and CascadeSet structures. Instead of recomputing an entire list when one
-  element changes, downstream queries would only receive the diff (additions/removals) for ultra-fast granular updates.
-
-
-  15.  Pluggable Storage Backends: Abstract the persistent disk cache to allow swapping MDBX for SQLite, RocksDB, or even ephemeral in-memory stores like Redis.
+  15.  More Storage Backends: MDBX and SQLite exist (cache_backend=); still open: RocksDB, or ephemeral in-memory stores like Redis.
 
 
   4. Memory Compression: Automatically compress large objects (like large ASTs or string blobs) in the in-memory LRU cache using LZ4 or Zstandard to

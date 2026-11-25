@@ -1490,13 +1490,21 @@ Ordered by the risk they leave open.
    sqlite; `test_incremental_persistence.py`, `test_code_versioning.py` and
    `test_error_caching_persistence.py` run mdbx only; `test_transaction_collections.py`
    runs sqlite only. The sqlite vacuum delete paths are excluded from coverage.
-7. **Async is thinly tested** and its internals are excluded from coverage:
-   no async tests for effects, bail-out counts or eviction, and snapshots,
-   TTL and fixed points have one or two each.
-8. **Collection concurrency has one deterministic test.** No multi-writer or
-   writer-against-pipeline stress, and none on free-threaded builds. One
-   more since: a writer whose mutation makes a compaction fall due while a
-   pipeline reads the collection (`test_collection_compaction_pins.py`).
+7. **Async assertions are weaker than sync ones.** The async evaluator is
+   no longer excluded from coverage, and `test_async_parity.py` awaits on a
+   running loop for effects (replay, rollback, waiters), bail-out counts,
+   `memoize=False`, eviction, `prune` and `sweep_unaccessed`, snapshots
+   under concurrent writes and mixed sync and async fan-out. Mutation
+   testing still leaves more alive in the async paths
+   (`compute_or_get_memo_async` 78 survivors against 42 in the sync
+   function, in the last run, which predates that file).
+8. **Collection concurrency is stress-tested, not checked exhaustively.**
+   `test_collection_concurrency.py` runs several writers against rewritten
+   readers, snapshots and compaction for a list, a set and a dict, and
+   atomic transactions over several collections against concurrent
+   readers. `test_collection_compaction_pins.py` forces a compaction that
+   falls due inside a mutation while a pipeline reads. Interleavings are
+   left to chance, and the state machine (gap 3) has one writer.
 9. **Transactions inside the block are untested** for queries reading a
    mutated or newly created collection, `submit` and two engines. Threads and
    async tasks are covered by `test_transaction_ownership.py`.
@@ -1518,5 +1526,8 @@ Ordered by the risk they leave open.
     `.github/workflows/mutation.yml`.
 11. **A race gets through most pushes.** CI runs the suite once per push on
     the free-threaded build. D35 failed one run in ten there and never
-    under the interpreter lock, so the push before it passed. Nothing runs
-    the thread tests repeatedly.
+    under the interpreter lock, so the push before it passed.
+    `.github/workflows/concurrency-soak.yml` runs the thread, cycle,
+    collection and transaction test files repeatedly (50 rounds by default)
+    on 3.14t with `PYTHON_GIL=0`, but only when started by hand; nothing
+    gates a push on it.

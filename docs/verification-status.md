@@ -564,7 +564,12 @@ one of six threads got `CycleError` where 50 was due.
   not make the new test fail. So nothing in the suite pins that a
   verification does not retry. Tried directly: with `_retry_after` always
   true, the cycle, fixed-point, defect, concurrency and engine test files
-  pass. That is a gap, and no test shows what goes wrong without the rule.
+  pass. That was a gap. Two tests in `test_async_parity.py` pin the rule
+  since (`test_retry_after_verification_does_not_retry_joined_cycle_error_sync`
+  and its async twin): a verification joins a run of a dependency that
+  ends in `CycleError`, and the dependency must not run again. With
+  `_retry_after` always true, on a copy, both fail (the dependency runs
+  four times instead of three); on the real source they pass.
 
 ### The first push: what CI showed
 
@@ -667,8 +672,8 @@ the first row, which is code for the other platform (file locking in
   `no cover`, 14 `no branch`). Each has a reason, or sits next to one. One
   was tested rather than believed: the trimming block of
   `_append_version_locked`, which three pins released one at a time did
-  not reach. `Evaluator._note_write_failure` is marked as an unused helper
-  and has no caller: it could be deleted.
+  not reach. `Evaluator._note_write_failure` was marked as an unused helper
+  and had no caller; it has been deleted.
 - **Async coverage and 3.14t soak added.** Function-level `# pragma: no cover`
   exclusions were removed from all 16 async evaluator methods in
   `src/cascade/_evaluator.py`, and 19 event-loop-awaited async parity tests
