@@ -674,39 +674,52 @@ the first row, which is code for the other platform (file locking in
   `_append_version_locked`, which three pins released one at a time did
   not reach. `Evaluator._note_write_failure` was marked as an unused helper
   and had no caller; it has been deleted.
-- **Async coverage and 3.14t soak added.** Function-level `# pragma: no cover`
-  exclusions were removed from all 16 async evaluator methods in
-  `src/cascade/_evaluator.py`, and 19 event-loop-awaited async parity tests
-  were added in `tests/test_async_parity.py` (accumulator replay/rollback/waiters,
-  early bail-out & `memoize=False`, `max_entries`/`prune`/`sweep_unaccessed` with
-  async fixed points, async snapshots under concurrent writes, mixed sync↔async
-  fan-out, sync+async `_retry_after` verification rules, and `compute_or_get_memo_async`
+- **Async coverage and 3.14t soak added (`1b2e596`).** Function-level
+  `# pragma: no cover` exclusions were removed from all 16 async evaluator
+  methods in `src/cascade/_evaluator.py`, and 19 event-loop-awaited async
+  parity tests were added in `tests/test_async_parity.py` (accumulator
+  replay/rollback/waiters, early bail-out & `memoize=False`,
+  `max_entries`/`prune`/`sweep_unaccessed` with async fixed points, async
+  snapshots under concurrent writes, mixed sync↔async fan-out, sync+async
+  `_retry_after` verification rules, and `compute_or_get_memo_async`
   condition/operator branches). Multi-writer collection concurrency stress tests
   (`tests/test_collection_concurrency.py`) and an on-demand 3.14t soak workflow
   (`.github/workflows/concurrency-soak.yml`) were added. On 3.12 the full suite
   reaches 99.35% total coverage (99.53% branch coverage); on 3.14t with
-  `PYTHON_GIL=0`, the full suite passes and 50/50 local soak rounds pass.
+  `PYTHON_GIL=0`, the full suite passes, 50/50 local soak rounds pass, and the
+  50-round GitHub Actions soak (`45546504695`) passed in 5m1s.
+- **Second repeat over `cascade._evaluator` (`1b2e596`).** Run locally with
+  `python scripts/mutation.py run "cascade._evaluator.*"` on 28 processes
+  (50.0 minutes) against 2,176 tests (0 untested mutants across all 11,619
+  mutants):
+
+  | Run | Mutants | Killed | Survived | Timeout | Other | Survival rate |
+  |---|---:|---:|---:|---:|---:|---:|
+  | Baseline | 3,316 | 2,411 | 888 | 16 | 1 | 26.8% |
+  | First repeat | 3,316 | 2,469 | 828 | 18 | 1 | 25.0% |
+  | **Second repeat (`1b2e596`)** | **3,463** | **2,671** | **762** | **28** | **2** | **22.0%** |
+
+  Removing `# pragma: no cover` on the async methods added 147 newly mutated
+  sites, yet total kills rose by +202 and survivors fell by -66 (-3.0 pp).
+  `compute_or_get_memo_async` dropped from 78 to 49 survivors (vs 37 in sync
+  `compute_or_get_memo`), `_verify_disk_deps` and `_verify_disk_deps_async`
+  are at parity (13 each), and `_retry_after` (2/2), `_wait_for_joined_run`
+  (8/8), and `_release_in_flight` (10/10) have 0 survivors.
 
 ## Next steps
 
 In order of value for the time they take.
 
-1. **Re-run `.github/workflows/mutation.yml` (`shards=small`) once more.**
-   In the run for `08e08f8` mutmut did complete: the `small` shard ran to
-   the end. The run was shown as failed because the summary step exits
-   with an error when a module has no checked mutant, and with one shard
-   asked for that is every module of the others. `scripts/mutation.py
-   summary --only SHARD...` now takes the shards that were asked for, and
-   the workflow passes them: the rest is listed as not part of the run. A
-   full run still fails if a shard died. (`model-check.yml` already passed
-   on GitHub in 12m44s.)
-2. **Repeat the mutation run over `cascade._evaluator`.** Its tables are
-   from before the three fixes and the tests of the sections above, which
-   were checked against changes made by hand only.
-3. **Look at the survivors in the async paths that change a condition or
-   an operator.** `compute_or_get_memo_async` still has 78 survivors
-   against 42 in the sync function, and awaiting on a running loop is
-   what made the difference in `try_mark_green_async`.
+1. ~~**Re-run `.github/workflows/mutation.yml` (`shards=small`) once more.**~~
+   Done (`45546501531`, passed in 11m24s with `--only small`).
+2. ~~**Repeat the mutation run over `cascade._evaluator`.**~~ Done above
+   (`22.0%` survival rate across 3,463 mutants).
+3. **Optionally pin the last few behavioral survivors in
+   `compute_or_get_memo_async`.** Most of the remaining 49 survivors are
+   `trace_event` arguments, pin/unpin calls, or the `_finished_meanwhile_locked`
+   race window; the main behavioral ones left are provisional-hit and
+   `cache_green` effect replay (`return pending, True` / `return existing, True`)
+   and `_refuse_reentry` under async shadow verification.
 4. **Decide whether mutation runs fix the Hypothesis seed.** With random
    examples a few verdicts change from run to run; a fixed seed makes the
    rate comparable over time, at the price of always trying the same
