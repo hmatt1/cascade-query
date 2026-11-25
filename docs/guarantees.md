@@ -1319,6 +1319,11 @@ of those were already present at the audit commit. D33 and D34 were found
 on 2026-11-24, while writing tests for what mutation testing showed; D33
 came with the fix for D24. D35 was found the same day by the free-threaded
 CI job; it came with the fix for D25.
+D36 was found on 2026-11-25 by the generated query bodies of
+`tests/test_rewrite_programs.py`, on their first run; it was there from
+the first version of the collections (`f13e825`, 2026-07-21). D37 was
+found by the same test a few hours later, in a longer run; it came with
+the fix for D7, which made a raising element fall back to plain evaluation.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
@@ -1366,6 +1371,8 @@ without an expected-failure marker.
 | D33 | The body of a query ran twice at one revision, on two threads, with no cycle anywhere, and the trace showed `dedup_cycle` (G5). Thread B ran `total()`, which needs `part()`, and waited for thread A's run of `part()`; A finished `part()` and asked for `total()`. B had its answer but was still recorded as waiting for A, because a waiter removed its record itself, after it had taken the engine's lock again. A took the record for two threads waiting for each other (D24) and ran `total()` on its own stack: 300 of 300 trials with nothing patched. Both runs returned the right value; with `fixed_point=`, both threads iterated the fixed point. A run that is released now drops the records of the callers that waited for it. | `fix: a query ran twice, and a cancelled waiter failed the run it waited for` |
 | D34 | Cancelling one task that waited for a run of an async query failed the run's owner and its other waiters. With three tasks asking for one query, one running it and two waiting, and one waiter cancelled (`task.cancel()`, or `asyncio.wait_for` running out), the task that ran it got `concurrent.futures.InvalidStateError` where 42 was due and the other waiter got `CancelledError`. A thread that calls an async query from sync code runs it in a task of its own: a sync query `outer()` that calls async `slow()` raised `InvalidStateError` when a task elsewhere had waited for that run and been cancelled, and the error was cached, so later calls raised it again without running anything. The callers that join a run share one future, and a task that stopped waiting for it cancelled it for all of them. A task now waits on a future of its own, which the shared one settles; one that has stopped waiting, or whose loop is closed, is left alone. | `fix: a query ran twice, and a cancelled waiter failed the run it waited for` |
 | D35 | With several threads or tasks asking for a fixed-point cycle member whose result had been dropped, or for a query that depends on it, after an input changed, one of them could get `CycleError` for a cycle that converges: one of six threads in about one run in ten on a free-threaded build, where CI met it, and never seen under the interpreter lock. A member's run that reaches itself through its head starts over by bringing the head up to date (D25). The head's run asks for the member; if another caller had taken over the member by then, that caller's run failed as the first one's had, and the head's run gave up on it the way a verification does. Nothing ran the head for real afterwards, so it stayed as it was, and the member ran once more, reached itself and raised. Entering a cycle through its head now retries a joined run that ended in `CycleError`: the head runs the member on its own stack, where the cycle converges. | `fix: a dropped fixed-point member asked for by two threads raised CycleError` |
+| D36 | A `dict` built over stages of a `CascadeDict` was built from its `(key, value)` pairs, where Python iterates a dict's keys: `{x: 1 for x in d}` over `{0: 5, 1: 6}` gave `{(0, 5): 1, (1, 6): 1}` instead of `{0: 1, 1: 1}`, and so did `dict((x, 1) for x in d)` and `dict(map(f, d))`; `{p: q for p, q in d}`, which raises in Python because the int keys cannot be unpacked, returned a copy of `d`. The runtime read a `CascadeDict` under the `dict` reducer as its items, which is right only for `dict(d)` itself, and the rewriter dropped the stage of `{k: v for k, v in ...}`, so that comprehension looked like `dict(d)`. The items are now read only for `dict(d)` with no stage, and a dict comprehension always keeps its stage. | `fix: a dict built from a CascadeDict iterated its items, not its keys` |
+| D37 | A rewritten list comprehension was evaluated lazily when it fell back to plain Python. `any([1 // x for x in xs])` over `[1, 0]` returned `True`, and `all([x - 1 // x for x in xs])` `False`, where Python builds the list first and raises `ZeroDivisionError`; the same with the list inside `map` or `filter`, and a stage outside the list could raise its own error first. When an element raises, the runtime evaluates the expression the plain way, and it chained the stages of a list comprehension as lazy iterators, like those of a generator expression, so `any` stopped at the first true element before the one that raises. A list comprehension now ends in a stage that builds the list on the plain path; the incremental path, which evaluates every element anyway, skips it. | `fix: a rewritten list comprehension was evaluated lazily` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
@@ -1444,9 +1451,9 @@ actions to the code and the invariants to the guarantees.
   history retention. Change stamps are reused once nobody holds them, where
   the code counts up; the outcome of a walk over input dependencies is fixed
   in the step that looks the row up.
-- None of D1–D35 is reachable in the model: each is in a feature it leaves
+- None of D1–D37 is reachable in the model: each is in a feature it leaves
   out (for D33 the record of who waits for whom, for D34 tasks and their
-  cancellation, for D35 fixed points). The state machine (test gap 3) is
+  cancellation, for D35 fixed points, for D36 and D37 the rewrite). The state machine (test gap 3) is
   what covers the others. It runs threads and tasks since, but only as
   readers beside one writer, and it cancels nothing.
 
@@ -1455,7 +1462,7 @@ actions to the code and the invariants to the guarantees.
 Ordered by the risk they leave open.
 
 1. **Every defect has a regression test, and none is open.**
-   `tests/test_known_defects.py` has a test for each defect (D1-D35), each
+   `tests/test_known_defects.py` has a test for each defect (D1-D37), each
    asserting the correct behaviour; a defect found from now on gets one
    under `xfail(strict=True)` until it is fixed.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
@@ -1491,12 +1498,26 @@ Ordered by the risk they leave open.
    more than one collection, and any control of how threads interleave:
    reverting the D35 fix, which needs two callers to meet inside a fixed
    point, does not fail it.
-4. **Rewrite equivalence is tested per reducer, not per program.**
+4. **Generated query bodies are small and numeric.**
    `test_rewrite_differential.py` compares each rewritten reducer with the
-   builtin over ints, floats, strings, tuples and mixtures. It does not
-   generate query bodies, so interactions between several pipelines in one
-   body, nested comprehensions and closures over changing values rest on
-   example tests.
+   builtin over ints, floats, strings, tuples and mixtures.
+   `test_rewrite_programs.py` generates whole query bodies from a grammar:
+   several pipelines in one body, comprehensions nested in the elements and
+   conditions of others and inside two-`for` comprehensions, `:=`, lambdas,
+   a closure variable, locals used as sources, `for` loops and `if`
+   statements, an input read inside an element, and elements that raise.
+   Each body runs as a query over two lists, a set and a dict and as plain
+   Python, and after every change, transaction (committed or rolled back),
+   input change and snapshot the two must agree exactly, also through the
+   snapshot. Its first runs found D36 and D37. The values are small ints or
+   a few floats; strings, tuples, `None`, mixed types, `sorted` keys that
+   raise, accumulator effects and nested function definitions are not
+   generated. At 300 examples it catches a seeded fault of the kind of D30,
+   D32 or D36, and one that ignores an older head. Two faults in how dict
+   and list diffs are read were caught in one run of 300 and missed in
+   four others, and caught at 3,000 examples; a fault of the kind of D37
+   was caught once at 3,000 and missed once (`CASCADE_PROGRAM_EXAMPLES`
+   sets the count). The regression tests of D36 and D37 pin those two.
 5. **No cross-process or cross-version determinism test for the codecs.**
    `test_codec_properties.py` checks round trips and determinism within one
    process with Hypothesis.

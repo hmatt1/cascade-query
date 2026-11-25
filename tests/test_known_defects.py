@@ -1,4 +1,4 @@
-"""Regression tests for the defects listed in docs/guarantees.md (D1-D35).
+"""Regression tests for the defects listed in docs/guarantees.md (D1-D37).
 
 Every test here asserts the CORRECT behaviour. A test for an open defect is
 marked ``xfail(strict=True)``: it fails today, so the suite stays green, and
@@ -28,6 +28,7 @@ import pytest
 
 import cascade
 from cascade import (
+    CascadeDict,
     CascadeList,
     CascadeSet,
     CollectionBypassedError,
@@ -1224,6 +1225,127 @@ def test_d35_two_tasks_asking_for_a_dropped_cycle_member_both_get_its_value() ->
     outcomes = asyncio.run(asyncio.wait_for(two_callers(), 8 * HANG_TIMEOUT))
     assert outcomes == [5, 5]
     assert asyncio.run(warm()) == (11, 5)
+
+
+def _d36_bodies(d: Any) -> list[Any]:
+    def comp() -> Any:
+        return {x: 1 for x in d}
+
+    def comp_same() -> Any:
+        return {x: x for x in d}
+
+    def comp_filtered() -> Any:
+        return {x: -x for x in d if x}
+
+    def from_generator() -> Any:
+        return dict((x, 1) for x in d)
+
+    def from_map() -> Any:
+        return dict(map(lambda x: (x, 2), d))
+
+    def unpacking_keys() -> Any:
+        # The keys are ints: plain Python cannot unpack them.
+        return {p: q for p, q in d}
+
+    def bare() -> Any:
+        return dict(d)
+
+    def over_items() -> Any:
+        return {p: q for p, q in d.items()}
+
+    return [comp, comp_same, comp_filtered, from_generator, from_map,
+            unpacking_keys, bare, over_items]  # fmt: skip
+
+
+def _d36_outcome(fn: Any) -> Any:
+    try:
+        return ("value", fn())
+    except Exception as exc:  # noqa: BLE001
+        return ("raises", type(exc).__name__, str(exc))
+
+
+def test_d36_dict_built_from_a_cascade_dict_iterates_its_keys() -> None:
+    """D36: ``dict`` over stages of a ``CascadeDict`` saw its items.
+
+    Iterating a dict gives its keys. The rewritten ``{x: 1 for x in d}``
+    iterated ``(key, value)`` pairs instead, because the runtime read a
+    ``CascadeDict`` under the ``dict`` reducer as its items, which is right
+    only for ``dict(d)`` itself.
+    """
+    engine = Engine()
+    d = CascadeDict(engine, {0: 5, 1: 6})
+    plain = {0: 5, 1: 6}
+    queries = [engine.query(fn, name=fn.__name__) for fn in _d36_bodies(d)]
+    for query, reference in zip(queries, _d36_bodies(plain), strict=True):
+        assert _d36_outcome(query) == _d36_outcome(reference), query.id
+    d[2] = 7
+    plain[2] = 7
+    del d[0]
+    del plain[0]
+    for query, reference in zip(queries, _d36_bodies(plain), strict=True):
+        assert _d36_outcome(query) == _d36_outcome(reference), query.id
+
+
+def _d37_bodies(xs: Any) -> list[Any]:
+    def any_of_list() -> Any:
+        return any([1 // x for x in xs])
+
+    def all_of_list() -> Any:
+        return all([x - 1 // x for x in xs])
+
+    def any_of_map_of_list() -> Any:
+        return any(map(abs, [1 // x for x in xs]))
+
+    def first_error() -> Any:
+        # The list is built in full first: 10 // 0 raises before the outer
+        # stage divides by zero on the first element.
+        return sum(map(lambda v: 1 / (v - 10), [10 // x for x in xs]))
+
+    def len_of_list() -> Any:
+        return len([1 // x for x in xs if x is not None])
+
+    def any_of_generator() -> Any:
+        return any(1 // x for x in xs)  # lazy in Python too
+
+    return [any_of_list, all_of_list, any_of_map_of_list, first_error,
+            len_of_list, any_of_generator]  # fmt: skip
+
+
+def test_d37_list_comprehension_is_built_in_full_before_it_is_read() -> None:
+    """D37: a rewritten list comprehension was evaluated lazily.
+
+    ``any([1 // x for x in xs])`` over ``[1, 0]`` raises in Python, because
+    the list is built before ``any`` reads it. The rewritten expression fell
+    back to a lazy plain evaluation when an element raised, and ``any``
+    stopped at the first element: it returned True.
+    """
+    engine = Engine()
+    xs = CascadeList(engine, [1, 0])
+    plain = [1, 0]
+    queries = [engine.query(fn, name=fn.__name__) for fn in _d37_bodies(xs)]
+    for query, reference in zip(queries, _d37_bodies(plain), strict=True):
+        assert _d36_outcome(query) == _d36_outcome(reference), query.id
+    xs.append(0)
+    plain.append(0)
+    xs[1] = 2
+    plain[1] = 2
+    for query, reference in zip(queries, _d37_bodies(plain), strict=True):
+        assert _d36_outcome(query) == _d36_outcome(reference), query.id
+
+
+def test_d37_dict_of_a_list_of_cascade_dict_keys_iterates_the_keys() -> None:
+    """With D36: ``dict([p for p in d])`` has no stage but the list's own."""
+    engine = Engine()
+    d = CascadeDict(engine, {0: 5})
+
+    @engine.query
+    def copied() -> Any:
+        return dict([p for p in d])
+
+    with pytest.raises(TypeError):
+        dict([p for p in {0: 5}])
+    with pytest.raises(TypeError):
+        copied()
 
 
 def _plain_object() -> Any:

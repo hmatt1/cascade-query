@@ -707,7 +707,7 @@ class IncrementalRuntime:
           once they are gone or replaced, the reducer answers again.
         """
         stages = rstages[::-1]
-        resolved = self._resolve_source(source, reducer_name)
+        resolved = self._resolve_source(source, reducer_name, stages)
         if resolved is None:
             return _fallback(reducer_name, source, stages, reducer_args)
         collection, view = resolved
@@ -922,12 +922,15 @@ class IncrementalRuntime:
 
     # --- source resolution and bookkeeping ---
     def _resolve_source(
-        self, source: Any, reducer_name: str
+        self, source: Any, reducer_name: str, stages: tuple[tuple[Any, ...], ...]
     ) -> tuple[Any, str | None] | None:
         if isinstance(source, CascadeList) or isinstance(source, CascadeSet):
             return source, None
         if isinstance(source, CascadeDict):
-            return source, "items" if reducer_name == "dict" else "keys"
+            # ``dict(d)`` copies the mapping; anything that iterates ``d``
+            # (a stage, ``{x: ... for x in d}``) sees its keys (D36).
+            bare_copy = reducer_name == "dict" and not stages
+            return source, "items" if bare_copy else "keys"
         if isinstance(source, _CascadeDictView):
             return source.parent, source.which
         return None
@@ -947,7 +950,7 @@ class IncrementalRuntime:
             source = f"collection:{core.kind}:{core.name}"
             if view is not None:
                 source += f".{view}"
-            logical = tuple(st[0] for st in stages)
+            logical = tuple(st[0] for st in stages if st[0] != "materialize")
             info = _PipelineInfo(
                 site=site,
                 source=source,
@@ -1178,6 +1181,8 @@ def _fallback(
     for st in stages:
         if st[0] == "reverse":
             it = reversed(it)
+        elif st[0] == "materialize":
+            it = list(it)  # where a list comprehension ends (D37)
         elif st[0] == "map":
             it = map(st[1], it)
         else:

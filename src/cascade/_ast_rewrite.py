@@ -252,20 +252,11 @@ class _Rewriter(ast.NodeTransformer):
         return self._build_run_call(node, "set", source, stages, [])
 
     def visit_DictComp(self, node: ast.DictComp) -> ast.AST:
-        target = node.generators[0].target if node.generators else None
-        if (
-            isinstance(target, ast.Tuple)
-            and len(target.elts) == 2
-            and all(isinstance(e, ast.Name) for e in target.elts)
-            and isinstance(node.key, ast.Name)
-            and isinstance(node.value, ast.Name)
-            and node.key.id == target.elts[0].id
-            and node.value.id == target.elts[1].id
-        ):
-            elt: ast.expr | None = None  # {k: v for k, v in pairs}: identity
-        else:
-            elt = ast.Tuple(elts=[node.key, node.value], ctx=ast.Load())
-            ast.copy_location(elt, node.key)
+        # Always a stage, also for {k: v for k, v in pairs}: with no stage
+        # the runtime would take a CascadeDict source for ``dict(d)`` and
+        # read its items, where the comprehension iterates its keys (D36).
+        elt = ast.Tuple(elts=[node.key, node.value], ctx=ast.Load())
+        ast.copy_location(elt, node.key)
         decomposed = _decompose_comp(node, elt)
         if decomposed is _ABORT or self._hides_loop_names(decomposed[1]):
             return self._keep(node)
@@ -340,10 +331,8 @@ class _Rewriter(ast.NodeTransformer):
         stage_nodes: list[ast.expr] = []
         for stage in stages:
             kind = stage[0]
-            if kind == "reverse":
-                stage_nodes.append(
-                    ast.Tuple(elts=[ast.Constant("reverse")], ctx=ast.Load())
-                )
+            if kind in ("reverse", "materialize"):
+                stage_nodes.append(ast.Tuple(elts=[ast.Constant(kind)], ctx=ast.Load()))
             elif kind in ("map", "filter"):
                 stage_nodes.append(
                     ast.Tuple(
@@ -473,8 +462,20 @@ def _match_pipeline(expr: ast.expr) -> tuple[ast.expr, list[tuple[Any, ...]]] | 
         # Set/dict comprehensions under a reducer call change multiplicity
         # semantics (dedup before reduce); keep standard execution.
         return _ABORT
-    if isinstance(expr, (ast.ListComp, ast.GeneratorExp)):
+    if isinstance(expr, ast.GeneratorExp):
         return _decompose_comp(expr, expr.elt)
+    if isinstance(expr, ast.ListComp):
+        decomposed = _decompose_comp(expr, expr.elt)
+        if decomposed is _ABORT:
+            return _ABORT
+        # A list comprehension is built in full before anything reads it:
+        # an element that raises does so even if ``any()`` or ``all()``
+        # above would have stopped earlier, and before the stages outside
+        # it run on the first element. The plain path builds the list here
+        # (D37); the incremental path evaluates every element anyway.
+        source, stages = decomposed
+        stages.append(("materialize",))
+        return source, stages
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Name)

@@ -753,6 +753,43 @@ the first row, which is code for the other platform (file locking in
   - It ran with the sequential state machine; the widened one (see "Widened
     beyond one thread" above) came after it.
 
+### Generated query bodies: D36 and D37 (2026-11-25)
+
+`tests/test_rewrite_programs.py` closes most of test gap 4: Hypothesis
+writes whole query bodies from a small grammar and each runs as a rewritten
+query and as plain Python, which must agree exactly after every change to
+the collections, transaction, input change and snapshot (see gap 4 in
+`docs/guarantees.md` for what the grammar covers and leaves out). It runs
+300 examples in about 15 seconds; `CASCADE_PROGRAM_EXAMPLES` raises that.
+
+It found two defects, both silent wrong results, both fixed with
+regression tests in `tests/test_known_defects.py`:
+
+- **D36**, on its first run: a dict built over stages of a `CascadeDict`
+  (`{x: 1 for x in d}`, `dict((x, 1) for x in d)`, `dict(map(f, d))`) was
+  built from the `(key, value)` pairs instead of the keys. There since the
+  collections were added in July.
+- **D37**, in a run of 12 seeds with 4,000 examples each: a rewritten list
+  comprehension fell back to lazy evaluation when an element raised, so
+  `any([1 // x for x in xs])` over `[1, 0]` returned `True` where Python
+  raises `ZeroDivisionError`. It came with the fix for D7.
+
+Faults seeded on a copy, one at a time:
+
+| Fault | 300 examples | 3,000 examples |
+|---|---|---|
+| D30: `:=` moved into the helper | caught | |
+| D32: a helper that needs a hidden loop variable | caught | |
+| D36: the items read under every `dict` | caught | |
+| Pipeline state kept for an older head | caught | |
+| A dict key update read as an add | caught 1 of 5 | caught |
+| A list update read as an insert | caught 1 of 5 | caught |
+| D37: no materialize stage from the rewriter | missed 4 of 4 | caught |
+| D37: the fallback does not build the list | missed 4 of 4 | missed |
+
+Changing `filter(None, ...)` to `filter(abs, ...)` was also tried; it is not
+a fault for numbers.
+
 ## Next steps
 
 In order of value for the time they take.
