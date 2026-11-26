@@ -1825,3 +1825,159 @@ def test_d51_setting_the_default_after_a_result_reused_from_disk_is_no_change(
         assert call(q) == 6
     finally:
         engine.shutdown()
+
+
+def test_dNN_closures_made_in_a_comprehension_see_its_last_loop_value() -> None:
+    # A comprehension's loop variable is one variable: lambdas and
+    # generators made in its element and called afterwards all see its last
+    # value. The rewriter moved the element into a helper function, where
+    # the loop variable is a new variable for each element, so each closure
+    # kept its own: [10, 20] where Python gives [20, 20], on the first run.
+    # Found by test_rewrite_programs.py once it made closures in elements.
+    engine = Engine()
+    ys = CascadeList(engine, [10, 20])
+
+    def body(source: Any) -> Any:
+        fs = [lambda v: v + y for y in source]
+        gs = [(v + y for v in (0, 1)) for y in source]
+        return [f(0) for f in fs], [list(g) for g in gs]
+
+    @engine.query
+    def q() -> Any:
+        fs = [lambda v: v + y for y in ys]
+        gs = [(v + y for v in (0, 1)) for y in ys]
+        return [f(0) for f in fs], [list(g) for g in gs]
+
+    assert q() == body(list(ys)) == ([20, 20], [[20, 21], [20, 21]])
+    ys.append(30)
+    assert q() == body(list(ys))
+
+
+def test_dNN_a_comprehension_that_changes_a_local_list_does_so_for_every_element() -> (
+    None
+):
+    # A pipeline runs its element, ``if``, ``map``, ``filter`` and ``key=``
+    # functions for the elements that changed only.
+    # ``[seen.append(x) for x in xs]`` appended every element on the first
+    # run and, after ``xs.append(4)``, only ``4`` to the new list ``seen``:
+    # [4] where Python gives [1, 2, 3, 4]. An expression whose functions call
+    # a method that changes a list, set or dict the query assigns is now
+    # left as written. A helper function that changes an object is not seen;
+    # an accumulator is the way to collect effects.
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2, 3])
+
+    @engine.query
+    def q() -> Any:
+        seen: list[int] = []
+        [seen.append(x) for x in xs]
+        found: set[int] = set()
+        total = sum(x for x in xs if found.add(x) is None)
+        mapped: list[int] = []
+        doubled = list(map(lambda v: mapped.append(v) or 2 * v, xs))
+        keys: dict[int, int] = {}
+        ordered = sorted(xs, key=lambda v: keys.setdefault(v, -v))
+        return seen, sorted(found), total, mapped, doubled, keys, ordered
+
+    assert q() == (
+        [1, 2, 3],
+        [1, 2, 3],
+        6,
+        [1, 2, 3],
+        [2, 4, 6],
+        {1: -1, 2: -2, 3: -3},
+        [3, 2, 1],
+    )
+    xs.append(4)
+    assert q() == (
+        [1, 2, 3, 4],
+        [1, 2, 3, 4],
+        10,
+        [1, 2, 3, 4],
+        [2, 4, 6, 8],
+        {1: -1, 2: -2, 3: -3, 4: -4},
+        [4, 3, 2, 1],
+    )
+
+
+def test_dNN_a_caller_replays_the_effects_of_a_run_that_gave_the_same_value() -> None:
+    # A query that ran again and gave the same value kept its old
+    # ``changed_at`` (early cutoff), so a caller was not run again and
+    # replayed the effects it had stored, which held the dependency's old
+    # ones: ``p`` collected [1] after ``n`` became 2, where ``q`` itself
+    # collected [2]. A result now keeps its ``changed_at`` only if its
+    # effects are the same too. Found by test_rewrite_programs.py once it
+    # collected effects through a query over two bodies.
+    engine = Engine()
+    log = engine.accumulator("log")
+    runs: list[str] = []
+
+    @engine.input
+    def n() -> int:
+        return 1
+
+    @engine.query
+    def q() -> int:
+        log.push(n())
+        return 0
+
+    @engine.query
+    def p() -> int:
+        runs.append("p")
+        return q()
+
+    for value in (1, 2, 1.0, 1.0):
+        n.set(value=value)
+        mine: dict[str, list[Any]] = {}
+        above: dict[str, list[Any]] = {}
+        assert q(effects=mine) == 0
+        assert p(effects=above) == 0
+        assert repr(above) == repr(mine) == repr({"log": [value]})
+    # Run again for each change of the effects (1.0 is not 1), not for the
+    # last ``set``, which changed nothing.
+    assert runs.count("p") == 3
+
+    # The same for a cached error: a caller that catches it collects the
+    # effects the failed run pushed.
+    @engine.query
+    def fails() -> int:
+        log.push(n())
+        raise ValueError("no")
+
+    @engine.query
+    def catches() -> str:
+        try:
+            fails()
+        except ValueError:
+            return "caught"
+        return "not caught"  # pragma: no cover
+
+    for value in (3, 4):
+        n.set(value=value)
+        above = {}
+        assert catches(effects=above) == "caught"
+        assert above == {"log": [value]}
+
+
+def test_dNN_a_value_made_by_a_stage_is_new_on_every_run() -> None:
+    # A pipeline keeps the values its stages made and hands the same objects
+    # out on the next run. A body that changed one, or used one up, found it
+    # so on the next run, where Python makes a new one: after
+    # ``xs.append(3)``, ``rows[0]`` was [1, 99, 99] and the second generator
+    # was empty. A pipeline whose stages make a value that can be changed in
+    # place (anything but numbers, strings, bytes, None, and tuples and
+    # frozensets of those) is now rebuilt on every run. Found by
+    # test_rewrite_programs.py on 3.14t, with generators made in elements.
+    engine = Engine()
+    xs = CascadeList(engine, [1, 2])
+
+    @engine.query
+    def q() -> Any:
+        rows = [[x] for x in xs]
+        rows[0].append(99)
+        gens = [(v for v in (1, 2)) for x in xs]
+        return rows, [list(g) for g in gens], max([x] for x in xs)
+
+    assert q() == ([[1, 99], [2]], [[1, 2], [1, 2]], [2])
+    xs.append(3)
+    assert q() == ([[1, 99], [2], [3]], [[1, 2], [1, 2], [1, 2]], [3])

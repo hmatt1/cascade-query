@@ -213,6 +213,33 @@ def _flush_all_at_exit() -> None:
             pass
 
 
+def _same_effects(
+    store: GraphStore,
+    old: Mapping[str, Sequence[Any]],
+    new: Mapping[str, Sequence[Any]],
+) -> bool:
+    """Whether a run pushed the effects the stored result holds.
+
+    A result keeps the ``changed_at`` of the one before it only if both its
+    value and its effects are the same: its callers replay the effects they
+    stored, which include its own, so they must run again when those
+    changed. Compared by digest, so ``1`` and ``1.0`` differ; effects that
+    cannot be encoded count as changed.
+    """
+    old = {name: items for name, items in old.items() if items}
+    new = {name: items for name, items in new.items() if items}
+    if not old and not new:
+        return True
+    if old.keys() != new.keys():
+        return False
+    try:
+        return store.stable_hash(
+            {name: tuple(items) for name, items in old.items()}
+        ) == store.stable_hash({name: tuple(items) for name, items in new.items()})
+    except Exception:
+        return False
+
+
 _STOP = None  # ends the writer thread; the engine closes the cache
 _CLOSE = object()  # ends it after closing the cache: the engine was dropped
 
@@ -2775,7 +2802,11 @@ class Evaluator:
 
         with store.lock:
             previous = None if provisional else store.memos.get(key)
-            if previous is not None and previous.value_hash == value_hash:
+            if (
+                previous is not None
+                and previous.value_hash == value_hash
+                and _same_effects(store, previous.effects, frozen_effects)
+            ):
                 changed_at = previous.changed_at
                 store.trace_event("backdate", key)
             else:
