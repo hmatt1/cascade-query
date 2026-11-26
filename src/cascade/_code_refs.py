@@ -152,9 +152,30 @@ def _names_assigned(code: types.CodeType) -> set[str]:
     return names
 
 
+def _layers(fn: Any) -> list[Any]:
+    """``fn`` and the functions it wraps (``__wrapped__``), outermost first."""
+    layers = [fn]
+    while len(layers) < 64:
+        inner = getattr(layers[-1], "__wrapped__", None)
+        if inner is None or any(inner is layer for layer in layers):
+            break
+        layers.append(inner)
+    return layers
+
+
 def refs_hash(fn: Callable[..., Any]) -> str:
-    """Digest of what ``fn`` refers to outside its own body; ``""`` if nothing."""
-    fn = getattr(fn, "__wrapped__", fn)
+    """Digest of what ``fn`` refers to outside its own body; ``""`` if nothing.
+
+    The stored hash covers the bytecode of the registered function only. Under
+    a decorator that is the wrapper, so the body it wraps (``__wrapped__``,
+    as ``functools.wraps`` sets) is hashed here, layer by layer, with what
+    each layer refers to (D40). A query Cascade rewrote is the exception: its
+    bytecode is made from the body it wraps, so only that body's references
+    are added, as for an undecorated query.
+    """
+    layers = _layers(fn)
+    if getattr(fn, "__cascade_rewritten__", False):
+        layers = layers[1:]
     parts: list[str] = []
     seen: set[int] = set()
 
@@ -218,11 +239,19 @@ def refs_hash(fn: Callable[..., Any]) -> str:
         for name, default in sorted((f.__kwdefaults__ or {}).items()):
             visit_value(f"default:{name}", default)
 
-    if not isinstance(fn, types.FunctionType):
+    functions = [f for f in layers if isinstance(f, types.FunctionType)]
+    if not functions:
         return ""
-    seen.add(id(fn))
+    seen.update(id(f) for f in functions)
     try:
-        visit_function(fn)
+        for depth, f in enumerate(layers):
+            if not isinstance(f, types.FunctionType):
+                continue
+            if depth:
+                # The outermost bytecode is in the base hash already (or,
+                # rewritten, was made from this layer).
+                parts.append(f"wrapped:{depth}=fn:{hash_bytecode(f)}")
+            visit_function(f)
     except Exception:  # noqa: BLE001 - never fail a query over its hash
         return "unhashable-refs"
     if not parts:
