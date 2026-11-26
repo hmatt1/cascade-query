@@ -41,7 +41,7 @@ SHARDS: dict[str, list[str]] = {
     "store": ["_store"],
     "incremental": ["_incremental"],
     "disk": ["_disk_cache", "_serde", "_canonical"],
-    "rewrite-keys": ["_ast_rewrite", "_keys", "_types"],
+    "rewrite-keys": ["_ast_rewrite", "_keys", "_types", "_code_refs"],
     "small": [
         "_errors",
         "_graph_export",

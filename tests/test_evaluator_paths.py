@@ -15,8 +15,12 @@ hope for an ordering; every join has a timeout.
 from __future__ import annotations
 
 import asyncio
+import gc
+import re
 import threading
 import time
+import unittest.mock
+import weakref
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -709,6 +713,45 @@ def test_fixed_point_head_that_mutates_a_cached_value_fails_and_stores_nothing()
     assert runs["rows"] == 2  # computed again after being dropped
 
 
+def test_fixed_point_head_that_mutates_leaves_no_guess_for_a_caller_that_retries() -> (
+    None
+):
+    # The failed run's members were computed from its guesses. A caller that
+    # catches the error and asks again, in the same call, must get a run from
+    # the fixed_point= guess, not one seeded with those members: f below has
+    # two fixed points, 2 (reached from 0) and 3 (the failed run's last).
+    engine = Engine(check_mutations=True)
+    state = {"mutate": True}
+
+    @engine.query
+    def rows() -> list[int]:
+        return [1, 2]
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        found = rows()
+        m = member()
+        if state["mutate"]:
+            found.append(0)
+            return min(m + 1, 3)  # guesses 0, 1, 2, 3
+        return m + 1 if m < 2 else m  # f(0) = 1, f(1) = 2, f(2) = 2, f(3) = 3
+
+    @engine.query
+    def member() -> int:
+        return head()
+
+    @engine.query
+    def retrying() -> int:
+        try:
+            return head()
+        except MutatedValueError:
+            state["mutate"] = False
+            return head()
+
+    assert retrying() == 2
+    assert (head(), member()) == (2, 2)
+
+
 # --- disk records whose dependencies are gone or fail ----------------------
 
 
@@ -1076,3 +1119,323 @@ def test_load_from_disk_reaching_the_running_head(tmp_path: Path) -> None:
     assert not hits
     fresh_values, fresh_runs, _ = second_session(tmp_path / "fresh")
     assert (fresh_values, fresh_runs) == (values, session_runs)
+
+
+# --- the row a memoize=False query leaves (G10) -----------------------------
+
+
+def test_unmemoized_result_equal_to_the_last_one_does_not_rerun_its_readers() -> None:
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.input
+    def n() -> int:
+        return 1
+
+    @engine.query(memoize=False)
+    def parity() -> int:
+        runs["parity"] += 1
+        return n() % 2
+
+    @engine.query
+    def label() -> str:
+        runs["label"] += 1
+        return f"p{parity()}"
+
+    assert label() == "p1"
+    # parity() runs again for each new n and comes out the same: label()
+    # keeps its result, every time.
+    for value in (3, 5):
+        n.set(value)
+        assert label() == "p1"
+    assert runs == {"parity": 3, "label": 1}
+    n.set(6)
+    assert label() == "p0"
+    assert runs == {"parity": 5, "label": 2}  # verified, then run for the value
+
+
+def test_sweep_unaccessed_after_an_unmemoized_query() -> None:
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.query(memoize=False)
+    def scratch() -> list[int]:
+        return [1]
+
+    @engine.query
+    def kept() -> int:
+        runs["kept"] += 1
+        return len(scratch())
+
+    assert kept() == 1
+    engine.sweep_unaccessed(engine.access_id)
+    assert kept() == 1
+    assert runs["kept"] == 2  # swept, so computed again
+
+
+def test_unmemoized_query_with_a_ttl_expires() -> None:
+    engine = Engine()
+    clock = [100.0]
+    runs: Counter[str] = Counter()
+
+    @engine.input
+    def other() -> int:
+        return 0
+
+    @engine.query(memoize=False, ttl=10.0)
+    def hundreds() -> int:
+        runs["hundreds"] += 1
+        return int(clock[0] // 100)
+
+    @engine.query
+    def reader() -> int:
+        runs["reader"] += 1
+        return hundreds() + other()
+
+    with unittest.mock.patch(
+        "cascade._evaluator.time.time", side_effect=lambda: clock[0]
+    ):
+        assert reader() == 1
+        other.set(1)  # reader() checks hundreds(), which has not expired
+        assert reader() == 2
+        clock[0] = 205.0  # it has now
+        assert reader() == 3
+    assert runs["reader"] == 3
+
+
+@pytest.mark.parametrize("backend", ["mdbx", "sqlite"])
+def test_nothing_is_written_to_disk_for_an_unmemoized_query(
+    tmp_path: Path, backend: str
+) -> None:
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+
+        @engine.query(memoize=False)
+        def big() -> list[int]:
+            return [1, 2, 3]
+
+        @engine.query
+        def total() -> int:
+            return sum(big())
+
+        assert total() == 6
+        engine.flush_disk()
+        stored = {t.key for t in engine.traces() if t.event == "disk_store"}
+        assert stored == {f"query:{total.id}()"}
+    finally:
+        engine.shutdown()
+
+
+# --- what a converged fixed point stores ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "member_ttl", [None, 100.0], ids=["member-without", "member-longer"]
+)
+def test_fixed_point_head_with_a_ttl_expires_at_its_own_ttl(
+    member_ttl: float | None,
+) -> None:
+    # The head expires at the earliest of its own TTL and what its members
+    # read: a member with no expiry, or a later one, does not extend it.
+    engine = Engine()
+    clock = [1000.0]
+    runs: Counter[str] = Counter()
+
+    @engine.query(ttl=member_ttl)
+    def source() -> int:
+        return 0
+
+    @engine.query(fixed_point=0, ttl=5.0)
+    def head() -> int:
+        runs["head"] += 1
+        return min(member() + 1, 3)
+
+    @engine.query
+    def member() -> int:
+        return head() + source()
+
+    with unittest.mock.patch(
+        "cascade._evaluator.time.time", side_effect=lambda: clock[0]
+    ):
+        assert head() == 3
+        assert runs["head"] == 4  # guesses 0, 1, 2, 3
+        clock[0] += 2
+        assert head() == 3
+        assert runs["head"] == 4
+        clock[0] += 10
+        assert head() == 3
+        assert runs["head"] == 8
+
+
+def test_cycle_members_are_not_run_again_while_nothing_they_read_changed() -> None:
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.input
+    def other() -> int:
+        return 0
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        runs["head"] += 1
+        return min(member() + 1, 3)
+
+    @engine.query
+    def member() -> int:
+        runs["member"] += 1
+        return head()
+
+    @engine.query
+    def unrelated() -> int:
+        return other()
+
+    assert head() == 3
+    assert runs == {"head": 4, "member": 4}
+    assert member() == 3
+    other.set(1)  # a new revision: member() is checked, not run
+    assert unrelated() == 1
+    assert (member(), head()) == (3, 3)
+    assert runs == {"head": 4, "member": 4}
+
+
+def _plain_nested() -> tuple[int, int, int]:
+    """outer = min(inner + 1, 5); inner = max(leaf, outer); leaf = inner."""
+    outer = 0
+    while True:
+        inner = 0
+        while True:
+            leaf = inner
+            new_inner = max(leaf, outer)
+            if new_inner == inner:
+                break
+            inner = new_inner
+        new_outer = min(inner + 1, 5)
+        if new_outer == outer:
+            return outer, inner, leaf
+        outer = new_outer
+
+
+def test_nested_fixed_points_store_the_inner_cycle_members() -> None:
+    # inner() converges while it depends on the guess of outer(), so its
+    # member leaf() then depends on outer() instead. It is stored when
+    # outer() converges, and read again in the same call it has its final
+    # value.
+    engine = Engine()
+    runs: Counter[str] = Counter()
+
+    @engine.query(fixed_point=0)
+    def outer() -> int:
+        runs["outer"] += 1
+        return min(inner() + 1, 5)
+
+    @engine.query(fixed_point=0)
+    def inner() -> int:
+        runs["inner"] += 1
+        return max(leaf(), outer())
+
+    @engine.query
+    def leaf() -> int:
+        runs["leaf"] += 1
+        return inner()
+
+    @engine.query
+    def everything() -> tuple[int, int, int]:
+        return outer(), inner(), leaf()
+
+    assert everything() == _plain_nested() == (5, 5, 5)
+    before = dict(runs)
+    assert (leaf(), inner(), outer()) == (5, 5, 5)
+    assert runs == before
+
+
+class _Payload:
+    """Weakly referenceable, so a test can see whether it is still held."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+
+def test_unmemoized_cycle_member_keeps_no_value() -> None:
+    engine = Engine()
+    made: list[weakref.ref[_Payload]] = []
+
+    @engine.query(fixed_point=0)
+    def head() -> int:
+        return min(member().n + 1, 3)
+
+    @engine.query(memoize=False)
+    def member() -> _Payload:
+        payload = _Payload(head())
+        made.append(weakref.ref(payload))
+        return payload
+
+    assert head() == 3  # stores member() as a member of the cycle
+    gc.collect()
+    assert made
+    assert all(ref() is None for ref in made)
+    assert member().n == 3
+
+
+# --- trace events -----------------------------------------------------------
+
+
+def test_trace_records_a_backdated_result_and_how_long_the_body_ran() -> None:
+    engine = Engine()
+
+    @engine.input
+    def n() -> int:
+        return 1
+
+    @engine.query
+    def slow() -> int:
+        time.sleep(0.05)
+        return n() % 2
+
+    assert slow() == 1
+    engine.clear_traces()
+    n.set(3)
+    assert slow() == 1  # the same value: backdated
+    events = [(t.event, t.key, t.detail) for t in engine.traces()]
+    key = f"query:{slow.id}()"
+    assert ("backdate", key, "") in events
+    (done,) = [d for event, k, d in events if event == "recompute_done" and k == key]
+    assert re.fullmatch(r"\d+\.\d{3}ms", done)
+    assert float(done[:-2]) >= 40.0  # slept 50 ms; a coarse clock may round down
+
+
+# --- errors raised before a query runs --------------------------------------
+
+
+def test_method_query_names_the_class_of_a_self_it_cannot_key() -> None:
+    engine = Engine()
+
+    class Doc:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        @engine.query
+        def words(self) -> int:
+            return len(self.text.split())
+
+    class Unhashable:
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, Unhashable)
+
+        @engine.query
+        def size(self) -> int:
+            return 0
+
+    with pytest.raises(
+        TypeError, match=r"is a method, and its self \(a [\w.<>]+\.Doc\) .* identity"
+    ):
+        Doc("a b").words()
+    with pytest.raises(
+        TypeError,
+        match=r"is a method, and its self \(a [\w.<>]+\.Unhashable\) .* must be hashable",
+    ):
+        Unhashable().size()
+
+
+def test_incremental_per_element_that_is_not_a_bool_is_refused() -> None:
+    with pytest.raises(TypeError, match=r"^incremental_per_element must be a bool$"):
+        Engine().query(incremental_per_element=0)

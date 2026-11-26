@@ -37,12 +37,23 @@ class Frozen:
     b: Any = 0
 
 
+@dataclasses.dataclass(frozen=True)
+class Tagged:
+    """Hashable, with a field left out of the hash: it may hold a list or dict."""
+
+    items: Any = dataclasses.field(hash=False)
+
+
 # Each group: values that are == (and hash alike) but a body can tell apart.
 LOOK_ALIKE_GROUPS: list[list[Any]] = [
     [1, True, 1.0, decimal.Decimal(1), fractions.Fraction(1), Level.LOW, complex(1)],
     [0, False, 0.0, -0.0],
     ["fast", Mode.FAST],
     [(1, 2), (1, 2.0), (True, 2), Pair(1, 2)],
+    [Pair(1, 2), Pair(1, 2.0), Pair(True, 2)],
+    [Tagged([1]), Tagged([1.0])],
+    [Tagged({1: 0}), Tagged({1.0: 0})],
+    [Tagged({1: 1}), Tagged({1: 1.0})],
     [frozenset({1}), frozenset({True}), frozenset({1.0})],
     [decimal.Decimal("1.0"), decimal.Decimal("1.00")],
     [pathlib.PureWindowsPath("A"), pathlib.PureWindowsPath("a")],

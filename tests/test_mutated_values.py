@@ -350,6 +350,136 @@ def test_by_default_queries_do_not_check_but_check_mutations_does() -> None:
     assert base() == [1, 2]  # dropped and computed again
 
 
+def test_values_read_after_ones_that_are_not_checked_are_still_checked() -> None:
+    """A cached error or a ``memoize=False`` result read first skips only itself."""
+    engine = Engine(check_mutations=True)
+
+    @engine.query(cache_exceptions=True)
+    def failing() -> int:
+        raise ValueError("cached")
+
+    @engine.query(memoize=False)
+    def scratch() -> list[int]:
+        return [0]
+
+    @engine.query
+    def base() -> list[int]:
+        return [1, 2]
+
+    @engine.query
+    def after_error() -> int:
+        try:
+            failing()
+        except ValueError:
+            pass
+        values = base()
+        values.append(3)  # meant to build a new list
+        return len(values)
+
+    @engine.query
+    def after_unmemoized() -> int:
+        scratch()
+        values = base()
+        values.append(3)
+        return len(values)
+
+    for reader in (after_error, after_unmemoized):
+        with pytest.raises(MutatedValueError) as info:
+            reader()
+        assert info.value.keys == (("query", base.id, ()),)
+        assert base() == [1, 2]  # dropped and computed again
+
+
+def test_check_mutations_goes_past_values_it_does_not_check() -> None:
+    engine = Engine()
+
+    @engine.query(cache_exceptions=True)
+    def failing() -> int:
+        raise ValueError("cached")
+
+    @engine.query(memoize=False)
+    def scratch() -> list[int]:
+        return [0]
+
+    @engine.query
+    def base() -> list[int]:
+        return [1, 2]
+
+    # Stored in this order: the changed result comes after the other two.
+    with pytest.raises(ValueError):
+        failing()
+    assert scratch() == [0]
+    base().append(3)
+    with pytest.raises(MutatedValueError) as info:
+        engine.check_mutations()
+    assert info.value.keys == (("query", base.id, ()),)
+    assert base() == [1, 2]
+
+
+def test_setting_an_equal_value_keeps_the_object_the_input_holds() -> None:
+    """Nothing changed, so nothing is replaced: only a changed object is."""
+    engine = Engine(check_mutations=True)
+    first = [1, 2]
+
+    @engine.input
+    def source() -> list[int]:
+        return []
+
+    source.set(first)
+    revision = engine.revision
+    source.set([1, 2])
+    assert engine.revision == revision
+    assert source() is first
+    engine.check_mutations()
+
+
+def test_the_error_names_every_changed_value_and_says_what_to_do() -> None:
+    engine = Engine()
+
+    @engine.input
+    def cfg() -> dict[str, int]:
+        return {"a": 1}
+
+    @engine.query
+    def rows() -> list[int]:
+        return [1]
+
+    rows_name = f"query:{rows.id}()"
+    cfg_name = f"input:{cfg.id}()"
+
+    def message() -> str:
+        with pytest.raises(MutatedValueError) as info:
+            engine.check_mutations()
+        return str(info.value)
+
+    rows().append(2)
+    cfg()["a"] = 2
+    both = message()
+    assert both.startswith(
+        f"the value of {rows_name}, {cfg_name} was changed in place after "
+        "Cascade stored it. Queries and inputs hand out the stored object"
+    )
+    assert (
+        "every later reader gets. Build a new value instead of changing the "
+        "returned one (for example [*rows, x] instead of rows.append(x))"
+    ) in both
+    assert (
+        "computed again on its next use. Give an input a new value with set() "
+        "instead of changing the one it returned"
+    ) in both
+
+    # Only the advice for what was changed: a query result, or an input.
+    cfg.set({"a": 1})
+    rows().append(3)
+    only_result = message()
+    assert "Build a new value" in only_result
+    assert "Give an input" not in only_result
+    cfg()["a"] = 5
+    only_input = message()
+    assert "Give an input" in only_input
+    assert "Build a new value" not in only_input
+
+
 def test_a_dependency_that_raised_has_no_value_to_check() -> None:
     engine = Engine(check_mutations=True)
 

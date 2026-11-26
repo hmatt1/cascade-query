@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import types
 from pathlib import Path
 from typing import Any
 
@@ -333,3 +334,13 @@ def test_object_keyed_by_identity_is_refused_as_any_argument() -> None:
     # bare object() used as a sentinel, which has no state.
     assert scaled(Config, 3) == 6
     assert setting(object()) == 0
+
+    @engine.query
+    def name_of(thing: Any) -> str:
+        return thing.__name__
+
+    def helper() -> None:
+        pass
+
+    assert name_of(helper) == "helper"
+    assert name_of(types) == "types"

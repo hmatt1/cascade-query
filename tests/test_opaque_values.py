@@ -188,6 +188,8 @@ def test_one_shot_iterator_result_is_refused(make: Any) -> None:
     with pytest.raises(UnencodableValueError, match="can be read only once") as info:
         items()
     assert "items" in str(info.value)
+    # It names what was returned: "returned a generator", "a map", ...
+    assert f"returned a {type(make()).__name__}," in str(info.value)
     # Not cached: the next call runs the body and raises again.
     with pytest.raises(UnencodableValueError):
         items()
