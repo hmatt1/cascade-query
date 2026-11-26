@@ -1551,3 +1551,64 @@ def test_d39_submit_after_an_async_query_started_the_pool(tmp_path: Path) -> Non
     assert held() == 6
     assert runs["double"] == 1
     engine.shutdown()
+
+
+def test_d40_edited_body_under_a_wrapping_decorator_is_recomputed(
+    tmp_path: Path,
+) -> None:
+    # The stored hash covered the bytecode of the registered function, which
+    # under a decorator is the wrapper; the body it wraps was not hashed, so
+    # an edit to it between runs left the old stored result in use.
+    import textwrap
+
+    def program(value: int) -> Any:
+        namespace: dict[str, Any] = {"__name__": "program"}
+        source = f"""
+        import functools
+
+        def logged(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)
+            return wrapper
+
+        @logged
+        def q():
+            return {value}
+        """
+        exec(textwrap.dedent(source), namespace)
+        return namespace["q"]
+
+    for value in (1, 1, 2):
+        engine = Engine(cache_dir=tmp_path)
+        try:
+            assert engine.query(program(value), name="q")() == value
+        finally:
+            engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("then_append", [True, False], ids=["tail", "snapshot-only"])
+def test_d41_held_back_record_does_not_overwrite_another_engines_collection(
+    tmp_path: Path, backend: str, then_append: bool
+) -> None:
+    # The fix for D38 holds a new named collection's record back to the
+    # commit. Written then without looking, it replaced the compacted
+    # snapshot another engine had written to the name in the meantime.
+    a = Engine(cache_dir=tmp_path, cache_backend=backend)
+    b = Engine(cache_dir=tmp_path, cache_backend=backend)
+    with a.transaction():
+        CascadeList(a, name="xs")
+        xs = CascadeList(b, name="xs")
+        xs.extend([1, 2])
+        xs.compact()
+        if then_append:  # a snapshot and a tail on disk, or the snapshot alone
+            xs.append(3)
+    a.shutdown()
+    b.shutdown()
+    reopened = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        expected = [1, 2, 3] if then_append else [1, 2]
+        assert list(CascadeList(reopened, name="xs")) == expected
+    finally:
+        reopened.shutdown()

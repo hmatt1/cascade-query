@@ -399,7 +399,7 @@ class _CollectionCore:
                 # nothing (G25). Rolled back, it waits for the first change.
                 tx = engine._active_transaction()
                 if tx is None:
-                    self._stamp()
+                    self._stamp(checked=True)
                 else:
                     self._unstamped = True
                     tx.pending_disk.setdefault(self, [])
@@ -551,9 +551,26 @@ class _CollectionCore:
                 "Engine.snapshot() unreleased while it is in use"
             ) from None
 
-    def _stamp(self) -> None:
-        """Write the empty record that fixes this name's kind on disk."""
+    def _stamp(self, *, checked: bool = False) -> None:
+        """Write the empty record that fixes this name's kind on disk.
+
+        ``checked`` when the caller has just found no record. A stamp held
+        back by a transaction looks again first: another engine may have
+        recorded the name since, and its record (possibly a compacted
+        snapshot of its contents) is kept. Writing over it lost that
+        engine's data (D41). A record of another kind is refused, as at
+        construction.
+        """
         self._unstamped = False
+        if not checked:
+            snapshot, tail = self.disk.collection_load(self.name)
+            if snapshot is not None and snapshot["kind"] != self.kind:
+                raise PersistentCacheError(
+                    f"persisted collection {self.name!r} is a "
+                    f"{snapshot['kind']}, not a {self.kind}"
+                )
+            if snapshot is not None or tail:
+                return
         self.disk.collection_snapshot(
             self.name,
             {

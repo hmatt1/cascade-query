@@ -12,7 +12,9 @@ before the block. These tests pin what that means for:
 * ``engine.submit`` from inside the block (G6);
 * two engines: one changing its state while the other has a block open,
   transactions on both at once from two threads or two tasks of one thread,
-  and two engines on one ``cache_dir`` with named collections (G26).
+  and two engines on one ``cache_dir`` with named collections (G26);
+* names on disk: a refused name, and unnamed collections of two processes
+  that share a ``cache_dir``.
 
 After each step every read is compared with plain Python run on the
 collection's contents at that point.
@@ -21,6 +23,9 @@ collection's contents at that point.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -28,6 +33,7 @@ from typing import Any
 
 import pytest
 
+import cascade
 from cascade import (
     CascadeDict,
     CascadeList,
@@ -666,6 +672,29 @@ def test_rolled_back_creation_is_recorded_by_its_first_later_change(
     assert list(CascadeList(reopened, [0], name="later")) == [7]
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_value_that_cannot_be_persisted_is_refused_at_the_change_in_the_block(
+    engines: Callable[..., Engine], tmp_path: Path, backend: str
+) -> None:
+    # G26: refused at the mutating call, also in a block, where the write
+    # itself waits for the commit. The block goes on and commits the rest.
+    engine = engines(cache_dir=tmp_path, cache_backend=backend)
+    xs = CascadeList(engine, [1], name="xs")
+    with engine.transaction():
+        xs.append(2)
+        with pytest.raises(
+            PersistentCacheError,
+            match=r"^collection 'xs' received a value that cannot be persisted",
+        ):
+            xs.append(object())
+        assert list(xs) == [1, 2]
+        xs.append(3)
+    assert list(xs) == [1, 2, 3]
+    engine.shutdown()
+    reopened = engines(cache_dir=tmp_path, cache_backend=backend)
+    assert list(CascadeList(reopened, name="xs")) == [1, 2, 3]
+
+
 # --- 3. engine.submit inside the block (G6) ---------------------------------
 
 
@@ -1201,3 +1230,133 @@ def test_second_engine_block_refused_on_a_named_collection_rolls_back_whole(
     c = engines(cache_dir=tmp_path, cache_backend=backend)
     assert list(CascadeList(c, name="xs")) == ["base", "a"]
     assert list(CascadeList(c, name="own")) == []
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_block_creating_a_name_another_engine_then_writes_keeps_its_changes(
+    engines: Callable[..., Engine], tmp_path: Path, backend: str
+) -> None:
+    # A creates "xs" in a block and changes nothing, so the record of the
+    # name waits for the commit (D38). Meanwhile B creates the name and
+    # writes to it. The record A writes at its commit must leave B's changes
+    # on disk.
+    a = engines(cache_dir=tmp_path, cache_backend=backend)
+    b = engines(cache_dir=tmp_path, cache_backend=backend)
+    with a.transaction():
+        xs_a = CascadeList(a, name="xs")
+        xs_b = CascadeList(b, name="xs")
+        xs_b.append(1)
+        xs_b.append(2)
+    assert list(xs_a) == []
+    assert list(xs_b) == [1, 2]
+    a.shutdown()
+    b.shutdown()
+    c = engines(cache_dir=tmp_path, cache_backend=backend)
+    assert list(CascadeList(c, name="xs")) == [1, 2]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_block_creating_a_name_another_engine_then_compacts_keeps_its_contents(
+    engines: Callable[..., Engine], tmp_path: Path, backend: str
+) -> None:
+    a = engines(cache_dir=tmp_path, cache_backend=backend)
+    b = engines(cache_dir=tmp_path, cache_backend=backend)
+    with a.transaction():
+        CascadeList(a, name="xs")
+        xs_b = CascadeList(b, name="xs")
+        xs_b.extend([1, 2])
+        xs_b.compact()  # the record now holds [1, 2]
+        xs_b.append(3)
+    assert list(xs_b) == [1, 2, 3]
+    a.shutdown()
+    b.shutdown()
+    c = engines(cache_dir=tmp_path, cache_backend=backend)
+    # D41: the record held back to A's commit was written over B's
+    # compacted snapshot, and [1, 2] was lost.
+    assert list(CascadeList(c, name="xs")) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_block_creating_a_name_another_engine_records_as_another_kind_fails(
+    engines: Callable[..., Engine], tmp_path: Path, backend: str
+) -> None:
+    # The held-back record finds the name taken by another kind: the commit
+    # is refused, as constructing the collection then would have been.
+    a = engines(cache_dir=tmp_path, cache_backend=backend)
+    b = engines(cache_dir=tmp_path, cache_backend=backend)
+    with pytest.raises(PersistentCacheError, match="is a set, not a list"):
+        with a.transaction():
+            CascadeList(a, name="either")
+            CascadeSet(b, {1}, name="either")
+    a.shutdown()
+    b.shutdown()
+    c = engines(cache_dir=tmp_path, cache_backend=backend)
+    assert set(CascadeSet(c, name="either")) == {1}
+
+
+# --- 5. collection names on disk --------------------------------------------
+
+
+def test_collection_name_with_a_nul_character_is_refused(
+    engines: Callable[..., Engine], tmp_path: Path
+) -> None:
+    engine = engines(cache_dir=tmp_path)
+    for kind in (CascadeList, CascadeSet, CascadeDict):
+        with pytest.raises(
+            ValueError, match=r"^collection names must not contain NUL characters$"
+        ):
+            kind(engine, name="a\x00b")
+
+
+_UNNAMED_SESSION = """
+import sys
+
+from cascade import CascadeList, Engine
+
+engine = Engine(cache_dir=sys.argv[1])
+xs = CascadeList(engine, [int(v) for v in sys.argv[2:]])
+
+
+@engine.query
+def total():
+    t = 0
+    for x in xs:
+        t += x
+    return t
+
+
+print(total())
+engine.shutdown()
+"""
+
+
+def test_unnamed_collection_of_an_earlier_process_does_not_answer_for_a_new_one(
+    tmp_path: Path,
+) -> None:
+    # Unnamed collections get the same automatic name in every process
+    # ("list#1", ...). With the same number of changes they also have the
+    # same head, so only a per-object id keeps the second process from
+    # verifying total() against the first process's list on disk.
+    script = tmp_path / "session.py"
+    script.write_text(_UNNAMED_SESSION, encoding="utf-8")
+    env = dict(os.environ)
+    src = str(Path(cascade.__file__).resolve().parents[1])
+    # Prepended, not replaced: a test runner may need what is there (the
+    # mutation runner's import shim).
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (src, env.get("PYTHONPATH", "")) if p
+    )
+
+    def run(*items: int) -> str:
+        done = subprocess.run(
+            [sys.executable, str(script), str(tmp_path / "cache"), *map(str, items)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+            check=True,
+        )
+        return done.stdout.strip()
+
+    assert run(1, 2) == "3"
+    assert run(5, 6) == "11"
