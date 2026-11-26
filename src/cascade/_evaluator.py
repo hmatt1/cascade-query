@@ -840,9 +840,10 @@ class Evaluator:
         else:
             version = self._store.input_version_at((input_id, args), revision)
         if version is None:
-            if inspect.iscoroutinefunction(fn):
+            if inspect.iscoroutinefunction(fn):  # pragma: no branch
+                # Only an input defined with ``async def`` is read here.
                 default = await _keys.call(fn, args)
-            else:
+            else:  # pragma: no cover - see above
                 default = await self._run_sync_in_executor(fn, args)
             version = self._keep_default((input_id, args), revision, default)
         self.record_dependency(key, version.changed_at)
@@ -1792,22 +1793,12 @@ class Evaluator:
         # changed_at says nothing about this revision.
         return entry
 
-    async def dependency_changed_at_async(
-        self, key: QueryKey, snapshot: Snapshot
-    ) -> int:
-        kind, fid, args = key
-        if kind == "input":
-            version = self._store.input_version_at((fid, args), snapshot.revision)
-            return -1 if version is None else version.changed_at
-        entry = await self._dependency_entry_async(key, snapshot)
-        return _NEVER_CHANGED_AT if entry is None else entry.changed_at
-
     async def _dependency_entry_async(
         self, key: QueryKey, snapshot: Snapshot, *, as_verification: bool = True
     ) -> MemoEntry | None:
         fid = key[1]
         runtime = self._runtime_var.get()
-        if runtime is not None:
+        if runtime is not None:  # pragma: no branch - called from a running query
             overlay = runtime.provisional
             if overlay is not None and key in overlay:
                 return None
@@ -1816,7 +1807,7 @@ class Evaluator:
             if memo is not None and self._usable_locked(memo, snapshot.revision):
                 return memo
         fn = self._store.lookup_query(fid)
-        if runtime is not None:
+        if runtime is not None:  # pragma: no branch - called from a running query
             for frame in runtime.stack:
                 if frame.key == key:
                     return None
@@ -1839,7 +1830,7 @@ class Evaluator:
         runtime: RuntimeState | None,
         as_verification: bool = True,
     ) -> MemoEntry:
-        if runtime is None:
+        if runtime is None:  # pragma: no cover - called from a running query
             self._store.pin_snapshot(snapshot)
             entry = await self._run_in_runtime_async(
                 RuntimeState(
