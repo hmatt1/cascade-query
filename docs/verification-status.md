@@ -790,6 +790,52 @@ Faults seeded on a copy, one at a time:
 Changing `filter(None, ...)` to `filter(abs, ...)` was also tried; it is not
 a fault for numbers.
 
+### The 0.4.0 code (2026-11-25)
+
+A run limited to the code added or changed for 0.4.0, with
+`scripts/mutation_windows.py all` and these patterns: all of
+`cascade._code_refs`; `_StoredHashes`, `mutated_values`, `_value_changed`,
+`check_mutations`, `_replace_changed_value_locked` and `mutation_error` in
+`_store`; `shape` and `_identity_key_message` in `_keys`;
+`MutatedValueError`; `Evaluator._finish_recompute`; `_stamp`,
+`write_pending`, `emit` and `__init__` of `_CollectionCore`; and in `engine`
+`submit`, `check_mutations`, `_check_hashable` and `_check_per_element`.
+
+| Run | Mutants | Killed | Survived | Rate |
+|---|---|---|---|---|
+| First (released 0.4.0) | 999 | 780 | 219 | 21.9% |
+| After the tests below, with D40 and D41 fixed | 1,043 | 952 | 91 | 8.7% |
+
+The code hash was the weakest part: 97 of about 290 mutants of
+`_code_refs` survived the first run. Tests were then written for every
+survivor, each kill checked by applying the mutant to a copy of the source
+and running the new test there. Of the 91 left after the second run, 69
+were judged equivalent or not worth pinning when the tests were written
+(a `False` against a `None`, a digest size, a recursion limit off by one, a
+uid step, a pool size, a trace's milliseconds), 20 are the same kinds in
+the functions the fixes changed and so renumbered, and two were pinned
+afterwards by hand (a stamp that kept only a record with both a snapshot and
+a tail, and a `__wrapped__` walk that did not stop at `None`).
+
+Writing those tests found two defects, both fixed with regression tests
+(`docs/guarantees.md`):
+
+- **D40**, in 0.4.0 and before: a query under a `functools.wraps`
+  decorator kept its stored result after its body was edited between runs.
+  The hash of what a query refers to followed `__wrapped__` to the body's
+  references, but nothing hashed the body.
+- **D41**, brought in by the fix for D38 and released in 0.4.0: a named
+  collection created in a transaction writes its record at the commit,
+  without looking; if another engine had written and compacted the name
+  in the meantime, its data was replaced by the empty record.
+
+Two behaviours the tests did not pin are worth a look: a fixed-point head
+with `memoize=False` runs its cycle more times than needed after an input
+change (12 head runs where a mutant that keeps fewer cycle nodes needs 7,
+with the same values), and the digest format of the code hash has no
+golden-value test, so a change to it shows only as one recomputation of
+stored results.
+
 ## Next steps
 
 In order of value for the time they take.

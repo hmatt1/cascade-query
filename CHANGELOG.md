@@ -4,6 +4,23 @@ Releases before 0.4.0 were published from every push to `main` without
 notes; `docs/guarantees.md` records the defects fixed in them (D1–D37).
 Defects fixed since are listed under their release (D38 on).
 
+## 0.4.1
+
+### Fixed
+
+- **A query under a wrapping decorator kept its stored result after its
+  body was edited (D40).** With `cache_dir`, a query decorated with a
+  `functools.wraps` wrapper was hashed by the wrapper's code only, so an
+  edit to the body between runs served the old result. Every wrapped layer
+  is now part of the hash. On upgrade, stored results of decorated queries
+  are computed once more; other queries keep theirs.
+- **The fix for D38 in 0.4.0 could lose another engine's collection data
+  (D41).** A named collection created in a transaction writes its record
+  at commit; if another engine had written and compacted that collection
+  in the meantime, the empty record replaced its contents on disk. The
+  record is now written only if the name has none, and a record of another
+  kind fails the commit.
+
 ## 0.4.0
 
 This release turns several ways of getting a silently wrong answer into

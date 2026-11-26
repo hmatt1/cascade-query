@@ -530,6 +530,9 @@ helper defined below the query does not exist when it is decorated):
 - immutable values it names, in globals, closure cells or defaults:
   numbers, strings, bytes, tuples and frozensets of them, enum members,
   frozen dataclasses of them, dates, paths, `Decimal`, `UUID`.
+- under a decorator that sets `__wrapped__` (`functools.wraps`), each
+  function it wraps, down to the body: its bytecode and what it names, as
+  for the registered function (D40).
 
 Not followed: the standard library, `cascade` and installed packages
 (`site-packages`), methods called on objects, mutable objects, names the
@@ -1404,7 +1407,9 @@ D38 was found on 2026-11-25 by the tests written for test gap 9
 collections first stamped their kind on disk. D39 was found the same day
 by the state machine's new rule that holds a submitted run (test gap 3), on
 the free-threaded build only, where threads inherit their starter's context
-by default.
+by default. D40 was found on 2026-11-25 while writing tests for the
+mutants that survived the 0.4.0 code (test gap 10), and D41, which the
+fix for D38 brought in and 0.4.0 released, the same way.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
@@ -1456,6 +1461,8 @@ without an expected-failure marker.
 | D37 | A rewritten list comprehension was evaluated lazily when it fell back to plain Python. `any([1 // x for x in xs])` over `[1, 0]` returned `True`, and `all([x - 1 // x for x in xs])` `False`, where Python builds the list first and raises `ZeroDivisionError`; the same with the list inside `map` or `filter`, and a stage outside the list could raise its own error first. When an element raises, the runtime evaluates the expression the plain way, and it chained the stages of a list comprehension as lazy iterators, like those of a generator expression, so `any` stopped at the first true element before the one that raises. A list comprehension now ends in a stage that builds the list on the plain path; the incremental path, which evaluates every element anyway, skips it. | `fix: a rewritten list comprehension was evaluated lazily` |
 | D38 | A named collection created inside a transaction that rolled back left a record of itself on disk. Creating a named collection stamps an empty record that fixes the name's kind, and that write was made at once, outside the writes the transaction holds back until it commits. After `CascadeList(engine, [1, 2, 3], name="seeded")` in a block that raised, a new engine's `CascadeList(engine, [1, 2, 3], name="seeded")` restored the empty record, `[]` where it would have been `[1, 2, 3]` had the block never run, and a `CascadeSet` under the name raised `PersistentCacheError`. The stamp now waits for the commit; after a rollback it waits for the collection's first change (G25). | `fix: a rolled-back transaction left a named collection's record on disk` |
 | D39 | On a free-threaded build, a call made with `engine.submit` could return an old value and could not be cancelled. Threads there copy the context of the thread that starts them, and the pool `submit` uses is also where an async query runs sync code (for example the default of a sync input it checks while loading a result from disk). A worker started from inside such a query kept that query's runtime, so a later submitted call on it ran as part of the finished query: at its revision, with no cancellation. After `x.set(5)`, `engine.submit(double).result()` gave 2 where `double()` gives 10, or raised `SnapshotExpiredError` once that revision's history was trimmed. Under the interpreter lock threads start with an empty context and it never happened. A submitted call now runs in a context of its own (G5, G6). | `fix: a submitted call on a free-threaded build could run at an old revision` |
+| D40 | A query under a decorator that wraps it (`functools.wraps`) kept its stored result after its body was edited between runs. The stored hash covers the bytecode of the registered function, which is the wrapper, and the hash of what it refers to followed `__wrapped__` to the body's references but not to the body itself: with `cache_dir`, `@engine.query @logged def q(): return 1` edited to `return 2` went on returning 1. The bytecode of every wrapped layer, and what each refers to, is now part of the stored hash (G11). | `fix: an edit to a query under a wrapping decorator kept its stored result` |
+| D41 | The fix for D38 lost another engine's data. A named collection created in a transaction holds its record back to the commit, and wrote it then without looking: if another engine had recorded the name in the meantime and compacted it, the empty record replaced that engine's snapshot. With engine A's block creating `CascadeList(a, name="xs")` while engine B extended, compacted and appended to `xs`, a restart restored `[3]` instead of `[1, 2, 3]`. Released in 0.4.0. The held-back record now looks first, keeps a record it finds, and refuses one of another kind (G25, G26). | `fix: a held-back collection record overwrote another engine's data` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
@@ -1536,10 +1543,11 @@ actions to the code and the invariants to the guarantees.
   history retention. Change stamps are reused once nobody holds them, where
   the code counts up; the outcome of a walk over input dependencies is fixed
   in the step that looks the row up.
-- None of D1–D39 is reachable in the model: each is in a feature it leaves
+- None of D1–D41 is reachable in the model: each is in a feature it leaves
   out (for D33 the record of who waits for whom, for D34 tasks and their
   cancellation, for D35 fixed points, for D36 and D37 the rewrite, for D38
-  transactions and collections, for D39 threads and contexts). The state machine (test gap 3) is what
+  and D41 transactions and collections, for D39 threads and contexts, for D40
+  the code hash). The state machine (test gap 3) is what
   covers the others: threads and tasks as readers beside several writers,
   `submit` and its cancellation, and interleavings it picks itself.
 
@@ -1548,7 +1556,7 @@ actions to the code and the invariants to the guarantees.
 Ordered by the risk they leave open.
 
 1. **Every defect has a regression test, and none is open.**
-   `tests/test_known_defects.py` has a test for each defect (D1-D39), each
+   `tests/test_known_defects.py` has a test for each defect (D1-D41), each
    asserting the correct behaviour; a defect found from now on gets one
    under `xfail(strict=True)` until it is fixed.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
@@ -1662,7 +1670,12 @@ Ordered by the risk they leave open.
     overstates what the assertions would catch, most in the async paths,
     in the bookkeeping of a result reloaded from disk, and in two paths
     that tests reached only when threads happened to meet. Fixed tests
-    force those two since, and writing them found D33 and D34.
+    force those two since, and writing them found D33 and D34. The code
+    added for 0.4.0 had its own run on 2026-11-25: 21.9% survived at first
+    (a third of the code hash), 8.7% after tests for every survivor, the
+    rest judged equivalent or not worth pinning; writing those tests found
+    D40 and D41. The whole package has not been run again since the first
+    full run, so its rate is out of date for code changed since.
     `docs/verification-status.md` has the tables, how the runs were made
     and what in them is unconfirmed. A full run is hours of test runs, so
     it is done on demand, on a machine with many cores (on Windows through
