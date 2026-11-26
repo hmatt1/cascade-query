@@ -119,7 +119,7 @@ Not every feature is tested to the same depth. `docs/guarantees.md` has the deta
 | Disk cache, one process | Strong on the sync path, good for async | Rule 5 is the main risk |
 | Collections and rewritten comprehensions | Strong for reducers; generated whole-query tests use small numbers only | Two wrong-result bugs were fixed in November 2026 (D36, D37). If such a query gives a result you do not expect, `incremental_per_element=False` on it runs the same code as plain Python; please report any difference |
 | `async def` queries | Medium: fewer assertions than the sync path | Test your own async graphs |
-| Threads on free-threaded Python | Stress-tested; races are found by chance, not exhaustively | One race took about ten runs to show |
+| Threads on free-threaded Python | Stress-tested, and a randomized test that picks thread interleavings itself for some scenarios; not exhaustive | One race took about ten CI runs to show; that test now finds it on every build |
 | Several processes writing one `cache_dir` | Tested around named collections only, not under load | Give parallel jobs their own directories |
 
 ---

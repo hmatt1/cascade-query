@@ -1314,7 +1314,17 @@ backends),
 `test_transaction_commit_failure.py` (every kind of collection, an unhashable
 argument, the error raised, queries inside the block, a collection created in
 the block, the collection free for other threads afterwards; named
-collections on both backends).
+collections on both backends),
+`test_transaction_block_reads.py` (queries in the block reading a list, set
+or dict changed earlier in it, plain and rewritten, before and after commit
+or rollback; collections created in the block, unnamed and named on both
+backends; `submit` in the block, finishing in it or cancelled by its commit;
+two engines, one with a block open, both with blocks open on two tasks or
+threads, and two on one `cache_dir` with named collections),
+`test_known_defects.py::test_d38_rolled_back_creation_of_a_named_collection_writes_nothing`,
+`test_stateful_engine_invariants.py` (transactions on the machine's thread
+and on concurrent writers' threads, beside readers that must never see half
+of one).
 
 ### G26. Named collection persistence
 
@@ -1389,6 +1399,12 @@ D36 was found on 2026-11-25 by the generated query bodies of
 the first version of the collections (`f13e825`, 2026-07-21). D37 was
 found by the same test a few hours later, in a longer run; it came with
 the fix for D7, which made a raising element fall back to plain evaluation.
+D38 was found on 2026-11-25 by the tests written for test gap 9
+(`tests/test_transaction_block_reads.py`); it was there since named
+collections first stamped their kind on disk. D39 was found the same day
+by the state machine's new rule that holds a submitted run (test gap 3), on
+the free-threaded build only, where threads inherit their starter's context
+by default.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
@@ -1438,6 +1454,8 @@ without an expected-failure marker.
 | D35 | With several threads or tasks asking for a fixed-point cycle member whose result had been dropped, or for a query that depends on it, after an input changed, one of them could get `CycleError` for a cycle that converges: one of six threads in about one run in ten on a free-threaded build, where CI met it, and never seen under the interpreter lock. A member's run that reaches itself through its head starts over by bringing the head up to date (D25). The head's run asks for the member; if another caller had taken over the member by then, that caller's run failed as the first one's had, and the head's run gave up on it the way a verification does. Nothing ran the head for real afterwards, so it stayed as it was, and the member ran once more, reached itself and raised. Entering a cycle through its head now retries a joined run that ended in `CycleError`: the head runs the member on its own stack, where the cycle converges. | `fix: a dropped fixed-point member asked for by two threads raised CycleError` |
 | D36 | A `dict` built over stages of a `CascadeDict` was built from its `(key, value)` pairs, where Python iterates a dict's keys: `{x: 1 for x in d}` over `{0: 5, 1: 6}` gave `{(0, 5): 1, (1, 6): 1}` instead of `{0: 1, 1: 1}`, and so did `dict((x, 1) for x in d)` and `dict(map(f, d))`; `{p: q for p, q in d}`, which raises in Python because the int keys cannot be unpacked, returned a copy of `d`. The runtime read a `CascadeDict` under the `dict` reducer as its items, which is right only for `dict(d)` itself, and the rewriter dropped the stage of `{k: v for k, v in ...}`, so that comprehension looked like `dict(d)`. The items are now read only for `dict(d)` with no stage, and a dict comprehension always keeps its stage. | `fix: a dict built from a CascadeDict iterated its items, not its keys` |
 | D37 | A rewritten list comprehension was evaluated lazily when it fell back to plain Python. `any([1 // x for x in xs])` over `[1, 0]` returned `True`, and `all([x - 1 // x for x in xs])` `False`, where Python builds the list first and raises `ZeroDivisionError`; the same with the list inside `map` or `filter`, and a stage outside the list could raise its own error first. When an element raises, the runtime evaluates the expression the plain way, and it chained the stages of a list comprehension as lazy iterators, like those of a generator expression, so `any` stopped at the first true element before the one that raises. A list comprehension now ends in a stage that builds the list on the plain path; the incremental path, which evaluates every element anyway, skips it. | `fix: a rewritten list comprehension was evaluated lazily` |
+| D38 | A named collection created inside a transaction that rolled back left a record of itself on disk. Creating a named collection stamps an empty record that fixes the name's kind, and that write was made at once, outside the writes the transaction holds back until it commits. After `CascadeList(engine, [1, 2, 3], name="seeded")` in a block that raised, a new engine's `CascadeList(engine, [1, 2, 3], name="seeded")` restored the empty record, `[]` where it would have been `[1, 2, 3]` had the block never run, and a `CascadeSet` under the name raised `PersistentCacheError`. The stamp now waits for the commit; after a rollback it waits for the collection's first change (G25). | `fix: a rolled-back transaction left a named collection's record on disk` |
+| D39 | On a free-threaded build, a call made with `engine.submit` could return an old value and could not be cancelled. Threads there copy the context of the thread that starts them, and the pool `submit` uses is also where an async query runs sync code (for example the default of a sync input it checks while loading a result from disk). A worker started from inside such a query kept that query's runtime, so a later submitted call on it ran as part of the finished query: at its revision, with no cancellation. After `x.set(5)`, `engine.submit(double).result()` gave 2 where `double()` gives 10, or raised `SnapshotExpiredError` once that revision's history was trimmed. Under the interpreter lock threads start with an empty context and it never happened. A submitted call now runs in a context of its own (G5, G6). | `fix: a submitted call on a free-threaded build could run at an old revision` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
@@ -1518,18 +1536,19 @@ actions to the code and the invariants to the guarantees.
   history retention. Change stamps are reused once nobody holds them, where
   the code counts up; the outcome of a walk over input dependencies is fixed
   in the step that looks the row up.
-- None of D1–D37 is reachable in the model: each is in a feature it leaves
+- None of D1–D39 is reachable in the model: each is in a feature it leaves
   out (for D33 the record of who waits for whom, for D34 tasks and their
-  cancellation, for D35 fixed points, for D36 and D37 the rewrite). The state machine (test gap 3) is
-  what covers the others. It runs threads and tasks since, but only as
-  readers beside one writer, and it cancels nothing.
+  cancellation, for D35 fixed points, for D36 and D37 the rewrite, for D38
+  transactions and collections, for D39 threads and contexts). The state machine (test gap 3) is what
+  covers the others: threads and tasks as readers beside several writers,
+  `submit` and its cancellation, and interleavings it picks itself.
 
 ## Test gaps
 
 Ordered by the risk they leave open.
 
 1. **Every defect has a regression test, and none is open.**
-   `tests/test_known_defects.py` has a test for each defect (D1-D37), each
+   `tests/test_known_defects.py` has a test for each defect (D1-D39), each
    asserting the correct behaviour; a defect found from now on gets one
    under `xfail(strict=True)` until it is fixed.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
@@ -1560,11 +1579,25 @@ Ordered by the risk they leave open.
    were added; six more fail it since (effects not replayed on the sync or
    the async path, async verification that ignores a changed dependency,
    an error hashed without its args, `compute_many` ignoring its snapshot,
-   a dropped result that leaves its dependents clean). Still outside it:
-   several writers, cancellation and `submit`, transactions on threads,
-   more than one collection, and any control of how threads interleave:
-   reverting the D35 fix, which needs two callers to meet inside a fixed
-   point, does not fail it.
+   a dropped result that leaves its dependents clean).
+   Since 2026-11-25 the concurrent rule runs up to three writers, each on
+   inputs and a collection of its own, whose steps may be whole
+   transactions that commit or roll back; a live read must match a
+   combination of the writers' states, never half a transaction. A reader
+   may `submit`, and may see `QueryCancelled` only if the revision moved.
+   A second collection (a set) is read with the list in one rewritten
+   comprehension. Lock-step rules pick the interleaving instead of leaving
+   it to the OS: each thread stops at the start of every query body and
+   goes on only when every other one is stopped, waiting for a run in the
+   engine, or done, and drawn choices pick which goes on. One walks through
+   D35 from whatever state the machine is in; another holds a submitted run
+   while an input changes, which must cancel it (G6). With the D35 fix
+   undone, six runs of the file in six failed, where before none did, and
+   with cancellation turned off the first run failed. Its first run on the
+   free-threaded build found D39. Still outside it:
+   writers that change the same input or collection, `submit` through a
+   snapshot, and threads blocked anywhere but a query body or a wait for a
+   run, which the lock step cannot see and lets go after two seconds.
 4. **Generated query bodies are small and numeric.**
    `test_rewrite_differential.py` compares each rewritten reducer with the
    builtin over ints, floats, strings, tuples and mixtures.
@@ -1606,10 +1639,19 @@ Ordered by the risk they leave open.
    atomic transactions over several collections against concurrent
    readers. `test_collection_compaction_pins.py` forces a compaction that
    falls due inside a mutation while a pipeline reads. Interleavings are
-   left to chance, and the state machine (gap 3) has one writer.
-9. **Transactions inside the block are untested** for queries reading a
-   mutated or newly created collection, `submit` and two engines. Threads and
-   async tasks are covered by `test_transaction_ownership.py`.
+   left to chance there; the state machine (gap 3) runs several writers on
+   collections of their own, but not on one shared collection.
+9. **Transactions are tested against hand-written cases, two engines
+   included, but not generated ones beyond the state machine's.**
+   `test_transaction_block_reads.py` covers queries inside the block reading
+   a collection changed or created in it, `submit` in the block, and two
+   engines (one in a block, both in blocks on two tasks or threads, two on
+   one `cache_dir`); writing it found D38. Each of its tests checks the
+   value plain Python gives, inside the block and after commit or
+   rollback; seeding a query that reads the newest log entry instead of
+   the committed one fails 54 of them. Threads and async tasks are covered by
+   `test_transaction_ownership.py`, and transactions on writer threads by
+   the state machine.
 10. **One in five mutants survives, and nothing gates on it.**
     `scripts/mutation.py` runs mutmut (11,282 mutants on covered lines) and
     reports the survival rate per module with the diffs of the survivors.
@@ -1628,7 +1670,9 @@ Ordered by the risk they leave open.
     `.github/workflows/mutation.yml`.
 11. **A race gets through most pushes.** CI runs the suite once per push on
     the free-threaded build. D35 failed one run in ten there and never
-    under the interpreter lock, so the push before it passed.
+    under the interpreter lock, so the push before it passed. The state
+    machine's lock-step rules (gap 3) now reach D35 on every build, but
+    only for the queries and scenarios they are written for.
     `.github/workflows/concurrency-soak.yml` runs the thread, cycle,
     collection and transaction test files repeatedly (50 rounds by default)
     on 3.14t with `PYTHON_GIL=0`, but only when started by hand; nothing

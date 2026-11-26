@@ -2,6 +2,7 @@
 
 Releases before 0.4.0 were published from every push to `main` without
 notes; `docs/guarantees.md` records the defects fixed in them (D1–D37).
+Defects fixed since are listed under their release (D38 on).
 
 ## 0.4.0
 
@@ -39,6 +40,19 @@ option below.
   now raises `TypeError` before the body runs. Use a frozen dataclass or a
   `NamedTuple`. Classes, functions, modules and a bare `object()` sentinel
   are still accepted.
+
+### Fixed
+
+- **A named collection created in a transaction that rolled back left a
+  record on disk (D38).** A later engine restored it empty and ignored the
+  initial contents it was given, and refused another kind under the name.
+  The record is now written at commit, or at the collection's first change
+  after a rollback.
+- **On a free-threaded build, `engine.submit` could return an old value
+  (D39).** A pool thread started inside an async query kept that query's
+  context, and a call submitted to it later ran at the query's old revision
+  and could not be cancelled. Each submitted call now runs in a context of
+  its own.
 
 ### Added
 
