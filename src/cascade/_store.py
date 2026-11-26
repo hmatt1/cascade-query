@@ -977,7 +977,8 @@ class GraphStore:
                 return
         memo.head_clean = True
 
-    def drop_memo_locked(self, key: QueryKey) -> None:
+    def drop_memo_locked(self, key: QueryKey, *, replacing: bool = False) -> None:
+        """Drop the result of ``key``; ``replacing`` when a new one follows."""
         self._memo_verify_pin_count.pop(key, None)
         self._lru.pop(key, None)
         memo = self.memos.pop(key, None)
@@ -992,6 +993,14 @@ class GraphStore:
             dependents.discard(key)
             if not dependents:
                 self.dependents.pop(dep.key, None)
+        cycle = memo.cycle_nodes
+        if cycle and cycle[0] == key and not replacing:
+            # A fixed-point head: its members were computed from its value.
+            # Kept without it, the head's next run would read them from the
+            # cache, never reach itself and so never iterate, mixing their
+            # old values with whatever it reads anew (a TTL query run again).
+            for member in cycle[1:]:
+                self.drop_memo_locked(member)
 
     def _rebuild_lru_locked(self) -> None:
         ordered = sorted(self.memos.items(), key=lambda item: item[1].last_access)

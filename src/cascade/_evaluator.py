@@ -513,6 +513,9 @@ class Evaluator:
         self._waiting_callers_var: contextvars.ContextVar[frozenset[QueryKey]] = (
             contextvars.ContextVar("cascade_waiting_callers", default=frozenset())
         )
+        # Whether this thread holds the engine's pipeline lock (set by the
+        # engine; ``bool()`` is False). A pipeline's stage may call a query.
+        self.in_pipeline: Callable[[], bool] = bool
         self._keys = _KeyBlobs(store)
         # Aliases kept for introspection; the dicts are cleared in place.
         self._key_blobs = self._keys.by_key
@@ -1322,6 +1325,11 @@ class Evaluator:
         waiting = self._waiting_callers_var.get()
         if waiting and key in waiting:
             return None
+        if blocking and self.in_pipeline():
+            # The owner's run may reach a pipeline, which waits for the lock
+            # this thread holds while it waits for the run.
+            self._store.trace_event("dedup_pipeline", key)
+            return False
         waiting_on = self._store.waiting_on
         seen: set[Any] = set()
         current: InFlight | None = slot
@@ -2794,6 +2802,12 @@ class Evaluator:
                     Dependency(key, changed_at) if dep.key == key else dep
                     for dep in entry.deps
                 )
+                # They read the head's guess, which carried no expiry; their
+                # values follow the head's, so they expire with it.
+                if expires_at is not None and (
+                    entry.expires_at is None or expires_at < entry.expires_at
+                ):
+                    entry.expires_at = expires_at
             if provisional:
                 # Depends on the guess of a cycle head further up the stack:
                 # visible to this runtime only, until that head converges.
@@ -2824,7 +2838,7 @@ class Evaluator:
                         error=error,
                         expires_at=expires_at,
                     )
-                store.drop_memo_locked(key)
+                store.drop_memo_locked(key, replacing=True)
                 store.memos[key] = stored_memo
                 store.push_memo_lru_locked(key)
                 dependents = store.dependents
@@ -2850,7 +2864,7 @@ class Evaluator:
 
     def _store_memo_locked(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
         store = self._store
-        store.drop_memo_locked(key)
+        store.drop_memo_locked(key, replacing=True)
         store.memos[key] = memo
         store.push_memo_lru_locked(key)
         dependents = store.dependents
@@ -2965,7 +2979,7 @@ class Evaluator:
                 error=error,
                 expires_at=expires_at,
             )
-            self._store.drop_memo_locked(key)
+            self._store.drop_memo_locked(key, replacing=True)
             self._store.memos[key] = memo
             self._store.push_memo_lru_locked(key)
             for dep_key in observed:
@@ -3213,7 +3227,7 @@ class Evaluator:
                 error=error,
                 expires_at=expires_at,
             )
-            self._store.drop_memo_locked(key)
+            self._store.drop_memo_locked(key, replacing=True)
             self._store.memos[key] = memo
             self._store.push_memo_lru_locked(key)
             for dep_key in observed:
