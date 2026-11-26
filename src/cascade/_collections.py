@@ -381,6 +381,9 @@ class _CollectionCore:
         # (D28). ``base_len`` reads the storage's size without a dependency.
         self.base_len = _BASE_LEN[kind]
         self.tracked_len = 0
+        # A named collection first seen inside a transaction has no record
+        # on disk yet; the first write makes one (``_stamp``).
+        self._unstamped = False
 
         if self.disk is not None:
             snapshot, tail = self.disk.collection_load(self.name)
@@ -391,16 +394,15 @@ class _CollectionCore:
             if snapshot is None and not tail:
                 # First sighting of this name: stamp an empty snapshot so
                 # later sessions can verify the kind before replaying diffs.
-                self.disk.collection_snapshot(
-                    self.name,
-                    {
-                        "kind": kind,
-                        "base_rev": 0,
-                        "next_uid": 0,
-                        "items": [] if kind != _KIND_DICT else {},
-                    },
-                    0,
-                )
+                # Created inside a transaction, the stamp waits for the
+                # commit like every other write: a block that raises writes
+                # nothing (G25). Rolled back, it waits for the first change.
+                tx = engine._active_transaction()
+                if tx is None:
+                    self._stamp()
+                else:
+                    self._unstamped = True
+                    tx.pending_disk.setdefault(self, [])
             else:
                 if snapshot is not None:
                     self.log = DiffLog(
@@ -549,6 +551,20 @@ class _CollectionCore:
                 "Engine.snapshot() unreleased while it is in use"
             ) from None
 
+    def _stamp(self) -> None:
+        """Write the empty record that fixes this name's kind on disk."""
+        self._unstamped = False
+        self.disk.collection_snapshot(
+            self.name,
+            {
+                "kind": self.kind,
+                "base_rev": 0,
+                "next_uid": 0,
+                "items": [] if self.kind != _KIND_DICT else {},
+            },
+            0,
+        )
+
     def head_for_current_context(self) -> int:
         """Log head as seen by the active runtime (snapshot-aware dependency read)."""
         return self.handle()
@@ -569,6 +585,8 @@ class _CollectionCore:
                 if not self._writer:
                     self._claim_writer()
                 if tx is None:
+                    if self._unstamped:
+                        self._stamp()
                     self.disk.collection_append_many(
                         self.name, [(diff["rev"], diff) for diff in diffs]
                     )
@@ -642,7 +660,10 @@ class _CollectionCore:
     def write_pending(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
         """Write diffs a transaction held back; called when it commits."""
         try:
-            self.disk.collection_append_many(self.name, batch)
+            if self._unstamped:
+                self._stamp()
+            if batch:
+                self.disk.collection_append_many(self.name, batch)
         except PersistentCacheError:
             raise
         except Exception as exc:
@@ -747,6 +768,7 @@ class _CollectionCore:
         if not self._writer:
             # Rewrites the log on disk: only the engine that changes it may.
             self._claim_writer()
+        self._unstamped = False  # the snapshot below is the record
         head = self.log.head
         items = self.log.contents_at(head)
         if self.kind == _KIND_LIST:
