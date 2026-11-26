@@ -171,8 +171,8 @@ def test_set_diff_format(engine):
     s.add(1)
     s.remove(1)
     assert diffs(s) == [
-        {"action": "add", "value": 1, "rev": 1},
-        {"action": "remove", "value": 1, "rev": 2},
+        {"action": "add", "uid": 0, "value": 1, "rev": 1},
+        {"action": "remove", "uid": 0, "value": 1, "rev": 2},
     ]
 
 
@@ -224,9 +224,42 @@ def test_dict_diff_format(engine):
     d["k"] = 1
     del d["k"]
     assert diffs(d) == [
-        {"action": "upsert", "key": "k", "value": 1, "rev": 1},
-        {"action": "remove", "key": "k", "value": 1, "rev": 2},
+        {"action": "upsert", "uid": 0, "key": "k", "value": 1, "rev": 1},
+        {"action": "remove", "uid": 0, "key": "k", "value": 1, "rev": 2},
     ]
+
+
+def test_an_entry_keeps_its_id_and_its_key_while_it_is_in_the_dict(engine):
+    # An update names the entry it changes by id, and the dict keeps the key
+    # it was first given; a key removed and set again is a new entry.
+    d = CascadeDict(engine, {1: "a"})
+    d[1.0] = "b"
+    d.update({True: "c"})
+    del d[1]
+    d[1.0] = "d"
+    assert [(x["action"], x["uid"], x["key"]) for x in diffs(d)] == [
+        ("upsert", 0, 1),
+        ("upsert", 0, 1.0),
+        ("upsert", 0, True),
+        ("remove", 0, 1),
+        ("upsert", 1, 1.0),
+    ]
+    assert repr(replayed(d)) == repr(dict(d)) == "{1.0: 'd'}"
+
+
+def test_a_set_element_added_again_is_a_new_element(engine):
+    s = CascadeSet(engine, ["a", "b"])
+    s.discard("a")
+    s.add("a")
+    s.symmetric_difference_update({"b", "c"})
+    uids = [(x["action"], x["uid"], x["value"]) for x in diffs(s)]
+    assert uids[2:] == [
+        ("remove", 0, "a"),
+        ("add", 2, "a"),
+        ("remove", 1, "b"),
+        ("add", 3, "c"),
+    ]
+    assert replayed(s) == {"a", "c"}
 
 
 def test_dict_update_pop_popitem_setdefault_clear(engine):

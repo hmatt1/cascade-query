@@ -1656,16 +1656,16 @@ def test_d45_dict_items_keep_the_key_the_dict_holds_after_an_equal_key_update() 
     assert repr(dict(d)) == "{0: 'y', 'k': 'v', 1.0: 'd'}"
 
 
-@pytest.mark.xfail(strict=True, reason="D50, open: NaN identity is lost on disk")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_d50_nan_key_removed_before_a_restart_stays_removed(
     tmp_path: Path, backend: str
 ) -> None:
     # A dict holds a NaN key, and a set a NaN element, by identity: NaN is
     # equal to nothing, itself included, so ``del d[nan]`` finds the key
-    # only as the same object. The log on disk has the key twice, in the
-    # write and in the removal, and decoding makes two NaN objects of them:
-    # replayed at the next start, the removal finds nothing to remove.
+    # only as the same object. The log on disk had the key twice, in the
+    # write and in the removal, and decoding made two NaN objects of them:
+    # replayed at the next start, the removal found nothing to remove.
+    # Diffs now name entries by id (collection format 3).
     # Found by test_rewrite_programs.py once its values included NaN.
     nan = float("nan")
     engine = Engine(cache_dir=tmp_path, cache_backend=backend)
@@ -1710,3 +1710,118 @@ def test_d46_a_nan_captured_by_a_pipeline_is_one_object_in_its_result() -> None:
     nans, listed = q()
     assert len(nans) == 1
     assert listed[0] is listed[1]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("compact", [False, True])
+def test_d50_two_nan_keys_stay_two_and_each_is_removed_on_its_own(
+    tmp_path: Path, backend: str, compact: bool
+) -> None:
+    # Two NaN objects are two keys of a dict and two elements of a set. After
+    # a restart each is still there, in its place, and a removal of one (by
+    # the object a restarted engine hands back) removes that one only, also
+    # once a compaction has folded the earlier diffs into the snapshot.
+    first, second = float("nan"), float("nan")
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        d = CascadeDict(engine, name="d")
+        s = CascadeSet(engine, name="s")
+        d.update({"a": 0, first: 1, second: 2})
+        s.update([first, "b", second])
+        d[1] = "one"
+        d[1.0] = "uno"  # the entry keeps the key 1
+        del d[first]
+        s.discard(first)
+        if compact:
+            d.compact()
+            s.compact()
+    finally:
+        engine.shutdown()
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        d = CascadeDict(engine, name="d")
+        s = CascadeSet(engine, name="s")
+        assert repr(dict(d)) == "{'a': 0, nan: 2, 1: 'uno'}"
+        assert type(next(k for k in d if k != "a" and k == k)) is int
+        assert repr(list(s)) == "['b', nan]"
+        nan_key = next(k for k in d if k != k)
+        nan_element = next(v for v in s if v != v)
+        del d[nan_key]
+        s.remove(nan_element)
+        s.add(float("nan"))
+    finally:
+        engine.shutdown()
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        assert dict(CascadeDict(engine, name="d")) == {"a": 0, 1: "uno"}
+        assert repr(list(CascadeSet(engine, name="s"))) == "['b', nan]"
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("awaited", [False, True])
+def test_d51_setting_the_default_after_a_result_reused_from_disk_is_no_change(
+    tmp_path: Path, backend: str, awaited: bool
+) -> None:
+    # A result reused from disk checked a never-set input against its
+    # default without keeping it, as a direct read keeps it (G3). A later
+    # ``set`` to the default was then a change: the revision moved and a
+    # submitted call was cancelled (G6). Found by
+    # test_transaction_properties.py, whose model expected no change.
+    runs: list[str] = []
+
+    def session() -> tuple[Engine, Any, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.input(name="x")
+        def x() -> int:
+            return 0
+
+        if awaited:
+
+            @engine.query(name="q")
+            async def q() -> int:
+                runs.append("q")
+                return x() + 1
+
+        else:
+
+            @engine.query(name="q")
+            def q() -> int:
+                runs.append("q")
+                return x() + 1
+
+        return engine, x, q
+
+    def call(q: Any) -> int:
+        if awaited:
+            # Awaited on a running loop: the async path checks the disk.
+            async def main() -> int:
+                return await q()
+
+            return asyncio.run(main())
+        return q()
+
+    engine, _, q = session()
+    try:
+        assert call(q) == 1
+    finally:
+        engine.shutdown()
+    assert runs == ["q"]
+
+    engine, x, q = session()
+    try:
+        assert call(q) == 1
+        assert runs == ["q"]  # served from disk
+        revision = engine.revision
+        x.set(0)
+        assert engine.revision == revision
+        assert engine.submit(q).result(timeout=10) == 1
+        assert call(q) == 1
+        assert runs == ["q"]
+        x.set(5)
+        assert engine.revision == revision + 1
+        assert call(q) == 6
+    finally:
+        engine.shutdown()

@@ -851,7 +851,8 @@ Test gaps 3, 4, 7, 8 and 9 of `docs/guarantees.md` were worked on at once,
 one branch each. Every new test was checked by seeding faults into a copy of
 the source, one at a time, and was run 20 times or more on 3.12 and on the
 free-threaded 3.14t. Together they found nine defects: eight are fixed (D42
-to D49) and one is open (D50). See `docs/guarantees.md` for each.
+to D49). The ninth, D50, and a smaller one the transactions showed, D51,
+were fixed the same day in 0.4.4. See `docs/guarantees.md` for each.
 
 ### State machine: shared writers, snapshots and every wait
 
@@ -921,8 +922,8 @@ catch what they raise, and in-place updates are always among the changes.
 The file takes about as long as before, about 15 seconds.
 
 It found D45 (a `d.items()` pipeline took the key from the update), D46 (a
-captured NaN mixed objects across runs) and D50 (open: a NaN key removed
-before a restart comes back).
+captured NaN mixed objects across runs) and D50 (since fixed: a NaN key removed
+before a restart came back).
 
 Examples to the first failure, 10 seeds each (before: the old test, up to
 3,000; after: the new one, up to 1,500):
@@ -1037,9 +1038,9 @@ blocks open, commit and roll back; each value must be one committed during
 the call, and a future the state at its submit or `QueryCancelled` after a
 later change. It takes about 15 seconds; `CASCADE_TXN_EXAMPLES` raises it.
 
-It found D48 on its first run, and a smaller open item: a result reused
-from disk does not keep an input's default, so a later `set` to the default
-moves the revision (see `docs/guarantees.md`).
+It found D48 on its first run, and D51: a result reused from disk did not
+keep an input's default, so a later `set` to the default moved the
+revision. Both are fixed.
 
 | Fault (3.12, 200 examples, seeds 1–3) | Examples to first failure |
 |---|---|

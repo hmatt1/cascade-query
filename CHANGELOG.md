@@ -4,6 +4,28 @@ Releases before 0.4.0 were published from every push to `main` without
 notes; `docs/guarantees.md` records the defects fixed in them (D1–D37).
 Defects fixed since are listed under their release (D38 on).
 
+## 0.4.4
+
+### Changed
+
+- **Collection format 3: named collections written by 0.4.3 and earlier
+  are not read.** Every set element and dict entry now has an id on disk,
+  as list elements had. Opening a `cache_dir` that holds named collections
+  in format 1 or 2 raises `PersistentCacheError` and changes nothing;
+  delete the directory, or its collections, to start again. A directory
+  with no named collections is restamped, and its cached results are kept.
+
+### Fixed
+
+- **A NaN key removed from a named `CascadeDict` or `CascadeSet` came back
+  after a restart (D50).** The replay of the log on disk matched the removal
+  by equality, and a NaN equals nothing. Diffs now name the entry by id.
+  Two different NaN keys stay two keys.
+- **Setting an input to its default could count as a change after a result
+  was reused from disk (D51).** The check of the stored result read the
+  default without keeping it, so a later `set` to the same value moved the
+  revision and cancelled submitted calls. Values were never wrong.
+
 ## 0.4.3
 
 ### Fixed

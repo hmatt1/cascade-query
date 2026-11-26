@@ -3079,21 +3079,29 @@ class Evaluator:
             return None
         # Pull the input to fingerprint its current content; for file-backed
         # inputs this is the re-read-and-hash step that decides freshness.
-        # Verification is deliberately read-only: materializing here would
-        # advance the store revision past the runtime snapshot and desync the
-        # rest of the evaluation. changed_at=-1 matches the engine's existing
-        # convention for never-set default inputs, so green checks stay stable.
         value = _keys.call(fn, args)
         if isinstance(value, types.CoroutineType):
             value = _run_coroutine_blocking(
                 value, self._store.key_to_str(("input", input_id, args))
             )
-        return InputVersion(
-            revision=runtime.snapshot.revision,
-            changed_at=-1,
-            value_hash=self._store.stable_hash(value),
-            value=value,
-        )
+        return self._default_for_disk_check(input_key, runtime, value)
+
+    def _default_for_disk_check(
+        self,
+        input_key: tuple[str, tuple[Any, ...]],
+        runtime: RuntimeState,
+        value: Any,
+    ) -> InputVersion:
+        """The version a stored result is checked against, for a default read.
+
+        Kept as the input's value, as a direct read keeps it (G3): a result
+        reused from disk read the default, so the default is what the input
+        holds now. Without that, a later ``set`` to the default was a change
+        (the revision moved, submitted calls were cancelled; D51). Keeping it
+        does not move the revision. An unencodable default is no match.
+        """
+        self._store.stable_hash(value)  # TypeError, as before, if unencodable
+        return self._keep_default(input_key, runtime.snapshot.revision, value)
 
     def _current_query_state(
         self,
@@ -3328,12 +3336,7 @@ class Evaluator:
         else:
             value = await self._run_sync_in_executor(fn, args)
 
-        return InputVersion(
-            revision=runtime.snapshot.revision,
-            changed_at=-1,
-            value_hash=self._store.stable_hash(value),
-            value=value,
-        )
+        return self._default_for_disk_check(input_key, runtime, value)
 
     async def _current_query_state_async(
         self,

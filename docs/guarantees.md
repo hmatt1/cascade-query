@@ -904,8 +904,7 @@ in which elements were added. For dicts it includes the insertion order,
 because code can observe it (G2): the same items in another order are other
 bytes. This changed with disk format 3; format 2 sorted dict keys, so its
 results held dicts in an order the query had not returned, and they are
-dropped on open (G20). Collection logs written under format 2 are read
-unchanged. The converse holds as well: two values a query could tell apart
+dropped on open (G20). The converse holds as well: two values a query could tell apart
 never encode to the same bytes, in the disk codec and in the in-memory
 digest alike (`1`, `1.0`, `True`, `Decimal(1)` and `Level.LOW` are five
 values).
@@ -928,17 +927,18 @@ cache, because each backend uses its own files.
 
 A cache directory carries two format numbers. `DISK_FORMAT` (now 5) covers
 cached query results: results written under another number are deleted on
-open and recomputed. `COLLECTION_FORMAT` (now 2) covers the logs of named
+open and recomputed. `COLLECTION_FORMAT` (now 3) covers the logs of named
 collections, which are data and are never deleted: a change of `DISK_FORMAT`
 leaves them as they are, in both directions. Collection format 2 added the
-value types of result format 4; format 1 logs are read unchanged, and the
-directory is restamped 2, so an older release refuses it instead of failing
-on a value type it does not know. A directory whose collection data this version
-cannot read (a newer `COLLECTION_FORMAT`, or collections left by a release
-older than the ones known) is refused with `PersistentCacheError` at
-`Engine(cache_dir=...)`, and nothing in it is changed. A directory written
-before collections had a number of their own (result format 2) is read as
-collection format 1.
+value types of result format 4. Format 3 (0.4.4) gives every set element and
+dict entry an id, as list elements had, and names it by that id in every
+diff (D50); this version reads format 3 only. A directory whose collection
+data this version cannot read (formats 1 and 2, a newer `COLLECTION_FORMAT`,
+or collections left by a release older than the ones known) is refused with
+`PersistentCacheError` at `Engine(cache_dir=...)`, and nothing in it is
+changed. A directory with an older stamp and no named collections is
+restamped, and its results kept. A directory written before collections had
+a number of their own (result format 2) counts as collection format 1.
 
 Limits: a release from before this split still wipes collections when it
 opens a directory with a result format it does not know, so do not open a
@@ -949,8 +949,9 @@ Enforced by: `test_disk_cache.py::test_corrupt_blob_falls_back_to_recompute`,
 `::test_format_bump_wipes_stale_cache`, `::test_format_bump_sqlite`,
 `test_format_bump.py` (both backends: results recomputed and collections
 kept across a bump and back, a compacted log with its tail, a directory
-without a collection stamp, unreadable collection formats refused with
-nothing dropped),
+without a collection stamp, collection formats 1 and 2 and unknown ones
+refused with nothing dropped, an older stamp without collections
+restamped),
 `test_disk_format2.py::test_format_change_keeps_collection_logs`,
 `test_known_defects.py::test_d16_format_change_does_not_silently_drop_collections`,
 `test_disk_format2.py::test_corrupt_inline_value_falls_back_to_recompute`,
@@ -1432,18 +1433,13 @@ D42 to D50 were found on 2026-11-26 by the tests written for test gaps 3,
 4, 8 and 9. The state machine's rules for shared writers, hidden cycles and
 eviction found D42 to D44. The generated query bodies, once their values
 were widened, found D45, D46 and D50. The collection interleavings found D47
-to D49. The generated transactions found D48 on their own as well. D42 to
-D48 were in 0.4.2 and before; D49 came with the fix for D41.
+to D49. The generated transactions found D48 on their own as well, and
+D51. D42 to D48, D50 and D51 were in 0.4.2 and before; D49 came with the
+fix for D41. D50 and D51 were fixed in 0.4.4, the others in 0.4.3.
 
-One defect is open, D50, pinned by a strict expected failure in
-`tests/test_known_defects.py`. Every other defect found by the audit or
-since is fixed and listed below.
-
-### Open
-
-| ID | Defect |
-|---|---|
-| D50 | A NaN key removed from a named `CascadeDict` or `CascadeSet` before a restart comes back after it. `d[nan] = 1; del d[nan]` (or `s.add(nan); s.discard(nan)`) on mdbx or sqlite, then a new engine, restores the NaN. The log on disk decodes into two different NaN objects, and the replayed removal finds nothing, since NaN equals nothing. Fixing it means interning NaN when a collection loads, which would merge two genuinely separate NaN keys, or a change to the disk format. In memory the collection behaves as Python's dict and set do. |
+There are no open defects: every defect found by the audit or since is
+fixed and listed below, and every test in `tests/test_known_defects.py`
+passes without an expected-failure marker.
 
 ### Fixed since the audit
 
@@ -1498,18 +1494,12 @@ since is fixed and listed below.
 | D47 | `compact()` on a named collection read the head outside the collection's lock. The compaction a commit runs could read the head, a writer then appended and compacted at its newer head, and the older snapshot, written last, deleted that change on disk: a reload gave `(7, 1, 2)` instead of `(7, 1, 2, 3)`. `compact()` now holds the lock from reading the head to writing the snapshot (G26). | `test: run collection writers under interleavings the test chooses` |
 | D48 | `compact()` while a transaction held the collection wrote the block's uncommitted changes into the snapshot. After a rollback they stayed on disk (`[1]`, then a rolled-back `append(2)` and `compact()`, then `append(3)` reloaded as `[1, 3, 2]`); after a commit they were written twice (`[1, 2, 3]` reloaded as `[1, 2, 2, 3]`). `compact()` now snapshots the committed head, and a collection with nothing committed yet gets no record (G25, G26). | the same, and `test: generated transaction programs, two engines and submit (G25)` |
 | D49 | The fix for D41 left a gap between its check and its write. The held-back stamp looked in one disk read and wrote in another, and the stamp at construction did not look at all; another engine could create, fill and compact the name in between, and the empty record replaced it: a reload gave `()` instead of `(1, 2)`. The disk now checks and writes the stamp in one transaction (`collection_stamp`: an mdbx write transaction, sqlite `INSERT OR IGNORE`) (G26). | `test: run collection writers under interleavings the test chooses` |
+| D50 | A NaN key removed from a named `CascadeDict` or `CascadeSet` before a restart came back after it. `d[nan] = 1; del d[nan]` (or `s.add(nan); s.discard(nan)`) on mdbx or sqlite, then a new engine, restored the NaN: the log on disk held the key twice, in the write and in the removal, decoding made two NaN objects of them, and the replayed removal, which matched by equality, found nothing. Every set element and dict entry now has an id, as list elements had, and every diff names its element by id; a dict entry keeps its id while its key is in the dict. Collection format 3; directories in formats 1 and 2 are refused (G26). | `fix: set and dict entries have ids, so a NaN key is removed after a restart` |
+| D51 | A result reused from disk checked a never-set input against its default without keeping it, as a direct read keeps it. A later `set` to the default was then a change: the revision moved and submitted calls were cancelled. Values were never wrong. Engine A computed `q()` reading `x()` (default 0) on a `cache_dir`; engine B on the same directory got `q()` from disk, and `x.set(0)` moved its revision. The check now keeps the default, on the sync and the async path (G3, G6). | the same |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
 moving it (G3).
-
-Smaller item, open: a result reused from disk checks a never-set input
-against its default without keeping that default as the input's value, so
-a later `set` to the default moves the revision and cancels submitted
-calls, against the spirit of G3 and G6. Values are never wrong. Engine A
-computes `q()` reading `x()` (default 0) on a `cache_dir`; engine B on the
-same directory calls `q()`, served from disk, and then `x.set(0)` moves its
-revision. If B reads `x()` itself first, nothing moves.
 
 ## Limits that restrict who can use the library
 
@@ -1598,10 +1588,11 @@ actions to the code and the invariants to the guarantees.
 
 Ordered by the risk they leave open.
 
-1. **Every defect has a regression test, and one is open.**
+1. **Every defect has a regression test, and none is open.**
    `tests/test_known_defects.py` has a test for each defect from D1 to D41
-   and for D45, D46 and D50, each asserting the correct behaviour; D50 is
-   open and its test is under `xfail(strict=True)`. The regression tests of
+   and for D45, D46, D50 and D51, each asserting the correct behaviour; a
+   defect found from now on gets one under `xfail(strict=True)` until it is
+   fixed. The regression tests of
    D42 to D44 and D47 to D49 sit beside the tests that found them:
    `test_pipeline_lock_waits.py` (D42), `test_fixed_point_member_expiry.py`
    (D43, D44), and the section "Defects this harness found" of
@@ -1694,8 +1685,10 @@ Ordered by the risk they leave open.
    seeds of 10, where four needed thousands; of twelve new faults about the
    new values, eleven are caught at 300 (`CASCADE_PROGRAM_EXAMPLES` sets
    the count). Still not generated: `sorted` keys that raise, accumulator
-   effects and nested function definitions; NaN stays out of collections on
-   disk (D50).
+   effects and nested function definitions. NaN stays out of the
+   collections of the examples that restart: a restart cannot hand back the
+   NaN objects the plain-Python side holds, so the two would differ by
+   identity (D50's regression tests cover NaN keys across a restart).
 5. **No cross-process or cross-version determinism test for the codecs.**
    `test_codec_properties.py` checks round trips and determinism within one
    process with Hypothesis.

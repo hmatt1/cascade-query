@@ -187,17 +187,52 @@ def test_format_bump_keeps_a_compacted_collection_and_its_tail(
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_directory_written_before_collections_had_a_stamp_is_kept(
-    tmp_path: Path, backend: str
+@pytest.mark.parametrize("old", [1, 2])
+def test_collections_in_an_older_format_are_refused_and_kept(
+    tmp_path: Path, backend: str, old: int
 ) -> None:
+    # Formats 1 and 2 name set elements and dict keys by value (D50); this
+    # version does not read them, and changes nothing in the directory.
     _fill(tmp_path, backend)
-    # What the previous release left behind: result stamp 2, no collection stamp.
-    _set_stamp(tmp_path, backend, FORMAT_KEY, 2)
-    _set_stamp(tmp_path, backend, COLLECTION_KEY, None)
+    _set_stamp(tmp_path, backend, COLLECTION_KEY, old)
+    with pytest.raises(PersistentCacheError, match=f"collection format {old}"):
+        Engine(cache_dir=tmp_path, cache_backend=backend)
 
+    _set_stamp(tmp_path, backend, COLLECTION_KEY, disk_cache_mod.COLLECTION_FORMAT)
     engine = Engine(cache_dir=tmp_path, cache_backend=backend)
     try:
         _check_collections(engine)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_directory_written_before_collections_had_a_stamp_is_refused(
+    tmp_path: Path, backend: str
+) -> None:
+    _fill(tmp_path, backend)
+    # Result stamp 2 and no collection stamp: collection format 1.
+    _set_stamp(tmp_path, backend, FORMAT_KEY, 2)
+    _set_stamp(tmp_path, backend, COLLECTION_KEY, None)
+    with pytest.raises(PersistentCacheError, match="collection format 1"):
+        Engine(cache_dir=tmp_path, cache_backend=backend)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_an_older_collection_stamp_without_collections_is_restamped(
+    tmp_path: Path, backend: str
+) -> None:
+    runs: dict[str, int] = {}
+    engine, _, doubled = _session(tmp_path, backend, runs)
+    try:
+        assert doubled() == 20
+    finally:
+        engine.shutdown()
+    _set_stamp(tmp_path, backend, COLLECTION_KEY, 2)
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        xs = CascadeList(engine, [1], name="fresh")
+        assert list(xs) == [1]
     finally:
         engine.shutdown()
 

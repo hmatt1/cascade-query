@@ -94,15 +94,21 @@ _FORMAT_KEY = b"format"
 
 # Format of named collections' logs, versioned apart from the result cache
 # so that a ``DISK_FORMAT`` bump keeps them. Bump it only together with code
-# that migrates the older formats: collection data must never be dropped.
+# that migrates the older formats or refuses them with nothing changed:
+# collection data must never be dropped.
 # 1: snapshot record and one diff per revision, each a canonical msgpack map.
 # 2: the same, with the value types of result format 4 (Enum, Decimal, ...,
 #    a bytearray as itself). Format 1 logs are read unchanged, so a directory
 #    in format 1 is only restamped; a release that reads only format 1
 #    refuses it instead of failing on a value it does not know.
-COLLECTION_FORMAT = 2
+# 3: every set element and dict entry has an id, as list elements had: a
+#    snapshot holds ``[uid, value]`` pairs for a set and ``[uid, key, value]``
+#    triples for a dict, and each diff names its element by ``uid``. A
+#    replay that matched by equality could not remove a NaN (D50). Formats
+#    1 and 2 are not read: they name set elements and dict keys by value.
+COLLECTION_FORMAT = 3
 # Collection formats this version reads.
-_READABLE_COLLECTION_FORMATS = frozenset({1, 2})
+_READABLE_COLLECTION_FORMATS = frozenset({3})
 _COLLECTION_FORMAT_KEY = b"collections_format"
 # Directories written before collections had a stamp of their own carry only
 # the result-cache stamp. This maps that stamp to the collection format the
@@ -140,6 +146,8 @@ def _check_collection_format(
                 "it, or delete the directory if the data is not needed."
             )
     if stored not in _READABLE_COLLECTION_FORMATS:
+        if not has_collection_data():
+            return  # nothing in the older format to read
         raise PersistentCacheError(
             f"the cache at {path!r} holds named collections in collection "
             f"format {stored}; this version of cascade reads formats "

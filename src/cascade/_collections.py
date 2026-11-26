@@ -16,8 +16,15 @@ Diff formats follow the feature spec:
 * list: ``{"action": "insert|update|remove", "uid": ID, "value": V}``
   (inserts additionally carry ``"index"``, the position at emit time, so a
   replay of the log reconstructs element order)
-* set: ``{"action": "add|remove", "value": V}``
-* dict: ``{"action": "upsert|remove", "key": K, "value": V}``
+* set: ``{"action": "add|remove", "uid": ID, "value": V}``
+* dict: ``{"action": "upsert|remove", "uid": ID, "key": K, "value": V}``
+
+Every element of a list or set, and every entry of a dict, has an id
+(``uid``) that the log names it by. A replay matches a removal or an update
+by that id, never by equality: a NaN is equal to nothing, so a removal of a
+NaN key decoded from disk found nothing to remove (D50). An entry keeps its
+id while its key is in the dict, so ``d[1.0] = v`` over a key ``1`` updates
+that entry and the dict keeps the key ``1``, as Python's does.
 
 Every diff is tagged with a monotonic ``"rev"`` so downstream consumers can
 checkpoint the last revision they processed and request only newer diffs.
@@ -219,8 +226,9 @@ class _HistoryCompacted(RuntimeError):
 class DiffLog:
     """Append-only, revision-tagged diff log with replay support.
 
-    ``base_items`` is the materialized contents at ``base_rev`` (empty for a
-    fresh collection, the loaded snapshot for a restored one). ``entries``
+    ``base_items`` is the materialized contents at ``base_rev`` in record
+    form (see ``records_at``; empty for a fresh collection, the loaded
+    snapshot for a restored one). ``entries``
     holds every diff after ``base_rev``, so ``contents_at(rev)`` can rebuild
     the collection at any revision from ``base_rev`` on by replaying from the
     base. ``compact_to`` moves the base forward once older diffs are no
@@ -231,15 +239,10 @@ class DiffLog:
         self.kind = kind
         self.lock = threading.RLock()
         self.base_rev = base_rev
-        self.base_items = base_items if base_items is not None else self._empty()
+        self.base_items: list[tuple[Any, ...]] = [
+            tuple(record) for record in (base_items or ())
+        ]
         self.entries: list[dict[str, Any]] = []
-
-    def _empty(self) -> Any:
-        if self.kind == _KIND_LIST:
-            return []
-        if self.kind == _KIND_SET:
-            return []
-        return {}
 
     @property
     def head(self) -> int:
@@ -268,11 +271,12 @@ class DiffLog:
             hi = up_to - self.base_rev
             return self.entries[lo:hi]
 
-    def contents_at(self, rev: int) -> Any:
-        """Materialized contents at ``rev``, rebuilt by replaying the log.
+    def records_at(self, rev: int) -> list[tuple[Any, ...]]:
+        """Contents at ``rev`` with their ids, rebuilt by replaying the log.
 
-        For lists the result is a list of ``(uid, value)`` pairs in order; for
-        sets a list of values in insertion order; for dicts a plain dict.
+        In order: ``(uid, value)`` pairs for a list or a set, ``(uid, key,
+        value)`` triples for a dict. Every diff names its element by id, so
+        the replay never compares values (D50).
         """
         with self.lock:
             if rev < self.base_rev:
@@ -281,7 +285,7 @@ class DiffLog:
                 )
             diffs = self.since(self.base_rev, rev)
             if self.kind == _KIND_LIST:
-                pairs: list[tuple[Any, Any]] = [tuple(p) for p in self.base_items]
+                pairs: list[tuple[Any, ...]] = list(self.base_items)
                 for d in diffs:
                     action = d["action"]
                     if action == "insert":
@@ -292,21 +296,33 @@ class DiffLog:
                     else:
                         del pairs[_uid_index(pairs, d["uid"])]
                 return pairs
+            # Insertion order, by id: a dict keeps it, and so does a set's.
+            held: dict[Any, tuple[Any, ...]] = {r[0]: r for r in self.base_items}
             if self.kind == _KIND_SET:
-                seen: dict[Any, None] = dict.fromkeys(self.base_items)
                 for d in diffs:
                     if d["action"] == "add":
-                        seen[d["value"]] = None
+                        held[d["uid"]] = (d["uid"], d["value"])
                     else:
-                        seen.pop(d["value"], None)
-                return list(seen)
-            data = dict(self.base_items)
-            for d in diffs:
-                if d["action"] == "upsert":
-                    data[d["key"]] = d["value"]
-                else:
-                    data.pop(d["key"], None)
-            return data
+                        held.pop(d["uid"], None)
+            else:
+                for d in diffs:
+                    uid = d["uid"]
+                    if d["action"] == "upsert":
+                        old = held.get(uid)
+                        # The entry keeps the key it was first given.
+                        key = d["key"] if old is None else old[1]
+                        held[uid] = (uid, key, d["value"])
+                    else:
+                        held.pop(uid, None)
+            return list(held.values())
+
+    def contents_at(self, rev: int) -> Any:
+        """Materialized contents at ``rev``, rebuilt by replaying the log.
+
+        For lists the result is a list of ``(uid, value)`` pairs in order; for
+        sets a list of values in insertion order; for dicts a plain dict.
+        """
+        return _plain_contents(self.kind, self.records_at(rev))
 
     def compact_to(self, target: int) -> bool:
         """Fold every diff up to ``target`` into the base. Returns True if any were."""
@@ -314,14 +330,23 @@ class DiffLog:
             target = min(target, self.base_rev + len(self.entries))
             if target <= self.base_rev:
                 return False
-            base = self.contents_at(target)
+            base = self.records_at(target)
             del self.entries[: target - self.base_rev]
             self.base_items = base
             self.base_rev = target
             return True
 
 
-def _uid_index(pairs: list[tuple[Any, Any]], uid: Any) -> int:
+def _plain_contents(kind: str, records: list[tuple[Any, ...]]) -> Any:
+    """``records_at``'s records as ``contents_at`` gives them."""
+    if kind == _KIND_LIST:
+        return records
+    if kind == _KIND_SET:
+        return [value for _uid, value in records]
+    return {key: value for _uid, key, value in records}
+
+
+def _uid_index(pairs: list[tuple[Any, ...]], uid: Any) -> int:
     for i, (u, _) in enumerate(pairs):
         if u == uid:
             return i
@@ -419,7 +444,7 @@ class _CollectionCore:
                     uid = diff.get("uid")
                     if isinstance(uid, int) and uid >= self.next_uid:
                         self.next_uid = uid + 1
-                self.loaded = self.log.contents_at(self.log.head)
+                self.loaded = self.log.records_at(self.log.head)
         if self.log is None:
             self.log = DiffLog(kind)
         # The smallest head any reader of this collection can be handed.
@@ -570,7 +595,7 @@ class _CollectionCore:
                 "kind": self.kind,
                 "base_rev": 0,
                 "next_uid": 0,
-                "items": [] if self.kind != _KIND_DICT else {},
+                "items": [],
             },
         )
         if found is not None and found["kind"] != self.kind:
@@ -663,6 +688,12 @@ class _CollectionCore:
                 disk.unlock_collection(self.name)
             raise
         self._writer = True
+
+    def new_uid(self) -> int:
+        """A fresh id for an element or entry. Caller holds ``rw``."""
+        uid = self.next_uid
+        self.next_uid = uid + 1
+        return uid
 
     def _maybe_compact_disk(self) -> None:
         if (
@@ -772,7 +803,7 @@ class _CollectionCore:
     def _rollback(self) -> None:
         """Reset the owner's python-level storage to the committed log state."""
         if self.owner is not None:  # pragma: no branch - set before any change
-            self.owner._reset_to(self.log.contents_at(self.log.head))
+            self.owner._reset_to(self.log.records_at(self.log.head))
             self.tracked_len = self.base_len(self.owner)
 
     def compact(self) -> None:
@@ -806,9 +837,7 @@ class _CollectionCore:
             # created it (D38). Its first committed change makes one.
             return
         head = self.log.head if self._tx_start is None else self._tx_start
-        items = self.log.contents_at(head)
-        if self.kind == _KIND_LIST:
-            items = [list(p) for p in items]
+        items = [list(record) for record in self.log.records_at(head)]
         record = {
             "kind": self.kind,
             "base_rev": head,
@@ -862,9 +891,7 @@ class CascadeList(list):
         self._core.compact()
 
     def _new_uid(self) -> int:
-        uid = self._core.next_uid
-        self._core.next_uid = uid + 1
-        return uid
+        return self._core.new_uid()
 
     def _insert_diff(self, index: int, value: Any) -> dict[str, Any]:
         uid = self._new_uid()
@@ -1155,32 +1182,46 @@ class CascadeSet(set):
         name: str | None = None,
         compact_every: int = 1024,
     ) -> None:
-        self._order: dict[Any, None] = {}
+        # Each element, in insertion order, mapped to its id in the log.
+        self._order: dict[Any, int] = {}
         self._core = _CollectionCore(engine, _KIND_SET, name, compact_every)
         self._core.owner = self
         super().__init__()
         if self._core.loaded is not None:
-            set.update(self, self._core.loaded)
-            self._order = dict.fromkeys(self._core.loaded)
+            self._reset_to(self._core.loaded)
             self._core.tracked_len = set.__len__(self)
         else:
             self.update(iterable)
 
-    def _reset_to(self, contents: Iterable[Any]) -> None:
-        contents = list(contents)
+    def _reset_to(self, records: Iterable[tuple[Any, ...]]) -> None:
+        self._order = {value: uid for uid, value in records}
         set.clear(self)
-        set.update(self, contents)
-        self._order = dict.fromkeys(contents)
+        set.update(self, self._order)
 
     def compact(self) -> None:
         """Squash the on-disk event log into a snapshot at the current head."""
         self._core.compact()
 
+    def _add_diffs(self, values: Iterable[Any]) -> list[dict[str, Any]]:
+        """Give each new element an id; the diffs that record them."""
+        order = self._order
+        new_uid = self._core.new_uid
+        diffs = []
+        for v in values:
+            uid = order[v] = new_uid()
+            diffs.append({"action": "add", "uid": uid, "value": v})
+        return diffs
+
+    def _remove_diffs(self, values: Iterable[Any]) -> list[dict[str, Any]]:
+        """Drop each element's id; the diffs that record the removals."""
+        order = self._order
+        return [{"action": "remove", "uid": order.pop(v), "value": v} for v in values]
+
     def _emit_adds(self, values: Iterable[Any]) -> None:
-        self._core.emit([{"action": "add", "value": v} for v in values])
+        self._core.emit(self._add_diffs(values))
 
     def _emit_removes(self, values: Iterable[Any]) -> None:
-        self._core.emit([{"action": "remove", "value": v} for v in values])
+        self._core.emit(self._remove_diffs(values))
 
     # --- mutators ---
     @_mutator
@@ -1188,13 +1229,11 @@ class CascadeSet(set):
         if value in self:
             return
         set.add(self, value)
-        self._order[value] = None
         self._emit_adds([value])
 
     @_mutator
     def remove(self, value: Any) -> None:
         set.remove(self, value)
-        del self._order[value]
         self._emit_removes([value])
 
     @_mutator
@@ -1202,22 +1241,19 @@ class CascadeSet(set):
         if value not in self:
             return
         set.discard(self, value)
-        del self._order[value]
         self._emit_removes([value])
 
     @_mutator
     def pop(self) -> Any:
         # Like the builtin, an arbitrary element: the one the storage gives.
         value = set.pop(self)
-        del self._order[value]
         self._emit_removes([value])
         return value
 
     @_mutator
     def clear(self) -> None:
-        values = list(self)
+        values = list(self._order)
         set.clear(self)
-        self._order.clear()
         self._emit_removes(values)
 
     @_mutator
@@ -1231,7 +1267,6 @@ class CascadeSet(set):
                 if v not in self:
                     added[v] = None
         set.update(self, added)
-        self._order.update(added)
         self._emit_adds(added)
 
     @_mutator
@@ -1244,7 +1279,6 @@ class CascadeSet(set):
                 if v in self:
                     removed[v] = None
         set.difference_update(self, removed)
-        self._forget(removed)
         self._emit_removes(removed)
 
     @_mutator
@@ -1252,7 +1286,6 @@ class CascadeSet(set):
         keep = set(self).intersection(*others) if others else set(self)
         removed = [v for v in self if v not in keep]
         set.difference_update(self, removed)
-        self._forget(removed)
         self._emit_removes(removed)
 
     @_mutator
@@ -1261,12 +1294,7 @@ class CascadeSet(set):
         removed = [v for v in other if v in self]
         added = [v for v in other if v not in self]
         set.symmetric_difference_update(self, other)
-        self._forget(removed)
-        self._order.update(dict.fromkeys(added))
-        self._core.emit(
-            [{"action": "remove", "value": v} for v in removed]
-            + [{"action": "add", "value": v} for v in added]
-        )
+        self._core.emit(self._remove_diffs(removed) + self._add_diffs(added))
 
     @_mutator
     def __ior__(self, other: Any) -> CascadeSet:
@@ -1287,11 +1315,6 @@ class CascadeSet(set):
     def __ixor__(self, other: Any) -> CascadeSet:
         self.symmetric_difference_update(other)
         return self
-
-    def _forget(self, values: Iterable[Any]) -> None:
-        order = self._order
-        for v in values:
-            order.pop(v, None)
 
     # --- tracked reads ---
     def __iter__(self):
@@ -1481,18 +1504,40 @@ class CascadeDict(dict):
         compact_every: int = 1024,
         **kwargs: Any,
     ) -> None:
+        # Each key mapped to the id of its entry in the log.
+        self._uids: dict[Any, int] = {}
         self._core = _CollectionCore(engine, _KIND_DICT, name, compact_every)
         self._core.owner = self
         super().__init__()
         if self._core.loaded is not None:
-            dict.update(self, self._core.loaded)
+            self._reset_to(self._core.loaded)
             self._core.tracked_len = dict.__len__(self)
         else:
             self.update(mapping, **kwargs)
 
-    def _reset_to(self, contents: dict[Any, Any]) -> None:
+    def _reset_to(self, records: Iterable[tuple[Any, ...]]) -> None:
         dict.clear(self)
-        dict.update(self, contents)
+        uids: dict[Any, int] = {}
+        for uid, key, value in records:
+            dict.__setitem__(self, key, value)
+            uids[key] = uid
+        self._uids = uids
+
+    def _upsert(self, key: Any, value: Any) -> dict[str, Any]:
+        """The diff for ``self[key] = value``, already stored."""
+        uid = self._uids.get(key)
+        if uid is None:
+            uid = self._uids[key] = self._core.new_uid()
+        return {"action": "upsert", "uid": uid, "key": key, "value": value}
+
+    def _removal(self, key: Any, value: Any) -> dict[str, Any]:
+        """The diff for removing ``key``, already removed from the storage."""
+        return {
+            "action": "remove",
+            "uid": self._uids.pop(key),
+            "key": key,
+            "value": value,
+        }
 
     def compact(self) -> None:
         """Squash the on-disk event log into a snapshot at the current head."""
@@ -1502,21 +1547,19 @@ class CascadeDict(dict):
     @_mutator
     def __setitem__(self, key: Any, value: Any) -> None:
         dict.__setitem__(self, key, value)
-        self._core.emit([{"action": "upsert", "key": key, "value": value}])
+        self._core.emit([self._upsert(key, value)])
 
     @_mutator
     def __delitem__(self, key: Any) -> None:
         value = dict.__getitem__(self, key)
         dict.__delitem__(self, key)
-        self._core.emit([{"action": "remove", "key": key, "value": value}])
+        self._core.emit([self._removal(key, value)])
 
     @_mutator
     def update(self, *args: Any, **kwargs: Any) -> None:
         incoming = dict(*args, **kwargs)
         dict.update(self, incoming)
-        self._core.emit(
-            [{"action": "upsert", "key": k, "value": v} for k, v in incoming.items()]
-        )
+        self._core.emit([self._upsert(k, v) for k, v in incoming.items()])
 
     @_mutator
     def pop(self, key: Any, default: Any = _MISSING) -> Any:
@@ -1525,20 +1568,20 @@ class CascadeDict(dict):
                 raise KeyError(key)
             return default
         value = dict.pop(self, key)
-        self._core.emit([{"action": "remove", "key": key, "value": value}])
+        self._core.emit([self._removal(key, value)])
         return value
 
     @_mutator
     def popitem(self) -> tuple[Any, Any]:
         key, value = dict.popitem(self)
-        self._core.emit([{"action": "remove", "key": key, "value": value}])
+        self._core.emit([self._removal(key, value)])
         return key, value
 
     @_mutator
     def clear(self) -> None:
-        diffs = [{"action": "remove", "key": k, "value": v} for k, v in self.items()]
+        pairs = list(dict.items(self))
         dict.clear(self)
-        self._core.emit(diffs)
+        self._core.emit([self._removal(k, v) for k, v in pairs])
 
     @_mutator
     def setdefault(self, key: Any, default: Any = None) -> Any:
