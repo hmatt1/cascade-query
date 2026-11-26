@@ -1428,10 +1428,22 @@ fix for D38 brought in and 0.4.0 released, the same way.
 "Reported" meant found and probed during the audit but not re-run a second
 time; nothing is in that state now.
 
-There are no open defects: every defect found by the audit or since is
-fixed and listed below. The tables of open wrong results, data loss and
-hangs are empty, and every test in `tests/test_known_defects.py` passes
-without an expected-failure marker.
+D42 to D50 were found on 2026-11-26 by the tests written for test gaps 3,
+4, 8 and 9. The state machine's rules for shared writers, hidden cycles and
+eviction found D42 to D44. The generated query bodies, once their values
+were widened, found D45, D46 and D50. The collection interleavings found D47
+to D49. The generated transactions found D48 on their own as well. D42 to
+D48 were in 0.4.2 and before; D49 came with the fix for D41.
+
+One defect is open, D50, pinned by a strict expected failure in
+`tests/test_known_defects.py`. Every other defect found by the audit or
+since is fixed and listed below.
+
+### Open
+
+| ID | Defect |
+|---|---|
+| D50 | A NaN key removed from a named `CascadeDict` or `CascadeSet` before a restart comes back after it. `d[nan] = 1; del d[nan]` (or `s.add(nan); s.discard(nan)`) on mdbx or sqlite, then a new engine, restores the NaN. The log on disk decodes into two different NaN objects, and the replayed removal finds nothing, since NaN equals nothing. Fixing it means interning NaN when a collection loads, which would merge two genuinely separate NaN keys, or a change to the disk format. In memory the collection behaves as Python's dict and set do. |
 
 ### Fixed since the audit
 
@@ -1478,10 +1490,26 @@ without an expected-failure marker.
 | D39 | On a free-threaded build, a call made with `engine.submit` could return an old value and could not be cancelled. Threads there copy the context of the thread that starts them, and the pool `submit` uses is also where an async query runs sync code (for example the default of a sync input it checks while loading a result from disk). A worker started from inside such a query kept that query's runtime, so a later submitted call on it ran as part of the finished query: at its revision, with no cancellation. After `x.set(5)`, `engine.submit(double).result()` gave 2 where `double()` gives 10, or raised `SnapshotExpiredError` once that revision's history was trimmed. Under the interpreter lock threads start with an empty context and it never happened. A submitted call now runs in a context of its own (G5, G6). | `fix: a submitted call on a free-threaded build could run at an old revision` |
 | D40 | A query under a decorator that wraps it (`functools.wraps`) kept its stored result after its body was edited between runs. The stored hash covers the bytecode of the registered function, which is the wrapper, and the hash of what it refers to followed `__wrapped__` to the body's references but not to the body itself: with `cache_dir`, `@engine.query @logged def q(): return 1` edited to `return 2` went on returning 1. The bytecode of every wrapped layer, and what each refers to, is now part of the stored hash (G11). | `fix: an edit to a query under a wrapping decorator kept its stored result` |
 | D41 | The fix for D38 lost another engine's data. A named collection created in a transaction holds its record back to the commit, and wrote it then without looking: if another engine had recorded the name in the meantime and compacted it, the empty record replaced that engine's snapshot. With engine A's block creating `CascadeList(a, name="xs")` while engine B extended, compacted and appended to `xs`, a restart restored `[3]` instead of `[1, 2, 3]`. Released in 0.4.0. The held-back record now looks first, keeps a record it finds, and refuses one of another kind (G25, G26). | `fix: a held-back collection record overwrote another engine's data` |
+| D42 | A pipeline whose stage called a query another thread was running hung both threads for good. A rewritten comprehension holds the pipelines' lock while its stages run; the stage waited for the other thread's run, and that run reached a pipeline and waited for the lock. A thread inside a pipeline now runs such a query itself instead of waiting (trace event `dedup_pipeline`) (G5). | `test: the state machine shares writers, submits through snapshots, sees every wait` |
+| D43 | A fixed-point member did not expire with its head. A member reads the head's guess, which carries no expiry, so once the TTL query the head read had expired, a direct read of the member still gave its old value (0 where -1 was right). Members now take the head's expiry when the cycle converges (G7, G9). | the same |
+| D44 | Dropping a fixed-point head's result left its members cached. The head's next run read them from the cache, never reached itself and did not iterate; with a TTL query in the cycle that was run again, the head returned one step of the iteration (-1) instead of the fixed point (-2). It showed with `max_entries=3`, `sweep_unaccessed` or a direct drop, for memoized and `memoize=False` heads. Dropping a head now drops its members; replacing its row does not, so the reuse of 0.4.2 is kept (G7, G13). | the same |
+| D45 | A rewritten pipeline over `d.items()`, `dict(d)` and `{k: v for k, v in d.items()}` among them, took the key from the update. After `d[1.0] = "b"` where `1` is a key, `dict(d)` gave `{1.0: "b"}` where Python's dict holds `{1: "b"}`; a restart gave the right answer. There since the collections were added. The pipeline now keeps the key object the dict holds (G22). | `test: generated query bodies over wider values, and the two defects they found` |
+| D46 | A pipeline whose element read a NaN made anew on each run kept its state across runs, because every NaN has one digest. After a change, `m = float("nan"); set([m for _ in d.values()])` held two NaN objects where Python's has one. A pipeline that captures a NaN now rebuilds on every run (G22). | the same |
+| D47 | `compact()` on a named collection read the head outside the collection's lock. The compaction a commit runs could read the head, a writer then appended and compacted at its newer head, and the older snapshot, written last, deleted that change on disk: a reload gave `(7, 1, 2)` instead of `(7, 1, 2, 3)`. `compact()` now holds the lock from reading the head to writing the snapshot (G26). | `test: run collection writers under interleavings the test chooses` |
+| D48 | `compact()` while a transaction held the collection wrote the block's uncommitted changes into the snapshot. After a rollback they stayed on disk (`[1]`, then a rolled-back `append(2)` and `compact()`, then `append(3)` reloaded as `[1, 3, 2]`); after a commit they were written twice (`[1, 2, 3]` reloaded as `[1, 2, 2, 3]`). `compact()` now snapshots the committed head, and a collection with nothing committed yet gets no record (G25, G26). | the same, and `test: generated transaction programs, two engines and submit (G25)` |
+| D49 | The fix for D41 left a gap between its check and its write. The held-back stamp looked in one disk read and wrote in another, and the stamp at construction did not look at all; another engine could create, fill and compact the name in between, and the empty record replaced it: a reload gave `()` instead of `(1, 2)`. The disk now checks and writes the stamp in one transaction (`collection_stamp`: an mdbx write transaction, sqlite `INSERT OR IGNORE`) (G26). | `test: run collection writers under interleavings the test chooses` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
 moving it (G3).
+
+Smaller item, open: a result reused from disk checks a never-set input
+against its default without keeping that default as the input's value, so
+a later `set` to the default moves the revision and cancels submitted
+calls, against the spirit of G3 and G6. Values are never wrong. Engine A
+computes `q()` reading `x()` (default 0) on a `cache_dir`; engine B on the
+same directory calls `q()`, served from disk, and then `x.set(0)` moves its
+revision. If B reads `x()` itself first, nothing moves.
 
 ## Limits that restrict who can use the library
 
@@ -1570,10 +1598,15 @@ actions to the code and the invariants to the guarantees.
 
 Ordered by the risk they leave open.
 
-1. **Every defect has a regression test, and none is open.**
-   `tests/test_known_defects.py` has a test for each defect (D1-D41), each
-   asserting the correct behaviour; a defect found from now on gets one
-   under `xfail(strict=True)` until it is fixed.
+1. **Every defect has a regression test, and one is open.**
+   `tests/test_known_defects.py` has a test for each defect from D1 to D41
+   and for D45, D46 and D50, each asserting the correct behaviour; D50 is
+   open and its test is under `xfail(strict=True)`. The regression tests of
+   D42 to D44 and D47 to D49 sit beside the tests that found them:
+   `test_pipeline_lock_waits.py` (D42), `test_fixed_point_member_expiry.py`
+   (D43, D44), and the section "Defects this harness found" of
+   `test_collection_interleavings.py` (D47 to D49), with D48 also in
+   `test_transaction_properties.py`.
 2. **Durability is tested for normal exits only.** `test_durability_at_exit.py`
    exits child processes without `shutdown()` and with `os._exit`.
    `test_disk_writer_errors.py` injects write failures into a live engine.
@@ -1617,11 +1650,26 @@ Ordered by the risk they leave open.
    while an input changes, which must cancel it (G6). With the D35 fix
    undone, six runs of the file in six failed, where before none did, and
    with cancellation turned off the first run failed. Its first run on the
-   free-threaded build found D39. Still outside it:
-   writers that change the same input or collection, `submit` through a
-   snapshot, and threads blocked anywhere but a query body or a wait for a
-   run, which the lock step cannot see and lets go after two seconds.
-4. **Generated query bodies are small and numeric.**
+   free-threaded build found D39.
+   Since 2026-11-26 writers share what they change: up to three threads set
+   the same inputs and change the same list and set, a step at a time or in
+   transactions, free-running and in lock step, where a writer also stops
+   between a transaction's operations. The model enumerates every serial
+   order that agrees with what each writer saw (what each `pop` returned,
+   which changes were refused because another thread's transaction held the
+   collection) and the engine's end state must be one of them. `submit`
+   through a held snapshot must give the snapshot's value. The lock step
+   sees every wait: the engine's locks are swapped for tracked ones in the
+   test, waits for a run are followed to their owner, and the helper
+   threads of `submit` and `compute_many` take part themselves. Its
+   patience is only a detector now; a wait that long fails the rule.
+   Memoize=False fixed-point heads, sync and async, read state the engine
+   does not track and a TTL query, with results dropped while they run, so
+   the fallbacks of 0.4.2 are reached: the head reached again, another
+   value, an error, an expired row, a dropped member. These rules found
+   D42, D43 and D44. Still outside it: async readers in lock step, and a
+   reuse run over a value that cannot be encoded.
+4. **Generated query bodies leave out a few constructs.**
    `test_rewrite_differential.py` compares each rewritten reducer with the
    builtin over ints, floats, strings, tuples and mixtures.
    `test_rewrite_programs.py` generates whole query bodies from a grammar:
@@ -1632,15 +1680,22 @@ Ordered by the risk they leave open.
    Each body runs as a query over two lists, a set and a dict and as plain
    Python, and after every change, transaction (committed or rolled back),
    input change and snapshot the two must agree exactly, also through the
-   snapshot. Its first runs found D36 and D37. The values are small ints or
-   a few floats; strings, tuples, `None`, mixed types, `sorted` keys that
-   raise, accumulator effects and nested function definitions are not
-   generated. At 300 examples it catches a seeded fault of the kind of D30,
-   D32 or D36, and one that ignores an older head. Two faults in how dict
-   and list diffs are read were caught in one run of 300 and missed in
-   four others, and caught at 3,000 examples; a fault of the kind of D37
-   was caught once at 3,000 and missed once (`CASCADE_PROGRAM_EXAMPLES`
-   sets the count). The regression tests of D36 and D37 pin those two.
+   snapshot. Its first runs found D36 and D37. Since 2026-11-26 each
+   example draws one family of values: small ints; floats with `-0.0`, NaN
+   and infinities; values equal across types (`0`, `0.0`, `-0.0`, `False`),
+   which are also the dict's keys; ints beyond 64 bits; `str` and `bytes`;
+   a mix with `None`; and tuples, frozensets, lists and dicts. Results must
+   agree down to type and the sign of zero. Bodies call a query per
+   element, a query over two bodies must run again only when one changed,
+   and one example in five runs on disk and restarts. Each body and change
+   sequence uses a random part of the grammar. The widened values found
+   D45, D46 and D50. Every seeded fault listed in
+   `docs/verification-status.md` is now caught within 300 examples in 10
+   seeds of 10, where four needed thousands; of twelve new faults about the
+   new values, eleven are caught at 300 (`CASCADE_PROGRAM_EXAMPLES` sets
+   the count). Still not generated: `sorted` keys that raise, accumulator
+   effects and nested function definitions; NaN stays out of collections on
+   disk (D50).
 5. **No cross-process or cross-version determinism test for the codecs.**
    `test_codec_properties.py` checks round trips and determinism within one
    process with Hypothesis.
@@ -1648,24 +1703,40 @@ Ordered by the risk they leave open.
    sqlite; `test_incremental_persistence.py`, `test_code_versioning.py` and
    `test_error_caching_persistence.py` run mdbx only; `test_transaction_collections.py`
    runs sqlite only. The sqlite vacuum delete paths are excluded from coverage.
-7. **Async assertions are weaker than sync ones.** The async evaluator is
-   no longer excluded from coverage, and `test_async_parity.py` awaits on a
-   running loop for effects (replay, rollback, waiters), bail-out counts,
-   `memoize=False`, eviction, `prune` and `sweep_unaccessed`, snapshots
-   under concurrent writes and mixed sync and async fan-out. Mutation
-   testing still leaves more alive in the async paths
-   (`compute_or_get_memo_async` 78 survivors against 42 in the sync
-   function, in the last run, which predates that file).
-8. **Collection concurrency is stress-tested, not checked exhaustively.**
-   `test_collection_concurrency.py` runs several writers against rewritten
-   readers, snapshots and compaction for a list, a set and a dict, and
-   atomic transactions over several collections against concurrent
-   readers. `test_collection_compaction_pins.py` forces a compaction that
-   falls due inside a mutation while a pipeline reads. Interleavings are
-   left to chance there; the state machine (gap 3) runs several writers on
-   collections of their own, but not on one shared collection.
-9. **Transactions are tested against hand-written cases, two engines
-   included, but not generated ones beyond the state machine's.**
+7. **Async assertions now match sync ones in the main functions.** The
+   async evaluator is no longer excluded from coverage, and
+   `test_async_parity.py` awaits on a running loop for effects (replay,
+   rollback, waiters), bail-out counts, `memoize=False`, eviction, `prune`
+   and `sweep_unaccessed`, snapshots under concurrent writes and mixed sync
+   and async fan-out. `test_async_assertions.py` writes each body once as
+   a coroutine and puts the sync and the async path through the same
+   assertions: run counts, values, traces, memo fields, effects and
+   dependency edges. On 2026-11-26 `compute_or_get_memo_async` went from 39
+   surviving mutants to 5 (4 of them equivalent), against 7 in the sync
+   function; `recompute_async` from 41 to 25 (18 equivalent), against 21 in
+   `recompute`. The real survivors left survive on both paths.
+   `_try_hydrate_from_disk_async` was not measured again.
+8. **Collection concurrency is checked under chosen interleavings, to a
+   bound.** `test_collection_concurrency.py` runs several writers against
+   rewritten readers, snapshots and compaction for a list, a set and a
+   dict, and atomic transactions over several collections against
+   concurrent readers. `test_collection_compaction_pins.py` forces a
+   compaction that falls due inside a mutation while a pipeline reads.
+   `test_collection_interleavings.py` runs two or three writers and a
+   reader on one shared list, set or dict, in transactions and not, on
+   disk with compaction, and two engines on one `cache_dir`, under every
+   schedule with at most one preemption (about 3,900 by default, 106,000
+   under `-m slow` with one more); every result must fit one serial order.
+   It found D47, D48 and D49. Not covered: pause points inside the graph
+   store, and two readers asking for one query key.
+9. **Transactions are tested against hand-written and generated cases,
+   two engines and `submit` included.** `test_transaction_properties.py`
+   generates programs of blocks that commit, raise or fail at commit
+   against a plain model, in memory and on both backends; two engines on
+   one `cache_dir`, each on its own thread, with blocks open on both; and
+   reader threads that call, `submit` and snapshot queries while blocks
+   open, commit and roll back. It found D48. Async transactions on tasks
+   are not generated.
    `test_transaction_block_reads.py` covers queries inside the block reading
    a collection changed or created in it, `submit` in the block, and two
    engines (one in a block, both in blocks on two tasks or threads, two on

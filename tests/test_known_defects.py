@@ -1614,7 +1614,7 @@ def test_d41_held_back_record_does_not_overwrite_another_engines_collection(
         reopened.shutdown()
 
 
-def test_dict_items_keep_the_key_the_dict_holds_after_an_equal_key_update() -> None:
+def test_d45_dict_items_keep_the_key_the_dict_holds_after_an_equal_key_update() -> None:
     # A dict keeps the key it was first given: ``d[1.0] = "b"`` where ``1``
     # is a key replaces the value under ``1``. A rewritten pipeline over
     # ``d.items()``, ``dict(d)`` among them, took the key from the update
@@ -1656,9 +1656,9 @@ def test_dict_items_keep_the_key_the_dict_holds_after_an_equal_key_update() -> N
     assert repr(dict(d)) == "{0: 'y', 'k': 'v', 1.0: 'd'}"
 
 
-@pytest.mark.xfail(strict=True, reason="open: NaN identity is lost on disk")
+@pytest.mark.xfail(strict=True, reason="D50, open: NaN identity is lost on disk")
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_nan_key_removed_before_a_restart_stays_removed(
+def test_d50_nan_key_removed_before_a_restart_stays_removed(
     tmp_path: Path, backend: str
 ) -> None:
     # A dict holds a NaN key, and a set a NaN element, by identity: NaN is
@@ -1689,7 +1689,7 @@ def test_nan_key_removed_before_a_restart_stays_removed(
         engine.shutdown()
 
 
-def test_a_nan_captured_by_a_pipeline_is_one_object_in_its_result() -> None:
+def test_d46_a_nan_captured_by_a_pipeline_is_one_object_in_its_result() -> None:
     # Every NaN has the same digest, so a pipeline whose element reads a
     # NaN made anew on each run kept its state across runs and mixed the
     # NaN of an earlier run with this run's: ``set([m for _ in d.values()])``

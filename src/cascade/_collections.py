@@ -783,6 +783,9 @@ class _CollectionCore:
         reach the disk at its commit; folded into the snapshot they were
         written twice on commit and kept after a rollback.
 
+        A collection with nothing committed yet (made in a block, or in one
+        that rolled back) gets no record: the first committed change makes it.
+
         ``rw`` is held from reading the head to writing the snapshot, which
         deletes every diff up to that head. Without it a writer could
         append and compact in between, and the older snapshot written last
@@ -797,12 +800,12 @@ class _CollectionCore:
         if not self._writer:
             # Rewrites the log on disk: only the engine that changes it may.
             self._claim_writer()
-        head = self.log.head
-        if self._tx_start is not None:
-            if self._unstamped:
-                return  # nothing is committed; the commit writes the record
-            head = self._tx_start
-        self._unstamped = False  # the snapshot below is the record
+        if self._unstamped:
+            # Nothing of it is committed, so there is nothing to compact, and
+            # a record made now would outlive a rollback of the block that
+            # created it (D38). Its first committed change makes one.
+            return
+        head = self.log.head if self._tx_start is None else self._tx_start
         items = self.log.contents_at(head)
         if self.kind == _KIND_LIST:
             items = [list(p) for p in items]

@@ -4,6 +4,43 @@ Releases before 0.4.0 were published from every push to `main` without
 notes; `docs/guarantees.md` records the defects fixed in them (D1–D37).
 Defects fixed since are listed under their release (D38 on).
 
+## 0.4.3
+
+### Fixed
+
+- **A pipeline whose stage called a query another thread was running could
+  hang both threads for good (D42).** The stage waited for the run while
+  holding the pipelines' lock, and the run waited for that lock. A thread
+  inside a pipeline now runs the query itself instead of waiting.
+- **A fixed-point member did not expire with its head (D43).** After the
+  TTL of a query the cycle read had elapsed, a direct read of a member
+  still gave its old value. Members now take the head's expiry.
+- **Dropping a fixed-point head's result left its members cached (D44).**
+  After an LRU drop, `sweep_unaccessed` or a direct drop, a cycle with a
+  TTL query in it could return one step of the iteration instead of the
+  fixed point. Dropping a head now drops its members.
+- **A rewritten pipeline over `d.items()` took the key from the update
+  (D45).** After `d[1.0] = "b"` where `1` is a key, `dict(d)` inside a
+  query gave `{1.0: "b"}` where Python gives `{1: "b"}`.
+- **A pipeline that captured a NaN mixed NaN objects across runs (D46).**
+  `set([m for _ in d.values()])` with `m = float("nan")` could hold two
+  NaNs. Such a pipeline now rebuilds on every run.
+- **`compact()` on a named collection could delete another writer's change
+  on disk (D47).** It read the head outside the collection's lock; it now
+  holds the lock until the snapshot is written.
+- **`compact()` while a transaction held the collection wrote the block's
+  uncommitted changes to disk (D48).** They survived a rollback, and a
+  commit wrote them twice. It now snapshots only what is committed, and a
+  collection with nothing committed yet gets no record.
+- **The fix for D41 could still lose another engine's collection (D49).**
+  The check for an existing record and the write of the empty one were two
+  disk operations; they are now one (`collection_stamp`).
+
+### Known issue
+
+- A NaN key removed from a named `CascadeDict` or `CascadeSet` comes back
+  after a restart (D50).
+
 ## 0.4.2
 
 ### Changed

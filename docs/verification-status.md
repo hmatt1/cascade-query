@@ -845,6 +845,221 @@ not evicted between the check and the run, which is when those fallbacks
 matter. (Reusing a row that is not current gives the right values anyway:
 a member then has to run, reaches the head, and the run starts over.)
 
+## Five test gaps closed (2026-11-26)
+
+Test gaps 3, 4, 7, 8 and 9 of `docs/guarantees.md` were worked on at once,
+one branch each. Every new test was checked by seeding faults into a copy of
+the source, one at a time, and was run 20 times or more on 3.12 and on the
+free-threaded 3.14t. Together they found nine defects: eight are fixed (D42
+to D49) and one is open (D50). See `docs/guarantees.md` for each.
+
+### State machine: shared writers, snapshots and every wait
+
+Writers now share what they change. Up to three threads set the same inputs
+and change the same list and set, a step at a time or in transactions,
+free-running and in lock step. In lock step a writer also stops between a
+transaction's operations, so other threads go on while it is open. The
+model enumerates every serial order that agrees with what each writer saw:
+what each `pop` returned, which changes were refused because another
+thread's transaction held the collection, and the list inside a
+transaction. The engine's final inputs, list, set and revision must be
+those of one such order, and a refusal must have a cause. `submit` through
+a held snapshot must give the snapshot's value.
+
+The lock step now sees every place a thread can wait: a run in the engine,
+the engine's locks (swapped for tracked ones in the test) and the helper
+threads of `submit` and `compute_many`, which take part themselves. Its
+patience is only a detector: a wait that long fails the rule, and a
+deadlock is reported after two seconds with each thread's stack. In one run
+it handed turns past threads blocked on a lock 38 times and past threads
+waiting for a run 605 times, with no timeout.
+
+Hidden cycles reach the fallbacks added in 0.4.2: memoize=False
+fixed-point heads, sync and async, whose bodies read state the engine does
+not track and a TTL query, with results dropped while they run. The head
+reached again, another value, an error, an expired row and a dropped member
+are all reached, on both paths. Only a reuse run over a value that cannot
+be encoded is not.
+
+The new rules found D42 (a pipeline stage waiting for another thread's run
+while holding the pipelines' lock: a permanent hang), D43 (a fixed-point
+member that did not expire with its head) and D44 (dropping a head left its
+members, so the head returned one step of the iteration).
+
+| Fault | 3.12 | 3.14t |
+|---|---|---|
+| Each of the three fixes undone | 3, 3 and 2 of 3 | 3, 3 and 1 of 3 |
+| Transaction reservation check removed | 3 of 3 | 3 of 3 |
+| Collection write lock removed | 2 of 3 | 3 of 3 |
+| A transaction's first value wins | 3 of 3 | 3 of 3 |
+| `submit` ignores its snapshot | 3 of 3 | 3 of 3 |
+| A run on cached members kept whatever it gives | 3 of 3 | 3 of 3 |
+| The kept row loses its cycle | 2 of 3 | 0 of 3 |
+
+Four more faults in the 0.4.2 code survive; each leaves every value
+unchanged. The three machines take about 27 seconds on 3.12 (21 before) and
+26 on 3.14t (22). `CASCADE_STATE_EXAMPLES` raises the count, and
+`CASCADE_STATE_SHRINK=0` reports a failure without shrinking it.
+
+### Generated query bodies over wider values
+
+Each example of `tests/test_rewrite_programs.py` now draws one family of
+values for the collections, the input, the closure variable and the
+literals: small ints; floats with `-0.0`, NaN and infinities; values equal
+across types (`0`, `0.0`, `-0.0`, `False`), which are also the dict's keys;
+ints beyond 64 bits; `str` and `bytes`; a mix with `None`; and tuples,
+frozensets, lists and dicts. Results must agree down to type and the sign
+of zero, with NaN equal to NaN. Two bodies share each example, and a query
+over both must run again only when one of them changed. Bodies call a query
+per element, so the values reach query arguments. One example in five runs
+on mdbx or sqlite and restarts the engine.
+
+At first the wider values made the seeded faults rarer. Four changes fixed
+that: each body and change sequence uses a random part of the grammar
+(swarm testing), every body has a reducer right over a source, statements
+catch what they raise, and in-place updates are always among the changes.
+The file takes about as long as before, about 15 seconds.
+
+It found D45 (a `d.items()` pipeline took the key from the update), D46 (a
+captured NaN mixed objects across runs) and D50 (open: a NaN key removed
+before a restart comes back).
+
+Examples to the first failure, 10 seeds each (before: the old test, up to
+3,000; after: the new one, up to 1,500):
+
+| Fault | Before: within 300 | After: within 300 | After: median |
+|---|---|---|---|
+| D30: `:=` moved into the helper | 9 of 10 | 10 of 10 | 8 |
+| D32: a helper that needs a hidden loop variable | 9 of 10 | 10 of 10 | 5 |
+| D36: the items read under every `dict` | 7 of 10 | 10 of 10 | 6 |
+| Pipeline state kept for an older head | 10 of 10 | 10 of 10 | 7 |
+| A dict key update read as an add | 4 of 10 | 10 of 10 | 59 |
+| A list update read as an insert | 1 of 10 | 10 of 10 | 43 |
+| D37: no materialize stage from the rewriter | 2 of 10 | 10 of 10 | 18 |
+| D37: the fallback does not build the list | 2 of 10 | 10 of 10 | 18 |
+| D45 undone | 0 of 5 | 10 of 10 | 69 |
+| An input `set` compared with `==` | 0 of 5 | 9 of 10 | 54 |
+| Early cutoff by `==` | not reachable | 10 of 10 | 65 |
+| NaN digested differently each time | 0 of 5 | 9 of 10 | 89 |
+| Query keys without the float and bool tags | not reachable | 10 of 10 | 25 |
+| The in-memory digest without types | 0 of 5 | 10 of 10 | 65 |
+| The disk codec writes `True` and `1.0` as `1` | not reachable | 10 of 10 | 8 |
+| The disk codec writes `-0.0` as `0.0` | not reachable | 9 of 10 | 49 |
+| `sum` keeps a running total for floats | 0 of 5 | 10 of 10 | 41 |
+| NaN treated as an ordered number | 0 of 5 | 9 of 10 | 72 |
+| A set keeps the last of equal values | 1 of 5 | 10 of 10 | 81 |
+| D46 undone | not reachable | 0 of 10 | missed at 1,500 |
+
+"Not reachable": the old test had no dependent query, no query calls inside
+bodies, no disk and no NaN. D46 was found once, in a run of 1,500 examples;
+its regression test pins it.
+
+### Async parity of `compute_or_get_memo` and `recompute`
+
+The mutants of four functions were made again from the source of 0.4.2 and
+run with `scripts/mutation_windows.py` on 8 processes, then every survivor
+was run twice more against `tests/test_async_assertions.py`. That file
+writes each body once, as a coroutine, and puts the sync and the async path
+through the same assertions: run counts, values, traces with their keys,
+memo fields, effects and dependency edges. It has 53 tests and runs in
+under a second.
+
+| Function | Mutants | Survived before | After |
+|---|---:|---:|---:|
+| `compute_or_get_memo_async` | 244 | 39 | 5 |
+| `compute_or_get_memo` | 235 | 30 | 7 |
+| `recompute_async` | 198 | 41 | 25 |
+| `recompute` | 173 | 22 | 21 |
+
+Most async survivors changed something no async test checked: the trace of
+a hit, `verified_at` and `head_clean`, effects replayed on a provisional
+hit, a result another task stored meanwhile, a task joining a load from
+disk or a failed run, a cancelled waiter's record, the verification pin.
+Three gave a wrong value: an unmemoized query returned `None` after a
+retry, and after re-entering its cycle through the head, and a fallback
+above a failed fixed point stayed stale.
+
+Four of the five left in `compute_or_get_memo_async` change nothing (a
+default every caller overrides, two arguments only a blocking caller reads,
+a variable never read). Of the 25 in `recompute_async`, 18 change nothing.
+The real survivors left, in both functions, survive on the sync side too:
+a retry that drops `need_value`, the `routed` default, the cleanup after a
+fixed-point head fails, and `exc=None` to `_inherit_failed_deps`.
+`_try_hydrate_from_disk_async` was not measured again. No defect was found;
+`RuntimeState.snapshot_explicit` and `is_async` are never read.
+
+### Collection interleavings
+
+`tests/test_collection_interleavings.py` runs threads one at a time and
+picks, at each pause point, which goes next. The pause points are the
+collection's lock, the diff being emitted, the head being published, every
+disk write, load and stamp, the write-lock claim, compaction on disk and in
+memory, each stage of a commit or rollback, and each reader query. All are
+monkeypatched; src has no hooks. A walk runs every schedule with at most one
+preemption, and Hypothesis adds random programs under random schedules.
+Every call, reader result, snapshot (read again after the run) and the
+final contents must fit one serial order of a plain list, set or dict
+consistent with real time; named collections are then reloaded on both
+backends. A hung schedule fails within `CASCADE_INTERLEAVE_TIMEOUT`.
+
+The default run checks about 3,900 schedules in 11 seconds: two or three
+writers and a reader on one list, set or dict; transactions that commit or
+roll back; a snapshot reader while old diffs are folded; named lists with
+compaction; and two engines writing one named collection in one
+`cache_dir`. Under `-m slow` the same scenarios run one bound deeper, about
+106,000 schedules in under six minutes.
+
+It found D47, D48 and D49, all losing data on disk. Eighteen faults were
+seeded; fifteen fail the default run within 2 to 14 seconds (no write lock
+in mutators, a reader without the lock, no transaction reservation, a
+reservation released before the commit is written, reverting D41's fix, no
+out-of-date check between engines, no file write lock, a rollback without
+the lock, and each new fix undone, among others). The three that pass are
+equivalent to the code: the head published before the log append (hidden by
+the lock the writer holds), folding that ignores a transaction's start, and
+a snapshot cache kept on rollback.
+
+### Generated transactions
+
+`tests/test_transaction_properties.py` writes transaction programs and a
+plain model says what every read must return. One-engine programs, in
+memory and on both backends, mix blocks that commit, raise or fail at
+commit with plain changes; a block sets inputs, changes a list, a set, a
+dict and a list created in it, reads, submits and snapshots queries
+(including one whose body must run inside the block), compacts, and tries
+to nest a block. Inside a block, queries, inputs and futures see the state
+before it, the revision stays put and nothing reaches disk; after it, all of
+the block or none of it. Two-engine programs run two engines on one
+`cache_dir`, each on its own thread, with blocks open on either or both;
+the model predicts each write-lock and out-of-date refusal (G26). A third
+test runs two reader threads that call, submit and snapshot queries while
+blocks open, commit and roll back; each value must be one committed during
+the call, and a future the state at its submit or `QueryCancelled` after a
+later change. It takes about 15 seconds; `CASCADE_TXN_EXAMPLES` raises it.
+
+It found D48 on its first run, and a smaller open item: a result reused
+from disk does not keep an input's default, so a later `set` to the default
+moves the revision (see `docs/guarantees.md`).
+
+| Fault (3.12, 200 examples, seeds 1–3) | Examples to first failure |
+|---|---|
+| Input updates in a block applied at once | 3–14 |
+| Collection diffs written before the commit | 3–11 |
+| A rollback skips lists | 3–31 |
+| A rollback keeps the list's element ids | 11–99 |
+| A failed commit keeps collection changes (D27) | 5–160 |
+| A rollback applies the block's input updates | 12–44 |
+| Other threads read a block's uncommitted changes | 4–130 |
+| The block's queries read its own changes | 38–133 |
+| `submit` never cancelled | 4–26 |
+| The write lock not taken | 3–9 |
+| The out-of-date check skipped (D10) | 26, 67; missed 1 of 3 |
+| D48 undone | 3–153 |
+
+The out-of-date fault needs a write, a reopen and a write by the other
+engine, in that order; the default 40 examples catch it only some of the
+time.
+
 ## Next steps
 
 In order of value for the time they take.
@@ -853,8 +1068,9 @@ In order of value for the time they take.
    Done (`45546501531`, passed in 11m24s with `--only small`).
 2. ~~**Repeat the mutation run over `cascade._evaluator`.**~~ Done above
    (`22.0%` survival rate across 3,463 mutants).
-3. **Optionally pin the last few behavioral survivors in
-   `compute_or_get_memo_async`.** Most of the remaining 49 survivors are
+3. ~~**Optionally pin the last few behavioral survivors in
+   `compute_or_get_memo_async`.**~~ Done on 2026-11-26 (39 to 5; see
+   "Async parity" above). The note from before: most of the remaining 49 survivors were
    `trace_event` arguments, pin/unpin calls, or the `_finished_meanwhile_locked`
    race window; the main behavioral ones left are provisional-hit and
    `cache_green` effect replay (`return pending, True` / `return existing, True`)
