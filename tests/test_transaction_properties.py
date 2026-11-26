@@ -1,0 +1,1588 @@
+"""Generated transaction programs, checked against plain Python (G25, G6, G26).
+
+The hand-written transaction tests pin one scenario each. Here Hypothesis
+writes the programs, and a model made of plain values says what every read
+must return:
+
+1. **One engine.** A program is a list of segments: blocks that commit, raise,
+   or fail at commit on a value that cannot be encoded, and plain changes
+   between them. A block's steps set inputs, change a list, a set and a dict
+   (and a list created in the block), read queries, inputs and ``submit``
+   futures, take snapshots, compact, and try to nest a transaction. Inside a
+   block the collection objects show the block's changes, while queries,
+   input reads and futures see the state before it, the revision stays put
+   and nothing reaches disk. After it, the engine holds all of the block or
+   none of it: values, revision, the list's element ids and log heads, and
+   disk. At the end, every query equals a new engine's built from the model,
+   and with a ``cache_dir`` an engine reopened on the directory.
+2. **Two engines on one ``cache_dir``**, each on its own thread, on both disk
+   backends. Their steps interleave: blocks open on either or both at once,
+   changes to two named lists (each engine may try either list; the
+   per-collection write lock and the out-of-date check decide), reads, and
+   reopening one engine. The model tracks what each engine loaded, which
+   engine holds each list's lock, and what is on disk.
+3. **``submit`` while blocks are open, committing and rolling back.** Reader
+   threads call, submit and snapshot queries while the main thread runs a
+   program. The model keeps every committed state in order; each result must
+   be a query's value in one of the states committed while the call ran,
+   never a rolled-back or partial one. A submitted call is pinned at its
+   submit (G6), so a future's value must be the state current then, or
+   ``QueryCancelled`` when a change came after it. Futures held at a gate
+   until later steps have exact outcomes.
+
+``CASCADE_TXN_EXAMPLES`` sets the number of examples of every test here (the
+defaults keep the file to a few seconds a test).
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import queue
+import copy
+import os
+import random
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any
+
+import pytest
+from hypothesis import HealthCheck, event, given, settings
+from hypothesis import strategies as st
+
+from cascade import (
+    CascadeDict,
+    CascadeList,
+    CascadeSet,
+    Engine,
+    PersistentCacheError,
+    QueryCancelled,
+    UnencodableValueError,
+)
+from cascade._collections import DiffLog
+
+TIMEOUT = 30.0
+BACKENDS = ("mdbx", "sqlite")
+
+
+def _settings(default: int) -> settings:
+    return settings(
+        max_examples=int(os.environ.get("CASCADE_TXN_EXAMPLES", default)),
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+    )
+
+
+class Abort(Exception):
+    """Raised at the end of a block that is to roll back."""
+
+
+class Unencodable:
+    """An input value the commit cannot encode (D27)."""
+
+    def __repr__(self) -> str:
+        return "Unencodable()"
+
+
+BAD = Unencodable()
+
+
+@contextmanager
+def _cache_dir(backend: str | None) -> Iterator[str | None]:
+    if backend is None:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as path:
+        yield path
+
+
+def _disk_contents(engine: Engine, name: str, kind: str) -> Any:
+    """What a new engine would load for collection ``name``, or None."""
+    snapshot, tail = engine._disk.collection_load(name)  # noqa: SLF001
+    if snapshot is None and not tail:
+        return None
+    if snapshot is not None:
+        log = DiffLog(kind, base_rev=snapshot["base_rev"], base_items=snapshot["items"])
+    else:  # pragma: no cover - a stored log always has its snapshot
+        log = DiffLog(kind)
+    for _rev, diff in tail:
+        log.entries.append(diff)
+    raw = log.contents_at(log.head)
+    if kind == "list":
+        return [value for _uid, value in raw]
+    if kind == "set":
+        return set(raw)
+    return dict(raw)
+
+
+# =============================================================================
+# 1. One engine
+# =============================================================================
+
+
+@dataclass
+class World:
+    """Committed state of the one-engine rig, in plain values."""
+
+    x: Any = 0
+    y: Any = 0
+    w: list[Any] = field(default_factory=lambda: [0, 0, 0])
+    xs: list[int] = field(default_factory=lambda: [1, 2, 3])
+    ss: set[int] = field(default_factory=lambda: {1, 4})
+    dd: dict[int, int] = field(default_factory=lambda: {0: 5})
+    zs: list[int] | None = None  # created by a step, or not yet
+
+    def copy(self) -> World:
+        return copy.deepcopy(self)
+
+
+QUERIES = ("total", "evens", "looped", "tagged", "table", "pick", "everything")
+
+
+def _expect(world: World, name: str, arg: int = 0) -> Any:
+    """What query ``name`` returns over ``world``, in plain Python."""
+    xs = world.xs
+    if name == "total":
+        return sum(xs) + world.x
+    if name == "evens":
+        return [v for v in xs if v % 2 == 0]
+    if name == "looped":
+        return list(xs), (xs[0] if xs else None), len(xs)
+    if name == "tagged":
+        return sorted(v for v in world.ss if v > world.y)
+    if name == "table":
+        return {k: v + world.w[k % 3] for k, v in world.dd.items()}
+    if name == "pick":
+        return xs[arg] if arg < len(xs) else None
+    if name == "late":
+        zs = world.zs or []
+        return sum(zs), list(zs)
+    if name == "cold":
+        return (
+            arg,
+            list(xs),
+            sorted(world.ss),
+            dict(world.dd),
+            (world.x, world.y, *world.w),
+            sum(v * 2 for v in xs),
+            len(xs),
+        )
+    assert name == "everything"
+    return (
+        _expect(world, "total"),
+        _expect(world, "evens"),
+        _expect(world, "tagged"),
+        _expect(world, "table"),
+        _expect(world, "pick", 0),
+        world.w[0],
+        world.y,
+    )
+
+
+class Rig:
+    """An engine with the model's inputs, collections and queries."""
+
+    def __init__(self, engine: Engine, world: World, *, named: bool) -> None:
+        self.engine = engine
+        self.named = named
+
+        @engine.input
+        def x() -> int:
+            return 0
+
+        @engine.input
+        def y() -> int:
+            return 0
+
+        @engine.input
+        def w(k: int) -> int:
+            return 0
+
+        # compact_every is small so commits also compact the log on disk.
+        def name(n: str) -> str | None:
+            return n if named else None
+
+        xs = CascadeList(engine, world.xs, name=name("xs"), compact_every=4)
+        ss = CascadeSet(engine, world.ss, name=name("ss"), compact_every=4)
+        dd = CascadeDict(engine, world.dd, name=name("dd"), compact_every=4)
+
+        @engine.query
+        def total() -> int:
+            return sum(v for v in xs) + x()
+
+        @engine.query
+        def evens() -> list[int]:
+            return [v for v in xs if v % 2 == 0]
+
+        @engine.query
+        def looped() -> Any:
+            out = []
+            for v in xs:
+                out.append(v)
+            return out, (xs[0] if xs else None), len(xs)
+
+        @engine.query
+        def tagged() -> list[int]:
+            floor = y()
+            return sorted(v for v in ss if v > floor)
+
+        @engine.query
+        def table() -> dict[int, int]:
+            out = {}
+            for k, v in dd.items():
+                out[k] = v + w(k % 3)
+            return out
+
+        @engine.query
+        def pick(i: int) -> Any:
+            return xs[i] if i < len(xs) else None
+
+        @engine.query
+        def everything() -> Any:
+            return (total(), evens(), tagged(), table(), pick(0), w(0), y())
+
+        @engine.query
+        def cold(salt: int) -> Any:
+            # Called with a new salt each time, so never cached: its body
+            # runs where it is read (in a block, on a pool thread) and reads
+            # the collections there, plainly and through a pipeline.
+            out = []
+            for v in xs:
+                out.append(v)
+            return (
+                salt,
+                out,
+                sorted(ss),
+                dict(dd),
+                (x(), y(), w(0), w(1), w(2)),
+                sum(v * 2 for v in xs),
+                len(xs),
+            )
+
+        self.x, self.y, self.w = x, y, w
+        self.xs, self.ss, self.dd = xs, ss, dd
+        self.zs: CascadeList | None = None
+        self.queries: dict[str, Any] = {
+            "total": total,
+            "evens": evens,
+            "looped": looped,
+            "tagged": tagged,
+            "table": table,
+            "pick": pick,
+            "everything": everything,
+            "cold": cold,
+        }
+        if world.zs is not None:
+            self.create_late(world.zs)
+
+    def create_late(self, seed: list[int]) -> None:
+        zs = CascadeList(
+            self.engine, seed, name="zs" if self.named else None, compact_every=4
+        )
+
+        @self.engine.query
+        def late() -> Any:
+            return sum(z for z in zs), list(zs)
+
+        self.zs = zs
+        self.queries["late"] = late
+
+    def set_inputs(self, world: World) -> None:
+        self.x.set(world.x)
+        self.y.set(world.y)
+        for k in range(3):
+            self.w.set(k, world.w[k])
+
+    def input_value(self, which: str) -> Any:
+        if which == "x":
+            return self.x()
+        if which == "y":
+            return self.y()
+        return self.w(int(which[1:]))
+
+    def call(self, name: str, arg: int, **kwargs: Any) -> Any:
+        query = self.queries[name]
+        if name in ("pick", "cold"):
+            return query(arg, **kwargs)
+        return query(**kwargs)
+
+    def submit(self, name: str, arg: int) -> concurrent.futures.Future[Any]:
+        query = self.queries[name]
+        if name in ("pick", "cold"):
+            return self.engine.submit(query, arg)
+        return self.engine.submit(query)
+
+    def contents(self) -> World:
+        """The collection objects as plain values (inputs left at zero)."""
+        return World(
+            xs=list(self.xs),
+            ss=set(self.ss),
+            dd=dict(self.dd),
+            zs=None if self.zs is None else list(self.zs),
+        )
+
+    def heads(self) -> dict[str, int]:
+        heads = {c: getattr(self, c)._core.log.head for c in ("xs", "ss", "dd")}  # noqa: SLF001
+        if self.zs is not None:
+            heads["zs"] = self.zs._core.log.head  # noqa: SLF001
+        return heads
+
+
+VALUES = st.integers(min_value=-2, max_value=9)
+INDEX = st.integers(min_value=0, max_value=4)
+KEYS = st.integers(min_value=0, max_value=3)
+ARG = st.integers(min_value=0, max_value=2)
+
+LIST_STEP = st.one_of(
+    st.tuples(st.just("append"), VALUES),
+    st.tuples(st.just("extend"), st.lists(VALUES, max_size=2)),
+    st.tuples(st.just("insert"), INDEX, VALUES),
+    st.tuples(st.just("setitem"), INDEX, VALUES),
+    st.tuples(st.just("delitem"), INDEX),
+    st.tuples(st.just("pop")),
+    st.tuples(st.just("remove"), VALUES),
+    st.tuples(st.just("clear")),
+)
+SET_STEP = st.tuples(st.sampled_from(("add", "discard")), VALUES)
+DICT_STEP = st.one_of(
+    st.tuples(st.just("put"), KEYS, VALUES),
+    st.tuples(st.just("delkey"), KEYS),
+)
+INPUT_STEP = st.one_of(
+    st.tuples(st.just("set"), st.sampled_from(("x", "y", "w0", "w1", "w2")), VALUES),
+    st.tuples(st.just("set"), st.sampled_from(("x", "y", "w0", "w1", "w2")), VALUES),
+    st.tuples(st.just("bad"), st.sampled_from(("x", "w1"))),
+)
+READ_STEP = st.one_of(
+    st.tuples(st.sampled_from(("read", "submit", "snapshot")), st.just("cold"), ARG),
+    st.tuples(st.just("read"), st.sampled_from((*QUERIES, "late")), ARG),
+    st.tuples(st.just("read_input"), st.sampled_from(("x", "y", "w0", "w1", "w2"))),
+    st.tuples(st.just("submit"), st.sampled_from((*QUERIES, "late")), ARG),
+    st.tuples(st.just("snapshot"), st.sampled_from((*QUERIES, "late")), ARG),
+)
+OTHER_STEP = st.one_of(
+    st.tuples(st.just("create"), st.lists(VALUES, max_size=3)),
+    st.tuples(st.just("zappend"), VALUES),
+    st.tuples(st.just("compact"), st.sampled_from(("xs", "ss", "dd", "zs"))),
+    st.tuples(st.just("compact_memory"), st.sampled_from(("xs", "dd"))),
+    st.tuples(st.just("badval")),
+    st.tuples(st.just("nested")),
+)
+STEP = st.one_of(LIST_STEP, SET_STEP, DICT_STEP, INPUT_STEP, READ_STEP, OTHER_STEP)
+SEGMENT = st.one_of(
+    st.tuples(st.just("tx"), st.lists(STEP, max_size=8), st.just("commit")),
+    st.tuples(st.just("tx"), st.lists(STEP, max_size=8), st.just("raise")),
+    st.tuples(st.just("plain"), st.lists(STEP, max_size=3)),
+)
+PROGRAM = st.lists(SEGMENT, min_size=1, max_size=6)
+
+
+def _change_list(xs: list[Any], step: tuple[Any, ...]) -> bool | None:
+    """Apply a list step to ``xs`` (a plain list or a CascadeList).
+
+    Returns whether it records a change (moves the log), or None when the
+    step does not apply to the current contents and was skipped.
+    """
+    op = step[0]
+    n = len(xs)
+    if op == "append":
+        xs.append(step[1])
+        return True
+    if op == "extend":
+        xs.extend(step[1])
+        return bool(step[1])
+    if op == "insert":
+        xs.insert(step[1], step[2])
+        return True
+    if op == "setitem":
+        if step[1] >= n:
+            return None
+        xs[step[1]] = step[2]
+        return True
+    if op == "delitem":
+        if step[1] >= n:
+            return None
+        del xs[step[1]]
+        return True
+    if op == "pop":
+        if not n:
+            return None
+        xs.pop()
+        return True
+    if op == "remove":
+        if step[1] not in xs:
+            return None
+        xs.remove(step[1])
+        return True
+    assert op == "clear"
+    xs.clear()
+    return bool(n)
+
+
+LIST_OPS = {
+    "append",
+    "extend",
+    "insert",
+    "setitem",
+    "delitem",
+    "pop",
+    "remove",
+    "clear",
+}
+
+
+def _change(target: Any, step: tuple[Any, ...]) -> bool | None:
+    """Apply a collection step to ``target`` (a Rig's objects or a World)."""
+    op = step[0]
+    if op in LIST_OPS:
+        return _change_list(target.xs, step)
+    if op == "add":
+        if step[1] in target.ss:
+            target.ss.add(step[1])
+            return False
+        target.ss.add(step[1])
+        return True
+    if op == "discard":
+        present = step[1] in target.ss
+        target.ss.discard(step[1])
+        return present
+    if op == "put":
+        target.dd[step[1]] = step[2]
+        return True
+    if op == "delkey":
+        if step[1] not in target.dd:
+            return None
+        del target.dd[step[1]]
+        return True
+    assert op == "zappend"
+    if target.zs is None:
+        return None
+    target.zs.append(step[1])
+    return True
+
+
+COLLECTION_OPS = LIST_OPS | {"add", "discard", "put", "delkey", "zappend"}
+KINDS = {"xs": "list", "ss": "set", "dd": "dict", "zs": "list"}
+
+
+def _same_contents(rig: Rig, world: World) -> None:
+    assert list(rig.xs) == world.xs
+    assert set(rig.ss) == world.ss
+    assert list(rig.dd.items()) == list(world.dd.items())
+    if world.zs is None:
+        assert rig.zs is None
+    else:
+        assert rig.zs is not None
+        assert list(rig.zs) == world.zs
+
+
+def _input_of(world: World, which: str) -> Any:
+    if which in ("x", "y"):
+        return getattr(world, which)
+    return world.w[int(which[1:])]
+
+
+def _set_input_of(world: World, which: str, value: Any) -> None:
+    if which in ("x", "y"):
+        setattr(world, which, value)
+    else:
+        world.w[int(which[1:])] = value
+
+
+class OneEngine:
+    """Runs a generated program on a Rig and checks it against a World."""
+
+    def __init__(self, rig: Rig, world: World) -> None:
+        self.rig = rig
+        self.world = world  # committed
+        self.revision = rig.engine.revision
+        self.salt = 100  # the next argument for ``cold``, a key never read
+
+    # --- checks -------------------------------------------------------------
+
+    def check_reads(self, world: World) -> None:
+        rig = self.rig
+        for name in QUERIES:
+            for arg in (0, 2) if name == "pick" else (0,):
+                assert rig.call(name, arg) == _expect(world, name, arg), name
+        if rig.zs is not None:
+            assert rig.call("late", 0) == _expect(world, "late")
+        for which in ("x", "y", "w0", "w1", "w2"):
+            assert rig.input_value(which) == _input_of(world, which)
+
+    def check_disk(self, world: World) -> None:
+        if not self.rig.named:
+            return
+        engine = self.rig.engine
+        assert _disk_contents(engine, "xs", "list") == world.xs
+        assert _disk_contents(engine, "ss", "set") == world.ss
+        on_disk = _disk_contents(engine, "dd", "dict")
+        assert on_disk == world.dd
+        zs = _disk_contents(engine, "zs", "list")
+        # A list created in a block that rolled back has no record until
+        # its first change; read through a new engine it is empty either way.
+        assert (zs or []) == (world.zs or [])
+
+    def check_committed(self) -> None:
+        rig = self.rig
+        assert rig.engine.revision == self.revision
+        _same_contents(rig, self.world)
+        self.check_reads(self.world)
+        self.check_disk(self.world)
+
+    # --- steps --------------------------------------------------------------
+
+    def step(self, step: tuple[Any, ...], block: Block | None) -> None:
+        """Run one step; ``block`` is the open transaction's bookkeeping."""
+        rig = self.rig
+        op = step[0]
+        # What reads see: the committed state, in a block and out of one.
+        seen = self.world
+        if op in ("read", "submit", "snapshot") and step[1] == "cold":
+            self.salt += 1
+            step = (op, "cold", self.salt)
+        if op in COLLECTION_OPS:
+            target = block.staged if block is not None else self.world
+            if op == "zappend" and target.zs is None:
+                return
+            if op in LIST_OPS and _change_list(list(target.xs), step) is None:
+                return
+            if op == "delkey" and step[1] not in target.dd:
+                return
+            emitted = _change(rig, step)
+            assert _change(target, step) == emitted
+            if block is not None:
+                block.emitted |= bool(emitted)
+            elif emitted:
+                self.revision += 1
+        elif op == "set" or op == "bad":
+            which = step[1]
+            value = BAD if op == "bad" else step[2]
+            handle_args: tuple[Any, ...] = (
+                () if which in ("x", "y") else (int(which[1:]),)
+            )
+            handle = {"x": rig.x, "y": rig.y}.get(which, rig.w)
+            if block is not None:
+                assert handle.set(*handle_args, value) is None  # queued
+                block.queued[which] = value
+            elif value is BAD:
+                with pytest.raises(UnencodableValueError):
+                    handle.set(*handle_args, value)
+            else:
+                handle.set(*handle_args, value)
+                if _input_of(self.world, which) != value:
+                    _set_input_of(self.world, which, value)
+                    self.revision += 1
+        elif op == "read":
+            if step[1] == "late" and rig.zs is None:
+                return
+            assert rig.call(step[1], step[2]) == _expect(seen, step[1], step[2])
+        elif op == "read_input":
+            assert rig.input_value(step[1]) == _input_of(seen, step[1])
+        elif op == "submit":
+            if step[1] == "late" and rig.zs is None:
+                return
+            future = rig.submit(step[1], step[2])
+            assert future.result(TIMEOUT) == _expect(seen, step[1], step[2])
+        elif op == "snapshot":
+            if step[1] == "late" and rig.zs is None:
+                return
+            snap = rig.engine.snapshot()
+            expected = _expect(seen, step[1], step[2])
+            try:
+                assert rig.call(step[1], step[2], snapshot=snap) == expected
+            except BaseException:
+                snap.release()
+                raise
+            if block is not None:
+                # Read again after the block, then released.
+                block.snapshots.append((snap, step[1], step[2], expected))
+            else:
+                snap.release()
+        elif op == "create":
+            if rig.zs is not None:
+                return
+            rig.create_late(list(step[1]))
+            if block is not None:
+                block.staged.zs = list(step[1])
+                block.created = True
+                block.emitted = True
+            else:
+                self.world.zs = list(step[1])
+                self.revision += 2 if step[1] else 1
+        elif op == "compact":
+            coll = getattr(rig, step[1])
+            if coll is not None:
+                coll.compact()
+        elif op == "compact_memory":
+            getattr(rig, step[1])._core.compact_memory()  # noqa: SLF001
+        elif op == "badval":
+            if not rig.named:
+                return
+            with pytest.raises(PersistentCacheError, match="cannot be persisted"):
+                rig.xs.append(BAD)
+        else:
+            assert op == "nested"
+            inner = rig.engine.transaction()
+            if block is not None:
+                with pytest.raises(RuntimeError, match="Nested"):
+                    with inner:
+                        raise AssertionError("must not run")  # pragma: no cover
+            else:
+                with inner:
+                    pass
+        if block is not None:
+            # The objects show the block's changes; nothing else moves.
+            _same_contents(rig, block.staged)
+            assert rig.engine.revision == self.revision
+            self.check_disk(self.world)
+
+    def run_block(self, steps: list[tuple[Any, ...]], end: str) -> None:
+        rig = self.rig
+        block = Block(staged=self.world.copy())
+        uids = list(rig.xs._uids)  # noqa: SLF001
+        heads = rig.heads()
+        # The block fails at commit when an input's last value is bad.
+        try:
+            with rig.engine.transaction():
+                for step in steps:
+                    self.step(step, block)
+                if end == "raise":
+                    raise Abort
+            outcome = "commit"
+        except Abort:
+            outcome = "rollback"
+        except UnencodableValueError:
+            outcome = "failed"
+        bad = any(value is BAD for value in block.queued.values())
+        expected = "rollback" if end == "raise" else ("failed" if bad else "commit")
+        assert outcome == expected
+        event(f"block: {outcome}")
+        if outcome == "commit":
+            after = block.staged
+            changed = block.emitted
+            for which, value in block.queued.items():
+                if _input_of(after, which) != value:
+                    _set_input_of(after, which, value)
+                    changed = True
+            self.world = after
+            self.revision += 1 if changed else 0
+        else:
+            # Nothing of the block is left: a list created in it is empty.
+            if block.created:
+                self.world.zs = []
+                heads["zs"] = 0
+            assert rig.xs._uids == uids  # noqa: SLF001
+            assert rig.heads() == heads
+        self.check_committed()
+        for snap, name, arg, value in block.snapshots:
+            with snap:
+                assert rig.call(name, arg, snapshot=snap) == value
+
+    def run(self, program: list[tuple[Any, ...]]) -> None:
+        self.check_committed()
+        for segment in program:
+            if segment[0] == "tx":
+                self.run_block(segment[1], segment[2])
+            else:
+                for step in segment[1]:
+                    self.step(step, None)
+                self.check_committed()
+
+
+@dataclass
+class Block:
+    staged: World
+    queued: dict[str, Any] = field(default_factory=dict)
+    emitted: bool = False
+    created: bool = False
+    snapshots: list[Any] = field(default_factory=list)
+
+
+def _fresh_reads(world: World) -> dict[tuple[str, int], Any]:
+    """Every query's value on a new in-memory engine built from ``world``."""
+    engine = Engine()
+    try:
+        rig = Rig(engine, world, named=False)
+        rig.set_inputs(world)
+        out = {}
+        for name in rig.queries:
+            for arg in (0, 2) if name == "pick" else (0,):
+                out[name, arg] = rig.call(name, arg)
+        return out
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", [None, *BACKENDS], ids=["memory", *BACKENDS])
+@_settings(60)
+@given(program=PROGRAM)
+def test_one_engine_transaction_programs(backend: str | None, program: Any) -> None:
+    with _cache_dir(backend) as path:
+        kwargs = {} if path is None else {"cache_dir": path, "cache_backend": backend}
+        engine = Engine(**kwargs)
+        try:
+            runner = OneEngine(Rig(engine, World(), named=path is not None), World())
+            runner.run(program)
+            world = runner.world
+            reads = {
+                (name, arg): runner.rig.call(name, arg)
+                for name in runner.rig.queries
+                for arg in ((0, 2) if name == "pick" else (0,))
+            }
+        finally:
+            engine.shutdown()
+        # Results equal those of a new engine built from the model.
+        assert reads == _fresh_reads(world)
+        if path is None:
+            return
+        # Reopened on the directory: the collections are what the model
+        # committed, and the results (many of them cached on disk) are too.
+        reopened = Engine(**kwargs)
+        try:
+            seed = World(xs=[], ss=set(), dd={}, zs=None if world.zs is None else [])
+            rig = Rig(reopened, seed, named=True)
+            rig.set_inputs(world)
+            _same_contents(rig, world)
+            for (name, arg), value in reads.items():
+                assert rig.call(name, arg) == value, name
+        finally:
+            reopened.shutdown()
+
+
+# Found by test_one_engine_transaction_programs on its first run.
+
+
+@pytest.mark.parametrize("commit", [True, False], ids=["commit", "rollback"])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_compact_in_a_block_writes_only_committed_changes(
+    tmp_path: Any, backend: str, commit: bool
+) -> None:
+    # compact() inside a block wrote a snapshot of the log's head, the
+    # block's uncommitted changes included. A rollback left them on disk,
+    # and a commit then appended the same diffs again on top of the
+    # snapshot: a new engine read [1, 3] as [1, 3, 2] after a rollback and
+    # [1, 2, 3] as [1, 2, 2, 3] after a commit.
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    xs = CascadeList(engine, [1], name="xs")
+    try:
+        with engine.transaction():
+            xs.append(2)
+            xs.compact()
+            assert _disk_contents(engine, "xs", "list") == [1]
+            if not commit:
+                raise Abort
+    except Abort:
+        pass
+    expected = [1, 2] if commit else [1]
+    assert list(xs) == expected
+    assert _disk_contents(engine, "xs", "list") == expected
+    xs.append(3)
+    engine.shutdown()
+    reopened = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        assert list(CascadeList(reopened, name="xs")) == [*expected, 3]
+    finally:
+        reopened.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_compact_of_a_collection_created_in_a_rolled_back_block_records_nothing(
+    tmp_path: Any, backend: str
+) -> None:
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        with pytest.raises(Abort):
+            with engine.transaction():
+                made = CascadeList(engine, [1, 2], name="made")
+                made.compact()
+                raise Abort
+        assert _disk_contents(engine, "made", "list") is None
+        made.compact()  # still nothing committed: still no record
+        assert _disk_contents(engine, "made", "list") is None
+    finally:
+        engine.shutdown()
+    reopened = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        # The name is new: a set may take it, and its seed is used.
+        assert set(CascadeSet(reopened, {5}, name="made")) == {5}
+    finally:
+        reopened.shutdown()
+
+
+# =============================================================================
+# 2. Two engines on one cache_dir
+# =============================================================================
+
+
+class Actor:
+    """A thread that runs the calls it is given, one at a time, in order.
+
+    A transaction entered by a call stays open on the thread for the calls
+    after it, so two engines can each have a block open at once while the
+    test decides the order of every step.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: queue.Queue[Any] = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fn, future = job
+            try:
+                future.set_result(fn())
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+
+    def call(self, fn: Callable[[], Any]) -> Any:
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._jobs.put((fn, future))
+        return future.result(TIMEOUT)
+
+    def stop(self) -> None:
+        self._jobs.put(None)
+        self._thread.join(TIMEOUT)
+
+
+LISTS = ("la", "lb")
+SIDE_QUERIES = ("view", "rows", "both")
+
+
+class Side:
+    """One engine on the shared directory, with two named lists."""
+
+    def __init__(self, path: str, backend: str) -> None:
+        engine = Engine(cache_dir=path, cache_backend=backend)
+
+        @engine.input
+        def x() -> int:
+            return 0
+
+        la = CascadeList(engine, name="la", compact_every=3)
+        lb = CascadeList(engine, name="lb", compact_every=3)
+
+        # The same names in both engines: their results share the disk.
+        @engine.query
+        def view() -> Any:
+            return x(), sum(v for v in la), [v for v in lb]
+
+        @engine.query
+        def rows() -> Any:
+            out = []
+            for v in la:
+                out.append(v)
+            return out, len(lb)
+
+        @engine.query
+        def both() -> Any:
+            return view(), rows()
+
+        self.engine = engine
+        self.x = x
+        self.lists = {"la": la, "lb": lb}
+        self.queries = {"view": view, "rows": rows, "both": both}
+        self.tx: Any = None
+
+
+def _expect_side(x: Any, lists: dict[str, list[int]], name: str) -> Any:
+    view = (x, sum(lists["la"]), list(lists["lb"]))
+    rows = (list(lists["la"]), len(lists["lb"]))
+    return {"view": view, "rows": rows, "both": (view, rows)}[name]
+
+
+_UNSET = object()
+
+
+@dataclass
+class SideModel:
+    """One engine's own copy of each list, as it loaded or wrote it."""
+
+    revision: int
+    lists: dict[str, list[int]]
+    seq: dict[str, int]  # how many commits to each list this copy has seen
+    x: Any = 0
+    writer: dict[str, bool] = field(default_factory=lambda: dict.fromkeys(LISTS, False))
+    staged: dict[str, list[int]] | None = None  # an open block's lists
+    queued: Any = _UNSET  # an open block's last x
+    changed: set[str] = field(default_factory=set)
+
+
+SIDE = st.integers(min_value=0, max_value=1)
+TWO_STEP = st.one_of(
+    st.tuples(st.just("begin"), SIDE),
+    st.tuples(st.just("begin"), SIDE),
+    st.tuples(st.sampled_from(("commit", "raise")), SIDE),
+    st.tuples(st.just("set"), SIDE, VALUES),
+    st.tuples(st.just("bad"), SIDE),
+    st.tuples(st.just("append"), SIDE, st.sampled_from(LISTS), VALUES),
+    st.tuples(st.just("append"), SIDE, st.sampled_from(LISTS), VALUES),
+    st.tuples(st.just("pop"), SIDE, st.sampled_from(LISTS)),
+    st.tuples(st.just("compact"), SIDE, st.sampled_from(LISTS)),
+    st.tuples(st.sampled_from(("read", "submit")), SIDE, st.sampled_from(SIDE_QUERIES)),
+    st.tuples(st.just("reopen"), SIDE),
+    st.tuples(st.just("reopen"), SIDE),
+)
+
+
+class TwoEngines:
+    """Runs a two-engine program, each engine on its own Actor thread."""
+
+    def __init__(self, path: str, backend: str) -> None:
+        self.path = path
+        self.backend = backend
+        self.actors = [Actor(), Actor()]
+        self.sides: list[Side] = []
+        self.models: list[SideModel] = []
+        self.disk: dict[str, list[int]] = {name: [] for name in LISTS}
+        self.disk_seq = dict.fromkeys(LISTS, 0)
+        for i in (0, 1):
+            self.sides.append(self.actors[i].call(lambda: Side(path, backend)))
+            self.models.append(self._fresh_model(i))
+
+    def _fresh_model(self, i: int) -> SideModel:
+        # G3: read x first, so its default is its value. A result reused
+        # from disk reads the default without keeping it, and a set to the
+        # default after that is a change (a new revision, and G6 cancels).
+        assert self.actors[i].call(self.sides[i].x) == 0
+        return SideModel(
+            revision=self.sides[i].engine.revision,
+            lists=copy.deepcopy(self.disk),
+            seq=dict(self.disk_seq),
+        )
+
+    def close(self) -> None:
+        for actor, side in zip(self.actors, self.sides, strict=True):
+            try:
+                actor.call(side.engine.shutdown)
+            finally:
+                actor.stop()
+
+    # --- checks -------------------------------------------------------------
+
+    def check(self) -> None:
+        engine = self.sides[0].engine
+        on_disk = self.actors[0].call(
+            lambda: {name: _disk_contents(engine, name, "list") for name in LISTS}
+        )
+        assert on_disk == self.disk
+        for i in (0, 1):
+            side, model = self.sides[i], self.models[i]
+            shown = model.staged if model.staged is not None else model.lists
+            assert {n: list(c) for n, c in side.lists.items()} == shown
+            assert side.engine.revision == model.revision
+            got = self.actors[i].call(side.queries["both"])
+            assert got == _expect_side(model.x, model.lists, "both")
+
+    # --- steps --------------------------------------------------------------
+
+    def may_write(self, i: int, name: str) -> bool:
+        """G26: this engine holds the list's lock, or can take it."""
+        model, other = self.models[i], self.models[1 - i]
+        if model.writer[name]:
+            return True
+        return not other.writer[name] and self.disk_seq[name] <= model.seq[name]
+
+    def step(self, step: tuple[Any, ...]) -> None:
+        op, i = step[0], step[1]
+        side, model, actor = self.sides[i], self.models[i], self.actors[i]
+        in_block = model.staged is not None
+        if op == "begin":
+            if in_block:
+                return
+            side.tx = side.engine.transaction()
+            actor.call(side.tx.__enter__)
+            model.staged = copy.deepcopy(model.lists)
+            model.queued = _UNSET
+            model.changed = set()
+            if self.models[1 - i].staged is not None:
+                event("blocks open on both engines")
+        elif op in ("commit", "raise"):
+            if not in_block:
+                return
+            self.end_block(i, op == "commit")
+        elif op in ("set", "bad"):
+            value = BAD if op == "bad" else step[2]
+            if in_block:
+                assert actor.call(lambda: side.x.set(value)) is None
+                model.queued = value
+            elif value is BAD:
+                with pytest.raises(UnencodableValueError):
+                    actor.call(lambda: side.x.set(value))
+            else:
+                actor.call(lambda: side.x.set(value))
+                if model.x != value:
+                    model.x = value
+                    model.revision += 1
+        elif op in ("append", "pop"):
+            name = step[2]
+            target = (model.staged if in_block else model.lists)[name]
+            if op == "pop" and not target:
+                return
+            coll = side.lists[name]
+            change = (lambda: coll.append(step[3])) if op == "append" else coll.pop
+            if not self.may_write(i, name):
+                with pytest.raises(PersistentCacheError):
+                    actor.call(change)
+                event("a change refused by G26")
+                return
+            actor.call(change)
+            model.writer[name] = True
+            if op == "append":
+                target.append(step[3])
+            else:
+                target.pop()
+            if in_block:
+                model.changed.add(name)
+            else:
+                self.committed(i, name)
+                model.revision += 1
+        elif op == "compact":
+            name = step[2]
+            coll = side.lists[name]
+            if not self.may_write(i, name):
+                with pytest.raises(PersistentCacheError):
+                    actor.call(coll.compact)
+                return
+            actor.call(coll.compact)
+            model.writer[name] = True
+        elif op in ("read", "submit"):
+            query = side.queries[step[2]]
+            if op == "read":
+                got = actor.call(query)
+            else:
+                got = actor.call(lambda: side.engine.submit(query)).result(TIMEOUT)
+            assert got == _expect_side(model.x, model.lists, step[2])
+        else:
+            assert op == "reopen"
+            if in_block:
+                return
+            actor.call(side.engine.shutdown)
+            event("an engine reopened")
+            self.sides[i] = actor.call(lambda: Side(self.path, self.backend))
+            self.models[i] = self._fresh_model(i)
+        self.check()
+
+    def committed(self, i: int, name: str) -> None:
+        """Engine ``i``'s list ``name`` reached disk."""
+        model = self.models[i]
+        self.disk[name] = list(model.lists[name])
+        self.disk_seq[name] += 1
+        model.seq[name] = self.disk_seq[name]
+
+    def end_block(self, i: int, commit: bool) -> None:
+        side, model, actor = self.sides[i], self.models[i], self.actors[i]
+        tx, side.tx = side.tx, None
+        if not commit:
+            assert actor.call(lambda: tx.__exit__(Abort, Abort(), None)) is None
+        elif model.queued is BAD:
+            with pytest.raises(UnencodableValueError):
+                actor.call(lambda: tx.__exit__(None, None, None))
+        else:
+            actor.call(lambda: tx.__exit__(None, None, None))
+            assert model.staged is not None
+            changed = bool(model.changed)
+            model.lists = model.staged
+            for name in sorted(model.changed):
+                self.committed(i, name)
+            if model.queued is not _UNSET and model.queued != model.x:
+                model.x = model.queued
+                changed = True
+            model.revision += 1 if changed else 0
+        model.staged = None
+        model.queued = _UNSET
+        model.changed = set()
+
+    def run(self, program: list[tuple[Any, ...]]) -> None:
+        self.check()
+        for step in program:
+            self.step(step)
+        for i in (0, 1):
+            if self.models[i].staged is not None:
+                self.end_block(i, commit=True)
+                self.check()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@_settings(40)
+@given(program=st.lists(TWO_STEP, min_size=8, max_size=40), x=VALUES)
+def test_two_engines_on_one_cache_dir(backend: str, program: Any, x: int) -> None:
+    with _cache_dir(backend) as path:
+        assert path is not None
+        run = TwoEngines(path, backend)
+        try:
+            run.run(program)
+        finally:
+            run.close()
+        # A new engine restores what the model put on disk, and its results
+        # (read from the disk the other two wrote) are those of its inputs.
+        third = Side(path, backend)
+        try:
+            assert {n: list(c) for n, c in third.lists.items()} == run.disk
+            for name in SIDE_QUERIES:
+                assert third.queries[name]() == _expect_side(0, run.disk, name)
+            third.x.set(x)
+            for name in SIDE_QUERIES:
+                assert third.queries[name]() == _expect_side(x, run.disk, name)
+        finally:
+            third.engine.shutdown()
+
+
+# =============================================================================
+# 3. submit and reader threads while blocks open, commit and roll back
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Flat:
+    """A committed state of the submit rig."""
+
+    x: Any = 0
+    y: Any = 0
+    xs: tuple[int, ...] = (1, 2)
+    ss: frozenset[int] = frozenset({1})
+
+
+FLAT_QUERIES = ("total", "combo", "slow", "fresh")
+
+
+def _expect_flat(state: Flat, name: str) -> Any:
+    total = sum(state.xs) + state.x
+    if name == "total":
+        return total
+    if name == "combo":
+        return state.x, state.y, sorted(state.ss), len(state.xs)
+    if name == "slow":
+        return state.x, total, sorted(state.ss), state.y
+    if name == "fresh":
+        return state.x, list(state.xs), sorted(state.ss), state.y, sum(state.xs)
+    assert name == "gated"
+    return state.x, sum(state.xs), state.y, sorted(state.ss)
+
+
+class History:
+    """Every state the writer has committed or is committing, in order.
+
+    The writer publishes a state before the change that makes it, and
+    settles it once the change has returned. A reader that starts at
+    ``start()`` and ends at ``end()`` may see any state between the two.
+    """
+
+    def __init__(self, first: Flat) -> None:
+        self._lock = threading.Lock()
+        self.states = [first]
+        self._settled = 0
+
+    def start(self) -> int:
+        with self._lock:
+            return self._settled
+
+    def end(self) -> int:
+        with self._lock:
+            return len(self.states) - 1
+
+    def publish(self, state: Flat) -> None:
+        with self._lock:
+            self.states.append(state)
+
+    def settle(self) -> None:
+        with self._lock:
+            self._settled = len(self.states) - 1
+
+    def values(self, name: str, lo: int, hi: int) -> list[Any]:
+        return [_expect_flat(s, name) for s in self.states[lo : hi + 1]]
+
+
+class SubmitRig:
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+        self.gates: dict[int, threading.Event] = {}
+        gates = self.gates
+
+        @engine.input
+        def x() -> int:
+            return 0
+
+        @engine.input
+        def y() -> int:
+            return 0
+
+        xs = CascadeList(engine, [1, 2])
+        ss = CascadeSet(engine, {1})
+
+        @engine.query
+        def total() -> int:
+            return sum(v for v in xs) + x()
+
+        @engine.query
+        def combo() -> Any:
+            return x(), y(), sorted(ss), len(xs)
+
+        @engine.query
+        def slow() -> Any:
+            # Reads spread out in time, so changes land between them.
+            a = x()
+            time.sleep(0.0003)
+            t = total()
+            time.sleep(0.0003)
+            return a, t, sorted(v for v in ss), y()
+
+        @engine.query
+        def gated(token: int) -> Any:
+            first = x(), sum(v for v in xs)
+            assert gates[token].wait(TIMEOUT)
+            return (*first, y(), sorted(ss))
+
+        self.x, self.y, self.xs, self.ss = x, y, xs, ss
+
+        @engine.query
+        def fresh(token: int) -> Any:
+            # A new token each call: never cached, so the body runs on the
+            # caller's thread while a block may be open on another.
+            out = []
+            for v in xs:
+                out.append(v)
+            return x(), out, sorted(ss), y(), sum(v for v in xs)
+
+        self.queries = {
+            "total": total,
+            "combo": combo,
+            "slow": slow,
+            "fresh": fresh,
+            "gated": gated,
+        }
+        self._tokens = 0
+        self._token_lock = threading.Lock()
+
+    def args(self, name: str) -> tuple[Any, ...]:
+        """Arguments for a call of ``name``: a new token for ``fresh``."""
+        if name != "fresh":
+            return ()
+        with self._token_lock:
+            self._tokens += 1
+            return (self._tokens,)
+
+
+FLAT_STEP = st.one_of(
+    st.tuples(st.just("set"), st.sampled_from(("x", "y")), VALUES),
+    st.tuples(st.just("bad")),
+    st.tuples(st.just("append"), VALUES),
+    st.tuples(st.just("pop")),
+    st.tuples(st.sampled_from(("add", "discard")), VALUES),
+    st.tuples(st.sampled_from(("read", "submit")), st.sampled_from(FLAT_QUERIES)),
+    st.tuples(st.just("gate")),
+    st.tuples(st.just("release")),
+)
+FLAT_SEGMENT = st.one_of(
+    st.tuples(st.just("tx"), st.lists(FLAT_STEP, max_size=6), st.just("commit")),
+    st.tuples(st.just("tx"), st.lists(FLAT_STEP, max_size=6), st.just("raise")),
+    st.tuples(st.just("plain"), st.lists(FLAT_STEP, max_size=3)),
+)
+
+
+class Reader:
+    """A thread that reads, submits and snapshots until told to stop.
+
+    It records what it saw and the window of states it may have seen; the
+    checks run on the main thread afterwards.
+    """
+
+    def __init__(self, rig: SubmitRig, history: History, seed: int) -> None:
+        self.rig = rig
+        self.history = history
+        self.rng = random.Random(seed)
+        self.stop = threading.Event()
+        self.seen: list[tuple[Any, ...]] = []
+        self.kept: list[tuple[Any, ...]] = []
+        self.error: BaseException | None = None
+        self.ops = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            while not self.stop.is_set():
+                self._once()
+                self.ops += 1
+        except BaseException as exc:  # noqa: BLE001
+            self.error = exc
+
+    def _once(self) -> None:
+        rig, history = self.rig, self.history
+        kind = self.rng.choice(("call", "submit", "keep", "snapshot"))
+        name = self.rng.choice(FLAT_QUERIES)
+        query = rig.queries[name]
+        args = rig.args(name)
+        lo = history.start()
+        if kind == "call":
+            got = query(*args)
+            self.seen.append((name, lo, history.end(), got))
+        elif kind == "snapshot":
+            with rig.engine.snapshot() as snap:
+                got = query(*args, snapshot=snap)
+                time.sleep(0)
+                assert query(*args, snapshot=snap) == got
+            self.seen.append((name, lo, history.end(), got))
+        else:
+            future = rig.engine.submit(query, *args)
+            hi = history.end()
+            if kind == "keep":
+                self.kept.append((name, lo, hi, future))
+                return
+            try:
+                got = future.result(TIMEOUT)
+            except QueryCancelled:
+                got = QueryCancelled
+            self.seen.append((name, lo, hi, got, history.end()))
+
+
+@dataclass
+class Gate:
+    token: int
+    future: concurrent.futures.Future[Any]
+    state: int  # the committed state when it was submitted
+    changed: bool = False
+
+
+class SubmitRun:
+    """The writer: runs a program on the main thread, beside the readers."""
+
+    def __init__(self, rig: SubmitRig) -> None:
+        self.rig = rig
+        self.readers: list[Reader] = []
+        self.state = Flat()
+        self.history = History(self.state)
+        # G3: an input's default becomes its value when first read at the
+        # newest revision. Until then, setting it to the default is a change.
+        assert (rig.x(), rig.y()) == (0, 0)
+        self.revision = rig.engine.revision
+        self.gates: list[Gate] = []
+        self.tokens = 0
+
+    def pace(self) -> None:
+        """Let each reader finish a read, so that reads and steps interleave."""
+        start = [reader.ops for reader in self.readers]
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and any(
+            reader.ops == ops and reader.thread.is_alive()
+            for reader, ops in zip(self.readers, start, strict=True)
+        ):
+            time.sleep(0.0001)
+
+    def publish(self, state: Flat) -> None:
+        self.history.publish(state)
+        for gate in self.gates:
+            gate.changed = True
+
+    def release(self) -> None:
+        gate = self.gates.pop(0)
+        self.rig.gates[gate.token].set()
+        if gate.changed:
+            # G6: an input changed after the submit, so it is cancelled.
+            with pytest.raises(QueryCancelled):
+                gate.future.result(TIMEOUT)
+        else:
+            want = _expect_flat(self.history.states[gate.state], "gated")
+            assert gate.future.result(TIMEOUT) == want
+
+    def change(self, state: Flat, step: tuple[Any, ...]) -> Flat | None:
+        """``state`` after a change step, or None when it does not apply."""
+        op = step[0]
+        if op == "set":
+            return Flat(**{**state.__dict__, step[1]: step[2]})
+        if op == "append":
+            return Flat(state.x, state.y, (*state.xs, step[1]), state.ss)
+        if op == "pop":
+            if not state.xs:
+                return None
+            return Flat(state.x, state.y, state.xs[:-1], state.ss)
+        if op == "add":
+            return Flat(state.x, state.y, state.xs, state.ss | {step[1]})
+        assert op == "discard"
+        return Flat(state.x, state.y, state.xs, state.ss - {step[1]})
+
+    def apply(self, step: tuple[Any, ...]) -> None:
+        rig, op = self.rig, step[0]
+        if op == "set":
+            getattr(rig, step[1]).set(step[2])
+        elif op == "append":
+            rig.xs.append(step[1])
+        elif op == "pop":
+            rig.xs.pop()
+        elif op == "add":
+            rig.ss.add(step[1])
+        else:
+            rig.ss.discard(step[1])
+
+    def step(self, step: tuple[Any, ...], block: dict[str, Any] | None) -> None:
+        rig, op = self.rig, step[0]
+        if op in ("read", "submit"):
+            want = _expect_flat(self.state, step[1])
+            query = rig.queries[step[1]]
+            args = rig.args(step[1])
+            if op == "read":
+                assert query(*args) == want
+            else:
+                assert rig.engine.submit(query, *args).result(TIMEOUT) == want
+        elif op == "gate":
+            if len(self.gates) >= 2:
+                return
+            self.tokens += 1
+            rig.gates[self.tokens] = threading.Event()
+            future = rig.engine.submit(rig.queries["gated"], self.tokens)
+            self.gates.append(Gate(self.tokens, future, self.history.end()))
+        elif op == "release":
+            if self.gates:
+                self.release()
+        elif op == "bad":
+            if block is not None:
+                assert rig.x.set(BAD) is None
+                block["bad"] = True
+            else:
+                with pytest.raises(UnencodableValueError):
+                    rig.x.set(BAD)
+        else:
+            base = block["staged"] if block is not None else self.state
+            after = self.change(base, step)
+            if after is None:
+                return
+            if block is not None:
+                self.apply(step)
+                if op == "set":
+                    block["bad"] = False if step[1] == "x" else block["bad"]
+                # A change to a collection moves its log even when it
+                # cancels out; an input counts only if it ends changed.
+                block["moved"] |= op in ("append", "pop") or (
+                    op in ("add", "discard") and after.ss != base.ss
+                )
+                block["staged"] = after
+                return
+            if after == self.state and op != "append" and op != "pop":
+                self.apply(step)  # a no-op: nothing to publish
+            else:
+                self.publish(after)
+                self.apply(step)
+                self.history.settle()
+                self.state = after
+                self.revision += 1
+        assert rig.engine.revision == self.revision
+        self.pace()
+
+    def run_block(self, steps: list[tuple[Any, ...]], end: str) -> None:
+        block: dict[str, Any] = {"staged": self.state, "moved": False, "bad": False}
+        before = self.state
+        try:
+            with self.rig.engine.transaction():
+                for step in steps:
+                    self.step(step, block)
+                after = block["staged"]
+                inputs_moved = (after.x, after.y) != (before.x, before.y)
+                commits = end == "commit" and not block["bad"]
+                changed = commits and (block["moved"] or inputs_moved)
+                if changed:
+                    self.publish(after)
+                self.pace()  # readers run while the block is open
+                if end == "raise":
+                    raise Abort
+            outcome = "commit"
+        except Abort:
+            outcome = "rollback"
+        except UnencodableValueError:
+            outcome = "failed"
+        expected = (
+            "rollback" if end == "raise" else ("failed" if block["bad"] else "commit")
+        )
+        assert outcome == expected
+        if changed:
+            self.history.settle()
+            self.state = after
+            self.revision += 1
+        assert self.rig.engine.revision == self.revision
+        assert (list(self.rig.xs), set(self.rig.ss)) == (
+            list(self.state.xs),
+            set(self.state.ss),
+        )
+
+    def run(self, program: list[tuple[Any, ...]]) -> None:
+        for segment in program:
+            if segment[0] == "tx":
+                self.run_block(segment[1], segment[2])
+            else:
+                for step in segment[1]:
+                    self.step(step, None)
+            time.sleep(0)
+        while self.gates:
+            self.release()
+        for name in FLAT_QUERIES:
+            got = self.rig.queries[name](*self.rig.args(name))
+            assert got == _expect_flat(self.state, name)
+
+
+def _check_reader(history: History, reader: Reader) -> int:
+    """Check what one reader saw; returns how many values it saw."""
+    if reader.error is not None:
+        raise reader.error
+    last = history.end()
+    for name, lo, hi, *rest in reader.seen:
+        got = rest[0]
+        if got is QueryCancelled:
+            # Only when an input changed after the call was submitted.
+            assert rest[1] > lo, (name, lo, hi)
+            continue
+        assert got in history.values(name, lo, hi), (name, lo, hi, got)
+    for name, lo, hi, future in reader.kept:
+        try:
+            got = future.result(TIMEOUT)
+        except QueryCancelled:
+            assert last > lo, (name, lo, hi)
+            continue
+        assert got in history.values(name, lo, hi), (name, lo, hi, got)
+    return len(reader.seen) + len(reader.kept)
+
+
+@pytest.mark.parametrize("backend", [None, "mdbx"], ids=["memory", "mdbx"])
+@_settings(60)
+@given(
+    program=st.lists(FLAT_SEGMENT, min_size=1, max_size=6),
+    seed=st.integers(min_value=0, max_value=2**32 - 1),
+)
+def test_submit_and_readers_beside_transactions(
+    backend: str | None, program: Any, seed: int
+) -> None:
+    with _cache_dir(backend) as path:
+        kwargs = {} if path is None else {"cache_dir": path, "cache_backend": backend}
+        engine = Engine(**kwargs)
+        rig = SubmitRig(engine)
+        run = SubmitRun(rig)
+        readers = [Reader(rig, run.history, seed + i) for i in range(2)]
+        run.readers = readers
+        try:
+            run.run(program)
+        finally:
+            for gate in run.gates:
+                rig.gates[gate.token].set()
+            for reader in readers:
+                reader.stop.set()
+            for reader in readers:
+                reader.thread.join(TIMEOUT)
+        try:
+            assert not any(reader.thread.is_alive() for reader in readers)
+            seen = sum(_check_reader(run.history, reader) for reader in readers)
+            event(f"reader observations: {min(seen // 25 * 25, 200)}+")
+            windows = sum(
+                1 for r in readers for rec in r.seen + r.kept if rec[2] > rec[1]
+            )
+            event(f"observations spanning a change: {min(windows // 5 * 5, 50)}+")
+            cancelled = sum(
+                1 for r in readers for rec in r.seen if rec[3] is QueryCancelled
+            )
+            event(f"reader submits cancelled: {min(cancelled, 5)}")
+        finally:
+            engine.shutdown()

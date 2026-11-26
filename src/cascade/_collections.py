@@ -779,15 +779,26 @@ class _CollectionCore:
             self.tracked_len = self.base_len(self.owner)
 
     def compact(self) -> None:
-        """Squash the on-disk event log into a single snapshot at the current head."""
+        """Squash the on-disk event log into a snapshot at the committed head.
+
+        Changes made by a transaction that is still open are left out: they
+        are not on disk yet, and its commit appends them after the snapshot.
+        """
         if self.disk is None:
             return
         if not self._writer:
             # Rewrites the log on disk: only the engine that changes it may.
             self._claim_writer()
-        self._unstamped = False  # the snapshot below is the record
-        head = self.log.head
-        items = self.log.contents_at(head)
+        with self.rw:
+            if self._unstamped:
+                # Nothing of it is committed, so there is nothing to compact,
+                # and a record made now would outlive a rollback of the block
+                # that created it (D38). Its first committed change makes one.
+                return
+            # A snapshot of an open block's diffs kept them on disk after a
+            # rollback, and its commit then wrote them a second time on top.
+            head = self._tx_start if self._tx is not None else self.log.head
+            items = self.log.contents_at(head)
         if self.kind == _KIND_LIST:
             items = [list(p) for p in items]
         record = {
