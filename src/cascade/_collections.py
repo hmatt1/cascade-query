@@ -399,7 +399,7 @@ class _CollectionCore:
                 # nothing (G25). Rolled back, it waits for the first change.
                 tx = engine._active_transaction()
                 if tx is None:
-                    self._stamp(checked=True)
+                    self._stamp()
                 else:
                     self._unstamped = True
                     tx.pending_disk.setdefault(self, [])
@@ -551,27 +551,20 @@ class _CollectionCore:
                 "Engine.snapshot() unreleased while it is in use"
             ) from None
 
-    def _stamp(self, *, checked: bool = False) -> None:
+    def _stamp(self) -> None:
         """Write the empty record that fixes this name's kind on disk.
 
-        ``checked`` when the caller has just found no record. A stamp held
-        back by a transaction looks again first: another engine may have
-        recorded the name since, and its record (possibly a compacted
-        snapshot of its contents) is kept. Writing over it lost that
-        engine's data (D41). A record of another kind is refused, as at
-        construction.
+        Only if the name has no record yet, which the disk checks and
+        writes in one transaction. Another engine may record the name at
+        any moment (between this engine's load and its stamp, or before
+        the commit of a transaction that held the stamp back), and its
+        record, possibly a compacted snapshot of its contents, is kept.
+        Writing over it lost that engine's data (D41), also when the stamp
+        looked first in a separate read. A record of another kind is
+        refused, as at construction.
         """
         self._unstamped = False
-        if not checked:
-            snapshot, tail = self.disk.collection_load(self.name)
-            if snapshot is not None and snapshot["kind"] != self.kind:
-                raise PersistentCacheError(
-                    f"persisted collection {self.name!r} is a "
-                    f"{snapshot['kind']}, not a {self.kind}"
-                )
-            if snapshot is not None or tail:
-                return
-        self.disk.collection_snapshot(
+        found = self.disk.collection_stamp(
             self.name,
             {
                 "kind": self.kind,
@@ -579,8 +572,12 @@ class _CollectionCore:
                 "next_uid": 0,
                 "items": [] if self.kind != _KIND_DICT else {},
             },
-            0,
         )
+        if found is not None and found["kind"] != self.kind:
+            raise PersistentCacheError(
+                f"persisted collection {self.name!r} is a "
+                f"{found['kind']}, not a {self.kind}"
+            )
 
     def head_for_current_context(self) -> int:
         """Log head as seen by the active runtime (snapshot-aware dependency read)."""
@@ -779,14 +776,33 @@ class _CollectionCore:
             self.tracked_len = self.base_len(self.owner)
 
     def compact(self) -> None:
-        """Squash the on-disk event log into a single snapshot at the current head."""
+        """Squash the on-disk event log into a single snapshot.
+
+        The snapshot holds what is committed: the log up to the head an open
+        transaction started from, if one holds the collection. Its own diffs
+        reach the disk at its commit; folded into the snapshot they were
+        written twice on commit and kept after a rollback.
+
+        ``rw`` is held from reading the head to writing the snapshot, which
+        deletes every diff up to that head. Without it a writer could
+        append and compact in between, and the older snapshot written last
+        lost that writer's change on disk.
+        """
         if self.disk is None:
             return
+        with self.rw:
+            self._compact_locked()
+
+    def _compact_locked(self) -> None:
         if not self._writer:
             # Rewrites the log on disk: only the engine that changes it may.
             self._claim_writer()
-        self._unstamped = False  # the snapshot below is the record
         head = self.log.head
+        if self._tx_start is not None:
+            if self._unstamped:
+                return  # nothing is committed; the commit writes the record
+            head = self._tx_start
+        self._unstamped = False  # the snapshot below is the record
         items = self.log.contents_at(head)
         if self.kind == _KIND_LIST:
             items = [list(p) for p in items]
