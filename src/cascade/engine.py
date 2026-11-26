@@ -711,6 +711,7 @@ class Engine:
             self._store, disk=self._disk, get_executor=self._ensure_submit_executor
         )
         self._incremental_rt = IncrementalRuntime(self)
+        self._evaluator.in_pipeline = self._incremental_rt.holds_lock
         # Single private probe for invariant-oriented internals.
         self._internals = _EngineInternals(self._store, self._evaluator)
         self._submit_executor: concurrent.futures.ThreadPoolExecutor | None = None

@@ -52,17 +52,51 @@ rules add, all compared with the same plain functions:
   One of them walks through D35 (a fixed-point member whose result was
   dropped, asked for by several threads at once); another holds a
   submitted run while an input changes, which must cancel it (G6).
+
+Since 2026-11-26:
+
+- writers that share: several threads set the same inputs and change the
+  same list and set, a step at a time or in transactions, in the
+  concurrent rule (``shared``) and in a lock-step rule that also stops
+  between the operations of a transaction. ``_serial`` enumerates every
+  order of their steps that agrees with what each writer saw (what each
+  ``pop`` got, which changes were refused because another thread's
+  transaction had changed that collection, the list inside a transaction);
+  the inputs, the list, the set and the revision the engine ends with must
+  be those of one such order, and a live read among them must match a
+  state one passes through;
+- ``submit`` through a held snapshot gives the snapshot's value, alone and
+  among threads, and is cancelled like a live one;
+- the lock step sees every place a thread can wait for another: a run in
+  the engine, the engine's locks (swapped for ``_TrackedLock``), and the
+  helper threads of ``submit`` and ``compute_many``, which take part
+  themselves. It never needs its patience in a correct run, so a wait that
+  long fails the rule, and so does a deadlock (``_Lockstep.watch``);
+- hidden cycles (``W_HEADS``): memoize=False fixed-point heads, sync and
+  async, whose bodies read state the engine does not track (``Hidden``)
+  and a TTL query, with results dropped while they run, on the same
+  thread or another. They reach every fallback of the head that runs once
+  on its cached members (0.4.2). Members are compared only through their
+  head: a memoized member of a memoize=False head keeps the value of the
+  head's last run, which hidden state may have made stale;
+- a pipeline whose stage calls a query that runs a pipeline of its own
+  (``spread``, ``shifted``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import inspect
 import itertools
+import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -70,7 +104,7 @@ from typing import Any
 from unittest import mock
 
 import pytest
-from hypothesis import HealthCheck, settings, strategies as st
+from hypothesis import HealthCheck, Phase, settings, strategies as st
 from hypothesis.stateful import (
     RuleBasedStateMachine,
     initialize,
@@ -81,6 +115,7 @@ from hypothesis.stateful import (
 
 import cascade._collections as collections_module
 import cascade._evaluator as evaluator_module
+import cascade._scheduler as scheduler_module
 from cascade import (
     CascadeList,
     CascadeSet,
@@ -115,7 +150,18 @@ QUERIES = (
     "tagged",
     "loop_head",
     "nloop_head",
+    "shifted",
+    "spread",
+    "wloop_head",
+    "awloop_head",
 )
+# The heads of the cycles whose bodies read hidden state (``Hidden``).
+W_HEADS = ("wloop_head", "awloop_head")
+# Their members, read on their own only right after their cycle converged
+# (``cycle_follows_a_new_reading``): a memoized member of a memoize=False
+# head keeps the value of the head's last run, which hidden state may have
+# made stale.
+W_MEMBERS = ("wloop_member", "wloop_detour", "awloop_member", "awloop_detour")
 # Queries without arguments, and those defined with ``async def``.
 NO_ARGS = (
     "sensor",
@@ -125,16 +171,27 @@ NO_ARGS = (
     "tagged",
     "loop_head",
     "nloop_head",
+    "loop_member",
+    "spread",
+    *W_HEADS,
+    *W_MEMBERS,
 )
-ASYNC_QUERIES = ("achoose", "amix")
+ASYNC_QUERIES = ("achoose", "amix", "awloop_head")
 SYNC_QUERIES = tuple(q for q in QUERIES if q not in ASYNC_QUERIES)
 # compute_many returns values only; a raising call would end the batch.
-MANY_QUERIES = tuple(q for q in QUERIES if q not in ("strict", *ASYNC_QUERIES))
+MANY_QUERIES = tuple(
+    q for q in QUERIES if q not in ("strict", *W_HEADS, *ASYNC_QUERIES)
+)
 # How long a thread of the concurrent rule may take before it counts as hung.
 JOIN_TIMEOUT = 60.0
-# How long a lock-step thread waits for the others to stop before it goes on
-# regardless (a thread blocked somewhere the scheduler cannot see).
-LOCKSTEP_PATIENCE = 2.0
+# How long a lock-step thread may wait for the others to stop. The scheduler
+# sees every place a thread can block on another (``_Lockstep._quiet``), so
+# in a correct run it never waits this long: when it does, the rule fails
+# (``_Lockstep.timeouts``).
+LOCKSTEP_PATIENCE = 10.0
+# How long every thread of a lock-step rule may be blocked on another, none
+# stopped, before the rule fails as deadlocked (``_Lockstep.watch``).
+DEADLOCK_PATIENCE = 2.0
 
 INDEXES = st.integers(min_value=0, max_value=4)
 NODE = st.integers(min_value=0, max_value=NODES - 1)
@@ -199,12 +256,51 @@ DOMAINS = {
     "prune": 2,
 }
 READER = st.tuples(
-    st.sampled_from(("live", "snapshot", "async", "many", "submit")), READS
+    st.sampled_from(("live", "snapshot", "async", "many", "submit", "submit_snapshot")),
+    READS,
 )
 # Which stopped thread of a lock-step rule goes on next, drawn in turn.
-SCHEDULE = st.lists(st.integers(min_value=0, max_value=2), min_size=1, max_size=12)
+SCHEDULE = st.lists(st.integers(min_value=0, max_value=3), min_size=1, max_size=12)
 SYNC_READS = st.lists(
     st.tuples(st.sampled_from(SYNC_QUERIES), INDEXES), min_size=1, max_size=4
+)
+# Readers of the lock-step rules; ``submit`` and ``many`` hand their calls to
+# helper threads, which take part in the lock step as well.
+LOCKSTEP_READER = st.tuples(
+    st.sampled_from(("live", "snapshot", "submit", "submit_snapshot", "many")),
+    SYNC_READS,
+)
+# Writers that share what they change: the same inputs, the same list and
+# the same set, a step at a time or in transactions that commit or roll
+# back. Few values, so that their writes collide.
+SHARED_VALUE = st.integers(min_value=-2, max_value=2)
+SHARED_SET = st.one_of(
+    st.tuples(st.just("mode"), st.integers(min_value=0, max_value=1)),
+    st.tuples(st.just("bias"), SHARED_VALUE),
+    st.tuples(st.just("left"), st.integers(min_value=0, max_value=1), SHARED_VALUE),
+)
+SHARED_CHANGE = st.one_of(
+    SHARED_SET,
+    st.tuples(st.just("append"), SHARED_VALUE),
+    st.tuples(st.just("pop")),
+    st.tuples(st.sampled_from(("tag_add", "tag_discard")), SHARED_VALUE),
+)
+SHARED_STEP = st.one_of(
+    SHARED_CHANGE,
+    st.tuples(
+        st.just("txn"),
+        st.lists(SHARED_CHANGE, min_size=1, max_size=3),
+        st.booleans(),
+    ),
+)
+# Steps of the concurrent rule's writers when they share (``_serial``
+# enumerates their orders, so each writer gets a few).
+SHARED_PLAN = 3
+# What is dropped while a head of a hidden cycle runs: a member, the head's
+# own row, or whatever ``prune`` or ``sweep_unaccessed`` drop.
+IN_RUN_EVICTION = st.one_of(
+    st.tuples(st.just("drop"), st.sampled_from((*W_MEMBERS, *W_HEADS))),
+    EVICTION,
 )
 
 # --- the plain-Python model ---------------------------------------------------
@@ -267,14 +363,45 @@ def plain_tagged(world: World) -> int:
     return len([x for x in world.items if x in world.tags])
 
 
+def plain_fixed_point(shift: int) -> int:
+    """``head = head // 2 + shift``, iterated from the guess 0 until stable.
+
+    It has two fixed points, ``2 * shift`` and ``2 * shift - 1``; iterating
+    from 0 picks one. Those of two shifts never meet, so a stored value that
+    one run on the cached members gives again belongs to that shift.
+    """
+    head = 0
+    while (following := head // 2 + shift) != head:
+        head = following
+    return head
+
+
 def plain_loop_head(world: World) -> int:
     """``loop_head``: iterated from its ``fixed_point=0`` guess until stable."""
     bias = world.get("bias")
     assert bias is not None
-    head = 0
-    while (following := head // 2 + bias) != head:
-        head = following
-    return head
+    return plain_fixed_point(bias)
+
+
+def plain_spread(world: World) -> int:
+    """``spread``: a pipeline whose stage calls ``shifted``, a pipeline too."""
+    return sum(x % 3 + len(world.tags) for x in world.items)
+
+
+@dataclass
+class Hidden:
+    """State the hidden-cycle bodies read that the engine does not track.
+
+    ``drift`` shifts the value, ``detour`` sends the head through another
+    member, and ``fail`` makes it raise. A change to any of them leaves the
+    head's stored row current, so one run on the cached members does not give
+    the stored value (or reaches the head again, or raises), and the head
+    must fall back to iterating from the guess (0.4.2).
+    """
+
+    drift: int = 0
+    detour: bool = False
+    fail: bool = False
 
 
 def plain_noted(world: World, index: int) -> tuple[int, tuple[Any, ...]]:
@@ -304,27 +431,105 @@ class _Abort(Exception):
     pass
 
 
+# How far the revision moves for a step with each verdict (``_changes``).
+_MOVES = {True: (1,), False: (0,), None: (0, 1)}
+_COLLECTION_OF = {
+    "append": "items",
+    "pop": "items",
+    "tag_add": "tags",
+    "tag_discard": "tags",
+}
+
+
+def _collections_of(step: tuple[Any, ...]) -> set[str]:
+    """The collections a writer's step (or transaction) changes."""
+    ops = step[1] if step[0] == "txn" else [step]
+    return {_COLLECTION_OF[op[0]] for op in ops if op[0] in _COLLECTION_OF}
+
+
+# Thread -> the tracked lock it is blocked on (``_TrackedLock``).
+_LOCK_WAITS: dict[int, _TrackedLock] = {}
+
+
+class _TrackedLock:
+    """A re-entrant lock that tells the lock step who holds it and who waits.
+
+    The engine's locks are swapped for these when the machine builds an
+    engine (``_track_locks``): the store's, the pipelines', and each
+    collection's write lock and log lock. A thread blocked on one is still
+    while the thread holding it is (``_Lockstep._quiet``).
+    """
+
+    __slots__ = ("_count", "_inner", "owner")
+
+    def __init__(self) -> None:
+        self._inner = threading.RLock()
+        self._count = 0
+        self.owner: int | None = None
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        inner = self._inner
+        if not inner.acquire(False):
+            if not blocking:
+                return False
+            me = threading.get_ident()
+            _LOCK_WAITS[me] = self
+            try:
+                if not inner.acquire(True, timeout):
+                    return False
+            finally:
+                del _LOCK_WAITS[me]
+        self.owner = threading.get_ident()
+        self._count += 1
+        return True
+
+    __enter__ = acquire
+
+    def release(self) -> None:
+        self._count -= 1
+        if not self._count:
+            self.owner = None
+        self._inner.release()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+    def _is_owned(self) -> bool:
+        return self._inner._is_owned()  # type: ignore[attr-defined]
+
+
 class _Lockstep:
     """Lets one thread at a time run, each until it stops.
 
-    A thread taking part stops at the start of every query body it runs
-    (``checkpoint``). A stopped thread goes on only when every other one is
-    stopped too, waiting for a run in the engine (``waiting_on``), or
-    finished, and of the stopped threads the drawn ``schedule`` picks which.
-    So the interleaving is chosen by the machine, not by the OS. A thread
-    blocked somewhere else (a lock, a future) is seen as running; after
-    ``LOCKSTEP_PATIENCE`` seconds of that the stopped one goes on anyway.
-    Threads that do not take part (``compute_many``'s workers, the pool of
-    ``submit``) are not stopped.
+    A thread taking part stops at the start of every query body it runs, and
+    a writer before each of its steps (``checkpoint``). A stopped thread goes
+    on only when every other one is still, and of the stopped threads the
+    drawn ``schedule`` picks which. So the interleaving is chosen by the
+    machine, not by the OS. A thread is still when it is stopped or finished,
+    or blocked on a thread that is still itself (``_quiet``): waiting for
+    another thread's run in the engine, or for one of the engine's locks.
+    Calls a thread hands to others (``submit``, ``compute_many``) run on
+    helper threads that take part as well, while the thread that waits for
+    them counts as still (``delegating``). A collection another thread's
+    transaction has changed is not a place to block: changing it raises.
+
+    No thread should ever wait ``LOCKSTEP_PATIENCE`` for the others; one that
+    does goes on, and records why in ``timeouts``, which fails the rule.
     """
 
     def __init__(self, engine: Engine, schedule: list[int]) -> None:
         self.store = engine._internals._store  # noqa: SLF001
         self.schedule = itertools.cycle(schedule or [0])
         self.cond = threading.Condition()
-        self.state: dict[int, str] = {}  # thread id -> running, stopped, done
+        # thread id -> running, stopped, delegating or done
+        self.state: dict[int, str] = {}
         self.stopped: list[int] = []  # in the order they stopped
         self.turn: int | None = None
+        # Calls handed to helper threads that have not started yet.
+        self.pending = 0
+        self.timeouts: list[str] = []
+        # Why the others were still when a turn was handed out.
+        self.seen: Counter[str] = Counter()
 
     def join(self) -> None:
         with self.cond:
@@ -336,28 +541,136 @@ class _Lockstep:
             self.state[threading.get_ident()] = "done"
             self.cond.notify_all()
 
-    def _quiet(self, ident: int) -> bool:
-        state = self.state[ident]
-        if state != "running":
-            return True
-        with self.store.lock:
-            return ident in self.store.waiting_on
+    @contextlib.contextmanager
+    def delegating(self) -> Any:
+        """Wait for helper threads, which take part themselves."""
+        me = threading.get_ident()
+        with self.cond:
+            taking_part = self.state.get(me) == "running"
+            if taking_part:
+                self.state[me] = "delegating"
+                self.cond.notify_all()
+        try:
+            yield
+        finally:
+            if taking_part:
+                with self.cond:
+                    self.state[me] = "running"
+                    self.cond.notify_all()
+
+    def helper(self, fn: Any) -> Any:
+        """``fn``, to be run on a helper thread that takes part while it runs."""
+        with self.cond:
+            self.pending += 1
+
+        def run(*args: Any, **kwargs: Any) -> Any:
+            me = threading.get_ident()
+            with self.cond:
+                self.pending -= 1
+                self.state[me] = "running"
+                self.cond.notify_all()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                with self.cond:
+                    self.state[me] = "done"
+                    self.cond.notify_all()
+
+        return run
+
+    def _quiet(self, ident: int, seen: set[int] | None = None) -> str | None:
+        """Why thread ``ident`` cannot move until a stopped one does, or None."""
+        state = self.state.get(ident)
+        if state is not None and state != "running":
+            return state
+        # Running, or not taking part: still only while it waits for a
+        # thread that is still. A cycle of waits never ends (the join
+        # timeout reports it).
+        seen = set() if seen is None else seen
+        if ident in seen:
+            return "deadlocked"
+        seen.add(ident)
+        slot = self.store.waiting_on.get(ident)
+        if slot is not None:
+            return "run" if self._quiet(slot.owner_thread, seen) else None
+        lock = _LOCK_WAITS.get(ident)
+        if lock is not None:
+            owner = lock.owner
+            if owner is not None and owner != ident and self._quiet(owner, seen):
+                return "lock"
+        return None
+
+    def _describe(self) -> str:
+        waits = self.store.waiting_on
+        frames = sys._current_frames()  # noqa: SLF001
+        threads = "\n".join(
+            f"{ident}: {state}, waits for the run of "
+            f"{getattr(waits.get(ident), 'owner_thread', None)}, "
+            f"for the lock of {getattr(_LOCK_WAITS.get(ident), 'owner', None)}, at "
+            + " < ".join(
+                f"{f.name}:{f.lineno}"
+                for f in reversed(traceback.extract_stack(frames[ident])[-6:])
+            )
+            for ident, state in self.state.items()
+            if ident in frames
+        )
+        return f"{threads}\n{self.pending} calls not started"
+
+    def _stuck(self) -> bool:
+        """Whether no thread can move: all still, and none stopped to go on."""
+        with self.cond:
+            if self.pending or self.turn is not None:
+                return False
+            reasons = [self._quiet(t) for t in list(self.state)]
+        return (
+            all(reasons)
+            and "stopped" not in reasons
+            and any(r != "done" for r in reasons)
+        )
+
+    def watch(self, threads: list[threading.Thread]) -> str | None:
+        """Wait for ``threads``; describe a deadlock if they fall into one.
+
+        Every thread blocked on another that is blocked too, with none
+        stopped at a checkpoint that could be handed the turn, for
+        ``DEADLOCK_PATIENCE`` on end: none of them will ever move again.
+        """
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        stuck_since = None
+        while time.monotonic() < deadline:
+            alive = [t for t in threads if t.is_alive()]
+            if not alive:
+                return None
+            alive[0].join(0.01)
+            if not self._stuck():
+                stuck_since = None
+            elif stuck_since is None:
+                stuck_since = time.monotonic()
+            elif time.monotonic() - stuck_since > DEADLOCK_PATIENCE:
+                return self._describe()
+        return None
 
     def checkpoint(self) -> None:
         me = threading.get_ident()
         with self.cond:
-            if self.state.get(me) != "running":
+            if self.state.get(me) != "running" or self.timeouts:
                 return
             self.state[me] = "stopped"
             self.stopped.append(me)
             deadline = time.monotonic() + LOCKSTEP_PATIENCE
             while self.turn != me:
-                if self.turn is None and all(self._quiet(t) for t in self.state):
-                    # Everyone is still: hand the turn to a drawn stopped one.
-                    self.turn = self.stopped[next(self.schedule) % len(self.stopped)]
-                    self.cond.notify_all()
-                    continue
+                if self.turn is None and not self.pending:
+                    reasons = [self._quiet(t) for t in list(self.state)]
+                    if all(reasons):
+                        # Everyone is still: hand the turn to a drawn stopped one.
+                        self.seen.update(r for r in reasons if r != "stopped")
+                        self.turn = self.stopped[
+                            next(self.schedule) % len(self.stopped)
+                        ]
+                        self.cond.notify_all()
+                        continue
                 if time.monotonic() > deadline:
+                    self.timeouts.append(self._describe())
                     break
                 self.cond.wait(0.001)
             if self.turn == me:
@@ -365,6 +678,37 @@ class _Lockstep:
             self.stopped.remove(me)
             self.state[me] = "running"
             self.cond.notify_all()
+
+
+class _ThreadPerTask(concurrent.futures.Executor):
+    """Runs each submitted call on a thread of its own, in the lock step."""
+
+    def __init__(self, lockstep: _Lockstep) -> None:
+        self.lockstep = lockstep
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        task = self.lockstep.helper(fn)
+
+        def run() -> None:
+            future.set_running_or_notify_cancel()
+            try:
+                future.set_result(task(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001  (handed to the caller)
+                future.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+        return future
+
+
+def _track_locks(engine: Engine, *collections: Any) -> None:
+    """Swap the engine's locks for ``_TrackedLock``s before anything uses them."""
+    engine._internals._store.lock = _TrackedLock()  # noqa: SLF001
+    engine._incremental_rt._lock = _TrackedLock()  # noqa: SLF001
+    for collection in collections:
+        core = collection._core  # noqa: SLF001
+        core.rw = _TrackedLock()
+        core.log.lock = _TrackedLock()
 
 
 class EngineStateMachine(RuleBasedStateMachine):
@@ -388,6 +732,10 @@ class EngineStateMachine(RuleBasedStateMachine):
         # body passes through ``_checkpoint`` first.
         self.lockstep: _Lockstep | None = None
         self.hold: Any = None
+        # Called at the start of every query body, on any thread
+        # (``evict_while_a_head_runs``).
+        self.inside: Any = None
+        self.hidden = Hidden()
         self.loop = asyncio.new_event_loop()
         self._patches = [
             mock.patch.object(evaluator_module, "time", self.clock),
@@ -528,6 +876,65 @@ class EngineStateMachine(RuleBasedStateMachine):
             checkpoint("nloop_member")
             return nloop_head() // 2
 
+        # The same cycle again, whose head also reads state the engine does
+        # not track (``Hidden``) and a TTL query. A run on the cached members
+        # then need not give the stored value, may reach the head again
+        # through ``wloop_detour``, may raise, or may find the row expired:
+        # each must fall back to iterating from the guess (0.4.2).
+        hidden = self.hidden
+
+        @engine.query(name="wloop_head", fixed_point=0, memoize=False)
+        def wloop_head() -> int:
+            checkpoint("wloop_head")
+            member = wloop_detour() if hidden.detour else wloop_member()
+            if hidden.fail:
+                raise ValueError("w")
+            return member + bias() + hidden.drift + sensor()
+
+        @engine.query(name="wloop_member")
+        def wloop_member() -> int:
+            checkpoint("wloop_member")
+            return wloop_head() // 2
+
+        @engine.query(name="wloop_detour")
+        def wloop_detour() -> int:
+            checkpoint("wloop_detour")
+            return wloop_head() // 2
+
+        @engine.query(name="awloop_head", fixed_point=0, memoize=False)
+        async def awloop_head() -> int:
+            checkpoint("awloop_head")
+            if hidden.detour:
+                member = await awloop_detour()
+            else:
+                member = await awloop_member()
+            if hidden.fail:
+                raise ValueError("w")
+            return member + bias() + hidden.drift + sensor()
+
+        @engine.query(name="awloop_member")
+        async def awloop_member() -> int:
+            checkpoint("awloop_member")
+            return (await awloop_head()) // 2
+
+        @engine.query(name="awloop_detour")
+        async def awloop_detour() -> int:
+            checkpoint("awloop_detour")
+            return (await awloop_head()) // 2
+
+        # A pipeline whose stage calls a query that runs a pipeline of its
+        # own: a thread inside ``spread`` holds the pipelines' lock while it
+        # waits for ``shifted``.
+        @engine.query(name="shifted")
+        def shifted(index: int) -> int:
+            checkpoint("shifted")
+            return index + len([t for t in tags])
+
+        @engine.query(name="spread")
+        def spread() -> int:
+            checkpoint("spread")
+            return sum(shifted(x % 3) for x in items)
+
         notes = engine.accumulator("notes")
 
         @engine.query(name="strict")
@@ -577,6 +984,18 @@ class EngineStateMachine(RuleBasedStateMachine):
         h.tag_total, h.tagged = tag_total, tagged
         h.loop_head, h.loop_member = loop_head, loop_member
         h.nloop_head, h.nloop_member = nloop_head, nloop_member
+        h.wloop_head, h.wloop_member, h.wloop_detour = (
+            wloop_head,
+            wloop_member,
+            wloop_detour,
+        )
+        h.awloop_head, h.awloop_member, h.awloop_detour = (
+            awloop_head,
+            awloop_member,
+            awloop_detour,
+        )
+        h.shifted, h.spread = shifted, spread
+        _track_locks(engine, items, tags)
         self.engine = engine
         self.h = h
         self.items = items
@@ -594,6 +1013,9 @@ class EngineStateMachine(RuleBasedStateMachine):
         hold = self.hold
         if hold is not None:
             hold(name)
+        inside = self.inside
+        if inside is not None:
+            inside(name)
 
     def _register_scaled(self, variant: int) -> None:
         assert self.engine is not None
@@ -658,6 +1080,10 @@ class EngineStateMachine(RuleBasedStateMachine):
             return {plain_tagged(world)}
         if query in ("loop_head", "nloop_head"):
             return {plain_loop_head(world)}
+        if query == "shifted":
+            return {index + len(world.tags)}
+        if query == "spread":
+            return {plain_spread(world)}
         if query == "loop_member":
             return {plain_loop_head(world) // 2}
         return {value for value, _ in self._outcomes(world, query, index)}
@@ -687,6 +1113,13 @@ class EngineStateMachine(RuleBasedStateMachine):
         if query == "amix":
             second, notes = plain_noted(world, index + 1)
             return {(plain_choose(world, index) - second, notes)}
+        if query in W_HEADS:
+            if self.hidden.fail:
+                return {(("raise", "w"), ())}
+            bias = world.get("bias")
+            assert bias is not None
+            shift = bias + self.hidden.drift
+            return {(plain_fixed_point(shift + v), ()) for v in self._sensor_values()}
         outcomes = {(value, ()) for value in self._expected(world, query, index)}
         if query == "loop_member" and self.max_entries != 10_000:
             # Entered through a member, a cycle whose head has no result
@@ -875,6 +1308,9 @@ class EngineStateMachine(RuleBasedStateMachine):
     def _evict(self, step: tuple[Any, ...]) -> None:
         """Drop results: what a later read returns must not change."""
         assert self.engine is not None
+        if step[0] == "drop":
+            self._drop(step[1], 0)
+            return
         if step[0] == "sweep":
             # Everything not used in roughly the last ``step[1]`` accesses.
             self.engine.sweep_unaccessed(self.engine.access_id - step[1])
@@ -1031,32 +1467,52 @@ class EngineStateMachine(RuleBasedStateMachine):
         return world
 
     def _submit(
-        self, reads: list[tuple[str, int]]
+        self,
+        reads: list[tuple[str, int]],
+        snapshot: Snapshot | None = None,
+        lockstep: _Lockstep | None = None,
     ) -> list[tuple[tuple[str, int], Any]]:
-        """``submit`` every read at once; a cancelled call gives ``cancelled``."""
+        """``submit`` every read at once; a cancelled call gives ``cancelled``.
+
+        In a lock-step rule each call runs on a helper thread that takes part
+        in the lock step, and the caller is still while it waits.
+        """
         assert self.engine is not None
         calls = [(q, i) for q, i in reads if q not in ASYNC_QUERIES]
+        executor = None if lockstep is None else _ThreadPerTask(lockstep)
         pending = []
         for query, index in calls:
             effects: dict[str, list[Any]] = {}
             handle = getattr(self.h, query)
             future = self.engine.submit(
-                handle, *self._args(query, index), effects=effects
+                handle,
+                *self._args(query, index),
+                snapshot=snapshot,
+                effects=effects,
+                executor=executor,
             )
             pending.append((effects, future))
         out = []
-        for call, (effects, future) in zip(calls, pending, strict=True):
-            try:
-                outcome = self._outcome(
-                    effects, lambda f=future: f.result(timeout=JOIN_TIMEOUT)
-                )
-            except QueryCancelled:
-                outcome = ("cancelled",)
-            out.append((call, outcome))
+        waiting = (
+            contextlib.nullcontext() if lockstep is None else lockstep.delegating()
+        )
+        with waiting:
+            for call, (effects, future) in zip(calls, pending, strict=True):
+                try:
+                    outcome = self._outcome(
+                        effects, lambda f=future: f.result(timeout=JOIN_TIMEOUT)
+                    )
+                except QueryCancelled:
+                    outcome = ("cancelled",)
+                out.append((call, outcome))
         return out
 
     def _reader(
-        self, kind: str, reads: list[tuple[str, int]], snapshot: Snapshot | None
+        self,
+        kind: str,
+        reads: list[tuple[str, int]],
+        snapshot: Snapshot | None,
+        lockstep: _Lockstep | None = None,
     ) -> list[tuple[tuple[str, int], Any]]:
         if kind == "async":
 
@@ -1068,37 +1524,324 @@ class EngineStateMachine(RuleBasedStateMachine):
             return list(zip(reads, asyncio.run(gather()), strict=True))
         if kind == "many":
             return list(self._many(reads, snapshot))
-        if kind == "submit":
-            return self._submit(reads)
+        if kind in ("submit", "submit_snapshot"):
+            return self._submit(reads, snapshot, lockstep)
         return [((q, i), self._call(q, i, snapshot)) for q, i in reads]
+
+    # --- writers that share what they change --------------------------------
+
+    def _shared_op(self, op: tuple[Any, ...]) -> Any:
+        """One change by a writer that does not know the state; what it saw."""
+        kind = op[0]
+        if kind == "append":
+            self.items.append(op[1])
+        elif kind == "pop":
+            try:
+                return ("popped", self.items.pop())
+            except IndexError:
+                return ("empty",)
+        elif kind == "tag_add":
+            self.tags.add(op[1])
+        elif kind == "tag_discard":
+            self.tags.discard(op[1])
+        else:
+            name, *args, value = op
+            getattr(self.h, name).set(*args, value=value)
+        return None
+
+    def _shared_step(self, step: tuple[Any, ...], pause: Any = None) -> Any:
+        """One step of a writer beside others that change the same things.
+
+        Gives what ``_serial_step`` needs to know about how it went: whether
+        it was refused (a collection with another transaction's uncommitted
+        changes raises ``RuntimeError``), what each ``pop`` got, and for a
+        transaction whether it committed, whether each operation found its
+        collection changed by the transaction (only from then on can nobody
+        else change it), and the list as it saw it inside. ``pause`` runs
+        between the operations of a transaction, which then stays open while
+        other threads go on.
+        """
+        kind = step[0]
+        if kind in ("sweep", "prune"):
+            self._evict(step)
+            return ("evicted",)
+        if kind != "txn":
+            try:
+                return ("done", self._shared_op(step))
+            except RuntimeError as exc:
+                assert "uncommitted changes" in str(exc), exc
+                return ("refused",)
+        assert self.engine is not None
+        ops, commit = step[1], step[2]
+        seen: list[Any] = []
+        inside = None
+        cores = {"items": self.items._core, "tags": self.tags._core}  # noqa: SLF001
+        try:
+            with self.engine.transaction() as tx:
+                for position, op in enumerate(ops):
+                    if position and pause is not None:
+                        pause()
+                    got = self._shared_op(op)
+                    collection = _COLLECTION_OF.get(op[0])
+                    held = collection is not None and cores[collection]._tx is tx  # noqa: SLF001
+                    seen.append((got, held))
+                # Once it has changed the list, nobody else can until it
+                # ends: what it sees now is what it commits.
+                if cores["items"]._tx is tx:  # noqa: SLF001
+                    inside = list(self.items)
+                if pause is not None:
+                    pause()
+                if not commit:
+                    raise _Abort
+        except _Abort:
+            return ("rolled back",)
+        except RuntimeError as exc:
+            assert "uncommitted changes" in str(exc), exc
+            return ("refused",)
+        return ("committed", seen, inside)
+
+    @staticmethod
+    def _serial_op(world: World, op: tuple[Any, ...], got: Any) -> Any:
+        """Apply ``op`` to ``world`` in place and give its verdict.
+
+        ``Ellipsis`` when what the writer saw (``got``) cannot have happened
+        in this state.
+        """
+        kind = op[0]
+        if kind == "append":
+            world.items.append(op[1])
+            return True
+        if kind == "pop":
+            if got == ("empty",):
+                return ... if world.items else False
+            if not world.items or world.items[-1] != got[1]:
+                return ...
+            world.items.pop()
+            return True
+        if kind == "tag_add":
+            changed = op[1] not in world.tags
+            world.tags.add(op[1])
+            return changed
+        if kind == "tag_discard":
+            changed = op[1] in world.tags
+            world.tags.discard(op[1])
+            return changed
+        name, *args, value = op
+        key = (name, tuple(args))
+        verdict = EngineStateMachine._changes(world, key, value)
+        world.inputs[key] = value
+        return verdict
+
+    def _serial_step(
+        self, world: World, step: tuple[Any, ...], outcome: Any
+    ) -> tuple[World, Any] | None:
+        """The state after ``step`` taken alone at ``world``, and its verdict.
+
+        None when ``outcome`` (what the writer saw) rules this state out. A
+        transaction takes effect as one step when it commits: its inputs
+        then, and its collection changes as they were made, since nobody
+        else can change a collection it has changed until it ends. An
+        operation before the transaction changed that collection changed
+        nothing (a ``pop`` of an empty list, adding a tag already there):
+        it only read the collection, at a time other writers could still
+        change it, so it says nothing about the state at the commit.
+        """
+        if outcome[0] in ("evicted", "refused", "rolled back"):
+            return world, False
+        after = world.copy()
+        if step[0] != "txn":
+            verdict = self._serial_op(after, step, outcome[1])
+            return None if verdict is ... else (after, verdict)
+        _, seen, inside = outcome
+        changed: list[Any] = []
+        for op, (got, held) in zip(step[1], seen, strict=True):
+            if op[0] in _COLLECTION_OF:
+                if not held:
+                    continue
+                verdict = self._serial_op(after, op, got)
+                if verdict is ...:
+                    return None
+                changed.append(verdict)
+            else:
+                name, *args, value = op
+                after.inputs[(name, tuple(args))] = value
+        if inside is not None and after.items != inside:
+            return None
+        # One revision for the whole commit; the last value set wins.
+        changed += [
+            self._changes(world, key, value)
+            for key, value in after.inputs.items()
+            if key not in world.inputs or world.inputs[key] != value
+        ]
+        if any(v is True for v in changed):
+            return after, True
+        return after, (None if any(v is None for v in changed) else False)
+
+    @staticmethod
+    def _world_key(world: World) -> Any:
+        return (
+            tuple(sorted(world.inputs.items(), key=lambda kv: kv[0])),
+            tuple(world.items),
+            tuple(sorted(world.tags)),
+        )
+
+    def _serial(
+        self, base: World, logs: list[list[tuple[tuple[Any, ...], Any]]]
+    ) -> tuple[list[World], dict[Any, World]]:
+        """Every order of the writers' steps that agrees with what they saw.
+
+        Each writer's steps keep their order; between writers any order.
+        Gives every state some order passes through, and the states at the
+        end, each with how far the revision moved to get there (keyed
+        ``(state, moved)``).
+        """
+        frontier: dict[tuple[int, ...], dict[Any, World]] = {
+            (0,) * len(logs): {(self._world_key(base), 0): base}
+        }
+        seen: dict[Any, World] = {self._world_key(base): base}
+        for _ in range(sum(len(log) for log in logs)):
+            following: dict[tuple[int, ...], dict[Any, World]] = {}
+            for position, states in frontier.items():
+                for writer, log in enumerate(logs):
+                    if position[writer] == len(log):
+                        continue
+                    step, outcome = log[position[writer]]
+                    nxt = list(position)
+                    nxt[writer] += 1
+                    bucket = following.setdefault(tuple(nxt), {})
+                    for (_, moved), world in states.items():
+                        taken = self._serial_step(world, step, outcome)
+                        if taken is None:
+                            continue
+                        after, verdict = taken
+                        key = self._world_key(after)
+                        seen.setdefault(key, after)
+                        for step_moved in _MOVES[verdict]:
+                            bucket.setdefault((key, moved + step_moved), after)
+            frontier = following
+        (final,) = frontier.values()
+        return list(seen.values()), final
+
+    def _settle(
+        self, base: World, logs: list[list[tuple[tuple[Any, ...], Any]]], before: int
+    ) -> list[World]:
+        """Check the end state against every serial order; adopt it.
+
+        The writers' steps must have taken effect in some order: the inputs,
+        the list and the set the engine ends with, and how far its revision
+        moved, must be those of one order that agrees with what each writer
+        saw. A refusal must have had a cause: another writer's transaction
+        that changes the same collection. Gives every state an order passes
+        through, which is what a live read may see.
+        """
+        assert self.engine is not None
+        for writer, log in enumerate(logs):
+            for step, outcome in log:
+                if outcome[0] != "refused":
+                    continue
+                theirs = {
+                    collection
+                    for other, other_log in enumerate(logs)
+                    if other != writer
+                    for other_step, _ in other_log
+                    if other_step[0] == "txn"
+                    for collection in _collections_of(other_step)
+                }
+                assert _collections_of(step) & theirs, ("refused", step, logs)
+        worlds, finals = self._serial(base, logs)
+        moved = self.engine.revision - before
+        keys = sorted(
+            {
+                (op[0], tuple(op[1:-1]))
+                for log in logs
+                for step, _ in log
+                for op in (step[1] if step[0] == "txn" else [step])
+                if op[0] not in _COLLECTION_OF and op[0] not in ("sweep", "prune")
+            }
+        )
+        observed = (
+            list(self.items),
+            set(self.tags),
+            [getattr(self.h, name)(*args) for name, args in keys],
+        )
+        matches = [
+            world
+            for (_, world_moved), world in finals.items()
+            if world_moved == moved
+            and (
+                world.items,
+                world.tags,
+                [world.get(name, *args) for name, args in keys],
+            )
+            == observed
+        ]
+        assert matches, ("no serial order ends here", observed, moved, logs)
+        self.world = matches[0]
+        self.revision += moved
+        return worlds
+
+    def _check_reads(self, results: list[Any], worlds: list[World], moved: int) -> None:
+        """Check each reader's results.
+
+        A live read must match one of ``worlds``, a read through a snapshot
+        the snapshot's state; a submitted call may be cancelled only if the
+        revision moved (G6).
+        """
+        for kind, held, reads in results:
+            candidates = worlds if held is None else [held.world]
+            for (query, index), actual in reads:
+                if kind == "many":  # compute_many: the value alone
+                    allowed = {
+                        v for w in candidates for v in self._expected(w, query, index)
+                    }
+                    assert actual in allowed, (query, index, actual, allowed)
+                    continue
+                if actual == ("cancelled",):
+                    assert kind.startswith("submit") and moved > 0, (query, kind)
+                    continue
+                allowed = {
+                    o for w in candidates for o in self._outcomes(w, query, index)
+                }
+                assert actual in allowed, (query, index, actual, allowed, held)
 
     @rule(
         readers=st.lists(READER, min_size=1, max_size=4),
         writers=st.lists(st.lists(WRITER_STEP, max_size=4), min_size=1, max_size=3),
         pick=PICK,
+        shared=st.booleans(),
     )
     def concurrent(
         self,
         readers: list[tuple[str, list[tuple[str, int]]]],
         writers: list[list[tuple[Any, ...]]],
         pick: int,
+        shared: bool,
     ) -> None:
         """Readers on threads of their own beside up to three writers.
 
-        Each writer changes only what it owns (``DOMAINS``), so the state at
-        any moment is some combination of the states the writers passed
-        through, and a live read runs at one revision: it must equal the
-        plain function of one of those combinations, never of half a
-        transaction. A read through a snapshot gives the snapshot's state
-        exactly. A submitted call may be cancelled, only if the revision
-        moved (G6). The engine's own loops are not shared: an async reader
-        runs a loop of its own.
+        Without ``shared`` each writer changes only what it owns
+        (``DOMAINS``), so the state at any moment is some combination of the
+        states the writers passed through, and a live read runs at one
+        revision: it must equal the plain function of one of those
+        combinations, never of half a transaction. With ``shared`` the
+        writers change the same inputs and collections (a few steps each),
+        and the end state and every live read must agree with some order
+        of their steps (``_settle``). A read through a snapshot gives the
+        snapshot's state exactly. A submitted call may be cancelled, only if
+        the revision moved (G6). The engine's own loops are not shared: an
+        async reader runs a loop of its own.
         """
         assert self.engine is not None
         before = self.engine.revision
         base = self.world.copy()
-        plans = [self._plan(steps, w, len(writers)) for w, steps in enumerate(writers)]
+        if shared:
+            plans = [steps[:SHARED_PLAN] for steps in writers]
+        else:
+            plans = [
+                self._plan(steps, w, len(writers)) for w, steps in enumerate(writers)
+            ]
         histories: list[list[World]] = [[base] for _ in plans]
+        logs: list[list[Any]] = [[] for _ in plans]
         verdicts: list[Any] = []
         live = [held for held in self.snapshots if not held.released]
         start = threading.Barrier(len(readers) + len(plans))
@@ -1108,7 +1851,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         def run_reader(slot: int, kind: str, reads: list[tuple[str, int]]) -> None:
             try:
                 held = None
-                if kind == "snapshot" and live:
+                if kind in ("snapshot", "submit_snapshot") and live:
                     held = live[(pick + slot) % len(live)]
                 start.wait(timeout=JOIN_TIMEOUT)
                 snapshot = None if held is None else held.snapshot
@@ -1120,6 +1863,9 @@ class EngineStateMachine(RuleBasedStateMachine):
             try:
                 start.wait(timeout=JOIN_TIMEOUT)
                 for step in plans[writer]:
+                    if shared:
+                        logs[writer].append((step, self._shared_step(step)))
+                        continue
                     world, verdict = self._write(step, histories[writer][-1])
                     histories[writer].append(world)
                     verdicts.append(verdict)
@@ -1143,31 +1889,20 @@ class EngineStateMachine(RuleBasedStateMachine):
             raise failures[0]
 
         moved = self.engine.revision - before
-        worlds = [self._combine(base, parts) for parts in itertools.product(*histories)]
-        for kind, held, reads in results:
-            candidates = worlds if held is None else [held.world]
-            for (query, index), actual in reads:
-                if kind == "many":  # compute_many: the value alone
-                    allowed = {
-                        v for w in candidates for v in self._expected(w, query, index)
-                    }
-                    assert actual in allowed, (query, index, actual, allowed)
-                    continue
-                if actual == ("cancelled",):
-                    assert kind == "submit" and moved > 0, (query, index, kind)
-                    continue
-                allowed = {
-                    o for w in candidates for o in self._outcomes(w, query, index)
-                }
-                assert actual in allowed, (query, index, actual, allowed, held)
-
-        # Each writer's steps follow one another, and every step that
-        # changed something moved the revision by one.
-        must = sum(1 for v in verdicts if v is True)
-        may = sum(1 for v in verdicts if v is None)
-        assert must <= moved <= must + may, (moved, verdicts)
-        self.revision += moved
-        self.world = self._combine(base, tuple(h[-1] for h in histories))
+        if shared:
+            worlds = self._settle(base, logs, before)
+        else:
+            worlds = [
+                self._combine(base, parts) for parts in itertools.product(*histories)
+            ]
+            # Each writer's steps follow one another, and every step that
+            # changed something moved the revision by one.
+            must = sum(1 for v in verdicts if v is True)
+            may = sum(1 for v in verdicts if v is None)
+            assert must <= moved <= must + may, (moved, verdicts)
+            self.revision += moved
+            self.world = self._combine(base, tuple(h[-1] for h in histories))
+        self._check_reads(results, worlds, moved)
         # Nothing the race left behind may be served from here on.
         for _, reads in readers:
             for query, index in reads:
@@ -1184,79 +1919,241 @@ class EngineStateMachine(RuleBasedStateMachine):
             if key in store.memos:
                 store.drop_memo_locked(key)
 
-    def _lockstep(
-        self,
-        plans: list[tuple[_Held | None, list[tuple[str, int]]]],
-        schedule: list[int],
-    ) -> list[list[Any]]:
-        """Run each plan's reads on a thread of its own, in lock step."""
+    def _lockstep(self, programs: list[Any], schedule: list[int]) -> list[Any]:
+        """Run each program on a thread of its own, in lock step.
+
+        A program is called with the ``_Lockstep``. ``compute_many`` runs
+        its calls on helper threads that take part too, while its caller
+        counts as still. Fails if a thread had to wait ``LOCKSTEP_PATIENCE``
+        for the others: the scheduler did not see where one was blocked.
+        """
         assert self.engine is not None
         lockstep = _Lockstep(self.engine, schedule)
-        ready = threading.Barrier(len(plans))
-        results: list[Any] = [None] * len(plans)
+        ready = threading.Barrier(len(programs))
+        results: list[Any] = [None] * len(programs)
         failures: list[BaseException] = []
+        executor = scheduler_module.WorkStealingExecutor
+        submit_indexed, run_tasks = executor.submit_indexed, executor.run
 
-        def run(slot: int, held: _Held | None, reads: list[tuple[str, int]]) -> None:
+        def submit_helper(pool: Any, index: int, fn: Any) -> None:
+            submit_indexed(pool, index, lockstep.helper(fn))
+
+        def run_delegating(pool: Any, size: int) -> list[Any]:
+            with lockstep.delegating():
+                return run_tasks(pool, size)
+
+        def run(slot: int, program: Any) -> None:
             lockstep.join()
             try:
                 ready.wait(timeout=JOIN_TIMEOUT)
-                snapshot = None if held is None else held.snapshot
-                results[slot] = [self._call(q, i, snapshot) for q, i in reads]
+                results[slot] = program(lockstep)
             except BaseException as exc:  # noqa: BLE001  (re-raised below)
                 failures.append(exc)
             finally:
                 lockstep.leave()
 
         threads = [
-            threading.Thread(target=run, args=(slot, held, reads), daemon=True)
-            for slot, (held, reads) in enumerate(plans)
+            threading.Thread(target=run, args=(slot, program), daemon=True)
+            for slot, program in enumerate(programs)
         ]
         self.lockstep = lockstep
         try:
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=JOIN_TIMEOUT)
+            with (
+                mock.patch.object(executor, "submit_indexed", submit_helper),
+                mock.patch.object(executor, "run", run_delegating),
+            ):
+                for thread in threads:
+                    thread.start()
+                deadlock = lockstep.watch(threads)
         finally:
             self.lockstep = None
+        assert deadlock is None, f"deadlocked:\n{deadlock}"
         assert not any(t.is_alive() for t in threads), "a thread hung"
         if failures:
             raise failures[0]
+        assert not lockstep.timeouts, lockstep.timeouts
         return results
 
+    def _lockstep_reader(
+        self, kind: str, held: _Held | None, reads: list[tuple[str, int]]
+    ) -> Any:
+        snapshot = None if held is None else held.snapshot
+
+        def program(lockstep: _Lockstep) -> Any:
+            return (kind, held, self._reader(kind, reads, snapshot, lockstep))
+
+        return program
+
+    def _lockstep_readers(
+        self, readers: list[tuple[str, list[tuple[str, int]]]], pick: int
+    ) -> list[Any]:
+        live = [held for held in self.snapshots if not held.released]
+        programs = []
+        for slot, (kind, reads) in enumerate(readers):
+            held = None
+            if kind in ("snapshot", "submit_snapshot") and live:
+                held = live[(pick + slot) % len(live)]
+            programs.append(self._lockstep_reader(kind, held, reads))
+        return programs
+
+    def _evictor(self, steps: list[tuple[Any, ...]]) -> Any:
+        """A thread that drops results, stopping before each drop."""
+
+        def program(lockstep: _Lockstep) -> None:
+            for step in steps:
+                lockstep.checkpoint()
+                self._evict(step)
+
+        return program
+
     @rule(
-        threads=st.lists(st.tuples(st.booleans(), SYNC_READS), min_size=2, max_size=3),
+        readers=st.lists(LOCKSTEP_READER, min_size=2, max_size=3),
         drops=st.lists(st.tuples(st.sampled_from(SYNC_QUERIES), INDEXES), max_size=3),
+        evictions=st.lists(IN_RUN_EVICTION, max_size=3),
         schedule=SCHEDULE,
         pick=PICK,
     )
     def lockstep_readers(
         self,
-        threads: list[tuple[bool, list[tuple[str, int]]]],
+        readers: list[tuple[str, list[tuple[str, int]]]],
         drops: list[tuple[str, int]],
+        evictions: list[tuple[Any, ...]],
         schedule: list[int],
         pick: int,
     ) -> None:
         """Readers whose interleaving the machine picks, after drops.
 
         Each read must give the plain value at its revision: the head, or
-        the snapshot's (G1, G4, G5).
+        the snapshot's (G1, G4, G5). A reader may ``submit`` (live or through
+        a snapshot) or use ``compute_many``, whose helper threads take part.
+        With ``evictions`` another thread drops results between the readers'
+        steps, so a drop can land while a query runs: a hidden cycle's head
+        then finds a member gone that it was about to read (0.4.2).
         """
+        assert self.engine is not None
+        before = self.engine.revision
         for query, index in drops:
             self._drop(query, index)
-        live = [held for held in self.snapshots if not held.released]
-        plans = []
-        for slot, (through_snapshot, reads) in enumerate(threads):
-            held = (
-                live[(pick + slot) % len(live)] if through_snapshot and live else None
-            )
-            plans.append((held, reads))
-        results = self._lockstep(plans, schedule)
-        for (held, reads), outcomes in zip(plans, results, strict=True):
-            world = self.world if held is None else held.world
-            for (query, index), actual in zip(reads, outcomes, strict=True):
-                expected = self._outcomes(world, query, index)
-                assert actual in expected, (query, index, actual, expected, held)
+        programs = self._lockstep_readers(readers, pick)
+        if evictions:
+            programs.append(self._evictor(evictions))
+        results = self._lockstep(programs, schedule)
+        assert self.engine.revision == before
+        self._check_reads(results[: len(readers)], [self.world], 0)
+
+    @rule(
+        on_items=st.booleans(),
+        mine=SHARED_VALUE,
+        theirs=SHARED_STEP,
+        commit=st.booleans(),
+    )
+    def open_transaction_holds_its_collection(
+        self, on_items: bool, mine: int, theirs: tuple[Any, ...], commit: bool
+    ) -> None:
+        """G25: a collection an open transaction has changed is its own.
+
+        Another thread's change to it, alone or in a transaction of its own,
+        is refused until the block ends; one to anything else goes through.
+        Then the block commits or rolls back, and the state must be the
+        other thread's step followed by the block's change, or the other
+        step alone.
+        """
+        assert self.engine is not None
+        before = self.engine.revision
+        base = self.world.copy()
+        if on_items:
+            op: tuple[Any, ...] = ("append", mine)
+        else:
+            op = ("tag_discard" if mine in base.tags else "tag_add", mine)
+        changed = threading.Event()
+        outcome: list[Any] = []
+
+        def other() -> None:
+            assert changed.wait(JOIN_TIMEOUT)
+            outcome.append(self._shared_step(theirs))
+
+        thread = threading.Thread(target=other, daemon=True)
+        thread.start()
+        inside = None
+        try:
+            with self.engine.transaction():
+                self._shared_op(op)
+                changed.set()
+                thread.join(JOIN_TIMEOUT)
+                if on_items:
+                    inside = list(self.items)
+                if not commit:
+                    raise _Abort
+        except _Abort:
+            pass
+        finally:
+            changed.set()
+            thread.join(JOIN_TIMEOUT)
+        assert not thread.is_alive(), "a thread hung"
+        refused = outcome[0] == ("refused",)
+        assert refused == bool(_collections_of(theirs) & _collections_of(op)), (
+            theirs,
+            outcome,
+        )
+        block = ("txn", [op], commit)
+        done = ("committed", [(None, True)], inside) if commit else ("rolled back",)
+        self._settle(base, [[(theirs, outcome[0])], [(block, done)]], before)
+
+    @rule(
+        writers=st.lists(
+            st.lists(SHARED_STEP, min_size=1, max_size=3), min_size=2, max_size=3
+        ),
+        readers=st.lists(LOCKSTEP_READER, max_size=2),
+        schedule=SCHEDULE,
+        pick=PICK,
+    )
+    def shared_writers(
+        self,
+        writers: list[list[tuple[Any, ...]]],
+        readers: list[tuple[str, list[tuple[str, int]]]],
+        schedule: list[int],
+        pick: int,
+    ) -> None:
+        """Writers that change the same inputs and collections, in lock step.
+
+        Each writer stops before every step and between the operations of a
+        transaction, so the machine picks which writer's step comes next,
+        and a transaction stays open while the others go on: a change to a
+        collection it has changed must be refused. The inputs, the list and
+        the set the engine ends with, and how far its revision moved, must
+        be those of some serial order of the steps that agrees with what
+        each writer saw (``_settle``); a live read of a reader running among
+        them must match a state one such order passes through.
+        """
+        assert self.engine is not None
+        before = self.engine.revision
+        base = self.world.copy()
+
+        def writer(steps: list[tuple[Any, ...]]) -> Any:
+            def program(lockstep: _Lockstep) -> list[Any]:
+                log = []
+                for step in steps:
+                    lockstep.checkpoint()
+                    log.append((step, self._shared_step(step, lockstep.checkpoint)))
+                return log
+
+            return program
+
+        programs = [writer(steps) for steps in writers]
+        programs += self._lockstep_readers(readers, pick)
+        results = self._lockstep(programs, schedule)
+        moved = self.engine.revision - before
+        worlds = self._settle(base, results[: len(writers)], before)
+        self._check_reads(results[len(writers) :], worlds, moved)
+        for query, index in [
+            *(read for _, reads in readers for read in reads),
+            ("choose", 0),
+            ("choose", 1),
+            ("total", 0),
+            ("tagged", 0),
+            ("spread", 0),
+        ]:
+            self._read(query, index, self.world)
 
     @rule(
         bias=SMALL_INTS,
@@ -1280,21 +2177,56 @@ class EngineStateMachine(RuleBasedStateMachine):
         # The first caller asks for the member, as in D35; the others for
         # either.
         callers = ["loop_member", *callers]
-        results = self._lockstep([(None, [(c, 0)]) for c in callers], schedule)
-        for caller, [actual] in zip(callers, results, strict=True):
+        results = self._lockstep(
+            [self._lockstep_reader("live", None, [(c, 0)]) for c in callers],
+            schedule,
+        )
+        for caller, (_, _, [(_, actual)]) in zip(callers, results, strict=True):
             expected = self._outcomes(self.world, caller, 0)
             assert actual in expected, (caller, actual, expected)
         self._read("loop_head", 0, self.world)
         self._read("loop_member", 0, self.world)
 
-    @rule(query=st.sampled_from(SYNC_QUERIES), index=INDEXES)
-    def submitted_run_is_cancelled_by_a_change(self, query: str, index: int) -> None:
+    @rule(value=SMALL_INTS, first=st.booleans(), schedule=SCHEDULE)
+    def pipeline_stage_meets_a_run(
+        self, value: int, first: bool, schedule: list[int]
+    ) -> None:
+        """A pipeline's stage calls a query another thread is running.
+
+        ``spread`` holds the pipelines' lock while its stage calls
+        ``shifted``, and ``shifted`` runs a pipeline of its own. With the
+        other thread's run of ``shifted`` stopped at its start, the stage
+        must not wait for it: that run needs the lock the stage holds.
+        """
+        self.append_item(value)
+        shifted = ("shifted", value % 3)
+        for query, index in (("spread", 0), shifted):
+            self._drop(query, index)
+        readers = [[("spread", 0)], [shifted]]
+        if first:
+            readers.reverse()
+        programs = [self._lockstep_reader("live", None, reads) for reads in readers]
+        results = self._lockstep(programs, schedule)
+        self._check_reads(results, [self.world], 0)
+
+    @rule(
+        query=st.sampled_from(SYNC_QUERIES),
+        index=INDEXES,
+        through_snapshot=st.booleans(),
+        pick=PICK,
+    )
+    def submitted_run_is_cancelled_by_a_change(
+        self, query: str, index: int, through_snapshot: bool, pick: int
+    ) -> None:
         """G6: an input changed while a submitted run is held cancels it.
 
         The run is held at the start of the query's body until the change
-        is made. Nothing it computed may be served afterwards.
+        is made. Nothing it computed may be served afterwards. A call
+        submitted through a snapshot is cancelled the same way.
         """
         assert self.engine is not None
+        held = self._pick_snapshot(pick) if through_snapshot else None
+        world = self.world if held is None else held.world
         self._drop(query, index)
         reached = threading.Event()
         release = threading.Event()
@@ -1309,7 +2241,10 @@ class EngineStateMachine(RuleBasedStateMachine):
         try:
             effects: dict[str, list[Any]] = {}
             future = self.engine.submit(
-                getattr(self.h, query), *self._args(query, index), effects=effects
+                getattr(self.h, query),
+                *self._args(query, index),
+                snapshot=None if held is None else held.snapshot,
+                effects=effects,
             )
             deadline = time.monotonic() + JOIN_TIMEOUT
             while not reached.is_set() and not future.done():
@@ -1326,10 +2261,165 @@ class EngineStateMachine(RuleBasedStateMachine):
             with pytest.raises(QueryCancelled):
                 future.result(timeout=JOIN_TIMEOUT)
         else:
-            # Loaded from disk without running: an ordinary result.
+            # Found without running (cached, or loaded from disk).
             outcome = self._outcome(effects, lambda: future.result(JOIN_TIMEOUT))
-            assert outcome in self._outcomes(self.world, query, index)
+            assert outcome in self._outcomes(world, query, index)
         self._read(query, index, self.world)
+
+    def _pick_snapshot(self, pick: int) -> _Held:
+        """A snapshot still held, or a new one."""
+        live = [held for held in self.snapshots if not held.released]
+        return live[pick % len(live)] if live else self._take_snapshot()
+
+    @rule(
+        reads=st.lists(
+            st.tuples(st.sampled_from(SYNC_QUERIES), INDEXES), min_size=1, max_size=3
+        ),
+        change=st.one_of(st.none(), SET_INPUT, COLLECTION_STEP),
+        pick=PICK,
+    )
+    def submit_through_snapshot(
+        self, reads: list[tuple[str, int]], change: Any, pick: int
+    ) -> None:
+        """``submit`` with a held snapshot gives the snapshot's value (G4).
+
+        After an optional change, so that the head and the snapshot differ;
+        with nothing changing while the calls run, none is cancelled.
+        """
+        assert self.engine is not None
+        held = self._pick_snapshot(pick)
+        if change is not None:
+            before = self.engine.revision
+            verdict = self._apply(change, self.world)
+            self._moved(before, [verdict])
+        for (query, index), actual in self._submit(reads, held.snapshot):
+            expected = self._outcomes(held.world, query, index)
+            assert actual in expected, (query, index, actual, expected)
+
+    # --- rules: hidden cycles (0.4.2) ----------------------------------------
+
+    @rule(
+        drift=st.integers(min_value=-3, max_value=3),
+        detour=st.booleans(),
+        fail=st.integers(min_value=0, max_value=3).map(lambda n: n == 0),
+    )
+    def change_hidden(self, drift: int, detour: bool, fail: bool) -> None:
+        """Change what the hidden cycles read, which the engine does not see."""
+        self.hidden.drift = drift
+        self.hidden.detour = detour
+        self.hidden.fail = fail
+
+    @rule(
+        head=st.sampled_from(W_HEADS),
+        drift=st.integers(min_value=-3, max_value=3),
+        detour=st.booleans(),
+        fail=st.booleans(),
+    )
+    def hidden_change_falls_back(
+        self, head: str, drift: int, detour: bool, fail: bool
+    ) -> None:
+        """0.4.2: one run on the cached members disagrees; iterate instead.
+
+        With the head's row in place, a change the engine cannot see makes
+        the run on the cached members give another value, reach the head
+        again through ``detour``, or raise; each time the head must iterate
+        from the guess and give the plain value. And back.
+        """
+        self._read(head, 0, self.world)
+        before = (self.hidden.drift, self.hidden.detour, self.hidden.fail)
+        self.change_hidden(drift, detour, fail)
+        self._read(head, 0, self.world)
+        self.change_hidden(*before)
+        self._read(head, 0, self.world)
+
+    @rule(
+        head=st.sampled_from(W_HEADS),
+        steps=st.lists(IN_RUN_EVICTION, min_size=1, max_size=3),
+        reads=SYNC_READS,
+    )
+    def evict_while_a_head_runs(
+        self, head: str, steps: list[tuple[Any, ...]], reads: list[tuple[str, int]]
+    ) -> None:
+        """0.4.2: results are dropped while a hidden cycle's head runs.
+
+        The first read leaves a row to run on; in the second, each of the
+        head's first runs drops something as it starts (a member, the head's
+        own row, or what ``prune`` or ``sweep_unaccessed`` drop). A run on
+        the cached members whose member is gone reaches the head again and
+        must start over from the guess; every value is the plain one.
+        """
+        self._read(head, 0, self.world)
+        pending = list(steps)
+        main = threading.get_ident()
+
+        def inside(name: str) -> None:
+            if name == head and pending and threading.get_ident() == main:
+                self._evict(pending.pop(0))
+
+        self.inside = inside
+        try:
+            self._read(head, 0, self.world)
+        finally:
+            self.inside = None
+        for query, index in reads:
+            self._read(query, index, self.world)
+        self._read(head, 0, self.world)
+
+    @rule(head=st.sampled_from(W_HEADS), value=SMALL_INTS)
+    def expired_cycle_row_is_not_reused(self, head: str, value: int) -> None:
+        """0.4.2: a head whose row has expired iterates from the guess.
+
+        The hidden cycle reads the TTL query ``sensor``; once its TTL has
+        elapsed only the new reading is right.
+        """
+        self._read(head, 0, self.world)
+        self._read(head, 0, self.world)
+        self.change_sensor(value)
+        self.clock.now += TTL + 1.0
+        assert self._sensor_values() == {value}
+        self._read(head, 0, self.world)
+
+    @rule(
+        head=st.sampled_from(W_HEADS),
+        value=SMALL_INTS,
+        expire=st.booleans(),
+        member_first=st.booleans(),
+    )
+    def cycle_follows_a_new_reading(
+        self, head: str, value: int, expire: bool, member_first: bool
+    ) -> None:
+        """A hidden cycle's members follow the TTL reading its head took.
+
+        The members are computed afresh. Then the reading changes and either
+        its TTL elapses or its result is dropped (within the TTL it may then
+        come back with the new value). A member must expire with its head:
+        read on its own it must give half the new fixed point (unless the
+        head raises: entered through a member, that cycle may raise
+        ``CycleError``, G7). And a head
+        whose result is dropped must not leave its members behind: its next
+        run would find them cached, never reach itself and add the new
+        reading to their old values, one step of the iteration instead of a
+        fixed point.
+        """
+        prefix = head.removesuffix("_head")
+        member = f"{prefix}_detour" if self.hidden.detour else f"{prefix}_member"
+        for query in (head, f"{prefix}_member", f"{prefix}_detour"):
+            self._drop(query, 0)
+        self._read(head, 0, self.world)
+        self.change_sensor(value)
+        if not expire:
+            self._drop("sensor", 0)
+            self._drop(head, 0)
+        elif not member_first or self.hidden.fail:
+            self.clock.now += TTL + 1.0
+            self._drop(head, 0)
+        else:
+            # The head's row stays: the member alone must see its expiry.
+            self.clock.now += TTL + 1.0
+            actual = self._call(member, 0, None)
+            expected = {(v // 2, ()) for v, _ in self._outcomes(self.world, head, 0)}
+            assert actual in expected, (member, actual, expected)
+        self._read(head, 0, self.world)
 
     @rule(index=INDEXES, value=MAYBE_INT)
     def inactive_branch_write_does_not_rerun_choose(
@@ -1470,23 +2560,26 @@ class EngineStateMachine(RuleBasedStateMachine):
         self.world.items.append(value)
         self._moved(before, [True])
 
-    @precondition(lambda self: self.world.items)
+    # No precondition on the list: after writers that share it, its
+    # contents depend on how their threads interleaved, and Hypothesis needs
+    # the same draws to choose the same rules.
     @rule(pick=PICK, value=SMALL_INTS)
     def replace_item(self, pick: int, value: int) -> None:
         assert self.engine is not None
+        if not self.world.items:
+            return
         before = self.engine.revision
         position = pick % len(self.world.items)
         self.items[position] = value
         self.world.items[position] = value
         self._moved(before, [True])
 
-    @precondition(lambda self: self.world.items)
     @rule()
     def pop_item(self) -> None:
         assert self.engine is not None
         before = self.engine.revision
-        assert self.items.pop() == self.world.items.pop()
-        self._moved(before, [True])
+        verdict = self._apply(("pop",), self.world)
+        self._moved(before, [verdict])
 
     @rule(value=SMALL_INTS, add=st.booleans())
     def change_tags(self, value: int, add: bool) -> None:
@@ -1571,11 +2664,19 @@ class SqliteEngineStateMachine(EngineStateMachine):
 # against: thirteen, seeded into the engine by hand, at least one per group
 # of rules. At 40 examples of 30 steps one of them got past two of the three
 # machines. A step is cheap, so this is a few seconds per machine.
+# ``CASCADE_STATE_EXAMPLES`` raises the count for long runs (flakiness hunts on
+# the free-threaded build, seeded faults); ``CASCADE_STATE_SHRINK=0`` reports
+# a failure without shrinking it, which with threads can take many minutes.
 _SETTINGS = settings(
-    max_examples=100,
+    max_examples=int(os.environ.get("CASCADE_STATE_EXAMPLES", "100")),
     stateful_step_count=40,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
+    phases=[
+        phase
+        for phase in Phase
+        if phase != Phase.shrink or os.environ.get("CASCADE_STATE_SHRINK") != "0"
+    ],
 )
 
 TestEngineStateMachine = EngineStateMachine.TestCase

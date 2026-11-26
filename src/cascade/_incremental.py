@@ -676,6 +676,10 @@ class IncrementalRuntime:
         self._states: dict[tuple[Any, ...], _PipelineState] = {}
         self._info: dict[tuple[Any, ...], _PipelineInfo] = {}
 
+    def holds_lock(self) -> bool:
+        """Whether this thread is inside a pipeline, whose stages may wait."""
+        return self._lock._is_owned()  # type: ignore[attr-defined]
+
     # --- entry point called from rewritten query code ---
     def run(
         self,
