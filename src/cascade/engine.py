@@ -1001,7 +1001,14 @@ class Engine:
             cancel_epoch = store.cancel_epoch
 
         def run() -> Any:
-            return self._query_call(
+            # In a context of its own, as on a new thread of a build whose
+            # threads start empty. Where threads copy the context of the
+            # thread that starts them (free-threaded 3.14), a pool worker
+            # started from inside a query (an async query running sync code
+            # on this pool) keeps that query's runtime, and the call would
+            # run as part of it: at its old revision, never cancelled (D39).
+            return contextvars.Context().run(
+                self._query_call,
                 query.id,
                 query._live_fn(),
                 key,

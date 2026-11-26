@@ -1420,3 +1420,134 @@ def test_d21_sync_query_on_the_loop_does_not_deadlock_on_an_async_run() -> None:
     # clear error are both acceptable; blocking the loop forever is not.
     finished, _ = _run_with_timeout(lambda: asyncio.run(main()))
     assert finished, "sync call on the event-loop thread deadlocked"
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_d38_rolled_back_creation_of_a_named_collection_writes_nothing(
+    tmp_path: Path, backend: str
+) -> None:
+    # Creating a named collection stamped an empty record of it on disk at
+    # once, outside the transaction's held writes. After a rollback that
+    # record stayed: the next construction under the name restored it and
+    # dropped its own initial contents, and another kind was refused.
+    class Abort(Exception):
+        pass
+
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    with pytest.raises(Abort):
+        with engine.transaction():
+            CascadeList(engine, [1, 2, 3], name="seeded")
+            CascadeList(engine, [1], name="either")
+            raise Abort
+    engine.shutdown()
+    reopened = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        assert list(CascadeList(reopened, [1, 2, 3], name="seeded")) == [1, 2, 3]
+        assert set(CascadeSet(reopened, {1, 2}, name="either")) == {1, 2}
+    finally:
+        reopened.shutdown()
+
+
+def _d39_engine() -> tuple[Engine, Any, Any, dict[str, int]]:
+    engine = Engine()
+    runs = {"double": 0}
+
+    @engine.input
+    def x() -> int:
+        return 1
+
+    @engine.query
+    def double() -> int:
+        runs["double"] += 1
+        return 2 * x()
+
+    return engine, x, double, runs
+
+
+def test_d39_submitted_call_on_a_thread_that_copied_a_query_context() -> None:
+    # Where threads copy the context of the thread that starts them
+    # (free-threaded 3.14), a pool worker started from inside a running
+    # query keeps that query's runtime. A call submitted to it later ran as
+    # part of that finished query: at its old revision, never cancelled.
+    # The executor here imitates such a worker on any build.
+    import concurrent.futures
+    import contextvars
+
+    engine, x, double, _runs = _d39_engine()
+    captured: dict[str, contextvars.Context] = {}
+
+    @engine.query
+    def capture() -> int:
+        captured["ctx"] = contextvars.copy_context()
+        return x()
+
+    assert capture() == 1
+    x.set(5)
+
+    class InheritingExecutor(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+            return super().submit(captured["ctx"].run, fn, *args, **kwargs)
+
+    with InheritingExecutor(max_workers=1) as pool:
+        assert engine.submit(double, executor=pool).result(HANG_TIMEOUT) == 10
+    assert double() == 10
+    engine.shutdown()
+
+
+@pytest.mark.skipif(
+    not getattr(sys.flags, "thread_inherit_context", False),
+    reason="threads start with an empty context on this build",
+)
+def test_d39_submit_after_an_async_query_started_the_pool(tmp_path: Path) -> None:
+    # The path met on a free-threaded build: an async query loaded from disk
+    # checks the default of a sync input on the engine's pool, whose worker
+    # thread starts inside the async query's context; a later submit reuses
+    # that worker.
+    def build() -> tuple[Engine, Any, Any, Any, dict[str, int]]:
+        engine = Engine(cache_dir=tmp_path)
+        runs = {"double": 0}
+
+        @engine.input
+        def x() -> int:
+            return 1
+
+        @engine.query
+        def double() -> int:
+            runs["double"] += 1
+            return 2 * x()
+
+        @engine.query
+        async def outer() -> int:
+            return 3 * x()
+
+        return engine, x, double, outer, runs
+
+    async def read(outer: Any) -> int:
+        return await outer()
+
+    first, _x, _double, outer, _runs = build()
+    assert asyncio.run(read(outer)) == 3
+    first.shutdown()
+    engine, x, double, outer, runs = build()
+    assert asyncio.run(read(outer)) == 3  # loaded: x's default ran on the pool
+    x.set(5)
+    assert engine.submit(double).result(HANG_TIMEOUT) == 10
+    # Cancellation works on that worker too.
+    release = threading.Event()
+    reached = threading.Event()
+
+    @engine.query
+    def held() -> int:
+        reached.set()
+        assert release.wait(HANG_TIMEOUT)
+        return x()
+
+    future = engine.submit(held)
+    assert reached.wait(HANG_TIMEOUT)
+    x.set(6)
+    release.set()
+    with pytest.raises(QueryCancelled):
+        future.result(HANG_TIMEOUT)
+    assert held() == 6
+    assert runs["double"] == 1
+    engine.shutdown()
