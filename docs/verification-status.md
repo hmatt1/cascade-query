@@ -829,12 +829,21 @@ Writing those tests found two defects, both fixed with regression tests
   without looking; if another engine had written and compacted the name
   in the meantime, its data was replaced by the empty record.
 
-Two behaviours the tests did not pin are worth a look: a fixed-point head
-with `memoize=False` runs its cycle more times than needed after an input
-change (12 head runs where a mutant that keeps fewer cycle nodes needs 7,
-with the same values), and the digest format of the code hash has no
-golden-value test, so a change to it shows only as one recomputation of
-stored results.
+Two behaviours the tests did not pin were worth a look. A fixed-point head
+with `memoize=False` ran its whole cycle again on every call (a mutant that
+kept fewer cycle nodes needed fewer runs, with the same values); since
+0.4.2 it runs once over its cached members while nothing changed (G10). The
+digest format of the code hash has no golden-value test, so a change to it
+shows only as one recomputation of stored results.
+
+Faults seeded into that change, one at a time: keeping a run on the cached
+members that gives another value, iterating on mixed members when the head
+is reached again, and reusing a row that is not current. Each fails one
+test of `tests/test_fixed_point_memoize_false.py`; the state machine fails
+none of them, since its query bodies are deterministic and its members are
+not evicted between the check and the run, which is when those fallbacks
+matter. (Reusing a row that is not current gives the right values anyway:
+a member then has to run, reaches the head, and the run starts over.)
 
 ## Next steps
 

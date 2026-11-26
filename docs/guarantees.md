@@ -491,8 +491,23 @@ The query keeps its digest, dependencies and effects but no value. Every call
 that needs the value re-runs the body; verification alone does not. Nothing is
 written to disk for it.
 
+The head of a fixed-point cycle (G7) with `memoize=False` re-runs its body
+on every call too, but not the whole iteration. When its stored row is
+current (nothing the cycle read has changed), the body runs once and reads
+the members from the cache, which gives the value the cycle converged to. If
+that run reaches the head again (a member had to run) or gives another value
+(a body whose result does not follow from what it reads), it is abandoned,
+its effects are taken back, and the head iterates from the guess as after a
+change. Before this, every call dropped the members and iterated from the
+guess: six runs of each query of a three-query cycle where one run of the
+head now does.
+
 Enforced by: `test_memoize_false.py::test_memoize_false`,
-`::test_memoize_false_multiple_calls_same_revision`.
+`::test_memoize_false_multiple_calls_same_revision`,
+`test_fixed_point_memoize_false.py` (run counts, an input change, a
+different value, the head reached again with effects taken back, a dropped
+member, a cycle with two fixed points, async, both disk backends; each value
+compared with a fresh engine), and the state machine's `nloop_head`.
 
 ### G11. Code-aware invalidation
 

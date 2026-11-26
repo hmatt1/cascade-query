@@ -4,6 +4,18 @@ Releases before 0.4.0 were published from every push to `main` without
 notes; `docs/guarantees.md` records the defects fixed in them (D1–D37).
 Defects fixed since are listed under their release (D38 on).
 
+## 0.4.2
+
+### Changed
+
+- **A `memoize=False` fixed-point head called again no longer iterates its
+  whole cycle.** It keeps no value, so every call runs it, and each run used
+  to drop the cycle's members and iterate from the guess. When nothing the
+  cycle read has changed, the head now runs once over its cached members:
+  for a three-query cycle, one run of the head where there were six of each
+  query. If that run reaches the head again or gives another value, it falls
+  back to iterating from the guess. Values are unchanged.
+
 ## 0.4.1
 
 ### Fixed
