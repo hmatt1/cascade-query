@@ -1612,3 +1612,101 @@ def test_d41_held_back_record_does_not_overwrite_another_engines_collection(
         assert list(CascadeList(reopened, name="xs")) == expected
     finally:
         reopened.shutdown()
+
+
+def test_dict_items_keep_the_key_the_dict_holds_after_an_equal_key_update() -> None:
+    # A dict keeps the key it was first given: ``d[1.0] = "b"`` where ``1``
+    # is a key replaces the value under ``1``. A rewritten pipeline over
+    # ``d.items()``, ``dict(d)`` among them, took the key from the update
+    # and gave ``{1.0: "b"}``; a restart, which rebuilds the pipeline from
+    # the contents, gave ``{1: "b"}``. Found by test_rewrite_programs.py
+    # once its keys included equal values of other types.
+    engine = Engine()
+    d = CascadeDict(engine, {1: "a", 0: "z", "k": "v"})
+
+    def body(source: Any) -> Any:
+        return (
+            dict(source),
+            dict(source.items()),
+            {k: v for k, v in source.items()},
+            sorted(source.items(), key=str),
+            [k for k, _ in source.items()],
+        )
+
+    @engine.query
+    def q() -> Any:
+        return (
+            dict(d),
+            dict(d.items()),
+            {k: v for k, v in d.items()},
+            sorted(d.items(), key=str),
+            [k for k, _ in d.items()],
+        )
+
+    assert getattr(q.raw, "__cascade_rewritten__", False)
+    assert repr(q()) == repr(body(dict(d)))
+    d[1.0] = "b"
+    d[False] = "y"
+    d.update({True: "c"})
+    assert repr(q()) == repr(body(dict(d)))
+    assert repr(dict(d)) == "{1: 'c', 0: 'y', 'k': 'v'}"
+    del d[1.0]
+    d[1.0] = "d"
+    assert repr(q()) == repr(body(dict(d)))
+    assert repr(dict(d)) == "{0: 'y', 'k': 'v', 1.0: 'd'}"
+
+
+@pytest.mark.xfail(strict=True, reason="open: NaN identity is lost on disk")
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_nan_key_removed_before_a_restart_stays_removed(
+    tmp_path: Path, backend: str
+) -> None:
+    # A dict holds a NaN key, and a set a NaN element, by identity: NaN is
+    # equal to nothing, itself included, so ``del d[nan]`` finds the key
+    # only as the same object. The log on disk has the key twice, in the
+    # write and in the removal, and decoding makes two NaN objects of them:
+    # replayed at the next start, the removal finds nothing to remove.
+    # Found by test_rewrite_programs.py once its values included NaN.
+    nan = float("nan")
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        d = CascadeDict(engine, name="d")
+        s = CascadeSet(engine, name="s")
+        d[nan] = 1
+        d["a"] = 2
+        del d[nan]
+        s.add(nan)
+        s.discard(nan)
+        assert (dict(d), set(s)) == ({"a": 2}, set())
+    finally:
+        engine.shutdown()
+    engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+    try:
+        d = CascadeDict(engine, name="d")
+        s = CascadeSet(engine, name="s")
+        assert (dict(d), set(s)) == ({"a": 2}, set())
+    finally:
+        engine.shutdown()
+
+
+def test_a_nan_captured_by_a_pipeline_is_one_object_in_its_result() -> None:
+    # Every NaN has the same digest, so a pipeline whose element reads a
+    # NaN made anew on each run kept its state across runs and mixed the
+    # NaN of an earlier run with this run's: ``set([m for _ in d.values()])``
+    # held two NaN objects after a change, where Python's has one (a set
+    # tells NaN objects apart). Found by test_rewrite_programs.py once its
+    # values included NaN.
+    engine = Engine()
+    d = CascadeDict(engine, {0: 1, 1: 2})
+
+    @engine.query
+    def q() -> Any:
+        m = float("nan")  # a new object on every run
+        return set([m for _ in d.values()]), [m for _ in d.values()]
+
+    assert getattr(q.raw, "__cascade_rewritten__", False)
+    assert len(q()[0]) == 1
+    d[0] = 5
+    nans, listed = q()
+    assert len(nans) == 1
+    assert listed[0] is listed[1]

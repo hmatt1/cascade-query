@@ -646,7 +646,8 @@ class _PipelineState:
     # whether the call returns (it may stop before it reaches them) or which
     # exception it raises.
     failed: set[Any] = field(default_factory=set)
-    present: set[Any] = field(default_factory=set)
+    # Keys of a dict source, each mapped to the key object the dict holds.
+    present: dict[Any, Any] = field(default_factory=dict)
     impure: bool = False
     # A stage, filter or key function pushed accumulator effects. The
     # pipeline calls them for changed elements only, and in the order the
@@ -1111,11 +1112,16 @@ def _events(kind: str, view: str | None, diff: dict[str, Any], state: _PipelineS
         return
     key = diff["key"]
     if action == "remove":
-        state.present.discard(key)
+        state.present.pop(key, None)
         yield "remove", key, None
         return
     existed = key in state.present
-    state.present.add(key)
+    if existed:
+        # A dict keeps the key it was first given: ``d[1.0] = v`` where
+        # ``1`` is a key replaces the value under ``1``.
+        key = state.present[key]
+    else:
+        state.present[key] = key
     if view == "keys":
         if not existed:
             yield "add", key, key
@@ -1147,6 +1153,11 @@ def _env_fingerprint(
             visit_fn(value)
         elif callable(value):
             parts.append(getattr(value, "__qualname__", None) or repr(type(value)))
+        elif type(value) is float and value != value:
+            # Every NaN has one digest, but a set or dict tells NaN objects
+            # apart: elements mapped in an earlier run would hold another
+            # NaN than the ones mapped now, where Python has one object.
+            raise ValueError("a captured NaN is not one value across runs")
         else:
             parts.append(stable_hash(value))
 
