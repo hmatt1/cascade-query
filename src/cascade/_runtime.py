@@ -37,6 +37,10 @@ class RuntimeFrame:
     # False while a run that reaches itself through a fixed-point head may
     # still start again from that head (``Evaluator._head_to_enter_through``).
     routed: bool = True
+    # A memoize=False fixed-point head whose stored row was verified at this
+    # revision runs once on its cached members instead of iterating from the
+    # guess: this is that row (``Evaluator._reusable_cycle_locked``).
+    reused_cycle: Any = None
 
 
 @dataclass

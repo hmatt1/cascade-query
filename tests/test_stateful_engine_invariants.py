@@ -114,9 +114,18 @@ QUERIES = (
     "tag_total",
     "tagged",
     "loop_head",
+    "nloop_head",
 )
 # Queries without arguments, and those defined with ``async def``.
-NO_ARGS = ("sensor", "total", "above_bias", "tag_total", "tagged", "loop_head")
+NO_ARGS = (
+    "sensor",
+    "total",
+    "above_bias",
+    "tag_total",
+    "tagged",
+    "loop_head",
+    "nloop_head",
+)
 ASYNC_QUERIES = ("achoose", "amix")
 SYNC_QUERIES = tuple(q for q in QUERIES if q not in ASYNC_QUERIES)
 # compute_many returns values only; a raising call would end the batch.
@@ -507,6 +516,18 @@ class EngineStateMachine(RuleBasedStateMachine):
             checkpoint("loop_member")
             return loop_head() // 2
 
+        # The same cycle with a memoize=False head: every call runs it, on
+        # its cached members while nothing changed.
+        @engine.query(name="nloop_head", fixed_point=0, memoize=False)
+        def nloop_head() -> int:
+            checkpoint("nloop_head")
+            return nloop_member() + bias()
+
+        @engine.query(name="nloop_member")
+        def nloop_member() -> int:
+            checkpoint("nloop_member")
+            return nloop_head() // 2
+
         notes = engine.accumulator("notes")
 
         @engine.query(name="strict")
@@ -555,6 +576,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         h.achoose, h.amix = achoose, amix
         h.tag_total, h.tagged = tag_total, tagged
         h.loop_head, h.loop_member = loop_head, loop_member
+        h.nloop_head, h.nloop_member = nloop_head, nloop_member
         self.engine = engine
         self.h = h
         self.items = items
@@ -634,7 +656,7 @@ class EngineStateMachine(RuleBasedStateMachine):
             return {sum(world.tags)}
         if query == "tagged":
             return {plain_tagged(world)}
-        if query == "loop_head":
+        if query in ("loop_head", "nloop_head"):
             return {plain_loop_head(world)}
         if query == "loop_member":
             return {plain_loop_head(world) // 2}

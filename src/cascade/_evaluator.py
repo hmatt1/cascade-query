@@ -97,6 +97,22 @@ class _EnterThroughHead(CycleError):
         self.head = head
 
 
+class _RestartCycle(CycleError):
+    """A head running once on its cached members was reached again.
+
+    Internal. A memoize=False fixed-point head whose stored row is current
+    runs once, reading its members from the cache (``reused_cycle``). If the
+    run comes back to the head, a member had to run after all, and that run
+    would read the guess while other members hold the converged values; so it
+    is abandoned at once and the head iterates from the guess as usual. A
+    ``CycleError`` for the same reasons as ``_EnterThroughHead``.
+    """
+
+    def __init__(self, head: QueryKey) -> None:
+        super().__init__(f"internal: restart the fixed point of {head!r}")
+        self.head = head
+
+
 # A bypassed collection is repaired as the error is raised: the next run
 # reads it as it is, so the error must not outlive the run.
 _NEVER_CACHED_ERRORS = (
@@ -1885,6 +1901,8 @@ class Evaluator:
     ) -> Any:
         """``key`` is running at ``runtime.stack[index]`` and was called again."""
         stack = runtime.stack
+        if frame.reused_cycle is not None:
+            raise _RestartCycle(key)
         if frame.cycle_guess is UNSET:
             has_fp, fp_val = self._store.lookup_query_fixed_point(key[1])
             if not has_fp:
@@ -2355,6 +2373,89 @@ class Evaluator:
             if k != key:
                 self._store.drop_memo_locked(k)
 
+    def _reusable_cycle_locked(
+        self, key: QueryKey, old_memo: MemoEntry | None, runtime: RuntimeState
+    ) -> bool:
+        """Whether a run of fixed-point head ``key`` can skip iterating.
+
+        A memoize=False head keeps no value, so every call runs it, and each
+        run used to drop its members and iterate from the guess, though
+        nothing had changed. When its stored row is current at this
+        revision (checked just before the run), every member whose own
+        dependencies are unchanged is valid against it, and one run of the
+        head over the cached members gives the fixed point it converged to.
+        Only then: an error, an expired row, memoize=False members (no value
+        to read) or a member already dropped would only make the run start
+        over (``_RestartCycle``), and so would being inside another cycle.
+        """
+        store = self._store
+        if (
+            old_memo is None
+            or not old_memo.cycle_nodes
+            or old_memo.error is not None
+            or runtime.provisional is not None
+            or store.lookup_query_memoize(key[1])
+        ):
+            return False
+        expires_at = old_memo.expires_at
+        if expires_at is not None and time.time() > expires_at:
+            return False
+        if not store.is_current_locked(old_memo, runtime.snapshot.revision):
+            return False
+        for member in old_memo.cycle_nodes:
+            if member == key:
+                continue
+            if member not in store.memos or not store.lookup_query_memoize(member[1]):
+                return False
+        return True
+
+    def _prepare_cycle_locked(
+        self, key: QueryKey, frame: RuntimeFrame, runtime: RuntimeState, reuse: bool
+    ) -> None:
+        """Before a run of ``key``: keep its last cycle, or drop its members."""
+        old_memo = self._store.memos.get(key)
+        if reuse and self._reusable_cycle_locked(key, old_memo, runtime):
+            frame.reused_cycle = old_memo
+            self._store.trace_event("cycle_reused", key)
+        elif old_memo is not None and old_memo.cycle_nodes:
+            self._drop_previous_cycle_locked(key, old_memo)
+
+    def _reused_digest(self, result: Any, error: Any, value_hash: str | None) -> Any:
+        """The digest of a run on cached members; None if it has none."""
+        if error is not None or value_hash is not None:
+            return value_hash
+        try:
+            return self._store.digest_or_opaque(result)
+        except TypeError:
+            return None  # _finish_recompute reports it, after the restart
+
+    @staticmethod
+    def _reuse_failed(frame: RuntimeFrame, error: Any, value_hash: Any) -> bool:
+        """Whether a run on the cached members did not give the stored value.
+
+        Equal inputs give the value the cycle converged to; anything else (a
+        body that is not deterministic, an error) is settled by iterating
+        from the guess.
+        """
+        return (
+            error is not None
+            or value_hash is None
+            or value_hash != frame.reused_cycle.value_hash
+        )
+
+    def _abandon_reused_cycle(
+        self, key: QueryKey, frame: RuntimeFrame, runtime: RuntimeState, stack: Any
+    ) -> None:
+        """Take back what the run on cached members did; drop the members."""
+        self._retract_effects(runtime, stack, frame.effects)
+        self._store.trace_event("cycle_restart", key)
+        with self._store.lock:
+            old_memo = self._store.memos.get(key)
+            if (
+                old_memo is not None and old_memo.cycle_nodes
+            ):  # pragma: no branch - the row reused, unless another thread replaced it
+                self._drop_previous_cycle_locked(key, old_memo)
+
     def recompute(
         self,
         key: QueryKey,
@@ -2362,6 +2463,7 @@ class Evaluator:
         runtime: RuntimeState,
         *,
         routed: bool = True,
+        reuse_cycle: bool = True,
     ) -> MemoEntry:
         frame = RuntimeFrame(key=key, runtime=runtime, routed=routed)
         runtime.stack.append(frame)
@@ -2369,9 +2471,7 @@ class Evaluator:
         self._store.trace_event("recompute_start", key)
 
         with self._store.lock:
-            old_memo = self._store.memos.get(key)
-            if old_memo is not None and old_memo.cycle_nodes:
-                self._drop_previous_cycle_locked(key, old_memo)
+            self._prepare_cycle_locked(key, frame, runtime, reuse_cycle)
 
         error: BaseException | None = None
         # Digest of the result, or of a cached error. Computed after the run
@@ -2379,6 +2479,7 @@ class Evaluator:
         # body's exception handling.
         value_hash: str | None = None
         iterations = 1
+        restart = False
         while True:
             try:
                 self.check_cancelled(runtime.cancel_epoch)
@@ -2393,6 +2494,9 @@ class Evaluator:
                 error = None
                 value_hash = None
             except BaseException as exc:
+                if isinstance(exc, _RestartCycle) and exc.head == key:
+                    restart = True
+                    break
                 error_hash = self._cacheable_error_digest(key, exc)
                 if error_hash is not None:
                     error = exc
@@ -2428,6 +2532,14 @@ class Evaluator:
             runtime.stack.pop()
             break
 
+        if not restart and frame.reused_cycle is not None:
+            value_hash = self._reused_digest(result, error, value_hash)
+            restart = self._reuse_failed(frame, error, value_hash)
+        if restart:
+            if runtime.stack and runtime.stack[-1] is frame:
+                runtime.stack.pop()
+            self._abandon_reused_cycle(key, frame, runtime, runtime.stack)
+            return self.recompute(key, fn, runtime, routed=routed, reuse_cycle=False)
         return self._finish_recompute(
             key, frame, runtime, result, error, start, value_hash
         )
@@ -2439,6 +2551,7 @@ class Evaluator:
         runtime: RuntimeState,
         *,
         routed: bool = True,
+        reuse_cycle: bool = True,
     ) -> MemoEntry:
         frame = RuntimeFrame(key=key, is_async_body=True, routed=routed)
         new_runtime = RuntimeState(
@@ -2461,13 +2574,12 @@ class Evaluator:
             self._store.trace_event("recompute_start", key)
 
             with self._store.lock:
-                old_memo = self._store.memos.get(key)
-                if old_memo is not None and old_memo.cycle_nodes:
-                    self._drop_previous_cycle_locked(key, old_memo)
+                self._prepare_cycle_locked(key, frame, new_runtime, reuse_cycle)
 
             error: BaseException | None = None
             value_hash: str | None = None
             iterations = 1
+            restart = False
             while True:
                 try:
                     self.check_cancelled(new_runtime.cancel_epoch)
@@ -2479,6 +2591,9 @@ class Evaluator:
                     error = None
                     value_hash = None
                 except BaseException as exc:
+                    if isinstance(exc, _RestartCycle) and exc.head == key:
+                        restart = True
+                        break
                     error_hash = self._cacheable_error_digest(key, exc)
                     if error_hash is not None:
                         error = exc
@@ -2517,6 +2632,14 @@ class Evaluator:
 
                 break
 
+            if not restart and frame.reused_cycle is not None:
+                value_hash = self._reused_digest(result, error, value_hash)
+                restart = self._reuse_failed(frame, error, value_hash)
+            if restart:
+                self._abandon_reused_cycle(key, frame, new_runtime, runtime.stack)
+                return await self.recompute_async(
+                    key, fn, runtime, routed=routed, reuse_cycle=False
+                )
             return self._finish_recompute(
                 key, frame, new_runtime, result, error, start, value_hash
             )
@@ -2632,6 +2755,14 @@ class Evaluator:
                 for k in member_keys:
                     del overlay[k]  # type: ignore[union-attr]
                 members = []
+        elif frame.reused_cycle is not None:
+            # Run once on the cached members, with the value the cycle
+            # converged to (``_reuse_failed`` checked): the stored row's
+            # outside dependencies and members still describe it, where this
+            # run alone would record the head as reading its members.
+            reused = frame.reused_cycle
+            deps = {dep.key: dep.observed_changed_at for dep in reused.deps}
+            cycle_nodes = reused.cycle_nodes
         provisional = bool(heads)
 
         with store.lock:
