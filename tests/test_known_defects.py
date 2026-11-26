@@ -1825,3 +1825,82 @@ def test_d51_setting_the_default_after_a_result_reused_from_disk_is_no_change(
         assert call(q) == 6
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("waiter", ["task", "thread"])
+def test_dNN_cancelling_the_task_that_runs_a_query_does_not_cancel_its_waiters(
+    waiter: str,
+) -> None:
+    # A task runs slow() and another caller waits for that run (G5): a
+    # second task on the same loop, or a thread. Cancelling the task that
+    # runs it used to hand its CancelledError to every waiter: the second
+    # task ended cancelled although nobody cancelled it, and the thread
+    # raised asyncio.CancelledError out of a plain call. A waiter is not
+    # cancelled with the owner (G5, G6): it runs the query itself.
+    engine = Engine()
+    runs: list[int] = []
+    gates: list[asyncio.Event] = []
+
+    @engine.input
+    def x() -> int:
+        return 4
+
+    @engine.query
+    async def slow() -> int:
+        runs.append(1)
+        gate = asyncio.Event()
+        gates.append(gate)
+        if len(runs) == 1:
+            await gate.wait()  # the first run is cancelled here
+        return x() * 10
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    async def poll(condition: Any) -> None:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.002)
+
+    outcome: list[Any] = []
+
+    def call_in_thread() -> None:
+        try:
+            outcome.append(slow())
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+
+    async def main() -> Any:
+        owner = asyncio.create_task(slow())
+        await poll(lambda: runs)
+        if waiter == "task":
+            other: Any = asyncio.create_task(slow())
+        else:
+            other = threading.Thread(target=call_in_thread, daemon=True)
+            other.start()
+        await poll(lambda: waiting() == 1)
+        owner.cancel()
+        cancelled = (await asyncio.gather(owner, return_exceptions=True))[0]
+        if waiter == "task":
+            got = (await asyncio.gather(other, return_exceptions=True))[0]
+        else:
+            await asyncio.to_thread(other.join, HANG_TIMEOUT)
+            assert not other.is_alive(), "the waiting thread hung"
+            got = outcome[0]
+        return cancelled, got
+
+    finished, outcome_of_main = _run_with_timeout(
+        lambda: asyncio.run(asyncio.wait_for(main(), 4 * HANG_TIMEOUT)),
+        6 * HANG_TIMEOUT,
+    )
+    assert finished, "the test's event loop hung"
+    status, value = outcome_of_main[0]
+    assert status == "ok", value
+    cancelled, got = value
+    assert isinstance(cancelled, asyncio.CancelledError)
+    assert got == 40
+    assert len(runs) == 2
+    assert engine._internals.in_flight == {}  # noqa: SLF001
+    assert waiting() == 0

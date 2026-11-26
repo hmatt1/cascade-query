@@ -29,17 +29,37 @@ must return:
    submit (G6), so a future's value must be the state current then, or
    ``QueryCancelled`` when a change came after it. Futures held at a gate
    until later steps have exact outcomes.
+4. **Blocks on asyncio tasks**, on one event loop or two in two threads.
+   Actor tasks open, commit, roll back and fail blocks, set inputs, change a
+   list, a set and a dict, read, ``submit`` and snapshot queries, try to
+   nest a block, spawn tasks (which copy the block's context and are still
+   outside it) and are cancelled, in a block and in the middle of a query
+   they await there. Reader tasks await async queries whose bodies stop
+   between their reads until the test lets them go on, so blocks open, end
+   and are cancelled while a read is half done, and two or three readers
+   ask for one key at once (G5). The test decides every step, so a program
+   runs the same way each time. Every read must be a state committed while
+   it ran (an owner's read in its block: the state before the block), a
+   snapshot read the snapshot's state; every change refused for another
+   task's block is predicted; the revision and the collection objects match
+   the model after every step; and two runs of one key at one revision
+   never overlap.
 
 ``CASCADE_TXN_EXAMPLES`` sets the number of examples of every test here (the
-defaults keep the file to a few seconds a test).
+defaults keep the file to a few seconds a test); ``CASCADE_TXN_SHRINK=0``
+reports a failure without shrinking it.
 """
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import concurrent.futures
-import queue
+import contextvars
 import copy
+import itertools
 import os
+import queue
 import random
 import tempfile
 import threading
@@ -50,7 +70,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from hypothesis import HealthCheck, event, given, settings
+from hypothesis import HealthCheck, Phase, event, given, settings
 from hypothesis import strategies as st
 
 from cascade import (
@@ -73,6 +93,11 @@ def _settings(default: int) -> settings:
         max_examples=int(os.environ.get("CASCADE_TXN_EXAMPLES", default)),
         deadline=None,
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+        phases=[
+            phase
+            for phase in Phase
+            if phase != Phase.shrink or os.environ.get("CASCADE_TXN_SHRINK") != "0"
+        ],
     )
 
 
@@ -1586,3 +1611,985 @@ def test_submit_and_readers_beside_transactions(
             event(f"reader submits cancelled: {min(cancelled, 5)}")
         finally:
             engine.shutdown()
+
+
+# =============================================================================
+# 4. Blocks on asyncio tasks, readers on tasks, one or two event loops
+# =============================================================================
+#
+# Every task runs on an event loop thread; the test's own thread (the
+# driver) decides each step and waits until it is over, so a program runs
+# the same way every time. Actors are long-lived tasks that run the commands
+# they are sent, one at a time: a block an actor opens stays open across its
+# later commands, owned by that task (G25). Readers are tasks that await an
+# async query whose body stops at pause points between its reads until the
+# driver lets it go on, so blocks open, commit, roll back and fail while a
+# read is half done, and several readers can ask for one key at once (G5).
+# A reader that waits for another task's run is seen in ``waiting_on``.
+
+
+@dataclass(frozen=True)
+class AState:
+    """A committed state of the async rig; ``dd`` is the dict's items."""
+
+    x: Any = 0
+    y: Any = 0
+    xs: tuple[int, ...] = (1, 2)
+    ss: frozenset[int] = frozenset({1})
+    dd: tuple[tuple[int, int], ...] = ((0, 5),)
+
+
+A_COLLS = ("xs", "ss", "dd")
+A_LIST_OPS = ("append", "pop", "insert", "setitem")
+A_TARGET = {
+    **dict.fromkeys(A_LIST_OPS, "xs"),
+    "add": "ss",
+    "discard": "ss",
+    "put": "dd",
+    "delkey": "dd",
+}
+
+
+def _a_expect(state: AState, name: str) -> Any:
+    ss = tuple(sorted(state.ss))
+    view = (state.x, state.xs, ss, state.dd, state.y)
+    if name == "view":
+        return view
+    if name == "nest":
+        return view, len(state.xs), state.y
+    if name == "shared":
+        return state.x, sum(state.xs), ss, state.dd
+    if name == "combo":
+        return state.x, state.y, list(state.xs), list(ss), dict(state.dd)
+    assert name == "gated"
+    return state.x, state.xs, ss, state.y
+
+
+def _a_change(contents: Any, step: tuple[Any, ...]) -> tuple[Any, bool] | None:
+    """``contents`` after a collection step and whether it records a diff.
+
+    None when the step does not apply to these contents (it is skipped).
+    """
+    op = step[0]
+    if op == "append":
+        return (*contents, step[1]), True
+    if op == "pop":
+        return (contents[:-1], True) if contents else None
+    if op == "insert":
+        i = min(step[1], len(contents))
+        return (*contents[:i], step[2], *contents[i:]), True
+    if op == "setitem":
+        if step[1] >= len(contents):
+            return None
+        return (*contents[: step[1]], step[2], *contents[step[1] + 1 :]), True
+    if op == "add":
+        if step[1] in contents:
+            return contents, False
+        return contents | {step[1]}, True
+    if op == "discard":
+        if step[1] not in contents:
+            return contents, False
+        return contents - {step[1]}, True
+    items = dict(contents)
+    if op == "put":
+        items[step[1]] = step[2]
+        return tuple(items.items()), True
+    assert op == "delkey"
+    if step[1] not in items:
+        return None
+    del items[step[1]]
+    return tuple(items.items()), True
+
+
+def _a_apply(coll: Any, step: tuple[Any, ...]) -> None:
+    op = step[0]
+    if op == "append":
+        coll.append(step[1])
+    elif op == "pop":
+        coll.pop()
+    elif op == "insert":
+        coll.insert(step[1], step[2])
+    elif op in ("setitem", "put"):
+        coll[step[1]] = step[2]
+    elif op == "add":
+        coll.add(step[1])
+    elif op == "discard":
+        coll.discard(step[1])
+    else:
+        del coll[step[1]]
+
+
+class Paused:
+    """A task the driver can hold at a pause point and then let go on."""
+
+    def __init__(self, run: AsyncRun) -> None:
+        self.run = run
+        self.task: asyncio.Task[Any] | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.at: str | None = None
+        self.last = "the start"  # the last pause point, for timeouts
+        self._event: asyncio.Event | None = None
+        self.keep: Any = None  # a strong reference to the task
+
+    async def hold(self, label: str) -> None:
+        event = asyncio.Event()
+        with self.run.cond:
+            self.at, self.last, self._event = label, label, event
+            self.run.cond.notify_all()
+        await event.wait()
+
+    def go_on(self) -> None:
+        event, self.at, self._event = self._event, None, None
+        assert event is not None and self.loop is not None
+        self.loop.call_soon_threadsafe(event.set)
+
+
+class Gates:
+    """The pause points of the rig's async query bodies.
+
+    A body stops at one only in a task registered here; everywhere else (an
+    actor's own reads, the final checks) it runs straight through.
+    """
+
+    def __init__(self) -> None:
+        self.held: dict[Any, Paused] = {}
+
+    async def pause(self, label: str) -> None:
+        holder = self.held.get(asyncio.current_task())
+        if holder is not None:
+            await holder.hold(label)
+
+
+class AsyncRig:
+    def __init__(self, engine: Engine, *, named: bool) -> None:
+        self.engine = engine
+        self.gates = gates = Gates()
+        self.tokens = itertools.count(1)
+        self.submit_gates: dict[int, threading.Event] = {}
+        submit_gates = self.submit_gates
+        # Runs of ``shared``: [revision, start, end], end None while running.
+        self.shared_runs: list[list[Any]] = []
+        self.clock = itertools.count()
+        runs, clock = self.shared_runs, self.clock
+
+        @engine.input
+        def x() -> int:
+            return 0
+
+        @engine.input
+        def y() -> int:
+            return 0
+
+        def name(n: str) -> str | None:
+            return n if named else None
+
+        xs = CascadeList(engine, [1, 2], name=name("axs"), compact_every=4)
+        ss = CascadeSet(engine, {1}, name=name("ass"), compact_every=4)
+        dd = CascadeDict(engine, {0: 5}, name=name("add"), compact_every=4)
+
+        @engine.query
+        async def view(token: int) -> Any:
+            a = x()
+            await gates.pause("after x")
+            items = tuple(v for v in xs)  # async bodies are not rewritten
+            await gates.pause("after xs")
+            return a, items, tuple(sorted(ss)), tuple(dd.items()), y()
+
+        @engine.query
+        async def nest(token: int) -> Any:
+            inner = await view(token)
+            await gates.pause("after the inner query")
+            return inner, len(xs), y()
+
+        @engine.query
+        async def shared() -> Any:
+            runtime = engine._evaluator.current_runtime()  # noqa: SLF001
+            run = [runtime.snapshot.revision, next(clock), None]
+            runs.append(run)
+            try:
+                a = x()
+                await gates.pause("after x")
+                total = sum(v for v in xs)
+                await gates.pause("after xs")
+                return a, total, tuple(sorted(ss)), tuple(dd.items())
+            finally:
+                run[2] = next(clock)
+
+        @engine.query
+        def combo() -> Any:
+            return x(), y(), list(xs), sorted(ss), dict(dd)
+
+        @engine.query
+        def gated(token: int) -> Any:
+            first = x(), tuple(v for v in xs)
+            assert submit_gates[token].wait(TIMEOUT)
+            return (*first, tuple(sorted(ss)), y())
+
+        assert (x(), y()) == (0, 0)  # G3: the defaults are now values
+        self.x, self.y = x, y
+        self.colls = {"xs": xs, "ss": ss, "dd": dd}
+        self.view, self.nest, self.shared = view, nest, shared
+        self.combo, self.gated = combo, gated
+
+    def contents(self) -> dict[str, Any]:
+        """What the collection objects hold, written as the model writes it."""
+        return {
+            "xs": tuple(self.colls["xs"]),
+            "ss": frozenset(self.colls["ss"]),
+            "dd": tuple(self.colls["dd"].items()),
+        }
+
+
+class LoopThread:
+    """An event loop running on a daemon thread of its own.
+
+    Kept from one example to the next (``_loop_threads``): a new loop opens
+    a localhost socket pair, and on a machine short of ports making one can
+    hang, so the loop is made on its thread and waited for with a timeout.
+    """
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+        made: concurrent.futures.Future[asyncio.AbstractEventLoop] = (
+            concurrent.futures.Future()
+        )
+
+        def run() -> None:
+            loop = asyncio.new_event_loop()
+            made.set_result(loop)
+            loop.run_forever()
+
+        self.thread = threading.Thread(target=run, name=f"loop{index}", daemon=True)
+        self.thread.start()
+        try:
+            self.loop = made.result(TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            raise AssertionError(
+                f"making an event loop took over {TIMEOUT}s (a localhost "
+                "socket pair that never connected: is the machine out of ports?)"
+            ) from None
+
+    def start(self, coro: Any) -> concurrent.futures.Future[Any]:
+        # In an empty context: a task started by code outside any block.
+        return contextvars.Context().run(
+            asyncio.run_coroutine_threadsafe, coro, self.loop
+        )
+
+    def clear(self) -> None:
+        """Cancel every task on the loop and wait until they have ended."""
+
+        async def cancel_all() -> None:
+            me = asyncio.current_task()
+            tasks = [t for t in asyncio.all_tasks() if t is not me]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.start(cancel_all()).result(TIMEOUT)
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(TIMEOUT)
+        if not self.thread.is_alive():
+            self.loop.close()
+
+
+_LOOP_THREADS: list[LoopThread] = []
+
+
+def _loop_threads(count: int) -> list[LoopThread]:
+    while len(_LOOP_THREADS) < count:
+        _LOOP_THREADS.append(LoopThread(len(_LOOP_THREADS)))
+    return _LOOP_THREADS[:count]
+
+
+@atexit.register
+def _close_loop_threads() -> None:
+    for lt in _LOOP_THREADS:
+        if lt.thread.is_alive():
+            lt.close()
+
+
+class TaskActor(Paused):
+    """A task that runs the driver's commands; its blocks belong to it."""
+
+    def __init__(self, run: AsyncRun, ident: int, lt: LoopThread) -> None:
+        super().__init__(run)
+        self.ident = ident
+        self.lt = lt
+        self.loop = lt.loop
+        self.queue: asyncio.Queue[Any] | None = None
+        self.started = threading.Event()
+        self.done: concurrent.futures.Future[Any] = concurrent.futures.Future()
+
+    async def main(self) -> None:
+        self.task = asyncio.current_task()
+        self.queue = asyncio.Queue()
+        self.started.set()
+        try:
+            while True:
+                cmd, reply = await self.queue.get()
+                if cmd[0] == "stop":
+                    reply.set_result(None)
+                    break
+                if cmd[0] == "begin":
+                    await self.block(reply)
+                elif cmd[0] in ("commit", "raise"):
+                    reply.set_result("no block")
+                else:
+                    reply.set_result(await self.execute(cmd))
+        except BaseException as exc:
+            self.done.set_exception(exc)
+            raise
+        self.done.set_result(None)
+
+    async def block(self, opened: concurrent.futures.Future[Any]) -> None:
+        assert self.queue is not None
+        ended: concurrent.futures.Future[Any] | None = None
+        try:
+            with self.run.rig.engine.transaction():
+                opened.set_result(None)
+                while True:
+                    cmd, reply = await self.queue.get()
+                    if cmd[0] in ("commit", "raise"):
+                        ended = reply
+                        if cmd[0] == "raise":
+                            raise Abort
+                        break
+                    reply.set_result(await self.execute(cmd))
+        except Abort:
+            assert ended is not None
+            ended.set_result("rollback")
+        except UnencodableValueError:
+            if ended is None:
+                raise  # not at a commit: the driver reports it
+            ended.set_result("failed")
+        else:
+            assert ended is not None
+            ended.set_result("commit")
+
+    async def execute(self, cmd: tuple[Any, ...]) -> tuple[str, Any]:
+        rig, engine = self.run.rig, self.run.rig.engine
+        op = cmd[0]
+        try:
+            if op == "set":
+                handle = rig.x if cmd[1] == "x" else rig.y
+                return "ok", handle.set(cmd[2])
+            if op == "mut":
+                _a_apply(rig.colls[A_TARGET[cmd[1][0]]], cmd[1])
+                return "ok", None
+            if op == "aread":
+                query = rig.view if cmd[1] == "view" else rig.nest
+                return "ok", await query(cmd[2])
+            if op == "side":
+                return await asyncio.create_task(self.execute(cmd[1]))
+            if op == "gread":
+                # Held at the body's first pause point, then cancelled.
+                me = asyncio.current_task()
+                rig.gates.held[me] = self
+                try:
+                    return "ok", await rig.view(cmd[1])
+                finally:
+                    del rig.gates.held[me]
+            if op == "sread":
+                return "ok", rig.combo()
+            if op == "asubmit":
+                return "ok", await asyncio.wrap_future(engine.submit(rig.combo))
+            if op == "hold":
+                return "ok", engine.submit(rig.gated, cmd[1])
+            if op == "snapshot":
+                return "ok", engine.snapshot()
+            if op == "nested":
+                with engine.transaction():
+                    return "ok", None
+            # A task made here copies this task's context, open block and
+            # all, but is not part of the block (G25).
+            assert op in ("spawn", "spawn_reader")
+            child = cmd[1]
+            child.keep = asyncio.create_task(child.main())
+            return "ok", None
+        except Exception as exc:  # noqa: BLE001 - the driver checks it
+            return "raised", exc
+
+
+class TaskReader(Paused):
+    """A task that awaits one query, held at the body's pause points."""
+
+    def __init__(self, run: AsyncRun, kind: str, snap: Any, snap_state: int) -> None:
+        super().__init__(run)
+        self.kind = kind
+        self.snap, self.snap_state = snap, snap_state
+        self.token = next(run.rig.tokens)
+        self.lo = run.index()
+        self.hi: int | None = None
+        self.outcome: tuple[str, Any] | None = None
+        self.cancelled = False
+
+    async def main(self) -> None:
+        rig = self.run.rig
+        self.task = asyncio.current_task()
+        self.loop = asyncio.get_running_loop()
+        rig.gates.held[self.task] = self
+        kwargs = {} if self.snap is None else {"snapshot": self.snap}
+        try:
+            if self.kind in ("view", "snapview"):
+                got = await rig.view(self.token, **kwargs)
+            elif self.kind == "nest":
+                got = await rig.nest(self.token)
+            else:
+                got = await rig.shared(**kwargs)
+            self.outcome = ("ok", got)
+        except BaseException as exc:  # noqa: BLE001 - checked by the driver
+            self.outcome = ("raised", exc)
+        finally:
+            del rig.gates.held[self.task]
+            with self.run.cond:
+                self.run.cond.notify_all()
+
+    def expected(self, run: AsyncRun) -> list[Any]:
+        name = {"snapview": "view", "snapshared": "shared"}.get(self.kind, self.kind)
+        if self.snap is not None:
+            return [_a_expect(run.states[self.snap_state], name)]
+        assert self.hi is not None
+        return [_a_expect(s, name) for s in run.states[self.lo : self.hi + 1]]
+
+
+@dataclass
+class ABlock:
+    staged: dict[str, Any] = field(default_factory=dict)  # reserved collections
+    queued: dict[str, Any] = field(default_factory=dict)
+    moved: bool = False
+
+
+@dataclass
+class HeldSubmit:
+    future: concurrent.futures.Future[Any]
+    token: int
+    revision: int
+    state: int
+
+
+ACTORS = 3  # 0-2 started by the driver; 3 is a task an actor spawns
+READERS = 3
+
+
+class AsyncRun:
+    """Runs one async program and checks every step against the model."""
+
+    def __init__(self, rig: AsyncRig, loops: int, placement: list[int]) -> None:
+        self.rig = rig
+        self.cond = threading.Condition()
+        self.lts = _loop_threads(loops)
+        self.placement = placement
+        self.actors: dict[int, TaskActor | None] = dict.fromkeys(range(ACTORS + 1))
+        self.readers: dict[int, TaskReader | None] = dict.fromkeys(range(READERS))
+        self.finished: list[TaskReader] = []
+        self.state = AState()
+        self.states = [self.state]
+        self.revision = rig.engine.revision
+        self.holder: dict[str, int | None] = dict.fromkeys(A_COLLS)
+        self.blocks: dict[int, ABlock] = {}
+        self.held: list[HeldSubmit] = []
+        self.snaps: list[tuple[Any, int]] = []
+        for i in range(ACTORS):
+            self.start_actor(i, self.lts[placement[i] % loops])
+
+    # --- plumbing -------------------------------------------------------------
+
+    def index(self) -> int:
+        return len(self.states) - 1
+
+    def start_actor(self, i: int, lt: LoopThread) -> None:
+        actor = TaskActor(self, i, lt)
+        actor.keep = lt.start(actor.main())
+        assert actor.started.wait(TIMEOUT), f"actor {i} did not start"
+        self.actors[i] = actor
+
+    def post(self, actor: TaskActor, cmd: tuple[Any, ...]) -> concurrent.futures.Future:
+        reply: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        assert actor.queue is not None
+        actor.loop.call_soon_threadsafe(actor.queue.put_nowait, (cmd, reply))
+        return reply
+
+    def send(self, actor: TaskActor, cmd: tuple[Any, ...]) -> Any:
+        try:
+            return self.post(actor, cmd).result(TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            raise AssertionError(
+                f"actor {actor.ident} did not finish {cmd[0]!r} within {TIMEOUT}s"
+            ) from None
+
+    def until(self, what: str | Callable[[], str], done: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + TIMEOUT
+        with self.cond:
+            while not done():
+                if time.monotonic() > deadline:
+                    told = what if isinstance(what, str) else what()
+                    raise AssertionError(
+                        f"timed out after {TIMEOUT}s waiting for {told}"
+                    )
+                # Woken by pause points and finished readers. A wait for
+                # another task's run shows only in ``waiting_on``: polled.
+                self.cond.wait(0.002)
+
+    def settle(self) -> None:
+        """Wait until every reader is held, waiting for a run, or finished."""
+        waiting_on = self.rig.engine._store.waiting_on  # noqa: SLF001
+
+        def still(reader: TaskReader) -> bool:
+            if reader.outcome is not None or reader.at is not None:
+                return True
+            return reader.task is not None and reader.task in waiting_on
+
+        live = [r for r in self.readers.values() if r is not None]
+        self.until(
+            lambda: "every reader to be held, waiting for a run, or done; "
+            + "still going: "
+            + ", ".join(f"{r.kind} after {r.last}" for r in live if not still(r)),
+            lambda: all(still(r) for r in live),
+        )
+        if any(r.task in waiting_on for r in live):
+            event("a reader waits for another task's run")
+        for slot, reader in self.readers.items():
+            if reader is not None and reader.outcome is not None:
+                reader.hi = self.index()
+                self.finished.append(reader)
+                self.readers[slot] = None
+
+    # --- the model ------------------------------------------------------------
+
+    def live(self, coll: str) -> Any:
+        holder = self.holder[coll]
+        if holder is None:
+            return getattr(self.state, coll)
+        return self.blocks[holder].staged[coll]
+
+    def commit_state(self, **changes: Any) -> None:
+        self.state = AState(**{**self.state.__dict__, **changes})
+        self.states.append(self.state)
+        self.revision += 1
+
+    def check(self) -> None:
+        assert self.rig.engine.revision == self.revision
+        assert self.rig.contents() == {c: self.live(c) for c in A_COLLS}
+
+    # --- steps ----------------------------------------------------------------
+
+    def step(self, step: tuple[Any, ...]) -> None:
+        op = step[0]
+        if op in ("advance", "rcancel"):
+            self.reader_step(op, step[1])
+        elif op == "reader":
+            self.start_reader(*step[1:])
+        elif op == "readers":
+            for slot in range(READERS):
+                self.start_reader(slot, *step[1:])
+        elif op == "release":
+            if self.held:
+                self.release()
+        else:
+            actor = self.actors[step[1]]
+            if actor is not None:
+                self.actor_step(actor, op, step)
+        self.settle()
+        self.check()
+
+    def actor_step(
+        self, actor: TaskActor, op: str, step: tuple[Any, ...], *, side: bool = False
+    ) -> None:
+        # ``side``: the actor runs the step in a task it starts and awaits
+        # (as ``asyncio.gather`` would), which copies its context but is
+        # outside its block (G25): no block of its own, and no collection
+        # reserved for it.
+        a = -1 if side else actor.ident
+        block = None if side else self.blocks.get(a)
+
+        def send(cmd: tuple[Any, ...]) -> Any:
+            return self.send(actor, ("side", cmd) if side else cmd)
+
+        if op == "side":
+            inner = step[2]
+            self.actor_step(actor, inner[0], (inner[0], step[1], *inner[1:]), side=True)
+            if actor.ident in self.blocks:
+                event(f"a task awaited inside a block: {inner[0]}")
+        elif op == "begin":
+            if block is None:
+                assert self.send(actor, ("begin",)) is None
+                self.blocks[a] = ABlock()
+                if len(self.blocks) > 1:
+                    event("blocks open on two tasks")
+        elif op in ("commit", "raise"):
+            if block is not None:
+                outcome = self.send(actor, (op,))
+                self.end_block(a, outcome, commit=op == "commit")
+        elif op in ("cancel", "cancel_reading"):
+            self.cancel_actor(actor, mid_read=op == "cancel_reading")
+        elif op in ("set", "bad"):
+            value = BAD if op == "bad" else step[3]
+            status, got = send(("set", step[2], value))
+            if block is not None:
+                assert (status, got) == ("ok", None)  # queued
+                block.queued[step[2]] = value
+            elif value is BAD:
+                assert status == "raised" and isinstance(got, UnencodableValueError)
+            else:
+                assert status == "ok", got
+                if getattr(self.state, step[2]) != value:
+                    self.commit_state(**{step[2]: value})
+        elif op == "mut":
+            self.mutate(a, send, block, step[2])
+        elif op in ("aread", "sread", "asubmit"):
+            name = "combo" if op in ("sread", "asubmit") else step[2]
+            status, got = self.send(actor, (op, name, next(self.rig.tokens)))
+            assert status == "ok", got
+            # Nothing else runs meanwhile, so exactly the committed state:
+            # inside a block too, where queries see the engine as it was
+            # before the block (G25).
+            assert got == _a_expect(self.state, name), (op, name)
+            if block is not None:
+                event("an owner reads in its block")
+        elif op == "hold":
+            if len(self.held) < 2:
+                token = next(self.rig.tokens)
+                self.rig.submit_gates[token] = threading.Event()
+                status, future = self.send(actor, ("hold", token))
+                assert status == "ok", future
+                self.held.append(HeldSubmit(future, token, self.revision, self.index()))
+        elif op == "snapshot":
+            if len(self.snaps) < 2:
+                status, snap = self.send(actor, ("snapshot",))
+                assert status == "ok", snap
+                self.snaps.append((snap, self.index()))
+        elif op == "nested":
+            status, got = self.send(actor, ("nested",))
+            if block is not None:
+                assert status == "raised" and isinstance(got, RuntimeError), got
+                assert "Nested" in str(got)
+            else:
+                assert status == "ok", got
+        else:
+            assert op == "spawn"
+            if self.actors[ACTORS] is None:
+                child = TaskActor(self, ACTORS, actor.lt)
+                assert self.send(actor, ("spawn", child)) == ("ok", None)
+                assert child.started.wait(TIMEOUT)
+                self.actors[ACTORS] = child
+                if block is not None:
+                    event("a task spawned inside a block")
+
+    def mutate(
+        self,
+        a: int,
+        send: Callable[[tuple[Any, ...]], Any],
+        block: ABlock | None,
+        change: tuple[Any, ...],
+    ) -> None:
+        coll = A_TARGET[change[0]]
+        after = _a_change(self.live(coll), change)
+        if after is None:
+            return
+        holder = self.holder[coll]
+        if holder is not None and holder != a:
+            # Reserved by another task's block: refused, nothing changes.
+            status, got = send(("mut", change))
+            assert status == "raised" and isinstance(got, RuntimeError), got
+            assert "another thread or task" in str(got)
+            event("a change refused for another task's block")
+            return
+        assert send(("mut", change)) == ("ok", None)
+        contents, emitted = after
+        if not emitted:
+            return
+        if block is not None:
+            block.staged[coll] = contents
+            block.moved = True
+            self.holder[coll] = a
+        else:
+            self.commit_state(**{coll: contents})
+
+    def end_block(self, a: int, outcome: str, *, commit: bool) -> None:
+        block = self.blocks.pop(a)
+        bad = any(v is BAD for v in block.queued.values())
+        expected = "rollback" if not commit else ("failed" if bad else "commit")
+        assert outcome == expected
+        event(f"async block: {outcome}")
+        for coll in A_COLLS:
+            if self.holder[coll] == a:
+                self.holder[coll] = None
+        if outcome != "commit":
+            return
+        changes = dict(block.staged)
+        changed = block.moved
+        for which, value in block.queued.items():
+            if getattr(self.state, which) != value:
+                changes[which] = value
+                changed = True
+        if changed:
+            self.commit_state(**changes)
+
+    def cancel_actor(self, actor: TaskActor, *, mid_read: bool) -> None:
+        a = actor.ident
+        if mid_read:
+            # Cancelled inside an async query it awaits (in its block, if
+            # one is open), held at the query's first pause point.
+            self.post(actor, ("gread", next(self.rig.tokens)))
+            self.until(f"actor {a} to reach its read", lambda: actor.at is not None)
+            actor.at = None
+        assert actor.task is not None
+        actor.loop.call_soon_threadsafe(actor.task.cancel)
+        concurrent.futures.wait([actor.done], TIMEOUT)
+        assert actor.done.done(), f"actor {a} did not end when cancelled"
+        ended = actor.done.exception()
+        assert isinstance(ended, asyncio.CancelledError), (
+            f"actor {a} was cancelled and ended with {ended!r}"
+        )
+        if a in self.blocks:
+            # A cancelled task's block rolls back, as for any exception.
+            self.end_block(a, "rollback", commit=False)
+            event("a block rolled back by cancelling its task")
+        self.actors[a] = None
+        if a < ACTORS:
+            self.start_actor(a, actor.lt)
+
+    def start_reader(
+        self, slot: int, kind: str, origin: int | None, which: int
+    ) -> None:
+        if self.readers[slot] is not None:
+            return
+        snap, snap_state = None, -1
+        if kind in ("snapview", "snapshared"):
+            if not self.snaps:
+                return
+            snap, snap_state = self.snaps[which % len(self.snaps)]
+        actor = None if origin is None else self.actors[origin]
+        reader = TaskReader(self, kind, snap, snap_state)
+        self.readers[slot] = reader
+        if actor is None:
+            lt = self.lts[self.placement[ACTORS + slot] % len(self.lts)]
+            reader.keep = lt.start(reader.main())
+        else:
+            # Started by an actor's task, it copies that task's context and
+            # the block open there, which it is not part of.
+            assert self.send(actor, ("spawn_reader", reader)) == ("ok", None)
+            if actor.ident in self.blocks:
+                event("a reader started inside a block")
+
+    def reader_step(self, op: str, slot: int) -> None:
+        reader = self.readers[slot]
+        if reader is None:
+            return
+        if op == "advance":
+            if reader.at is not None:
+                reader.go_on()
+            return
+        assert reader.task is not None and reader.loop is not None
+        waiting_on = self.rig.engine._store.waiting_on  # noqa: SLF001
+        if any(r is not None and r.task in waiting_on for r in self.readers.values()):
+            event("a reader cancelled while another waits for a run")
+        reader.cancelled = True
+        reader.at = None
+        reader.loop.call_soon_threadsafe(reader.task.cancel)
+        self.until("the cancelled reader to end", lambda: reader.outcome is not None)
+
+    def release(self) -> None:
+        held = self.held.pop(0)
+        self.rig.submit_gates[held.token].set()
+        if held.revision != self.revision:
+            # G6: something changed after the submit, so it is cancelled.
+            with pytest.raises(QueryCancelled):
+                held.future.result(TIMEOUT)
+            event("a held submit cancelled")
+        else:
+            want = _a_expect(self.states[held.state], "gated")
+            assert held.future.result(TIMEOUT) == want
+
+    # --- the end --------------------------------------------------------------
+
+    def finish(self) -> None:
+        while self.held:
+            self.release()
+        for _ in range(4 * READERS + 4):
+            live = [r for r in self.readers.values() if r is not None]
+            if not live:
+                break
+            for reader in live:
+                if reader.at is not None:
+                    reader.go_on()
+            self.settle()
+        assert all(r is None for r in self.readers.values()), "a reader never ended"
+        for a, actor in self.actors.items():
+            if actor is not None and a in self.blocks:
+                self.end_block(a, self.send(actor, ("commit",)), commit=True)
+        self.check()
+        self.check_readers()
+        self.check_shared_runs()
+        for actor in self.actors.values():
+            if actor is not None:
+                assert self.send(actor, ("stop",)) is None
+        # Every query, read afresh, gives the final state.
+        rig = self.rig
+        assert rig.combo() == _a_expect(self.state, "combo")
+        future = rig.engine.submit(rig.combo)
+        assert future.result(TIMEOUT) == _a_expect(self.state, "combo")
+
+        def awaited(query: Any, *args: Any, **kwargs: Any) -> Any:
+            async def call() -> Any:
+                return await query(*args, **kwargs)
+
+            return call()
+
+        for name, query in (("view", rig.view), ("nest", rig.nest)):
+            got = self.lts[0].start(awaited(query, next(rig.tokens))).result(TIMEOUT)
+            assert got == _a_expect(self.state, name)
+        got = self.lts[-1].start(awaited(rig.shared)).result(TIMEOUT)
+        assert got == _a_expect(self.state, "shared")
+        for snap, state in self.snaps:
+            read = self.lts[0].start(awaited(rig.view, next(rig.tokens), snapshot=snap))
+            assert read.result(TIMEOUT) == _a_expect(self.states[state], "view")
+
+    def check_readers(self) -> None:
+        for reader in self.finished:
+            assert reader.outcome is not None
+            status, got = reader.outcome
+            if status == "raised":
+                # Only a reader the test cancelled may end without a value.
+                assert reader.cancelled, (reader.kind, got)
+                assert isinstance(got, asyncio.CancelledError), got
+                continue
+            event(f"async reader: {reader.kind}")
+            if reader.hi is not None and reader.hi > reader.lo:
+                event("an async read spanning a change")
+            expected = reader.expected(self)
+            assert got in expected, (reader.kind, reader.lo, reader.hi, got, expected)
+
+    def check_shared_runs(self) -> None:
+        """G5: two runs of ``shared`` at one revision never overlap."""
+        by_rev: dict[int, list[tuple[int, int]]] = {}
+        for rev, start, end in self.rig.shared_runs:
+            assert end is not None
+            by_rev.setdefault(rev, []).append((start, end))
+        for rev, spans in by_rev.items():
+            spans.sort()
+            for (_s1, e1), (s2, _e2) in itertools.pairwise(spans):
+                assert s2 > e1, f"shared ran twice at once at revision {rev}: {spans}"
+
+    def close(self) -> None:
+        for snap, _state in self.snaps:
+            snap.release()
+        for gate in self.rig.submit_gates.values():
+            gate.set()
+        for lt in self.lts:
+            try:
+                lt.clear()
+            except BaseException:
+                # Not to be used again: a later example gets a new one.
+                _LOOP_THREADS.remove(lt)
+                lt.close()
+                raise
+
+
+ACTOR = st.integers(min_value=0, max_value=ACTORS)
+SLOT = st.integers(min_value=0, max_value=READERS - 1)
+READER_KIND = st.sampled_from(
+    ("view", "nest", "shared", "shared", "snapview", "snapshared")
+)
+ORIGIN = st.one_of(st.none(), ACTOR)  # the driver, or an actor's task
+WHICH = st.integers(min_value=0, max_value=1)  # which snapshot
+A_CHANGE = st.one_of(
+    st.tuples(st.just("append"), VALUES),
+    st.tuples(st.just("pop")),
+    st.tuples(st.just("insert"), INDEX, VALUES),
+    st.tuples(st.just("setitem"), INDEX, VALUES),
+    st.tuples(st.sampled_from(("add", "discard")), VALUES),
+    st.tuples(st.just("put"), KEYS, VALUES),
+    st.tuples(st.just("delkey"), KEYS),
+)
+A_STEP = st.one_of(
+    st.tuples(st.just("begin"), ACTOR),
+    st.tuples(st.just("begin"), ACTOR),
+    st.tuples(st.sampled_from(("commit", "commit", "raise")), ACTOR),
+    st.tuples(st.sampled_from(("cancel", "cancel_reading")), ACTOR),
+    st.tuples(st.just("set"), ACTOR, st.sampled_from(("x", "y")), VALUES),
+    st.tuples(st.just("bad"), ACTOR, st.sampled_from(("x", "y"))),
+    st.tuples(st.just("mut"), ACTOR, A_CHANGE),
+    st.tuples(st.just("mut"), ACTOR, A_CHANGE),
+    st.tuples(
+        st.just("side"),
+        ACTOR,
+        st.one_of(
+            st.tuples(st.just("set"), st.sampled_from(("x", "y")), VALUES),
+            st.tuples(st.just("mut"), A_CHANGE),
+        ),
+    ),
+    st.tuples(st.just("aread"), ACTOR, st.sampled_from(("view", "nest"))),
+    st.tuples(st.sampled_from(("sread", "asubmit", "nested", "spawn")), ACTOR),
+    st.tuples(st.just("spawn"), ACTOR),
+    st.tuples(st.sampled_from(("hold", "snapshot")), ACTOR),
+    st.tuples(st.just("release")),
+    st.tuples(st.just("snapshot"), ACTOR),
+    st.tuples(st.just("reader"), SLOT, READER_KIND, ORIGIN, WHICH),
+    st.tuples(st.just("reader"), SLOT, READER_KIND, ORIGIN, WHICH),
+    # Every free slot at once, all asking for the same: joins (G5).
+    st.tuples(st.just("readers"), READER_KIND, ORIGIN, WHICH),
+    st.tuples(st.just("advance"), SLOT),
+    st.tuples(st.just("advance"), SLOT),
+    st.tuples(st.just("advance"), SLOT),
+    st.tuples(st.just("rcancel"), SLOT),
+)
+
+
+A_PROGRAM = st.lists(A_STEP, min_size=15, max_size=50)
+LOOPS = st.integers(min_value=1, max_value=2)
+# Which loop each actor and each reader the driver starts runs on.
+PLACEMENT = st.lists(
+    st.integers(min_value=0, max_value=1),
+    min_size=ACTORS + READERS,
+    max_size=ACTORS + READERS,
+)
+
+
+def _run_async_program(
+    backend: str | None, program: Any, loops: int, placement: list[int]
+) -> None:
+    with _cache_dir(backend) as path:
+        kwargs = {} if path is None else {"cache_dir": path, "cache_backend": backend}
+        engine = Engine(**kwargs)
+        rig = AsyncRig(engine, named=path is not None)
+        run = AsyncRun(rig, loops, placement)
+        event(f"event loops: {loops}")
+        try:
+            run.check()
+            for step in program:
+                run.step(step)
+            run.finish()
+            final = run.state
+        finally:
+            try:
+                run.close()
+            finally:
+                engine.shutdown()
+        if path is None:
+            return
+        # The named collections on disk hold what the model committed.
+        reopened = Engine(**kwargs)
+        try:
+            again = AsyncRig(reopened, named=True)
+            assert again.contents() == {c: getattr(final, c) for c in A_COLLS}
+        finally:
+            reopened.shutdown()
+
+
+@_settings(200)
+@given(program=A_PROGRAM, loops=LOOPS, placement=PLACEMENT)
+def test_async_transaction_programs(
+    program: Any, loops: int, placement: list[int]
+) -> None:
+    _run_async_program(None, program, loops, placement)
+
+
+@_settings(30)
+@given(program=A_PROGRAM, loops=LOOPS, placement=PLACEMENT)
+def test_async_transaction_programs_on_disk(
+    program: Any, loops: int, placement: list[int]
+) -> None:
+    _run_async_program("mdbx", program, loops, placement)

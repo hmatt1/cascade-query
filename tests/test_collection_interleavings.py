@@ -15,12 +15,18 @@ Pause points:
   head being published, the disk append, the disk snapshot, the disk load,
   the write-lock claim, compaction (on disk and in memory), and each stage
   of a transaction's commit or rollback;
-* the start of every reader query body, and between its two reads.
+* the start of every reader query body, and between its two reads;
+* with readers that share a query key, every acquisition of the graph
+  store's lock where a call looks up the key's row and claims or joins its
+  run (``compute_or_get_memo`` and its async twin).
 
 A thread blocked on an instrumented lock leaves the schedule until the lock
-is free. The other locks a pause can happen under (the diff log's lock, the
-pipeline runtime's lock) are instrumented the same way without being pause
-points. A thread that does not reach its next pause point within
+is free. So does a thread waiting for another thread's run of the same key
+(G5): the future it waits on is swapped for one whose waiting is done by the
+scheduler, for sync and async callers alike, and the run's owner is followed
+for the deadlock check. The other locks a pause can happen under (the diff
+log's lock, the pipeline runtime's lock) are instrumented the same way
+without being pause points. A thread that does not reach its next pause point within
 ``CASCADE_INTERLEAVE_TIMEOUT`` seconds (default 20) fails the run with the
 schedule that hung it; managed threads run on daemon threads, so a hung schedule
 cannot hang the suite. A deadlock among managed threads fails at once.
@@ -47,11 +53,17 @@ change, and is only allowed while such a transaction was open. After every
 run the collection's own invariants are checked (log replay equals the
 storage, element ids, the published head), derived queries are compared
 with plain Python and must run again exactly when the collection changed,
-and a named collection is reloaded from disk and compared.
+and a named collection is reloaded from disk and compared. Two or three
+readers may ask for one key (a plain view, a rewritten sum, an async view
+awaited on a loop or called from sync code, a view through a snapshot);
+then two runs of that key at one revision must never overlap (G5), and
+each reader's value goes into the serial order like any other read.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import contextvars
 import functools
 import itertools
@@ -68,7 +80,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from cascade import (
@@ -80,6 +92,7 @@ from cascade import (
 )
 from cascade import _collections as collections_module
 from cascade import _disk_cache as disk_module
+from cascade import _evaluator as evaluator_module
 from cascade import _store as store_module
 from cascade import engine as engine_module
 
@@ -186,6 +199,8 @@ class Scheduler:
         self.progress = 0
         self.failure: str | None = None
         self.trace: list[str] = []
+        # Waits for another thread's run of a query (G5) in this schedule.
+        self.joins = 0
 
     # -- setup and the main thread's side --------------------------------
 
@@ -390,10 +405,19 @@ class _SchedLock:
     it the ordinary way.
     """
 
-    def __init__(self, sched: Scheduler, name: str, *, pause: bool) -> None:
+    def __init__(
+        self,
+        sched: Scheduler,
+        name: str,
+        *,
+        pause: bool,
+        pause_in: frozenset[str] = frozenset(),
+    ) -> None:
         self.sched = sched
         self.name = name
         self.pause = pause
+        # Functions whose acquisitions are pause points when ``pause`` is off.
+        self.pause_in = pause_in
         self.owner: int | None = None
         self.count = 0
 
@@ -416,6 +440,13 @@ class _SchedLock:
             return True
         if self.pause:
             sched.point(f"lock {self.name}")
+        elif self.pause_in:
+            # The caller of ``acquire``, or of ``__enter__`` for a ``with``.
+            frame = sys._getframe(1)  # noqa: SLF001
+            if frame.f_code.co_name == "__enter__":
+                frame = frame.f_back
+            if frame is not None and frame.f_code.co_name in self.pause_in:
+                sched.point(f"lock {self.name} in {frame.f_code.co_name}")
         with sched.cond:
             while self.owner is not None:
                 if not blocking:  # pragma: no cover - not used by cascade
@@ -434,11 +465,93 @@ class _SchedLock:
             self.owner = None
             self.sched.unblock(self)
 
+    def _is_owned(self) -> bool:
+        # As on ``threading.RLock``: asked when a caller is about to wait
+        # for another thread's run while inside a pipeline.
+        return self.owner == threading.get_ident()
+
     def __enter__(self) -> bool:
         return self.acquire()
 
     def __exit__(self, *exc: Any) -> None:
         self.release()
+
+
+class _SchedFuture(concurrent.futures.Future):
+    """The future a caller waits on for another thread's run of a query (G5).
+
+    The evaluator makes one when a second caller asks for a key at the same
+    revision (``_claim_in_flight_locked``) and waits on it in the OS, where
+    the scheduler cannot see it. This one waits by taking the thread out of
+    the schedule until the run's owner sets the result, as ``_SchedLock``
+    does for a lock. ``owner`` is the owner's thread, for the deadlock check.
+    """
+
+    def __init__(self, owner_thread: int | None) -> None:
+        super().__init__()
+        self.owner = owner_thread
+        self.name = f"the run of thread {owner_thread}"
+
+    def _wait_in_schedule(self) -> None:
+        sched = _ACTIVE
+        me = sched.current() if sched is not None else None
+        if me is None:
+            return
+        with sched.cond:
+            if not self.done():
+                sched.joins += 1
+            while not self.done():
+                sched.block_on(me, self)  # type: ignore[arg-type]
+
+    def _wake(self) -> None:
+        sched = _ACTIVE
+        if sched is not None:
+            with sched.cond:
+                sched.unblock(self)  # type: ignore[arg-type]
+
+    def result(self, timeout: float | None = None) -> Any:
+        self._wait_in_schedule()
+        return super().result(timeout)
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        self._wait_in_schedule()
+        return super().exception(timeout)
+
+    def set_result(self, result: Any) -> None:
+        super().set_result(result)
+        self._wake()
+
+    def set_exception(self, exception: BaseException | None) -> None:
+        super().set_exception(exception)
+        self._wake()
+
+
+def _claim_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(fn)
+    def claim(
+        self: Any, in_flight_key: Any, owner: Any = None, owner_thread: Any = None
+    ) -> Any:
+        # Called with the store's lock held. A second caller is about to
+        # join the run: give the slot a future the scheduler can see.
+        slot = self._store.in_flight.get(in_flight_key)  # noqa: SLF001
+        if slot is not None and slot.future is None:
+            slot.future = _SchedFuture(slot.owner_thread)
+        return fn(self, in_flight_key, owner, owner_thread)
+
+    return claim
+
+
+def _joined_wait_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(fn)
+    async def wait(shared: Any) -> Any:
+        # An async caller waits by awaiting, on a loop the test runs alone
+        # on a managed thread: block that thread in the schedule until the
+        # run is over, then let the library relay the result as it does.
+        if isinstance(shared, _SchedFuture):
+            shared.exception()
+        return await fn(shared)
+
+    return wait
 
 
 # --------------------------------------------------------------------------
@@ -523,11 +636,34 @@ def hooks(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
                 _before("disk stamp", backend.collection_stamp),
             )
         patch(backend, "collection_head", _after("disk head", backend.collection_head))
+    evaluator = evaluator_module.Evaluator
+    patch(
+        evaluator,
+        "_claim_in_flight_locked",
+        _claim_hook(evaluator._claim_in_flight_locked),  # noqa: SLF001
+    )
+    patch(
+        evaluator_module,
+        "_wait_for_joined_run",
+        _joined_wait_hook(evaluator_module._wait_for_joined_run),  # noqa: SLF001
+    )
     yield
 
 
-def _instrument(sched: Scheduler, engine: Engine, coll: Any) -> None:
-    """Put the collection's locks (and the pipeline runtime's) under ``sched``."""
+# Where a caller looks up a query's row and then claims or joins its run
+# (G5). With readers sharing a key, the store's lock is a pause point there,
+# so another thread can finish, store or start a run in between.
+_CLAIM_SITES = frozenset({"compute_or_get_memo", "compute_or_get_memo_async"})
+
+
+def _instrument(
+    sched: Scheduler, engine: Engine, coll: Any, *, store: bool = False
+) -> None:
+    """Put the collection's locks (and the pipeline runtime's) under ``sched``.
+
+    With ``store``, the graph store's lock too, pausing where a query call
+    looks up its row and claims or joins its run.
+    """
     core = coll._core  # noqa: SLF001
     tag = f"{core.name}@{id(engine) % 1000}"
     core.rw = _SchedLock(sched, f"rw {tag}", pause=True)
@@ -535,6 +671,10 @@ def _instrument(sched: Scheduler, engine: Engine, coll: Any) -> None:
     rt = engine._incremental_rt  # noqa: SLF001
     if not isinstance(rt._lock, _SchedLock):  # noqa: SLF001
         rt._lock = _SchedLock(sched, "pipelines", pause=False)  # noqa: SLF001
+    if store:
+        engine._store.lock = _SchedLock(  # noqa: SLF001
+            sched, "store", pause=False, pause_in=_CLAIM_SITES
+        )
 
 
 def _uninstrument(engine: Engine, coll: Any) -> None:
@@ -543,6 +683,8 @@ def _uninstrument(engine: Engine, coll: Any) -> None:
     core.rw = threading.RLock()
     core.log.lock = threading.RLock()
     engine._incremental_rt._lock = threading.RLock()  # noqa: SLF001
+    if isinstance(engine._store.lock, _SchedLock):  # noqa: SLF001
+        engine._store.lock = threading.RLock()  # noqa: SLF001
 
 
 # --------------------------------------------------------------------------
@@ -555,6 +697,7 @@ class Explored:
     runs: int = 0
     complete: bool = False
     longest: int = 0
+    joined: int = 0  # schedules in which a caller waited for another's run
 
 
 def _next_prefix(
@@ -594,6 +737,7 @@ def explore(
                 f"schedule {stats.runs} of the walk (bound {bound}): {exc}"
             ) from exc
         stats.longest = max(stats.longest, len(sched.picks))
+        stats.joined += sched.joins > 0
         nxt = _next_prefix(sched.picks, sched.widths, sched.preemptive, bound)
         if nxt is None:
             stats.complete = True
@@ -657,6 +801,30 @@ def mark(name: str) -> Step:
 
 def snapview(name: str) -> Step:
     return Step("snapview", f"view {name}", snap=name)
+
+
+# Readers that share one query key, so that they can join each other's run
+# (G5): the same plain view for every thread, the same rewritten sum, and an
+# async view that a thread awaits on an event loop of its own or calls from
+# synchronous code.
+SVIEW = Step("sview", "shared view")
+STOTAL = Step("stotal", "shared sum")
+ASVIEW = Step("asview", "async shared view, awaited")
+SASVIEW = Step("sasview", "async shared view, called")
+
+
+def snapsview(name: str) -> Step:
+    return Step("snapsview", f"shared view {name}", snap=name)
+
+
+# What the oracle checks each shared reader's result as.
+_ATOM_KIND = {
+    "sview": "view",
+    "asview": "view",
+    "sasview": "view",
+    "stotal": "total",
+    "snapsview": "snapview",
+}
 
 
 @dataclass(eq=False)
@@ -732,7 +900,7 @@ def _atoms(e: Event) -> list[_Atom]:
         return atoms
     if kind == "compact":
         return [_Atom("none", e, e.start, e.end)]
-    return [_Atom(kind, e, e.start, e.end, observed=e.observed)]
+    return [_Atom(_ATOM_KIND.get(kind, kind), e, e.start, e.end, observed=e.observed)]
 
 
 def _linearizable(
@@ -888,6 +1056,17 @@ class _Run:
             # Rewriting a query costs a parse: only for threads that sum.
             if any(step.kind == "total" for step in steps):
                 self.totals[t] = self._make_total(t)
+        # One key for every thread that reads it: [revision, start, end] of
+        # each run of the body, end None until it returns.
+        self.shared_runs: dict[str, list[list[Any]]] = {}
+        used = {step.kind for steps in sc.threads for step in steps}
+        self.shared: dict[str, Any] = {}
+        if used & {"sview", "snapsview"}:
+            self.shared["sview"] = self._make_shared_view()
+        if "stotal" in used:
+            self.shared["stotal"] = self._make_shared_total()
+        if used & {"asview", "sasview"}:
+            self.shared["asview"] = self._make_async_shared_view()
 
     def _make_view(self, t: int) -> Any:
         coll = self.coll
@@ -918,6 +1097,62 @@ class _Run:
             return sum(v for v in coll)  # rewritten into a pipeline
 
         return self.engine.query(total, name=f"total{t}")
+
+    def _contents(self) -> Any:
+        coll = self.coll
+        if self.sc.kind == "list":
+            return tuple(coll)
+        if self.sc.kind == "set":
+            return tuple(sorted(coll))
+        return tuple(sorted(coll.items()))
+
+    def _run_started(self, name: str) -> list[Any]:
+        runtime = self.engine._evaluator.current_runtime()  # noqa: SLF001
+        assert runtime is not None
+        run = [runtime.snapshot.revision, self.sched.tick(), None]
+        self.shared_runs.setdefault(name, []).append(run)
+        return run
+
+    def _make_shared_view(self) -> Any:
+        coll = self.coll
+
+        def sview() -> Any:
+            run = self._run_started("sview")
+            _point("shared view body")
+            n = len(coll)
+            _point("between reads")
+            out = n, self._contents()
+            run[2] = self.sched.tick()
+            return out
+
+        return self.engine.query(sview, name="sview", incremental_per_element=False)
+
+    def _make_shared_total(self) -> Any:
+        coll = self.coll
+
+        def stotal() -> int:
+            run = self._run_started("stotal")
+            _point("shared total body")
+            out = sum(v for v in coll)  # rewritten into a pipeline
+            run[2] = self.sched.tick()
+            return out
+
+        return self.engine.query(stotal, name="stotal")
+
+    def _make_async_shared_view(self) -> Any:
+        coll = self.coll
+
+        async def asview() -> Any:
+            run = self._run_started("asview")
+            _point("async shared body")
+            n = len(coll)
+            await asyncio.sleep(0)
+            _point("between reads")
+            out = n, self._contents()
+            run[2] = self.sched.tick()
+            return out
+
+        return self.engine.query(asview, name="asview")
 
     # -- inside the managed threads --------------------------------------
 
@@ -971,6 +1206,12 @@ class _Run:
             ev.observed = self.views[t](snapshot=self.snaps[step.snap])
         elif kind == "compact":
             coll.compact()
+        elif kind in ("sview", "stotal", "sasview"):
+            ev.observed = self.shared[{"sasview": "asview"}.get(kind, kind)]()
+        elif kind == "snapsview":
+            ev.observed = self.shared["sview"](snapshot=self.snaps[step.snap])
+        elif kind == "asview":
+            ev.observed = _await_on_this_thread(self.shared["asview"])
         else:  # pragma: no cover
             raise AssertionError(kind)
 
@@ -1003,7 +1244,9 @@ class _Run:
         if why is not None:
             raise AssertionError(self.sched.describe(why))
         self._check_core(core, final)
+        self._check_one_run_per_revision()
         self._check_queries(final)
+        self._check_shared(final)
         for snap in self.snaps.values():
             snap.release()
         self.engine.shutdown()
@@ -1057,6 +1300,49 @@ class _Run:
             )
         fresh.shutdown()
 
+    def _check_one_run_per_revision(self) -> None:
+        """G5: two runs of one shared key at one revision never overlap.
+
+        A caller that asks for the key while another thread's run of it at
+        the same revision is under way waits for that run. Runs at one
+        revision one after the other are allowed (the second may follow a
+        snapshot read that replaced the row); at the same time, never.
+        """
+        for name, runs in self.shared_runs.items():
+            by_rev: dict[int, list[tuple[int, float]]] = {}
+            for rev, start, end in runs:
+                span = (start, float("inf") if end is None else end)
+                by_rev.setdefault(rev, []).append(span)
+            for rev, spans in by_rev.items():
+                spans.sort()
+                for (_s1, e1), (s2, _e2) in itertools.pairwise(spans):
+                    if s2 < e1:
+                        raise AssertionError(
+                            self.sched.describe(
+                                f"{name} ran twice at once at revision {rev}: "
+                                f"{sorted(spans)} (G5)"
+                            )
+                        )
+
+    def _check_shared(self, final: Any) -> None:
+        """The shared queries give the final contents, and run only if stale."""
+        if "stotal" in self.shared:
+            assert self.engine.inspect_pipelines(), "the shared sum was not rewritten"
+        expected = self.model.view(final)
+        for name, query in self.shared.items():
+            want = sum(self.model.thaw(final)) if name == "stotal" else expected
+            runs = self.shared_runs.setdefault(name, [])
+            before = len(runs)
+
+            def read(query: Any = query, name: str = name) -> Any:
+                if name == "asview":
+                    return _await_on_a_worker(query)
+                return query()
+
+            assert read() == want, self.sched.describe(f"{name} differs at the end")
+            read()
+            assert len(runs) <= before + 1, f"{name} ran again with nothing changed"
+
     def _check_reload(self, final: Any) -> None:
         engine = Engine(cache_dir=self.cache_dir, cache_backend=self.sc.backend)
         try:
@@ -1069,6 +1355,47 @@ class _Run:
 
 
 _names = itertools.count()
+
+# One event loop per thread, kept: a new loop opens a localhost socket pair
+# (its self-pipe), and a walk of thousands of schedules that made a loop for
+# each read left the machine short of ports, where making one can hang.
+_thread_loops = threading.local()
+
+
+def _await_on_this_thread(query: Any) -> Any:
+    """Await ``query()`` on this thread's own event loop."""
+    loop = getattr(_thread_loops, "loop", None)
+    if loop is None:
+        loop = _thread_loops.loop = asyncio.new_event_loop()
+
+    async def awaited() -> Any:
+        return await query()
+
+    try:
+        return loop.run_until_complete(awaited())
+    except BaseException:
+        # Ended by a failed run (``_Abort``) or a failing read: a new loop
+        # next time, rather than one an aborted task may have left behind.
+        _thread_loops.loop = None
+        loop.close()
+        raise
+
+
+def _await_on_a_worker(query: Any) -> Any:
+    """``_await_on_this_thread`` on a worker thread, given STEP_TIMEOUT."""
+    done: concurrent.futures.Future[Any] = concurrent.futures.Future()
+
+    def job() -> None:
+        try:
+            done.set_result(_await_on_this_thread(query))
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            done.set_exception(exc)
+
+    _Worker.submit(job)
+    try:
+        return done.result(STEP_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        raise AssertionError(f"awaiting {query} hung for {STEP_TIMEOUT}s") from None
 
 
 class Runner:
@@ -1085,7 +1412,7 @@ class Runner:
     def __call__(self, sched: Scheduler) -> None:
         run = _Run(self.sc, sched, self.cache_dir)
         try:
-            _instrument(sched, run.engine, run.coll)
+            _instrument(sched, run.engine, run.coll, store=bool(run.shared))
             for t in range(len(self.sc.threads)):
                 sched.spawn(f"T{t}", run.thread_body(t))
             sched.run()
@@ -1461,6 +1788,110 @@ SCENARIOS: dict[str, tuple[Callable[[], Scenario], int, int]] = {
     ),
 }
 
+# Two or three readers ask for one query key while writers change the
+# collection: a reader that finds another thread's run of the key at its own
+# revision waits for that run (G5) and must get the same value, which must
+# fit the serial order like every other read.
+SHARED_SCENARIOS: dict[str, tuple[Callable[[], Scenario], int, int]] = {
+    "two readers share a view while a list changes": (
+        lambda: Scenario(
+            initial=(7,),
+            threads=[
+                [_append(1)],
+                [SVIEW],
+                [SVIEW],
+            ],
+        ),
+        2,
+        3,
+    ),
+    "three readers share a view beside a transaction": (
+        lambda: Scenario(
+            initial=(7,),
+            threads=[
+                [
+                    tx(
+                        "tx append 1, pop 0",
+                        lambda xs: xs.append(1),
+                        lambda xs: xs.pop(0),
+                    )
+                ],
+                [SVIEW],
+                [SVIEW],
+                [SVIEW],
+            ],
+        ),
+        1,
+        2,
+    ),
+    "readers share a rewritten sum while a rollback runs": (
+        lambda: Scenario(
+            initial=(7,),
+            threads=[
+                [_append(1)],
+                [tx("tx append 2, rolled back", lambda xs: xs.append(2), commit=False)],
+                [STOTAL],
+                [STOTAL],
+            ],
+        ),
+        1,
+        2,
+    ),
+    "a snapshot reader and a live reader share a view": (
+        lambda: Scenario(
+            initial=(7,),
+            threads=[
+                [_append(1)],
+                [mark("s"), snapsview("s")],
+                [SVIEW],
+            ],
+        ),
+        2,
+        3,
+    ),
+    "an async and a sync reader share an async query": (
+        lambda: Scenario(
+            initial=(7,),
+            threads=[
+                [_append(1)],
+                [ASVIEW],
+                [SASVIEW],
+            ],
+        ),
+        1,
+        2,
+    ),
+    "set readers share a view and a sum": (
+        lambda: Scenario(
+            kind="set",
+            initial=(1,),
+            threads=[
+                [
+                    op("add 2", lambda s: s.add(2)),
+                    op("discard 1", lambda s: s.discard(1)),
+                ],
+                [SVIEW, STOTAL],
+                [STOTAL, SVIEW],
+            ],
+        ),
+        1,
+        2,
+    ),
+    "dict readers share an async view beside a transaction": (
+        lambda: Scenario(
+            kind="dict",
+            initial={1: "a"},
+            threads=[
+                [tx("tx d[2] = b, del d[1]", _set(2, "b"), _del(1))],
+                [ASVIEW],
+                [SASVIEW],
+            ],
+        ),
+        1,
+        2,
+    ),
+}
+
 # Named collections: every change is written to disk before it is applied,
 # and compaction (here after every two changes) rewrites the log.
 DISK_SCENARIOS: dict[str, tuple[Callable[[str], Scenario], int, int]] = {
@@ -1502,10 +1933,11 @@ DISK_SCENARIOS: dict[str, tuple[Callable[[str], Scenario], int, int]] = {
 
 def _explore_scenario(
     runner: Any, capsys: Any, label: str, sc: Scenario, bound: int
-) -> None:
+) -> Explored:
     stats = explore(runner(sc), bound=bound)
     _report(capsys, f"{label} (bound {bound})", stats)
     assert stats.complete
+    return stats
 
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
@@ -1527,6 +1959,21 @@ def test_interleavings_on_disk(
 @pytest.mark.parametrize("name", list(SCENARIOS))
 def test_interleavings_deeper(runner: Any, capsys: Any, name: str) -> None:
     make, _default, bound = SCENARIOS[name]
+    _explore_scenario(runner, capsys, name, make(), bound)
+
+
+@pytest.mark.parametrize("name", list(SHARED_SCENARIOS))
+def test_readers_sharing_a_query(runner: Any, capsys: Any, name: str) -> None:
+    make, bound, _deeper = SHARED_SCENARIOS[name]
+    stats = _explore_scenario(runner, capsys, name, make(), bound)
+    # The walk reaches the wait it is for.
+    assert stats.joined > 0
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", list(SHARED_SCENARIOS))
+def test_readers_sharing_a_query_deeper(runner: Any, capsys: Any, name: str) -> None:
+    make, _default, bound = SHARED_SCENARIOS[name]
     _explore_scenario(runner, capsys, name, make(), bound)
 
 
@@ -1670,19 +2117,54 @@ def _random_settings(examples: int) -> Any:
     )
 
 
-def _run_random(sc: Scenario, picks: list[int]) -> None:
+def _run_random(sc: Scenario, picks: list[int]) -> Scheduler:
     with pytest.MonkeyPatch.context() as mp:
         run = Runner(sc, mp)
+        sched = Scheduler(picks)
         try:
-            run(Scheduler(picks))
+            run(sched)
         finally:
             run.close()
+    return sched
 
 
 @_random_settings(_RANDOM_EXAMPLES)
 @given(sc=_programs(disk=False), picks=st.lists(st.integers(0, 3), max_size=60))
 def test_random_programs_and_schedules(sc: Scenario, picks: list[int]) -> None:
     _run_random(sc, picks)
+
+
+_SHARED_READERS = {
+    "sview": SVIEW,
+    "stotal": STOTAL,
+    "asview": ASVIEW,
+    "sasview": SASVIEW,
+}
+
+
+@st.composite
+def _shared_programs(draw: Any) -> Scenario:
+    """Writers as above, and two or three readers of one shared key."""
+    sc = draw(_programs(disk=False))
+    sc.threads.pop()  # the per-thread reader
+    key = draw(st.sampled_from([*_SHARED_READERS, "async either way"]))
+    for i in range(draw(st.integers(2, 3))):
+        if key == "async either way":
+            sc.threads.append([draw(st.sampled_from([ASVIEW, SASVIEW]))])
+        elif key == "sview" and draw(st.booleans()):
+            sc.threads.append([mark(f"s{i}"), snapsview(f"s{i}")])
+        else:
+            sc.threads.append([_SHARED_READERS[key]])
+    return sc
+
+
+@_random_settings(2 * _RANDOM_EXAMPLES)
+@given(
+    sc=_shared_programs(), picks=st.lists(st.integers(0, 3), min_size=30, max_size=60)
+)
+def test_random_programs_with_shared_readers(sc: Scenario, picks: list[int]) -> None:
+    sched = _run_random(sc, picks)
+    event(f"a reader waited for another's run: {sched.joins > 0}")
 
 
 @pytest.mark.slow

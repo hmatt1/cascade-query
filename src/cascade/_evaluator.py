@@ -1481,6 +1481,11 @@ class Evaluator:
         if future is None:
             return
         if exc is not None:
+            if isinstance(exc, asyncio.CancelledError):
+                # The task that ran it was cancelled. That cancels nobody
+                # who waits for the run: each claims the query again and
+                # runs it, as after a submitted run's QueryCancelled.
+                exc = QueryCancelled("the task running this query was cancelled")
             future.set_exception(exc)
         else:
             future.set_result(result)  # type: ignore[arg-type]
