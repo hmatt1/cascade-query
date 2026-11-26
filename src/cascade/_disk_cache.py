@@ -552,6 +552,32 @@ class MdbxDiskCache:
                 ) from exc
             raise
 
+    def collection_stamp(
+        self, name: str, record: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Write ``record`` as the snapshot of ``name`` unless it has one.
+
+        Returns the snapshot found instead, if any. Checked and written in
+        one write transaction, so a record another engine writes in the
+        meantime is never replaced.
+        """
+        blob = _canonical.encode(record)
+        key = self._snap_key(name)
+        try:
+            with self._begin(write=True) as txn:
+                raw = self._collections.get(txn, key)
+                if raw is not None:
+                    return _canonical.decode(bytes(raw))
+                self._collections.put(txn, key, blob)
+        except mdbx.MDBXErrorExc as exc:  # pragma: no cover - a full map
+            if "MDBX_MAP_FULL" in str(exc):
+                raise PersistentCacheError(
+                    f"persistent cache at {self.path!r} is full; pass a larger cache_map_size "
+                    "to Engine, or clear the cache with engine.clear_disk_cache()."
+                ) from exc
+            raise
+        return None
+
     def collection_snapshot(
         self, name: str, record: dict[str, Any], upto_rev: int
     ) -> None:
@@ -861,6 +887,28 @@ class SqliteDiskCache:
                 self._conn.execute("rollback")
                 raise
 
+    def collection_stamp(
+        self, name: str, record: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Write ``record`` as the snapshot of ``name`` unless it has one.
+
+        Returns the snapshot found instead, if any. The insert is one
+        statement, so a record another engine writes in the meantime is
+        never replaced.
+        """
+        blob = _canonical.encode(record)
+        key = self._snap_key(name)
+        with self._lock:
+            cursor = self._conn.execute(
+                "insert or ignore into collections (k, v) values (?, ?)", (key, blob)
+            )
+            if cursor.rowcount == 1:
+                return None
+            row = self._conn.execute(
+                "select v from collections where k = ?", (key,)
+            ).fetchone()
+        return _canonical.decode(bytes(row[0]))
+
     def collection_snapshot(
         self, name: str, record: dict[str, Any], upto_rev: int
     ) -> None:
@@ -938,6 +986,9 @@ class DiskCacheProtocol(Protocol):
         self, name: str, batch: list[tuple[int, dict[str, Any]]]
     ) -> None: ...
     def collection_head(self, name: str) -> int: ...
+    def collection_stamp(
+        self, name: str, record: dict[str, Any]
+    ) -> dict[str, Any] | None: ...
     def lock_collection(self, name: str) -> bool: ...
     def unlock_collection(self, name: str) -> None: ...
     def collection_snapshot(
