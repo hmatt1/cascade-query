@@ -1010,33 +1010,46 @@ def _compile(
 # --- exact comparison -----------------------------------------------------------
 
 
-def _canon(value: Any) -> Any:
+def _canon(value: Any, signed: bool = False) -> Any:
     """A value equal only for results no code could tell apart.
 
-    Object identity aside: every NaN of one sign is equal here, as it is to
-    the digests.
+    Object identity aside, and the sign of a NaN unless ``signed``: CPython
+    itself gives ``inf - inf`` and ``nan + nan`` either sign, from one call
+    of a function to the next, as its bytecode is specialized (so a loop
+    ``a += x`` over ``[nan, inf, -inf]`` does). The engine keeps a NaN's
+    sign, in digests and on disk; ``signed`` compares it.
     """
     kind = type(value)
     if kind is float:
+        if value != value and not signed:
+            return ("float", "nan")
         return ("float", repr(value), math.copysign(1.0, value))
     if kind is list or kind is tuple:
-        return (kind.__name__, tuple(_canon(v) for v in value))
+        return (kind.__name__, tuple(_canon(v, signed) for v in value))
     if kind is set or kind is frozenset:
         # Counted: a set can hold several NaN objects.
-        return (kind.__name__, frozenset(Counter(map(_canon, value)).items()))
+        items = Counter(_canon(v, signed) for v in value).items()
+        return (kind.__name__, frozenset(items))
     if kind is dict:
-        return ("dict", tuple((_canon(k), _canon(v)) for k, v in value.items()))
+        items = value.items()
+        return ("dict", tuple((_canon(k, signed), _canon(v, signed)) for k, v in items))
     return (kind.__name__, value)
 
 
 def _outcome(fn: Callable[[], Any], loop: Any = None) -> Any:
-    """What ``fn()`` gives; awaited on ``loop`` if it gives an awaitable."""
+    """What ``fn()`` gives; awaited on ``loop`` if it gives an awaitable.
+
+    Also the same with the signs of NaNs: ``(outcome, signed)``.
+    """
     try:
         if loop is None:
-            return ("value", _canon(fn()))
-        return ("value", _canon(loop.run_until_complete(_awaited(fn))))
+            value = fn()
+        else:
+            value = loop.run_until_complete(_awaited(fn))
     except Exception as exc:  # noqa: BLE001
-        return ("raises", type(exc).__name__, str(exc))
+        outcome = ("raises", type(exc).__name__, str(exc))
+        return outcome, outcome
+    return ("value", _canon(value)), ("value", _canon(value, signed=True))
 
 
 async def _awaited(fn: Callable[[], Any]) -> Any:
@@ -1269,12 +1282,13 @@ def _contents(collections: dict[str, Any]) -> Any:
             list(collections["ys"]),
             list(collections["s"]),
             dict(collections["d"]),
-        )
+        ),
+        signed=True,
     )
 
 
 def _model_contents(model: dict[str, Any]) -> Any:
-    return _canon((model["xs"], model["ys"], list(model["s"]), model["d"]))
+    return _canon((model["xs"], model["ys"], list(model["s"]), model["d"]), signed=True)
 
 
 # Bodies per example: they share the data, the changes and the engine.
@@ -1393,20 +1407,23 @@ def _run(
         # The rewriter leaves async queries as written (G22).
         assert not (body.is_async and rewritten), body.source
 
-    # What the plain function pushed on its last call, raising or not.
+    # What the plain function pushed on its last call, raising or not, and
+    # what the last live call gave, with the signs of NaNs.
     pushed: list[Any] = [None]
+    exact: list[Any] = [None]
 
     def plain_call(plain: Callable[[], Any], on: Any) -> Any:
         """The plain outcome and its effects: none when it raises."""
         log.clear()
-        outcome = _outcome(plain, on)
-        pushed[0] = _canon(list(log))
+        outcome, _ = _outcome(plain, on)
+        pushed[0] = list(log)
         return outcome, _canon(list(log) if outcome[0] == "value" else [])
 
     def live_call(call: Callable[..., Any], on: Any) -> Any:
         effects: dict[str, list[Any]] = {}
-        outcome = _outcome(lambda: call(effects=effects), on)
+        outcome, signed = _outcome(lambda: call(effects=effects), on)
         assert set(effects) <= {EFFECTS}, effects
+        exact[0] = (signed, _canon(effects.get(EFFECTS, []), signed=True))
         return outcome, _canon(effects.get(EFFECTS, []))
 
     last: list[Any] = [None]
@@ -1416,8 +1433,15 @@ def _run(
         seen = []
         for source, plain, query, on in zip(sources, plains, live.queries, loops):
             want = plain_call(plain, on)
-            seen.append((want[0], pushed[0]))
             got = live_call(query, on)
+            if want[0][0] == "value":
+                seen.append(exact[0])
+            elif _canon(pushed[0], signed=True) != _canon(pushed[0]):
+                # Raised, and pushed a NaN: the live call's effects, which a
+                # caller would collect, cannot be seen, nor their signs.
+                seen.append(None)
+            else:
+                seen.append((want[0], _canon(pushed[0])))
             assert got == want, (
                 f"after {step!r}:\n{source}\n"
                 f"rewritten: {got[0]}\n           effects {got[1]}\n"
@@ -1449,7 +1473,11 @@ def _run(
         # caller that catches the error collects them. A read through a
         # snapshot replaces the cached result with an older one, so the
         # next run at the head compares against that (G4).
-        assert live.p_runs[0] == runs or last[0] is None or last[0] != seen, (
+        # The live results are compared with their NaN signs: a NaN made by
+        # arithmetic may change sign when the query runs again, and so its
+        # digest, and the caller runs again for it.
+        unknown = last[0] is None or None in last[0] or None in seen
+        assert live.p_runs[0] == runs or unknown or last[0] != seen, (
             f"after {step!r}: the query over the bodies ran again, but they "
             f"still give\n{seen}\n" + "\n".join(sources)
         )

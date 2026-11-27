@@ -639,7 +639,14 @@ _FROZEN_TYPES = (int, float, complex, str, bytes, type(None))
 
 
 def _frozen(value: Any) -> bool:
-    """Whether ``value`` is of a type that cannot be changed in place."""
+    """Whether ``value`` is the same to Python if it is handed out again.
+
+    Not if it can be changed in place, nor if it is a NaN: Python makes a
+    new NaN object each time, and a set or dict tells NaN objects apart
+    (``{f(x) for _ in (0, 1)}`` holds two). See D46 for a captured one.
+    """
+    if isinstance(value, (float, complex)):
+        return value == value
     if isinstance(value, _FROZEN_TYPES):
         return True
     if isinstance(value, (tuple, frozenset)):
@@ -840,10 +847,11 @@ class IncrementalRuntime:
                     state.impure = True
                 if unfrozen:
                     # A stage made a value that can be changed in place (a
-                    # list, a dict, a generator, an object). The result
-                    # hands it out, and a body that changes it would find
-                    # it changed on the next run, where Python makes a new
-                    # one: rebuild each time (dNN).
+                    # list, a dict, a generator, an object), or a NaN. The
+                    # result hands it out, and a body that changes it would
+                    # find it changed on the next run, or a set the same
+                    # NaN object twice, where Python makes a new one:
+                    # rebuild each time (dNN, and a second dNN for NaN).
                     state.impure = True
                 self._record_info(
                     state_key, site, reducer_name, core, view, stages, state

@@ -1981,3 +1981,24 @@ def test_dNN_a_value_made_by_a_stage_is_new_on_every_run() -> None:
     assert q() == ([[1, 99], [2]], [[1, 2], [1, 2]], [2])
     xs.append(3)
     assert q() == ([[1, 99], [2], [3]], [[1, 2], [1, 2], [1, 2]], [3])
+
+
+def test_dNN_a_nan_made_by_a_stage_is_a_new_object_each_time() -> None:
+    # Python makes a new NaN object for each ``v + 1`` over a NaN, and a set
+    # tells NaN objects apart. A pipeline called twice in one run handed out
+    # the NaN its state held both times: ``{min(map(f, xs)) for _ in (0, 1)}``
+    # held one NaN where Python's holds two. A stage that makes a NaN now
+    # makes the pipeline rebuild on every call, as a captured NaN does (D46).
+    # Found by the soak of test_rewrite_programs.py on 3.14t (15,000
+    # examples), behind the 3.14 message difference of the plain set model.
+    engine = Engine()
+    xs = CascadeList(engine, [float("nan")])
+
+    @engine.query
+    def q() -> Any:
+        return len({min(map(lambda v: v + 1, xs)) for _ in (0, 1)})
+
+    assert getattr(q.raw, "__cascade_rewritten__", False)
+    assert q() == 2
+    xs.append(1.0)
+    assert q() == 2
