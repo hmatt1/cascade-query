@@ -38,6 +38,9 @@ Defects fixed since are listed under their release (D38 on).
   dependencies and effects (D56)**, so its own result was served after the
   input changed.
 - **Threads entering a cycle of async queries from both ends hung (D57).**
+- **A fixed-point head could replay its last run's effects twice (D64)**
+  after threads met in its cycle, or after its member was read through a
+  snapshot. Values were right.
 - **A submitted call that raised after an input changed returned the stale
   error instead of `QueryCancelled` (D58).**
 - **A result that read a default kept meanwhile at a newer revision was not

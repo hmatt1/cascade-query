@@ -1066,8 +1066,8 @@ time.
 A second round aimed at wrong results that raise nothing, and at the async
 paths. Four generators were widened, one branch each, and the harnesses
 already there ran for three hours, looping with a new seed each round on
-3.12 and the free-threaded 3.14t. Together they found twelve defects, D52 to
-D63, all fixed in 0.4.5; `docs/guarantees.md` has each. Crashes and several
+3.12 and the free-threaded 3.14t. Together they found thirteen defects, D52 to
+D64, all fixed in 0.4.5; `docs/guarantees.md` has each. Crashes and several
 processes on one directory were set aside as out of scope by design (G17,
 test gap 2).
 
@@ -1154,6 +1154,15 @@ lines of `_try_hydrate_from_disk_async`.
 Of 17 faults seeded into the async functions, 16 failed in each of 5 seeds
 within 250 examples, most within 20; the 17th (verification that counts a
 dependency's uncached error as unchanged) in 3 of 5. It found D55 to D59.
+
+It also showed, once, a head's effects replayed twice after threads met in
+its cycle. Made deterministic, that was D64: while it ran, a head could
+take its own member from another run of the head and store an ordinary
+result with the member's effects, which hold the head's last run, before
+its own push. It had a second way in on one thread, through a snapshot.
+Two regression tests force both orders on threads and tasks and both
+backends; without the fix all eight cases fail every time. The file now
+compares those effects again, and passed 25 runs on each build.
 
 ### Generated query bodies: keys, effects, nested functions, async
 

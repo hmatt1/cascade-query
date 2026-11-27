@@ -616,8 +616,11 @@ checks),
 ### G12. Accumulator effects
 
 Effects pushed during a query are stored with its result and replayed on every
-cache hit, to every waiting caller, in execution order. A query that fails
-leaks no partial effects. `compute_many(effects=)` merges per-call effects in
+cache hit, to every waiting caller, in execution order. A query that raises
+keeps the effects it pushed before raising: they come with the error to any
+caller that catches it, from its run or from a replay of the cached error,
+and to a caller that joined that run. A call that raises adds nothing to the
+caller's `effects=` dict. `compute_many(effects=)` merges per-call effects in
 call order.
 
 A fixed-point head runs until a run returns the guess it was computed from
@@ -1452,11 +1455,11 @@ were widened, found D45, D46 and D50. The collection interleavings found D47
 to D49. The generated transactions found D48 on their own as well, and
 D51. D42 to D48, D50 and D51 were in 0.4.2 and before; D49 came with the
 fix for D41. D50 and D51 were fixed in 0.4.4, the others in 0.4.3.
-D52 to D63 were found on 2026-11-26 by a second round of generators, aimed
+D52 to D64 were found on 2026-11-26 by a second round of generators, aimed
 at silent wrong results and the async paths: the state machine with tasks
 in its lock step found D52 to D54 (D54 also in a three-hour soak), the
 generated sync-against-async programs of `tests/test_async_differential.py`
-found D55 to D59, the async transactions and readers sharing a query key
+found D55 to D59 and D64, the async transactions and readers sharing a query key
 found D52 as well, and the generated query bodies found D55, D60 to D62,
 and D63 in the soak. All were in 0.4.4 and before, and are fixed in 0.4.5.
 
@@ -1531,6 +1534,7 @@ passes without an expected-failure marker.
 | D61 | A rewritten comprehension whose element called a method that changes a local of the query ran it for changed elements only: `seen = []; [seen.append(x) for x in xs]` held `[4]` after `xs.append(4)`. Such an expression is now left as written; a helper function that changes an object is not seen (G22). | `test: generated query bodies with keys, effects, nested functions and async, and the four defects they found` |
 | D62 | A pipeline handed the values its stages made to the next run as the same objects: `rows = [[x] for x in xs]; rows[0].append(99)` gave `[1, 99, 99]` after `xs.append(3)`, and a stored generator came back used up. A pipeline whose map stage makes a value that can be changed in place now rebuilds on every run (G22, at a cost to G23). | `test: generated query bodies with keys, effects, nested functions and async, and the four defects they found` |
 | D63 | A pipeline called twice in a run handed out the NaN its state held both times: `{min(map(lambda v: v + 1, xs)) for _ in (0, 1)}` over `[nan]` held one NaN where Python's set holds two. A stage that makes a NaN now makes its pipeline rebuild on every call, as a captured NaN does (D46) (G22). | `fix: a NaN made by a stage was handed out twice, and the soak's harness failures` |
+| D64 | A fixed-point head, while it ran, could take its own member from another run of the head, so its run never reached itself and was stored as an ordinary result depending on the member, with the member's effects (which hold the head's last run) before its own push: every reader got that run's effects twice. Values were right. Two ways in: two threads or tasks met in the cycle and one finished the member from its own iteration while the other waited for it; or one thread read the member through a snapshot while the head's row was kept at the newest revision. Inside a run of a head, a current row or a joined result that depends on that head now runs again on the caller's stack, as a member on the head's guess; nothing changes unless a `fixed_point=` query is registered (G7, G12). | `fix: a head's run served a member stored from another run of the head` |
 
 Smaller items, fixed: the first read of a never-set input bumped
 `engine.revision`. It now keeps the default at the current revision without
@@ -1770,7 +1774,7 @@ Ordered by the risk they leave open.
    fixed point, collections, snapshots, `submit`, `compute_many`, eviction,
    new code and, on both backends, restarts. Nine differences are allowed
    and listed in the file; none is a value. Of 17 faults seeded into the
-   async functions, 16 failed in every seed. It found D55 to D59.
+   async functions, 16 failed in every seed. It found D55 to D59 and D64.
 8. **Collection concurrency is checked under chosen interleavings, to a
    bound.** `test_collection_concurrency.py` runs several writers against
    rewritten readers, snapshots and compaction for a list, a set and a
