@@ -633,6 +633,41 @@ def _fuse(stages: tuple[tuple[Any, ...], ...]) -> Callable[[Any], tuple[bool, An
     return fused
 
 
+# Reducers whose result holds the values the stages made.
+_HANDS_OUT_VALUES = frozenset({"list", "set", "dict", "sorted", "min", "max"})
+_FROZEN_TYPES = (int, float, complex, str, bytes, type(None))
+
+
+def _frozen(value: Any) -> bool:
+    """Whether ``value`` is the same to Python if it is handed out again.
+
+    Not if it can be changed in place, nor if it is a NaN: Python makes a
+    new NaN object each time, and a set or dict tells NaN objects apart
+    (``{f(x) for _ in (0, 1)}`` holds two). See D46 for a captured one.
+    """
+    if isinstance(value, (float, complex)):
+        return value == value
+    if isinstance(value, _FROZEN_TYPES):
+        return True
+    if isinstance(value, (tuple, frozenset)):
+        return all(_frozen(item) for item in value)
+    return False
+
+
+def _watch_frozen(
+    fused: Callable[[Any], tuple[bool, Any]], unfrozen: list[bool]
+) -> Callable[[Any], tuple[bool, Any]]:
+    """``fused`` that notes in ``unfrozen`` a value that is not ``_frozen``."""
+
+    def watched(value: Any) -> tuple[bool, Any]:
+        ok, mapped = fused(value)
+        if ok and not unfrozen and not _frozen(mapped):
+            unfrozen.append(True)
+        return ok, mapped
+
+    return watched
+
+
 @dataclass
 class _PipelineState:
     reducer: _Reducer
@@ -737,6 +772,10 @@ class IncrementalRuntime:
                 reducer_name, _items_at(core, view, head), stages, reducer_args
             )
         fused = _fuse(stages)
+        # Values the result hands out that the query body could change.
+        unfrozen: list[bool] = []
+        if reducer_name in _HANDS_OUT_VALUES and any(st[0] == "map" for st in stages):
+            fused = _watch_frozen(fused, unfrozen)
         fingerprint = _env_fingerprint(
             [fn for kind, *rest in stages if kind != "reverse" for fn in rest]
             + ([reducer_args["key"]] if callable(reducer_args.get("key")) else []),
@@ -805,6 +844,14 @@ class IncrementalRuntime:
                     # Reads are counted, not new dependencies: the query
                     # body may have read the same input or query before the
                     # pipeline did.
+                    state.impure = True
+                if unfrozen:
+                    # A stage made a value that can be changed in place (a
+                    # list, a dict, a generator, an object), or a NaN. The
+                    # result hands it out, and a body that changes it would
+                    # find it changed on the next run, or a set the same
+                    # NaN object twice, where Python makes a new one:
+                    # rebuild each time (dNN, and a second dNN for NaN).
                     state.impure = True
                 self._record_info(
                     state_key, site, reducer_name, core, view, stages, state

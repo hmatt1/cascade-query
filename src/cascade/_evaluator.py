@@ -3056,6 +3056,9 @@ class Evaluator:
         Compared by digest, like values (G2); effects that cannot be
         digested count as changed.
         """
+        # A channel pushed nothing to is the same as no channel.
+        old = {name: items for name, items in old.items() if items}
+        new = {name: items for name, items in new.items() if items}
         if not old and not new:
             return True
         if old.keys() != new.keys():

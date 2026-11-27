@@ -30,6 +30,12 @@ Boundaries are strict and fail toward normal execution:
   nested inside a comprehension that is not rewritten, a helper that uses
   that comprehension's loop variables, which the helper would not see
   (D32).
+* Also left as written: a comprehension whose element or ``if`` clauses
+  make a lambda or a generator over its loop variable that may outlive the
+  element (in the helper each would keep its own element, where Python's
+  all see the last one), or call a method that changes a list, set or dict
+  the query assigns (``seen.append(x)``), which a pipeline would call for
+  changed elements only (dNN).
 
 The rewritten function is compiled against the original filename with the
 original line numbers, and its closure cells are the original cell objects,
@@ -99,7 +105,7 @@ def _rewrite(
     if _shadows_relevant_names(fdef):
         return None
 
-    rewriter = _Rewriter(fn.__qualname__ if site is None else site)
+    rewriter = _Rewriter(fn.__qualname__ if site is None else site, _local_names(fdef))
     fdef.body = rewriter.rewrite_block(fdef.body)
     if rewriter.count == 0:
         return None
@@ -135,8 +141,10 @@ def _strip_annotations(fdef: ast.FunctionDef) -> None:
 
 
 class _Rewriter(ast.NodeTransformer):
-    def __init__(self, qualname: str) -> None:
+    def __init__(self, qualname: str, local_names: frozenset[str]) -> None:
         self.qualname = qualname
+        # Names the query assigns: a value it may return.
+        self.local_names = local_names
         self.count = 0
         self._n = 0
         self._pending: list[list[ast.stmt]] = []
@@ -231,7 +239,7 @@ class _Rewriter(ast.NodeTransformer):
             # len() of map(), filter() or reversed() is a TypeError: those
             # are iterators. Only a list comprehension has a length.
             return self.generic_visit(node)
-        if self._hides_loop_names(stages):
+        if self._unsafe(stages) or self._changes_locals([kw.value for kw in extra]):
             return self.generic_visit(node)
         return self._build_run_call(node, reducer, source, stages, extra)
 
@@ -239,14 +247,14 @@ class _Rewriter(ast.NodeTransformer):
         # A bare comprehension is its own terminal: [f(x) for x in xs]
         # is list-reduce over a map stage.
         pipeline = _match_pipeline(node)
-        if pipeline is _ABORT or self._hides_loop_names(pipeline[1]):
+        if pipeline is _ABORT or self._unsafe(pipeline[1]):
             return self._keep(node)
         source, stages = pipeline
         return self._build_run_call(node, "list", source, stages, [])
 
     def visit_SetComp(self, node: ast.SetComp) -> ast.AST:
         decomposed = _decompose_comp(node, node.elt)
-        if decomposed is _ABORT or self._hides_loop_names(decomposed[1]):
+        if decomposed is _ABORT or self._unsafe(decomposed[1]):
             return self._keep(node)
         source, stages = decomposed
         return self._build_run_call(node, "set", source, stages, [])
@@ -258,10 +266,34 @@ class _Rewriter(ast.NodeTransformer):
         elt = ast.Tuple(elts=[node.key, node.value], ctx=ast.Load())
         ast.copy_location(elt, node.key)
         decomposed = _decompose_comp(node, elt)
-        if decomposed is _ABORT or self._hides_loop_names(decomposed[1]):
+        if decomposed is _ABORT or self._unsafe(decomposed[1]):
             return self._keep(node)
         source, stages = decomposed
         return self._build_run_call(node, "dict", source, stages, [])
+
+    def _unsafe(self, stages: list[tuple[Any, ...]]) -> bool:
+        """Whether moving ``stages`` into helpers would change what they do."""
+        return self._hides_loop_names(stages) or self._changes_locals(
+            [stage[-1] for stage in stages if len(stage) > 1]
+        )
+
+    def _changes_locals(self, exprs: list[ast.expr]) -> bool:
+        """Whether a stage, filter or key changes a local of the query.
+
+        A pipeline runs them for the elements that changed only: with
+        ``seen = []; [seen.append(x) for x in xs]``, after ``xs.append(4)``
+        the new ``seen`` would hold ``4`` alone (dNN). Seen here: a method
+        that changes a list, set or dict, called on a name the query
+        assigns. Not seen: a helper function that changes an object.
+        """
+        return any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _MUTATORS
+            and _root_name(node.func.value) in self.local_names
+            for expr in exprs
+            for node in ast.walk(expr)
+        )
 
     def _hides_loop_names(self, stages: list[tuple[Any, ...]]) -> bool:
         """Whether a helper for ``stages`` would use an enclosing loop variable.
@@ -419,6 +451,8 @@ def _decompose_comp(
         # ``:=`` in a comprehension binds in the enclosing function. Moved
         # into a helper it would bind there and be lost (D30).
         return _ABORT
+    if _closes_over(moved, set(_store_names(gen.target))):
+        return _ABORT
     inner = _match_pipeline(gen.iter)
     if inner is _ABORT:
         return _ABORT
@@ -432,6 +466,104 @@ def _decompose_comp(
     ):
         stages.append(("comp_map", gen.target, elt))
     return source, stages
+
+
+def _closes_over(moved: list[ast.expr], loop_names: set[str]) -> bool:
+    """Whether the moved parts make a closure that may outlive the element.
+
+    A comprehension's loop variable is one variable for all its elements: a
+    lambda, or a generator not consumed on the spot, made in the element
+    sees its value when it is called, after the loop has moved on (all of
+    ``[lambda: x for x in xs]`` return the last element). In the helper
+    that holds the element it is a variable of each call, so each closure
+    would keep its own element instead (dNN).
+    """
+    for part in moved:
+        done = _used_at_once(part)
+        for node in ast.walk(part):
+            if (
+                isinstance(node, (ast.Lambda, ast.GeneratorExp))
+                and id(node) not in done
+            ):
+                if loop_names.intersection(_load_names(node)):
+                    return True
+    return False
+
+
+def _used_at_once(part: ast.expr) -> set[int]:
+    """Ids of the lambdas and generators in ``part`` that cannot outlive it.
+
+    A generator handed to a reducer is consumed by it; so are ``map`` and
+    ``filter`` over it, with their lambda; a ``key=`` lambda of ``sorted``,
+    ``min`` or ``max`` is called by it. (These names are the builtins: the
+    rewriter declines a query that rebinds one.)
+    """
+    done: set[int] = set()
+
+    def consume(arg: ast.expr) -> None:
+        if isinstance(arg, ast.GeneratorExp):
+            done.add(id(arg))
+        elif (
+            isinstance(arg, ast.Call)
+            and isinstance(arg.func, ast.Name)
+            and arg.func.id in ("map", "filter")
+            and arg.args
+        ):
+            done.add(id(arg.args[0]))
+            for inner in arg.args[1:]:
+                consume(inner)
+
+    for node in ast.walk(part):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _REDUCER_NAMES:
+            for arg in node.args:
+                consume(arg)
+            if func.id in ("sorted", "min", "max"):
+                done.update(id(kw.value) for kw in node.keywords if kw.arg == "key")
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr == "join"
+            and isinstance(func.value, ast.Constant)
+        ):
+            for arg in node.args:
+                consume(arg)
+    return done
+
+
+# Methods of list, set and dict that change the object they are called on.
+_MUTATORS = frozenset(
+    {
+        "append",
+        "extend",
+        "insert",
+        "add",
+        "update",
+        "discard",
+        "remove",
+        "pop",
+        "popitem",
+        "clear",
+        "setdefault",
+        "sort",
+        "reverse",
+    }
+)
+
+
+def _root_name(node: ast.expr) -> str | None:
+    """The name at the root of ``a``, ``a.b`` or ``a[i].b``, if any."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _local_names(fdef: ast.FunctionDef) -> frozenset[str]:
+    """Names the function, or a function or comprehension in it, assigns."""
+    names = {a.arg for a in ast.walk(fdef) if isinstance(a, ast.arg)}
+    names.update(_store_names(fdef))
+    return frozenset(names)
 
 
 def _loop_names(

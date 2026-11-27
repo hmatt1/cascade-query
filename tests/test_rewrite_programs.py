@@ -33,11 +33,36 @@ of change only (swarm testing), always has a reducer or two right over a
 source, and mostly catches what each statement raises, so that one part
 that raises does not hide the others. Without that the faults seeded into
 how a pipeline reads its diffs needed thousands of examples.
+
+Four more parts of the grammar are each in some bodies only:
+
+* ``key=`` functions for ``sorted``, ``min`` and ``max`` that raise for
+  some elements or return keys of types that cannot be compared, so that
+  the error, and the effects pushed before it, must be Python's;
+* accumulator effects pushed from elements, filters, ``key=`` functions,
+  a query called per element and statements: what a call collects must be
+  what the plain function pushes, in its order, after every change, on a
+  cache hit and through a snapshot (and nothing when the call raises);
+  also a local list appended to from elements, filters and keys;
+* functions defined in the body: used as stages, filters and keys, with
+  defaults, holding comprehensions over the collections themselves, and
+  defined inside a loop over the loop variable;
+* closures: lambdas and generators made in a comprehension's element over
+  its loop variable (all of them see its last value), and lambdas over a
+  local computed from the collections, so it changes between runs.
+
+One body in four is ``async def``, with ``await`` of an async query between
+statements and in comprehensions, and ``async for``. The rewriter leaves
+async queries as written; such a body, awaited on a running loop, must
+still give what the plain coroutine gives. Being left as written, it reads
+``set(s)`` without a trace (G21): an async body takes ``set(iter(s))``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import inspect
 import linecache
 import math
 import os
@@ -208,6 +233,30 @@ PARTIALS = (
 HELPERS = ("inc", "neg", "half", "kind", "tag")
 PREDICATES = ("is_odd", "is_pos", "is_int")
 MAX_DEPTH = 2
+# Parts of the grammar that only some bodies use (swarm testing).
+FEATURES = ("keys", "effects", "defs", "closures")
+# ``key=`` functions the old grammar had, and those of the "keys" part:
+# some raise for some elements, some give keys of types that cannot be
+# compared with each other, one is a query.
+OLD_KEYS = ("neg", "lambda v: v % 3", "kind")
+KEYS = (
+    *OLD_KEYS,
+    "inc",
+    "str",
+    "tag",
+    "lambda v: 1 // v",
+    "lambda v: v if is_int(v) else kind(v)",
+    "lambda v: (is_pos(v), v)",
+    "lambda v: -v if is_pos(v) else v",
+    # Frozensets are ordered by inclusion only: many ties, some pairs
+    # neither smaller nor larger, and no error.
+    "lambda v: frozenset({kind(v)})",
+)
+# Functions that push accumulator effects: for every element, for some
+# only, as a filter, as a key, and a query called per element.
+EFFECT_HELPERS = ("noted", "noted_odd", "ntag")
+EFFECT_PREDICATES = ("seen",)
+EFFECT_KEYS = ("keyed",)
 
 
 class _Writer:
@@ -223,16 +272,32 @@ class _Writer:
     reducer over seven sources rarely does.
     """
 
-    def __init__(self, draw: Callable[..., Any], literals: tuple[Any, ...]) -> None:
+    def __init__(
+        self,
+        draw: Callable[..., Any],
+        literals: tuple[Any, ...],
+        *,
+        is_async: bool = False,
+    ) -> None:
         self.draw = draw
         self.literals = tuple(_lit(v) for v in literals)
         self.sources = _some(draw, SOURCES)
         self.reducers = _some(draw, REDUCERS)
-        self.helpers = _some(draw, HELPERS)
+        self.helpers = list(_some(draw, HELPERS))
         self.partials = _some(draw, PARTIALS)
         self.expr_kinds = ("name", *_some(draw, EXPR_KINDS))
         self.pipe_kinds = ("source", *_some(draw, PIPE_KINDS))
         self.top_kinds = _some(draw, TOP_KINDS)
+        self.features = _some(draw, FEATURES, at_least=0)
+        self.is_async = is_async
+        self.predicates = list(PREDICATES)
+        self.keys = list(_some(draw, KEYS) if "keys" in self.features else OLD_KEYS)
+        if "effects" in self.features:
+            self.helpers += _some(draw, EFFECT_HELPERS)
+            self.predicates += EFFECT_PREDICATES
+            self.keys += EFFECT_KEYS
+        # Functions defined in the body so far.
+        self.defs: list[str] = []
         self.n_locals = 0
         self.n_walrus = 0
         self.lists: list[str] = []
@@ -246,6 +311,12 @@ class _Writer:
     def expr(self, names: tuple[str, ...], depth: int) -> str:
         kinds = [*self.expr_kinds, "name"]
         if depth < MAX_DEPTH:
+            # Calls that push effects or call a function of the body; not
+            # deeper, so that expressions stay small.
+            if "effects" in self.features:
+                kinds.append("noted")
+            if self.defs:
+                kinds.append("call")
             kinds += ["reduce", "reduce"]
         kind = self.choice(kinds)
         if kind == "name" and names:
@@ -263,6 +334,11 @@ class _Writer:
             return f"({left} {op} {right})"
         if kind == "factor":
             return "factor()"
+        if kind == "noted":
+            return f"noted({self.expr(names, depth + 1)})"
+        if kind == "call":
+            # A function defined in the body, called in an element.
+            return f"{self.choice(self.defs)}({self.expr(names, depth + 1)})"
         if kind == "cond":
             return (
                 f"({self.expr(names, depth + 1)} if {self.cond(names, depth + 1)}"
@@ -304,7 +380,7 @@ class _Writer:
     def cond(self, names: tuple[str, ...], depth: int) -> str:
         kind = self.choice(("cmp", "pred", "in", "any_all"))
         if kind == "pred" and names:
-            return f"{self.choice(PREDICATES)}({self.choice(names)})"
+            return f"{self.choice(self.predicates)}({self.choice(names)})"
         if kind == "in":
             return f"{self.expr(names, depth + 1)} in {self.source()}"
         if kind == "any_all" and depth < MAX_DEPTH:
@@ -352,7 +428,7 @@ class _Writer:
             return f"map(lambda {var}: {body}, {inner})"
         if kind == "filter":
             inner = self.pipe(names, depth + 1)
-            fn = self.choice((*PREDICATES, "None"))
+            fn = self.choice((*self.predicates, "None"))
             return f"filter({fn}, {inner})"
         var = self.choice(LOOP_NAMES)
         inner_names = (*names, var)
@@ -409,11 +485,9 @@ class _Writer:
         if kind == "list":
             return f"list({self.pipe(names, 1)})"
         if kind == "sorted":
-            key = self.choice(("", ", key=neg", ", key=lambda v: v % 3", ", key=kind"))
-            rev = self.choice(("", ", reverse=True"))
-            return f"sorted({self.pipe(names, 1)}{key}{rev})"
+            return self.keyed(names, self.pipe(names, 1))
         if kind == "set":
-            return f"set({self.pipe(names, 1)})"
+            return self.set_of(self.pipe(names, 1))
         if kind == "setcomp":
             var = self.choice(LOOP_NAMES)
             return f"{{{self.element((*names, var), 1)} for {var} in {self.source()}}}"
@@ -438,6 +512,57 @@ class _Writer:
             return f'",".join(map(str, {self.pipe(names, 1)}))'
         return self.expr(names, 0)
 
+    def key(self, names: tuple[str, ...]) -> str:
+        """A ``key=`` function: a name, or a lambda over the names in scope."""
+        if "keys" in self.features and self.draw(st.integers(0, 3)) == 0:
+            return f"lambda v: {self.expr((*names, 'v'), 1)}"
+        return self.choice(self.keys)
+
+    def keyed(self, names: tuple[str, ...], inner: str) -> str:
+        """``sorted``, ``min`` or ``max`` with ``key=``.
+
+        Without the "keys" part, the ``sorted`` the old grammar had.
+        ``min`` and ``max`` with ``key=`` are left as written.
+        """
+        if "keys" not in self.features:
+            key = self.choice(("", *(f", key={k}" for k in self.keys)))
+            rev = self.choice(("", ", reverse=True"))
+            return f"sorted({inner}{key}{rev})"
+        key = self.key(names)
+        form = self.choice(("sorted", "sorted", "reverse", "min", "max", "default"))
+        if form == "sorted":
+            return f"sorted({inner}, key={key})"
+        if form == "reverse":
+            return f"sorted({inner}, key={key}, reverse=True)"
+        if form == "default":
+            name = self.choice(("min", "max"))
+            return f"{name}({inner}, key={key}, default=None)"
+        return f"{form}({inner}, key={key})"
+
+    def async_top(self, names: tuple[str, ...]) -> str:
+        """``await`` inside a comprehension, or ``async for``.
+
+        Only where Python allows them: list, set and dict comprehensions in
+        an ``async def``.
+        """
+        var = self.choice(LOOP_NAMES)
+        elt = self.element((*names, var), 1)
+        form = self.choice(("list", "set", "dict", "sum", "async_for", "async_if"))
+        if form == "list":
+            return f"[await atag({elt}) for {var} in {self.pipe(names, 1)}]"
+        if form == "set":
+            return f"{{await atag({elt}) for {var} in {self.source()}}}"
+        if form == "dict":
+            return f"{{{var}: await atag({elt}) for {var} in {self.source()}}}"
+        if form == "sum":
+            return f"sum([await atag({var}) for {var} in {self.source()}])"
+        if form == "async_if":
+            return (
+                f"[{elt} for {var} in {self.source()}"
+                f" if await atag({self.cond((*names, var), 1)})]"
+            )
+        return f"[{elt} async for {var} in agen({self.pipe(names, 1)})]"
+
     def fold(self) -> str:
         """A reducer right over a source, or over one plain stage.
 
@@ -454,12 +579,14 @@ class _Writer:
                 f"map({self.choice(self.helpers)}, {source})",
                 # A query called per element: its argument is its key.
                 f"map(tag, {source})",
-                f"filter({self.choice((*PREDICATES, 'None'))}, {source})",
+                f"filter({self.choice((*self.predicates, 'None'))}, {source})",
                 f"(x * {self.choice(self.literals)} for x in {source})",
                 # Built in full before the reducer sees it (D37).
                 f"[{self.partial('x', ('x',))} for x in {source}]",
             )
         )
+        if "keys" in self.features and self.draw(st.booleans()):
+            return self.keyed((), inner)
         reducer = self.choice((*self.reducers, "sorted", "list", "set"))
         if source in ("d", "d.items()") and self.draw(st.booleans()):
             reducer = "dict"
@@ -467,7 +594,20 @@ class _Writer:
             return f"sum(1 for _ in {inner})"
         if reducer == "len":
             return f"len({source})"
+        if reducer == "set":
+            return self.set_of(inner)
         return f"{reducer}({inner})"
+
+    def set_of(self, inner: str) -> str:
+        """``set(inner)``; over the bare set through ``iter`` in an async body.
+
+        ``set(s)`` copies a set subclass without calling it, so a query
+        that is not rewritten records no read (a documented limit, G21),
+        and an async query is never rewritten.
+        """
+        if self.is_async and inner == "s":
+            return "set(iter(s))"
+        return f"set({inner})"
 
     # --- statements ---
 
@@ -488,10 +628,78 @@ class _Writer:
             lines.append("except Exception as e:")
             lines.append(f"    {name} = {fallback}")
 
+        kinds = ["assign", "assign", "list", "loop", "if"]
+        if "defs" in self.features:
+            kinds += ["def", "def", "loop_def"]
+        if "closures" in self.features:
+            kinds += ["late", "captured", "rows"]
+        if "effects" in self.features:
+            kinds += ["push", "collect"]
+        if self.is_async:
+            kinds += ["await", "await"]
         for _ in range(self.draw(st.integers(1, 4))):
-            kind = self.choice(("assign", "assign", "list", "loop", "if"))
+            kind = self.choice(kinds)
             self.n_locals += 1
             name = f"a{self.n_locals}"
+            if kind == "def":
+                lines.extend(self.define(f"f{self.n_locals}", names))
+                continue
+            if kind == "loop_def":
+                lines.append(f"{name} = ()")
+                add(self.loop_def(name, names), name, name)
+                others.append(name)
+                continue
+            if kind == "rows":
+                add(self.rows(name, names), name, "[]")
+                others.append(name)
+                continue
+            if kind == "late":
+                add(self.late(name, names), name, "(type(e).__name__, str(e))")
+                others.append(name)
+                continue
+            if kind == "captured":
+                local = f"m{self.n_locals}"
+                add([f"{local} = {self.reduce(names, 1)}"], local, "0")
+                names = (*names, local)
+                var = self.choice(LOOP_NAMES)
+                body = self.expr((*names, "v"), 1)
+                src = self.source()
+                use = self.choice(
+                    (
+                        f"sorted({src}, key=lambda v: {body})",
+                        f"list(map(lambda v: {body}, {src}))",
+                        f"[(lambda v: {body})({var}) for {var} in {src}]",
+                        f"list(filter(lambda v: {body}, {src}))",
+                    )
+                )
+                add([f"{name} = {use}"], name, "(type(e).__name__, str(e))")
+                others.append(name)
+                continue
+            if kind == "push":
+                lines.append(f"push({self.choice(names)})")
+                continue
+            if kind == "collect":
+                # A local list changed from an element, not an accumulator:
+                # plain Python appends for every element, on every run.
+                var = self.choice(LOOP_NAMES)
+                elt = self.element((*names, var), 1)
+                src = self.pipe(names, 1)
+                made = self.choice(
+                    (
+                        f"[{name}.append({elt}) for {var} in {src}]",
+                        f"sum(1 for {var} in {src} if {name}.append({elt}) is None)",
+                        f"list(map(lambda v: {name}.append(v) or v, {src}))",
+                        f"sorted({src}, key=lambda v: {name}.append(v) or {elt})",
+                    )
+                )
+                lines.append(f"{name} = []")
+                add([made], name, name)
+                others.append(name)
+                continue
+            if kind == "await":
+                add([f"{name} = await atag({self.expr(names, 1)})"], name, "0")
+                names = (*names, name)
+                continue
             if kind == "list":
                 add([f"{name} = list({self.pipe(names, 1)})"], name, "[]")
                 self.lists.append(name)
@@ -521,6 +729,8 @@ class _Writer:
         # Reducers right over a source in every body, besides the rest.
         tops = [self.fold() for _ in range(self.draw(st.integers(1, 4)))]
         tops += [self.top(names) for _ in range(self.draw(st.integers(0, 2)))]
+        if self.is_async:
+            tops += [self.async_top(names) for _ in range(self.draw(st.integers(1, 2)))]
         results = []
         for i, expr in enumerate(tops):
             add([f"r{i} = {expr}"], f"r{i}", "(type(e).__name__, str(e))")
@@ -542,6 +752,119 @@ class _Writer:
             results.append("bound")
         lines.append(f"return ({', '.join(results)},)")
         return lines
+
+    def define(self, fn: str, names: tuple[str, ...]) -> list[str]:
+        """A function defined in the body, over the names in scope.
+
+        It may take a default from them, and its body may itself hold a
+        comprehension over a collection. It is a stage, a filter, a key and
+        a function called in elements from here on.
+        """
+        params = "v"
+        inner = (*names, "v")
+        if self.draw(st.integers(0, 3)) == 0:
+            params = f"v, m={self.choice(names)}"
+            inner = (*inner, "m")
+        form = self.choice(("expr", "reduce", "cond"))
+        if form == "cond":
+            body = self.cond(inner, 1)
+            self.predicates.append(fn)
+        else:
+            body = self.reduce(inner, 1) if form == "reduce" else self.expr(inner, 1)
+            self.helpers.append(fn)
+        self.keys.append(fn)
+        self.defs.append(fn)
+        return [f"def {fn}({params}):", f"    return {body}"]
+
+    def loop_def(self, name: str, names: tuple[str, ...]) -> list[str]:
+        """A function defined in a loop over the loop variable, used there.
+
+        Each pass gives it another value to close over, or to take as a
+        default: a pipeline that uses it must see each.
+
+        The loop variable is not one of the comprehensions' names. Where a
+        function takes ``x`` from outside, CPython raises
+        ``UnboundLocalError`` for ``[x for z in [1 for x in ys]]`` in it;
+        rewritten, the inner comprehension is in a helper and ``x`` is the
+        outer one.
+        """
+        var = "i"
+        fn = f"g{self.n_locals}"
+        params = "v"
+        if self.draw(st.booleans()):
+            params = f"v, m={var}"
+        # Mostly over what changes from pass to pass only, so that it shows.
+        local = (var, "v", *(("m",) if "m" in params else ()))
+        if self.draw(st.booleans()):
+            body = self.expr(local[1:] if "m" in params else local, 1)
+            body = f"({body}, {local[-1]})"
+        else:
+            body = self.expr((*names, *local), 1)
+        # Over a collection: a pipeline keeps its state from pass to pass.
+        src = self.choice(self.sources)
+        use = self.choice(
+            (
+                f"sum(map({fn}, {src}))",
+                f"sorted({src}, key={fn})",
+                f"[{fn}(y) for y in {src}]",
+                f"list(filter({fn}, {src}))",
+                f"max(map({fn}, {src}), default=None)",
+            )
+        )
+        # Often two passes with values that differ, whatever the data.
+        if self.draw(st.booleans()):
+            loop = self.choice(("(1, 2)", "(0, -1)", "(2, 2.0)"))
+        else:
+            loop = self.pipe(names, 1)
+        return [
+            f"for {var} in {loop}:",
+            f"    def {fn}({params}):",
+            f"        return {body}",
+            f"    {name} += ({use},)",
+        ]
+
+    def rows(self, name: str, names: tuple[str, ...]) -> list[str]:
+        """Values made by a comprehension, changed by the body afterwards.
+
+        A list or dict per element, appended to or updated, or a generator
+        per element, advanced: each run must start from new ones.
+        """
+        var = self.choice(LOOP_NAMES)
+        form = self.choice(("list", "dict", "gen"))
+        if form == "list":
+            made = f"[[{self.element((*names, var), 1)}] for {var} in {self.pipe(names, 1)}]"
+            change = "row.append(k)"
+        elif form == "dict":
+            made = f"[{{'v': {var}}} for {var} in {self.pipe(names, 1)}]"
+            change = "row.update(v=(row['v'], k))"
+        else:
+            made = f"[(k for _ in {self.source()}) for {var} in {self.source()}]"
+            change = "next(row, None)"
+        return [
+            f"{name} = {made}",
+            f"for row in {name}:",
+            f"    {change}",
+            # A generator is not a value to return; what is left of it is.
+            f"{name} = [row if type(row) is dict else list(row) for row in {name}]",
+        ]
+
+    def late(self, name: str, names: tuple[str, ...]) -> list[str]:
+        """Lambdas or generators made in a comprehension's element.
+
+        They close over its loop variable, which is one variable for the
+        whole comprehension: called afterwards, all see its last value.
+        """
+        var = self.choice(LOOP_NAMES)
+        src = self.source()
+        if self.draw(st.booleans()):
+            other = self.choice([n for n in LOOP_NAMES if n != var])
+            body = self.expr((*names, var, other), 1)
+            made = f"[({body} for {other} in {self.source()}) for {var} in {src}]"
+            return [f"{name} = {made}", f"{name} = [list(g) for g in {name}]"]
+        body = self.expr((*names, var, "v"), 1)
+        arg = self.choice((*names, *self.literals))
+        made = f"[lambda v: {body} for {var} in {src}]"
+        return [f"{name} = {made}", f"{name} = [f({arg}) for f in {name}]"]
 
 
 @functools.cache
@@ -565,9 +888,10 @@ def _masks(n: int, at_least: int) -> Any:
     return st.integers(0, 2**n - 1).filter(lambda m: m.bit_count() >= at_least)
 
 
-def _program(lines: list[str]) -> str:
+def _program(lines: list[str], is_async: bool = False) -> str:
     body = "\n".join("        " + line for line in lines)
-    return f"def make(k):\n    def q():\n{body}\n    return q\n"
+    head = "async def" if is_async else "def"
+    return f"def make(k):\n    {head} q():\n{body}\n    return q\n"
 
 
 # --- the namespaces ---------------------------------------------------------------
@@ -583,7 +907,64 @@ def _plain_tag(v: Any) -> Any:
     return _tag(v)
 
 
-def _helpers() -> dict[str, Any]:
+def _ntag(push: Callable[[Any], None]) -> Callable[[Any], Any]:
+    """Body of the query ``ntag``: ``tag`` that also pushes an effect."""
+
+    def ntag(v: Any) -> Any:
+        push(("t", v))
+        return _tag(v)
+
+    return ntag
+
+
+def _plain_ntag(push: Callable[[Any], None]) -> Callable[[Any], Any]:
+    def ntag(v: Any) -> Any:
+        hash(v)
+        push(("t", v))
+        return _tag(v)
+
+    return ntag
+
+
+async def _atag(v: Any) -> Any:
+    """Body of the async query ``atag`` that async bodies await."""
+    await asyncio.sleep(0)
+    return v
+
+
+async def _plain_atag(v: Any) -> Any:
+    hash(v)
+    await asyncio.sleep(0)
+    return v
+
+
+async def _agen(source: Any) -> Any:
+    """An async iterable over ``source``, for ``async for``."""
+    for v in source:
+        await asyncio.sleep(0)
+        yield v
+
+
+def _helpers(push: Callable[[Any], None]) -> dict[str, Any]:
+    def noted(v: Any) -> Any:
+        push(v)
+        return v
+
+    def noted_odd(v: Any) -> Any:
+        # Pushes for some elements only: a pipeline that has never pushed
+        # stays incremental until one of these arrives.
+        if type(v) is int and v % 2:
+            push(("odd", v))
+        return v
+
+    def seen(v: Any) -> bool:
+        push(("f", v))
+        return bool(v)
+
+    def keyed(v: Any) -> Any:
+        push(("k", v))
+        return v
+
     return {
         "inc": lambda v: v + 1,
         "neg": lambda v: -v,
@@ -594,6 +975,12 @@ def _helpers() -> dict[str, Any]:
         "is_int": lambda v: type(v) is int,
         "nan": NAN,
         "inf": INF,
+        "push": push,
+        "noted": noted,
+        "noted_odd": noted_odd,
+        "seen": seen,
+        "keyed": keyed,
+        "agen": _agen,
     }
 
 
@@ -623,30 +1010,54 @@ def _compile(
 # --- exact comparison -----------------------------------------------------------
 
 
-def _canon(value: Any) -> Any:
+def _canon(value: Any, signed: bool = False) -> Any:
     """A value equal only for results no code could tell apart.
 
-    Object identity aside: every NaN of one sign is equal here, as it is to
-    the digests.
+    Object identity aside, and the sign of a NaN unless ``signed``: CPython
+    itself gives ``inf - inf`` and ``nan + nan`` either sign, from one call
+    of a function to the next, as its bytecode is specialized (so a loop
+    ``a += x`` over ``[nan, inf, -inf]`` does). The engine keeps a NaN's
+    sign, in digests and on disk; ``signed`` compares it.
     """
     kind = type(value)
     if kind is float:
+        if value != value and not signed:
+            return ("float", "nan")
         return ("float", repr(value), math.copysign(1.0, value))
     if kind is list or kind is tuple:
-        return (kind.__name__, tuple(_canon(v) for v in value))
+        return (kind.__name__, tuple(_canon(v, signed) for v in value))
     if kind is set or kind is frozenset:
         # Counted: a set can hold several NaN objects.
-        return (kind.__name__, frozenset(Counter(map(_canon, value)).items()))
+        items = Counter(_canon(v, signed) for v in value).items()
+        return (kind.__name__, frozenset(items))
     if kind is dict:
-        return ("dict", tuple((_canon(k), _canon(v)) for k, v in value.items()))
+        items = value.items()
+        return ("dict", tuple((_canon(k, signed), _canon(v, signed)) for k, v in items))
     return (kind.__name__, value)
 
 
-def _outcome(fn: Callable[[], Any]) -> Any:
+def _outcome(fn: Callable[[], Any], loop: Any = None) -> Any:
+    """What ``fn()`` gives; awaited on ``loop`` if it gives an awaitable.
+
+    Also the same with the signs of NaNs: ``(outcome, signed)``.
+    """
     try:
-        return ("value", _canon(fn()))
+        if loop is None:
+            value = fn()
+        else:
+            value = loop.run_until_complete(_awaited(fn))
     except Exception as exc:  # noqa: BLE001
-        return ("raises", type(exc).__name__, str(exc))
+        outcome = ("raises", type(exc).__name__, str(exc))
+        return outcome, outcome
+    return ("value", _canon(value)), ("value", _canon(value, signed=True))
+
+
+async def _awaited(fn: Callable[[], Any]) -> Any:
+    # Called on the running loop, as an async caller calls a query.
+    value = fn()
+    if inspect.isawaitable(value):
+        value = await value
+    return value
 
 
 # --- the data -------------------------------------------------------------------
@@ -757,6 +1168,18 @@ class _Rollback(Exception):
     pass
 
 
+class _SetModel(dict):
+    """The plain side's set: a dict, for its insertion order.
+
+    ``in`` raises what a set raises for an unhashable value; from 3.14 a
+    dict's message is another ("as a dict key", not "as a set element").
+    """
+
+    def __contains__(self, value: object) -> bool:
+        frozenset().__contains__(value)
+        return dict.__contains__(self, value)
+
+
 def _apply(target: str, op: Any, live: dict[str, Any], model: dict[str, Any]) -> None:
     """One change, to the collection and to its plain model."""
     if target in ("xs", "ys"):
@@ -774,6 +1197,12 @@ def _apply(target: str, op: Any, live: dict[str, Any], model: dict[str, Any]) ->
         assert _apply_dict_op(live["d"], op) is _apply_dict_op(model["d"], op)
 
 
+class _Body(NamedTuple):
+    source: str
+    filename: str
+    is_async: bool
+
+
 class _Live:
     """The engine side of one example: collections, the input and the queries.
 
@@ -782,7 +1211,7 @@ class _Live:
 
     def __init__(
         self,
-        bodies: list[tuple[str, str]],
+        bodies: list[_Body],
         k: Any,
         disk: tuple[str, str] | None,
         initial: dict[str, Any] | None,
@@ -809,20 +1238,41 @@ class _Live:
             return 1
 
         self.factor = factor
-        tag = engine.query(_tag, name="tag")
+        push = engine.accumulator(EFFECTS).push
+        shared = {
+            "factor": factor,
+            "tag": engine.query(_tag, name="tag"),
+            "ntag": engine.query(_ntag(push), name="ntag"),
+            "atag": engine.query(_atag, name="atag"),
+        }
         self.queries = []
-        for i, (source, filename) in enumerate(bodies):
-            namespace = _helpers() | self.collections | {"factor": factor, "tag": tag}
-            body = _compile(source, namespace, k, filename)
-            self.queries.append(engine.query(body, name=f"q{i}"))
+        for i, body in enumerate(bodies):
+            namespace = _helpers(push) | self.collections | shared
+            fn = _compile(body.source, namespace, k, body.filename)
+            self.queries.append(engine.query(fn, name=f"q{i}"))
         runs = self.p_runs = [0]
-        queries = tuple(self.queries)
+        queries = tuple(zip(self.queries, [body.is_async for body in bodies]))
 
-        def p() -> Any:
-            runs[0] += 1
-            return ("p", *(q() for q in queries))
+        if any(body.is_async for body in bodies):
+
+            async def p() -> Any:
+                runs[0] += 1
+                out = []
+                for q, is_async in queries:
+                    out.append(await q() if is_async else q())
+                return ("p", *out)
+
+        else:
+
+            def p() -> Any:
+                runs[0] += 1
+                return ("p", *(q() for q, _ in queries))
 
         self.p = engine.query(p, name="p")
+
+
+# The accumulator the bodies push to.
+EFFECTS = "log"
 
 
 def _contents(collections: dict[str, Any]) -> Any:
@@ -832,12 +1282,13 @@ def _contents(collections: dict[str, Any]) -> Any:
             list(collections["ys"]),
             list(collections["s"]),
             dict(collections["d"]),
-        )
+        ),
+        signed=True,
     )
 
 
 def _model_contents(model: dict[str, Any]) -> Any:
-    return _canon((model["xs"], model["ys"], list(model["s"]), model["d"]))
+    return _canon((model["xs"], model["ys"], list(model["s"]), model["d"]), signed=True)
 
 
 # Bodies per example: they share the data, the changes and the engine.
@@ -853,10 +1304,12 @@ BODIES = 2
 @given(data=st.data())
 def test_generated_query_bodies_equal_plain_python(data: Any) -> None:
     family = data.draw(FAMILY, label="family")
-    sources = []
+    written = []
     for _ in range(BODIES):
-        writer = _Writer(data.draw, family.literals)
-        source = _program(writer.body())
+        # One body in four is a coroutine.
+        is_async = data.draw(st.integers(0, 3), label="async") == 0
+        writer = _Writer(data.draw, family.literals, is_async=is_async)
+        source = _program(writer.body(), is_async)
         note(source)
         try:
             compile(source, "<check>", "exec")
@@ -865,7 +1318,11 @@ def test_generated_query_bodies_equal_plain_python(data: Any) -> None:
             assume(False)
         if writer.walrus_used:
             event("uses :=")
-        sources.append(source)
+        for feature in writer.features:
+            event(f"uses {feature}")
+        if is_async:
+            event("async")
+        written.append((source, is_async))
     backend = data.draw(BACKEND, label="backend")
     if backend is not None:
         family = family.on_disk()
@@ -884,79 +1341,147 @@ def test_generated_query_bodies_equal_plain_python(data: Any) -> None:
 
     directory = tempfile.mkdtemp(prefix="cascade-programs-") if backend else ""
     disk = (backend, directory) if backend else None
-    bodies = [(source, _filename()) for source in sources]
+    bodies = [_Body(source, _filename(), is_async) for source, is_async in written]
     initial = {"xs": xs0, "ys": ys0, "s": s0, "d": d0}
+    # Async bodies are awaited on a running loop, one per example.
+    loop = asyncio.new_event_loop() if any(b.is_async for b in bodies) else None
     opened = [_Live(bodies, k, disk, initial)]
     try:
-        _run(bodies, k, disk, opened, initial, steps)
+        _run(bodies, k, disk, opened, initial, steps, loop)
     finally:
         if disk is not None:
             for live in opened:
                 live.engine.shutdown()
         if directory:
             shutil.rmtree(directory, ignore_errors=True)
+        if loop is not None:
+            loop.close()
+
+
+def _plain_namespace(
+    data: dict[str, Any], factor: Callable[[], Any], log: list[Any]
+) -> dict[str, Any]:
+    """The plain side's names: ``data`` holds the collections' models."""
+    return (
+        _helpers(log.append)
+        | data
+        | {
+            "factor": factor,
+            "tag": _plain_tag,
+            "ntag": _plain_ntag(log.append),
+            "atag": _plain_atag,
+        }
+    )
 
 
 def _run(
-    bodies: list[tuple[str, str]],
+    bodies: list[_Body],
     k: Any,
     disk: tuple[str, str] | None,
     opened: list[_Live],
     initial: dict[str, Any],
     steps: list[Any],
+    loop: Any,
 ) -> None:
     live = opened[0]
-    sources = [source for source, _ in bodies]
+    sources = [body.source for body in bodies]
+    loops = [loop if body.is_async else None for body in bodies]
     model = {
         "xs": list(initial["xs"]),
         "ys": list(initial["ys"]),
-        "s": dict.fromkeys(initial["s"]),
+        "s": _SetModel.fromkeys(initial["s"]),
         "d": dict(initial["d"]),
         "factor": 1,
     }
-    plain_ns = {
-        "xs": model["xs"],
-        "ys": model["ys"],
-        "s": model["s"],
-        "d": model["d"],
-        "factor": lambda: model["factor"],
-        "tag": _plain_tag,
-    }
-    plains = [_compile(source, _helpers() | plain_ns, k) for source in sources]
-    for query in live.queries:
+    # What the plain functions push; cleared before each call.
+    log: list[Any] = []
+    plain_ns = _plain_namespace(
+        {name: model[name] for name in ("xs", "ys", "s", "d")},
+        lambda: model["factor"],
+        log,
+    )
+    plains = [_compile(source, dict(plain_ns), k) for source in sources]
+    for body, query in zip(bodies, live.queries):
         rewritten = getattr(query.raw, "__cascade_rewritten__", False)
         event("rewritten" if rewritten else "left as written")
+        # The rewriter leaves async queries as written (G22).
+        assert not (body.is_async and rewritten), body.source
+
+    # What the plain function pushed on its last call, raising or not, and
+    # what the last live call gave, with the signs of NaNs.
+    pushed: list[Any] = [None]
+    exact: list[Any] = [None]
+
+    def plain_call(plain: Callable[[], Any], on: Any) -> Any:
+        """The plain outcome and its effects: none when it raises."""
+        log.clear()
+        outcome, _ = _outcome(plain, on)
+        pushed[0] = list(log)
+        return outcome, _canon(list(log) if outcome[0] == "value" else [])
+
+    def live_call(call: Callable[..., Any], on: Any) -> Any:
+        effects: dict[str, list[Any]] = {}
+        outcome, signed = _outcome(lambda: call(effects=effects), on)
+        assert set(effects) <= {EFFECTS}, effects
+        exact[0] = (signed, _canon(effects.get(EFFECTS, []), signed=True))
+        return outcome, _canon(effects.get(EFFECTS, []))
 
     last: list[Any] = [None]
 
     def check(step: Any) -> None:
         wants = []
-        for source, plain, query in zip(sources, plains, live.queries):
-            want = _outcome(plain)
-            got = _outcome(query)
+        seen = []
+        for source, plain, query, on in zip(sources, plains, live.queries, loops):
+            want = plain_call(plain, on)
+            got = live_call(query, on)
+            if want[0][0] == "value":
+                seen.append(exact[0])
+            elif _canon(pushed[0], signed=True) != _canon(pushed[0]):
+                # Raised, and pushed a NaN: the live call's effects, which a
+                # caller would collect, cannot be seen, nor their signs.
+                seen.append(None)
+            else:
+                seen.append((want[0], _canon(pushed[0])))
             assert got == want, (
-                f"after {step!r}:\n{source}\nrewritten: {got}\nplain:     {want}"
+                f"after {step!r}:\n{source}\n"
+                f"rewritten: {got[0]}\n           effects {got[1]}\n"
+                f"plain:     {want[0]}\n           effects {want[1]}"
+            )
+            # Called again it is a cache hit, which replays the effects.
+            again = live_call(query, on)
+            assert again == want, (
+                f"after {step!r}, a cache hit:\n{source}\n"
+                f"rewritten: {again[0]}\n           effects {again[1]}\n"
+                f"plain:     {want[0]}\n           effects {want[1]}"
             )
             wants.append(want)
         runs = live.p_runs[0]
-        got_p = _outcome(live.p)
-        raised = [want for want in wants if want[0] == "raises"]
+        got_p = live_call(live.p, loop)
+        raised = [want for want, _ in wants if want[0] == "raises"]
         if raised:
-            want_p: Any = raised[0]
+            want_p: Any = (raised[0], _canon([]))
         else:
-            want_p = ("value", ("tuple", (("str", "p"), *(w[1] for w in wants))))
+            value = ("tuple", (("str", "p"), *(w[0][1] for w in wants)))
+            effects = ("list", tuple(e for w in wants for e in w[1][1]))
+            want_p = (("value", value), effects)
         assert got_p == want_p, (
             f"after {step!r}: the query over the bodies gives\n{got_p}\nnot\n{want_p}"
         )
-        # Early cutoff: a caller runs again only when a result it read
-        # changed. (That it does run then is the check just above.) A read
-        # through a snapshot replaces the cached result with an older one,
-        # so the next run at the head compares against that (G4).
-        assert live.p_runs[0] == runs or last[0] is None or last[0] != wants, (
+        # Early cutoff: a caller runs again only when a result it read, or
+        # the effects that came with it, changed. (That it does run then is
+        # the check just above.) The effects of a call that raises count: a
+        # caller that catches the error collects them. A read through a
+        # snapshot replaces the cached result with an older one, so the
+        # next run at the head compares against that (G4).
+        # The live results are compared with their NaN signs: a NaN made by
+        # arithmetic may change sign when the query runs again, and so its
+        # digest, and the caller runs again for it.
+        unknown = last[0] is None or None in last[0] or None in seen
+        assert live.p_runs[0] == runs or unknown or last[0] != seen, (
             f"after {step!r}: the query over the bodies ran again, but they "
-            f"still give\n{wants}\n" + "\n".join(sources)
+            f"still give\n{seen}\n" + "\n".join(sources)
         )
-        last[0] = wants
+        last[0] = seen
 
     check("start")
     # A snapshot and the plain functions over copies of the data it froze.
@@ -968,17 +1493,19 @@ def _run(
             if held is not None:
                 held[0].release()
             value = model["factor"]
-            frozen_ns = {
-                "xs": list(model["xs"]),
-                "ys": list(model["ys"]),
-                "s": dict(model["s"]),
-                "d": dict(model["d"]),
-                "factor": lambda value=value: value,
-                "tag": _plain_tag,
-            }
+            frozen_ns = _plain_namespace(
+                {
+                    "xs": list(model["xs"]),
+                    "ys": list(model["ys"]),
+                    "s": _SetModel(model["s"]),
+                    "d": dict(model["d"]),
+                },
+                lambda value=value: value,
+                log,
+            )
             held = (
                 live.engine.snapshot(),
-                [_compile(source, _helpers() | frozen_ns, k) for source in sources],
+                [_compile(source, dict(frozen_ns), k) for source in sources],
             )
         elif target == "factor":
             live.factor.set(value=op)
@@ -1039,12 +1566,15 @@ def _run(
         check(step)
         if held is not None:
             snapshot, frozen = held
-            for source, frozen_plain, query in zip(sources, frozen, live.queries):
-                want = _outcome(frozen_plain)
-                got = _outcome(lambda q=query, s=snapshot: q(snapshot=s))
+            for source, frozen_plain, query, on in zip(
+                sources, frozen, live.queries, loops
+            ):
+                want = plain_call(frozen_plain, on)
+                got = live_call(lambda q=query, **kw: q(snapshot=snapshot, **kw), on)
                 assert got == want, (
                     f"after {step!r}, through the snapshot:\n{source}\n"
-                    f"rewritten: {got}\nplain:     {want}"
+                    f"rewritten: {got[0]}\n           effects {got[1]}\n"
+                    f"plain:     {want[0]}\n           effects {want[1]}"
                 )
             last[0] = None
     if held is not None:
@@ -1052,37 +1582,47 @@ def _run(
 
 
 def test_generated_bodies_are_mostly_rewritten() -> None:
-    """The grammar must reach the rewriter, or the test above checks little."""
-    seen = Counter[bool]()
+    """The grammar must reach the rewriter, or the test above checks little.
+
+    Async bodies are left as written, every one of them (G22).
+    """
+    seen = Counter[tuple[bool, bool]]()
 
     @settings(max_examples=200, deadline=None, database=None)
     @given(data=st.data())
     def count(data: Any) -> None:
         family = data.draw(FAMILY)
-        writer = _Writer(data.draw, family.literals)
-        source = _program(writer.body())
+        is_async = data.draw(st.integers(0, 3)) == 0
+        writer = _Writer(data.draw, family.literals, is_async=is_async)
+        source = _program(writer.body(), is_async)
         try:
             compile(source, "<check>", "exec")
         except SyntaxError:
             return
         engine = Engine()
-        namespace = _helpers() | {
+        push = engine.accumulator(EFFECTS).push
+        namespace = _helpers(push) | {
             "xs": CascadeList(engine, []),
             "ys": CascadeList(engine, []),
             "s": CascadeSet(engine, []),
             "d": CascadeDict(engine, {}),
             "factor": engine.input(name="factor")(lambda: 1),
             "tag": engine.query(_tag, name="tag"),
+            "ntag": engine.query(_ntag(push), name="ntag"),
+            "atag": engine.query(_atag, name="atag"),
         }
         query = engine.query(_compile(source, namespace, 1), name="q")
-        seen[bool(getattr(query.raw, "__cascade_rewritten__", False))] += 1
+        rewritten = bool(getattr(query.raw, "__cascade_rewritten__", False))
+        seen[is_async, rewritten] += 1
 
     count()
-    assert seen[True] >= 0.8 * sum(seen.values()), seen
+    sync = seen[False, True] + seen[False, False]
+    assert seen[False, True] >= 0.8 * sync, seen
+    assert seen[True, False] > 0 and not seen[True, True], seen
 
 
 def test_literals_evaluate_to_the_values_they_stand_for() -> None:
-    namespace = _helpers()
+    namespace = _helpers([].append)
     for family in FAMILIES:
         for value in family.literals:
             assert _canon(eval(_lit(value), namespace)) == _canon(value)  # noqa: S307
