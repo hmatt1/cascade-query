@@ -1828,7 +1828,7 @@ def test_d51_setting_the_default_after_a_result_reused_from_disk_is_no_change(
 
 
 @pytest.mark.parametrize("waiter", ["task", "thread"])
-def test_dNN_cancelling_the_task_that_runs_a_query_does_not_cancel_its_waiters(
+def test_d52_cancelling_the_task_that_runs_a_query_does_not_cancel_its_waiters(
     waiter: str,
 ) -> None:
     # A task runs slow() and another caller waits for that run (G5): a
@@ -1910,7 +1910,7 @@ def test_dNN_cancelling_the_task_that_runs_a_query_does_not_cancel_its_waiters(
 
 
 @pytest.mark.parametrize("awaited", [False, True])
-def test_dNN_effects_of_a_dependency_rerun_to_an_equal_value_reach_its_dependents(
+def test_d55_effects_of_a_dependency_rerun_to_an_equal_value_reach_its_dependents(
     awaited: bool,
 ) -> None:
     # A dependent stores the effects replayed to it with its own result. A
@@ -1971,7 +1971,7 @@ def test_dNN_effects_of_a_dependency_rerun_to_an_equal_value_reach_its_dependent
 
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("awaited", [False, True])
-def test_dNN_stored_dependent_is_not_reused_when_a_dependency_has_other_effects(
+def test_d55_stored_dependent_is_not_reused_when_a_dependency_has_other_effects(
     tmp_path: Path, backend: str, awaited: bool
 ) -> None:
     # The same across a restart: a stored result recorded its query
@@ -2048,7 +2048,7 @@ def test_dNN_stored_dependent_is_not_reused_when_a_dependency_has_other_effects(
         engine.shutdown()
 
 
-def test_dNN_threads_entering_a_cycle_of_async_queries_from_both_ends_do_not_hang() -> (
+def test_d57_threads_entering_a_cycle_of_async_queries_from_both_ends_do_not_hang() -> (
     None
 ):
     # Two worker threads of compute_many each ran an async query of one
@@ -2087,7 +2087,7 @@ def test_dNN_threads_entering_a_cycle_of_async_queries_from_both_ends_do_not_han
 
 
 @pytest.mark.parametrize("cached", [True, False])
-def test_dNN_submitted_run_that_raises_after_an_input_change_is_cancelled(
+def test_d58_submitted_run_that_raises_after_an_input_change_is_cancelled(
     cached: bool,
 ) -> None:
     # A submitted call whose inputs change before it finishes raises
@@ -2133,7 +2133,7 @@ def _call_quietly(fn: Any) -> None:
 
 
 @pytest.mark.parametrize("callers", ["tasks", "threads"])
-def test_dNN_caller_that_joined_a_run_failing_uncached_gets_its_effects(
+def test_d56_caller_that_joined_a_run_failing_uncached_gets_its_effects(
     callers: str,
 ) -> None:
     # A query that raises keeps what it pushed, and a caller that catches
@@ -2223,7 +2223,7 @@ def test_dNN_caller_that_joined_a_run_failing_uncached_gets_its_effects(
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_dNN_result_that_read_a_default_kept_meanwhile_at_a_newer_revision_is_stored(
+def test_d59_result_that_read_a_default_kept_meanwhile_at_a_newer_revision_is_stored(
     tmp_path: Path, backend: str
 ) -> None:
     # A task at an older revision read an input's default (nothing is kept
@@ -2281,7 +2281,7 @@ def test_dNN_result_that_read_a_default_kept_meanwhile_at_a_newer_revision_is_st
 
 
 @pytest.mark.parametrize("callers", ["tasks", "threads"])
-def test_dNN_caller_that_joined_a_run_failing_uncached_depends_on_what_it_read(
+def test_d56_caller_that_joined_a_run_failing_uncached_depends_on_what_it_read(
     callers: str,
 ) -> None:
     # A caller that catches an error which is not cached, or caches its
@@ -2361,7 +2361,7 @@ def test_dNN_caller_that_joined_a_run_failing_uncached_depends_on_what_it_read(
     engine.shutdown()
 
 
-def test_dNN_cancelling_the_task_that_runs_a_query_leaves_its_waiters_to_run_it() -> (
+def test_d52_cancelling_the_task_that_runs_a_query_leaves_its_waiters_to_run_it() -> (
     None
 ):
     # A task runs slow(); another task and a thread wait for that run. The
@@ -2421,7 +2421,7 @@ def test_dNN_cancelling_the_task_that_runs_a_query_leaves_its_waiters_to_run_it(
     assert not engine._store.waiting_on  # noqa: SLF001
 
 
-def test_dNN_a_caller_that_joined_a_run_blocked_on_an_event_loop_runs_it_itself() -> (
+def test_d53_a_caller_that_joined_a_run_blocked_on_an_event_loop_runs_it_itself() -> (
     None
 ):
     # bridge() is a sync query calling the async aval(). Called from a
@@ -2492,7 +2492,7 @@ _OUTSIDE_READ_CASES = [
 
 @pytest.mark.parametrize("awaited", [False, True])
 @pytest.mark.parametrize(("before", "after", "on_run", "expected"), _OUTSIDE_READ_CASES)
-def test_dNN_a_fixed_point_whose_outside_read_changes_while_it_iterates_starts_again(
+def test_d54_a_fixed_point_whose_outside_read_changes_while_it_iterates_starts_again(
     awaited: bool, before: int, after: int, on_run: int, expected: int
 ) -> None:
     # head = member + reading and member = head // 2, iterated from the guess
@@ -2549,7 +2549,7 @@ def test_dNN_a_fixed_point_whose_outside_read_changes_while_it_iterates_starts_a
     assert "outside read" in [t.detail for t in engine.traces()]
 
 
-def test_dNN_closures_made_in_a_comprehension_see_its_last_loop_value() -> None:
+def test_d60_closures_made_in_a_comprehension_see_its_last_loop_value() -> None:
     # A comprehension's loop variable is one variable: lambdas and
     # generators made in its element and called afterwards all see its last
     # value. The rewriter moved the element into a helper function, where
@@ -2575,7 +2575,7 @@ def test_dNN_closures_made_in_a_comprehension_see_its_last_loop_value() -> None:
     assert q() == body(list(ys))
 
 
-def test_dNN_a_comprehension_that_changes_a_local_list_does_so_for_every_element() -> (
+def test_d61_a_comprehension_that_changes_a_local_list_does_so_for_every_element() -> (
     None
 ):
     # A pipeline runs its element, ``if``, ``map``, ``filter`` and ``key=``
@@ -2622,7 +2622,7 @@ def test_dNN_a_comprehension_that_changes_a_local_list_does_so_for_every_element
     )
 
 
-def test_dNN_a_caller_replays_the_effects_of_a_run_that_gave_the_same_value() -> None:
+def test_d55_a_caller_replays_the_effects_of_a_run_that_gave_the_same_value() -> None:
     # A query that ran again and gave the same value kept its old
     # ``changed_at`` (early cutoff), so a caller was not run again and
     # replayed the effects it had stored, which held the dependency's old
@@ -2681,7 +2681,7 @@ def test_dNN_a_caller_replays_the_effects_of_a_run_that_gave_the_same_value() ->
         assert above == {"log": [value]}
 
 
-def test_dNN_a_value_made_by_a_stage_is_new_on_every_run() -> None:
+def test_d62_a_value_made_by_a_stage_is_new_on_every_run() -> None:
     # A pipeline keeps the values its stages made and hands the same objects
     # out on the next run. A body that changed one, or used one up, found it
     # so on the next run, where Python makes a new one: after
@@ -2705,7 +2705,7 @@ def test_dNN_a_value_made_by_a_stage_is_new_on_every_run() -> None:
     assert q() == ([[1, 99], [2], [3]], [[1, 2], [1, 2], [1, 2]], [3])
 
 
-def test_dNN_a_nan_made_by_a_stage_is_a_new_object_each_time() -> None:
+def test_d63_a_nan_made_by_a_stage_is_a_new_object_each_time() -> None:
     # Python makes a new NaN object for each ``v + 1`` over a NaN, and a set
     # tells NaN objects apart. A pipeline called twice in one run handed out
     # the NaN its state held both times: ``{min(map(f, xs)) for _ in (0, 1)}``

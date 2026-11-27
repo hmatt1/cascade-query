@@ -4,6 +4,50 @@ Releases before 0.4.0 were published from every push to `main` without
 notes; `docs/guarantees.md` records the defects fixed in them (D1–D37).
 Defects fixed since are listed under their release (D38 on).
 
+## 0.4.5
+
+### Changed
+
+- **A comprehension whose elements are values that can be changed in place
+  is no longer incremental.** `[{"id": x} for x in xs]`, `[[x] for x in xs]`
+  and the like, under `list`, `set`, `dict`, `sorted`, `min` or `max`, now
+  run their element for every element on every run, as plain Python does.
+  Handing the same objects to the next run let a body that changed one see
+  it changed (D62). Elements that are ints, floats, strings, bytes, `None`,
+  or tuples and frozensets of those stay incremental.
+- **Early cutoff compares effects too.** A query that runs again to an equal
+  value with other effects counts as changed, so its callers collect the
+  new effects (D55). Stored results whose query dependencies push effects
+  are computed once more after the upgrade.
+- **Crashes and several processes on one `cache_dir` are out of scope, by
+  design.** After a crash, clear the cache. Use one process per directory;
+  engines in one process may share it.
+
+### Fixed
+
+- **Cancelling the task that ran a query cancelled every caller waiting for
+  it (D52)**, and a caller that joined a run blocked on another thread's
+  event loop got that loop's `EventLoopBlockedError` (D53). Waiters now run
+  the query themselves.
+- **A fixed point could settle on a wrong value (D54)** when something the
+  cycle read from outside changed while it iterated, such as a TTL result
+  dropped and run again. The iteration now starts again from the guess.
+- **Callers replayed stale effects after a dependency ran again to an equal
+  value (D55)**, in memory and from disk.
+- **A caller that joined a run failing with an uncached error lost the run's
+  dependencies and effects (D56)**, so its own result was served after the
+  input changed.
+- **Threads entering a cycle of async queries from both ends hung (D57).**
+- **A submitted call that raised after an input changed returned the stale
+  error instead of `QueryCancelled` (D58).**
+- **A result that read a default kept meanwhile at a newer revision was not
+  stored on disk (D59).**
+- **Rewritten comprehensions differed from Python in three cases:** lambdas
+  made per element each kept their own loop value (D60); an element that
+  appended to a local list ran for changed elements only (D61); a stage that
+  made a NaN handed out one NaN object twice (D63). The first two are now
+  left as written, the third rebuilds on every call.
+
 ## 0.4.4
 
 ### Changed

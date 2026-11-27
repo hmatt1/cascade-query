@@ -35,7 +35,7 @@ Boundaries are strict and fail toward normal execution:
   element (in the helper each would keep its own element, where Python's
   all see the last one), or call a method that changes a list, set or dict
   the query assigns (``seen.append(x)``), which a pipeline would call for
-  changed elements only (dNN).
+  changed elements only (D60, D61).
 
 The rewritten function is compiled against the original filename with the
 original line numbers, and its closure cells are the original cell objects,
@@ -282,7 +282,7 @@ class _Rewriter(ast.NodeTransformer):
 
         A pipeline runs them for the elements that changed only: with
         ``seen = []; [seen.append(x) for x in xs]``, after ``xs.append(4)``
-        the new ``seen`` would hold ``4`` alone (dNN). Seen here: a method
+        the new ``seen`` would hold ``4`` alone (D61). Seen here: a method
         that changes a list, set or dict, called on a name the query
         assigns. Not seen: a helper function that changes an object.
         """
@@ -476,7 +476,7 @@ def _closes_over(moved: list[ast.expr], loop_names: set[str]) -> bool:
     sees its value when it is called, after the loop has moved on (all of
     ``[lambda: x for x in xs]`` return the last element). In the helper
     that holds the element it is a variable of each call, so each closure
-    would keep its own element instead (dNN).
+    would keep its own element instead (D60).
     """
     for part in moved:
         done = _used_at_once(part)

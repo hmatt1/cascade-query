@@ -1061,6 +1061,148 @@ The out-of-date fault needs a write, a reopen and a write by the other
 engine, in that order; the default 40 examples catch it only some of the
 time.
 
+## Silent failures and the async paths (2026-11-26, second round)
+
+A second round aimed at wrong results that raise nothing, and at the async
+paths. Four generators were widened, one branch each, and the harnesses
+already there ran for three hours, looping with a new seed each round on
+3.12 and the free-threaded 3.14t. Together they found twelve defects, D52 to
+D63, all fixed in 0.4.5; `docs/guarantees.md` has each. Crashes and several
+processes on one directory were set aside as out of scope by design (G17,
+test gap 2).
+
+### The soak
+
+Three hours, on main as of 0.4.4: the state machine at 1,500 examples, the
+generated query bodies at 15,000, the generated transactions at 1,500, the
+collection interleavings under `-m slow` with 400 random programs, and the
+async test files, each looping on both builds.
+
+| Harness | Rounds | Failed |
+|---|---:|---:|
+| Async test files (3.14t) | 554 | 0 |
+| Collection interleavings, `-m slow` | about 90 | 0 |
+| Generated transactions | about 40 | 0 |
+| State machine | about 10 | 1 (3.14t) |
+| Generated query bodies | 35 | 17 |
+
+The state machine's failure was D54: a hidden fixed-point head gave -5 where
+-10 or -4 is right. Of the 17 in the query bodies, 13 (3.14t) came from the
+plain model of the set, a dict, which from 3.14 words the error of an
+unhashable `in` differently from a set, and 4 (3.12) from the sign of a NaN
+made by `inf - inf`, which CPython gives either way from one call to the
+next as it specializes a function. The engine keeps a NaN's sign in digests
+and on disk; the test now compares NaN without it. Behind one of the 13 was
+D63. With the test fixed and D63 fixed, every failing seed passes all
+15,000 examples.
+
+### State machine: tasks in the lock step
+
+Tasks take part in the lock step as threads do. A task stops at the start
+of every async query body and at awaits marked inside bodies, by awaiting a
+future of its own that the lock step resolves when the drawn schedule picks
+it. In a sync body called from a task it stops as a thread does and holds
+its loop. `store.waiting_on` records tasks as well as threads, so the lock
+step sees a task waiting for a thread's run, a thread waiting for a task's,
+and a loop held by one of its tasks. In one run it handed about 4,500 turns
+to tasks and 11,700 to threads. Six rules use it: up to three tasks on each
+of one or two loops beside threads and an evictor; one of several tasks
+asking for one query cancelled at a point the machine picks; a task through
+a snapshot and a live task on one query at two revisions; D35 walked
+through with an async cycle; G2 on the async path; and a TTL result dropped
+while a cycle iterates over it. A hidden head may return a value that
+cannot be encoded, which reaches the last path of 0.4.2 not reached before.
+It found D52, D53 and D54. The file is about 20% slower and passed 20 runs
+of 20 on each build.
+
+| Fault | 3.12 | 3.14t | Old file, 3.12 |
+|---|---|---|---|
+| Async verification checks `changed_at` for inputs only | 5 of 5 | 5 of 5 | 2 of 3 |
+| A task joins a run at another revision | 5 of 5 | 5 of 5 | 1 of 3 |
+| A joined task gets no effects replayed | 5 of 5 | 4 of 5 | 0 of 3 |
+| D34 undone | 5 of 5 | 5 of 5 | 0 of 3 |
+| An async fixed point stops after its second run | 5 of 5 | 5 of 5 | 3 of 3 |
+| A task's waits recorded under its thread | 4 of 5 | 5 of 5 | 0 of 3 |
+| A cancelled run stored as the result | 5 of 5 | 5 of 5 | 0 of 3 |
+| D52, D53, D54 undone | 5, 5 and 5 of 5 | 5, 3 and 5 of 5 | 0 of 3 |
+
+About two runs in 60 of intermediate versions on 3.14t stopped at the lock
+step's patience with one task ready and no turn given; the cause was not
+found, and the description it prints now names enough to find it next time.
+
+### Generated programs on both paths
+
+`tests/test_async_differential.py` generates query programs and runs each
+on two engines, one with plain functions and one with `async def` queries
+awaited on a running loop, every body written once as a coroutine. A
+program has three to five inputs with defaults (async ones on the async
+engine in half the examples), two to six queries that read them, call each
+other with arguments, raise and catch errors and push effects, a TTL query,
+a fixed-point head and member, and a list, a set and a dict. The reads of a
+step run as tasks of one gather on the async engine, so tasks join each
+other's runs. Steps set inputs, read, snapshot, submit a call held while an
+input changes, call `compute_many`, prune, sweep, move the clock and
+register new code; on mdbx and sqlite the engines restart. After each step
+both engines must give the same outcome, type and sign of zero included,
+and the same effects, as a plain model run from scratch, and end at the
+same revision. In steps that read one after another both must run each
+query as often; when tasks or threads run at once, no query may run twice
+at one revision. Nine differences are allowed and listed in the file; none
+is a value. 250 examples take about 20 seconds; the file reaches 54 of 55
+lines of `_try_hydrate_from_disk_async`.
+
+Of 17 faults seeded into the async functions, 16 failed in each of 5 seeds
+within 250 examples, most within 20; the 17th (verification that counts a
+dependency's uncached error as unchanged) in 3 of 5. It found D55 to D59.
+
+### Generated query bodies: keys, effects, nested functions, async
+
+The grammar of `tests/test_rewrite_programs.py` gained `key=` functions that
+raise for some elements or give keys that cannot be compared or are ordered
+by inclusion only; effects pushed from elements, filters, keys, a query
+called per element and statements, compared in order after every change,
+on a cache hit, through a snapshot and as nothing when the call raises;
+functions defined in the body and in loops; closures and per-element values
+changed by the body afterwards; and `async def` bodies (one in four) with
+`await` and `async for` in comprehensions. The rewriter never rewrites an
+async query (G22), and those bodies gave plain Python's results except for
+a documented untracked read, `set(s)` (G21), which the grammar spells
+`set(iter(s))`. The file takes about 17 seconds, against 15. It found D55,
+D60, D61 and D62, and the soak D63.
+
+| Fault (300 examples, 10 seeds) | Before: within 300 | After: within 300 |
+|---|---|---|
+| Effects pushed in a pipeline not noticed (D31) | 0 of 10 | 10 of 10 |
+| Pushes not taken back | 0 of 10 | 10 of 10 |
+| A key's error swallowed | 7 of 10 | 10 of 10 |
+| Descending sort reverses ties | 0 of 10 | 7 of 10 |
+| Closure cells not fingerprinted | 7 of 10 | 9 of 10 |
+| Defaults not fingerprinted | 0 of 10 | 4 of 10 |
+| D60, D61, D62, D55 undone | 0 of 10 each | 8, 10, 9 and 8 of 10 |
+| An async body rewritten, `await` dropped | not reachable | 10 of 10 |
+
+A query that takes `x` from outside and holds `[x for z in [1 for x in
+ys]]` raises `UnboundLocalError` in CPython and returns a value rewritten;
+this CPython corner is not fixed.
+
+### Async transactions and readers sharing a key
+
+`tests/test_transaction_properties.py` generates blocks on asyncio tasks,
+on one loop or on two loops in two threads: tasks open blocks, commit, raise
+and fail at commit, change inputs and collections, read, submit and
+snapshot, create tasks that copy the block's context, and are cancelled,
+also in the middle of a query they await in their block. Reader tasks await
+queries that stop between their reads; two or three often ask for one key.
+Every read must be a state committed while it ran. In
+`tests/test_collection_interleavings.py` the wait of a caller that joins
+another's run is now visible to the scheduler, so seven scenarios put two or
+three readers on one key while writers change a list, a set or a dict: about
+5,000 schedules by default, 95,000 under `-m slow`. Six faults in the dedup
+path fail the new scenarios within 2 to 494 schedules, five of which passed
+the file before; ten faults in the async transactions fail within 3 to 122
+examples, two of which (a cancelled task's block committing, and D52)
+passed the old transaction tests. It found D52.
+
 ## Next steps
 
 In order of value for the time they take.

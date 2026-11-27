@@ -851,7 +851,7 @@ class IncrementalRuntime:
                     # result hands it out, and a body that changes it would
                     # find it changed on the next run, or a set the same
                     # NaN object twice, where Python makes a new one:
-                    # rebuild each time (dNN, and a second dNN for NaN).
+                    # rebuild each time (D62, and D63 for NaN).
                     state.impure = True
                 self._record_info(
                     state_key, site, reducer_name, core, view, stages, state
