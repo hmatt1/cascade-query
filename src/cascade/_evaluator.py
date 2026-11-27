@@ -97,6 +97,29 @@ class _EnterThroughHead(CycleError):
         self.head = head
 
 
+class _FailedRun:
+    """What a run that raised an error which is not cached read and pushed.
+
+    Shaped like the frame ``Evaluator._inherit_failed_deps`` reads. Its
+    cycle heads are not kept: they belong to the owner's runtime.
+    """
+
+    __slots__ = ("key", "deps", "expires_at", "effects", "cycle_heads")
+
+    def __init__(
+        self,
+        key: QueryKey,
+        deps: dict[QueryKey, int],
+        expires_at: float | None,
+        effects: dict[str, tuple[Any, ...]],
+    ) -> None:
+        self.key = key
+        self.deps = deps
+        self.expires_at = expires_at
+        self.effects = effects
+        self.cycle_heads = None
+
+
 class _RestartCycle(CycleError):
     """A head running once on its cached members was reached again.
 
@@ -135,6 +158,9 @@ _NEVER_CHANGED_AT = -2
 # registering here never keeps an engine alive.
 _running_loop = asyncio._get_running_loop
 _get_ident = threading.get_ident
+# Set while this thread is blocked in ``_run_coroutine_blocking``: a
+# synchronous caller on it waits for the loop that runs an async body.
+_blocked_on_loop = threading.local()
 
 
 def _run_coroutine_blocking(coro: Any, what: str) -> Any:
@@ -154,7 +180,11 @@ def _run_coroutine_blocking(coro: Any, what: str) -> Any:
             "async query), or make the synchronous call from another thread, "
             "for example with `await asyncio.to_thread(...)`."
         )
-    return asyncio.run(coro)
+    _blocked_on_loop.active = True
+    try:
+        return asyncio.run(coro)
+    finally:
+        _blocked_on_loop.active = False
 
 
 async def _wait_for_joined_run(shared: concurrent.futures.Future[Any]) -> Any:
@@ -590,6 +620,26 @@ class Evaluator:
                 executor, functools.partial(ctx.run, fn, *positional, **keywords)
             )
         return await loop.run_in_executor(executor, ctx.run, fn, *positional)
+
+    def _cancelled_error(
+        self, exc: BaseException, runtime_cancel_epoch: int | None
+    ) -> QueryCancelled | None:
+        """``QueryCancelled`` for an error raised by a run that is cancelled.
+
+        A body that raises is checked like one that returns (G6): an input
+        changed while it ran, so its error is discarded as a value would be,
+        not cached, and the submitted call raises ``QueryCancelled``, not
+        the error. The engine's own errors are left as they are.
+        """
+        if runtime_cancel_epoch is None:
+            return None
+        if not isinstance(exc, Exception) or isinstance(
+            exc, (*_NEVER_CACHED_ERRORS, _ProvisionalResult)
+        ):
+            return None
+        if self._store.cancel_epoch == runtime_cancel_epoch:
+            return None
+        return QueryCancelled("query cancelled because inputs changed")
 
     def check_cancelled(self, runtime_cancel_epoch: int | None) -> None:
         if runtime_cancel_epoch is None:
@@ -1069,6 +1119,9 @@ class Evaluator:
                 if not self._retry_after(exc, runtime):
                     raise
                 failed = exc
+            except Exception as exc:
+                self._join_failed_run(slot, runtime, exc)
+                raise
             finally:
                 self._leave_wait(agent, slot)
             if pending_heads is not None:
@@ -1103,7 +1156,9 @@ class Evaluator:
                 raise
             redirect = exc.head
         except BaseException as exc:
-            self._release_in_flight(in_flight_key, slot, exc=exc)
+            self._release_in_flight(
+                in_flight_key, slot, exc=exc, failed=self._failed_run(runtime, exc)
+            )
             raise
         if redirect is not None:
             # Outside the except clause, so that what this raises does not
@@ -1208,6 +1263,9 @@ class Evaluator:
                 if not self._retry_after(exc, runtime):
                     raise
                 failed = exc
+            except Exception as exc:
+                self._join_failed_run(slot, runtime, exc)
+                raise
             finally:
                 self._leave_wait(agent, slot)
             if pending_heads is not None:
@@ -1241,7 +1299,9 @@ class Evaluator:
                 raise
             redirect = exc.head
         except BaseException as exc:
-            self._release_in_flight(in_flight_key, slot, exc=exc)
+            self._release_in_flight(
+                in_flight_key, slot, exc=exc, failed=self._failed_run(runtime, exc)
+            )
             raise
         if redirect is not None:
             await self._enter_cycle_through_head_async(redirect, runtime)
@@ -1255,6 +1315,41 @@ class Evaluator:
             return result, False
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
+
+    @staticmethod
+    def _failed_run(runtime: RuntimeState, exc: BaseException) -> _FailedRun | None:
+        """What the run that just raised ``exc`` here read and pushed."""
+        failed, runtime.failed_run = runtime.failed_run, None
+        if failed is None or failed[0] is not exc:
+            return None
+        frame = failed[1]
+        return _FailedRun(
+            frame.key,
+            dict(frame.deps),
+            frame.expires_at,
+            {name: tuple(items) for name, items in frame.effects.items() if items},
+        )
+
+    def _join_failed_run(
+        self, slot: InFlight, runtime: RuntimeState, exc: BaseException
+    ) -> None:
+        """Give a caller that joined a run failing with ``exc`` what the
+        owner's caller got.
+
+        An error that is not cached leaves no memo, so the owner's caller
+        took over what the failed run read (``_inherit_failed_deps``) and
+        had what it pushed (a query that raises keeps its effects). A caller
+        that joined the run got only the error: it did not depend on what
+        the run read, so what it cached from the error (its own cached
+        error, or a fallback) was never computed again, and it lost the
+        effects (G5, G12).
+        """
+        failed = slot.failed_run
+        if failed is None:
+            return
+        if failed.effects:
+            self.replay_effects(failed.effects)
+        self._inherit_failed_deps(runtime.stack, failed, exc)  # type: ignore[arg-type]
 
     @staticmethod
     def _retry_after(exc: BaseException, runtime: RuntimeState) -> bool:
@@ -1317,6 +1412,14 @@ class Evaluator:
         because its thread is blocked; the chain goes on through what that
         thread waits for.
 
+        A task on the loop that a synchronous caller runs an async body on
+        (``_run_coroutine_blocking``: an async query reached from plain code,
+        ``compute_many``, ``submit``) holds up that caller's thread, which
+        waits for the loop: the thread waits for whatever the task waits
+        for, and a chain that comes back to the thread comes back to the
+        task. Without that, two threads that entered one cycle of async
+        queries through different queries each waited for the other.
+
         Returns True when registered (wait, then call ``_leave_wait``),
         False when waiting would never end (run the query on this stack
         instead: the cycle is then visible to it), and None when the caller
@@ -1331,11 +1434,17 @@ class Evaluator:
             self._store.trace_event("dedup_pipeline", key)
             return False
         waiting_on = self._store.waiting_on
+        # A task whose thread is blocked in a synchronous call on this loop.
+        holds_thread = not blocking and getattr(_blocked_on_loop, "active", False)
         seen: set[Any] = set()
         current: InFlight | None = slot
         while current is not None:
             owner = current.owner
-            if owner == agent or (blocking and current.owner_thread == thread):
+            if (
+                owner == agent
+                or (blocking and current.owner_thread == thread)
+                or (holds_thread and owner == thread)
+            ):
                 self._store.trace_event("dedup_cycle", key)
                 return False
             if owner in seen:
@@ -1348,6 +1457,8 @@ class Evaluator:
                 nxt = waiting_on.get(current.owner_thread)
             current = nxt
         waiting_on[agent] = slot
+        if holds_thread and thread not in waiting_on:
+            waiting_on[thread] = slot
         return True
 
     def _leave_wait(self, agent: Any, slot: InFlight) -> None:
@@ -1361,6 +1472,10 @@ class Evaluator:
             waiting_on = self._store.waiting_on
             if waiting_on.get(agent) is slot:
                 del waiting_on[agent]
+            # The record a task left for its blocked thread (_enter_wait_locked).
+            thread = _get_ident()
+            if thread != agent and waiting_on.get(thread) is slot:
+                del waiting_on[thread]
 
     def _run_instead_of_waiting(
         self,
@@ -1460,6 +1575,7 @@ class Evaluator:
         *,
         result: MemoEntry | None = None,
         exc: BaseException | None = None,
+        failed: _FailedRun | None = None,
     ) -> None:
         # Unregister and read the waiter future in one critical section: a
         # waiter either attached its future before this point, or finds no slot
@@ -1469,6 +1585,7 @@ class Evaluator:
                 del self._store.in_flight[in_flight_key]
             future = slot.future
             if future is not None:
+                slot.failed_run = failed
                 # Whoever joined this run stops waiting here, not when it
                 # gets round to saying so. Until then its record would tell
                 # the owner of this run, asking for a query the waiter
@@ -2506,7 +2623,8 @@ class Evaluator:
                     restart = True
                     break
                 error_hash = self._cacheable_error_digest(key, exc)
-                if error_hash is not None:
+                cancelled = self._cancelled_error(exc, runtime.cancel_epoch)
+                if cancelled is None and error_hash is not None:
                     error = exc
                     result = None
                     value_hash = error_hash
@@ -2517,7 +2635,10 @@ class Evaluator:
                     if isinstance(exc, _EnterThroughHead) and exc.member == key:
                         # This run is abandoned and the query looked up again.
                         self._retract_effects(runtime, runtime.stack, frame.effects)
-                    self._inherit_failed_deps(runtime.stack, frame, exc)
+                    self._inherit_failed_deps(runtime.stack, frame, cancelled or exc)
+                    if cancelled is not None:
+                        raise cancelled from exc
+                    runtime.failed_run = (exc, frame)
                     raise
 
             if frame.is_cycle_root:
@@ -2603,7 +2724,8 @@ class Evaluator:
                         restart = True
                         break
                     error_hash = self._cacheable_error_digest(key, exc)
-                    if error_hash is not None:
+                    cancelled = self._cancelled_error(exc, new_runtime.cancel_epoch)
+                    if cancelled is None and error_hash is not None:
                         error = exc
                         result = None
                         value_hash = error_hash
@@ -2614,7 +2736,12 @@ class Evaluator:
                             self._retract_effects(
                                 new_runtime, runtime.stack, frame.effects
                             )
-                        self._inherit_failed_deps(runtime.stack, frame, exc)
+                        self._inherit_failed_deps(
+                            runtime.stack, frame, cancelled or exc
+                        )
+                        if cancelled is not None:
+                            raise cancelled from exc
+                        runtime.failed_run = (exc, frame)
                         raise
 
                 if frame.is_cycle_root:
@@ -2775,7 +2902,11 @@ class Evaluator:
 
         with store.lock:
             previous = None if provisional else store.memos.get(key)
-            if previous is not None and previous.value_hash == value_hash:
+            if (
+                previous is not None
+                and previous.value_hash == value_hash
+                and self._same_effects(previous.effects, frozen_effects)
+            ):
                 changed_at = previous.changed_at
                 store.trace_event("backdate", key)
             else:
@@ -2861,6 +2992,30 @@ class Evaluator:
         if store.is_stats_enabled():
             store.record_query_body_time(key, elapsed)
         return full_memo
+
+    def _same_effects(
+        self,
+        old: Mapping[str, tuple[Any, ...]],
+        new: Mapping[str, tuple[Any, ...]],
+    ) -> bool:
+        """Whether a run's effects are those of the row it replaces.
+
+        Dependents store the effects replayed to them with their own result,
+        so a run that gives an equal value with other effects is a change:
+        keeping the row's stamp would leave them replaying the old effects.
+        Compared by digest, like values (G2); effects that cannot be
+        digested count as changed.
+        """
+        if not old and not new:
+            return True
+        if old.keys() != new.keys():
+            return False
+        try:
+            return self._store.stable_hash(dict(old)) == self._store.stable_hash(
+                dict(new)
+            )
+        except TypeError:
+            return False
 
     def _store_memo_locked(self, key: QueryKey, memo: MemoEntry, revision: int) -> None:
         store = self._store
@@ -3103,13 +3258,29 @@ class Evaluator:
         self._store.stable_hash(value)  # TypeError, as before, if unencodable
         return self._keep_default(input_key, runtime.snapshot.revision, value)
 
+    def _query_fingerprint(self, memo: MemoEntry) -> str | None:
+        """What a stored result records for a query it read: its value's
+        digest, and the digest of its effects if it has any.
+
+        Effects count because a dependent stores those replayed to it: a
+        dependency that now gives an equal value with other effects must not
+        let a stored dependent be reused with the old ones (see
+        ``_same_effects``). None, never matching, if they cannot be digested.
+        """
+        if not memo.effects:
+            return memo.value_hash
+        try:
+            return f"{memo.value_hash}+{self._store.stable_hash(dict(memo.effects))}"
+        except TypeError:  # pragma: no cover - persisted effects are encodable
+            return None
+
     def _current_query_state(
         self,
         query_id: str,
         args: tuple[Any, ...],
         runtime: RuntimeState,
-    ) -> tuple[str, int, float | None] | None:
-        """``(value_hash, changed_at, expires_at)`` of a query brought up to date."""
+    ) -> tuple[str | None, int, float | None] | None:
+        """``(fingerprint, changed_at, expires_at)`` of a query brought up to date."""
         dep_key: QueryKey = ("query", query_id, args)
         try:
             fn = self._store.lookup_query(query_id)
@@ -3134,7 +3305,7 @@ class Evaluator:
         )
         # As in dependency_changed_at: use the entry valid at this revision,
         # not whatever row is stored by now.
-        return entry.value_hash, entry.changed_at, entry.expires_at
+        return self._query_fingerprint(entry), entry.changed_at, entry.expires_at
 
     async def _try_hydrate_from_disk_async(
         self, key: QueryKey, runtime: RuntimeState
@@ -3343,7 +3514,7 @@ class Evaluator:
         query_id: str,
         args: tuple[Any, ...],
         runtime: RuntimeState,
-    ) -> tuple[str, int, float | None] | None:
+    ) -> tuple[str | None, int, float | None] | None:
         dep_key: QueryKey = ("query", query_id, args)
         try:
             fn = self._store.lookup_query(query_id)
@@ -3365,7 +3536,7 @@ class Evaluator:
             shadow,
             lambda: self._shadow_entry_async(dep_key, fn, need_value=True),
         )
-        return entry.value_hash, entry.changed_at, entry.expires_at
+        return self._query_fingerprint(entry), entry.changed_at, entry.expires_at
 
     def _take_write_failure(self) -> tuple[BaseException, int] | None:
         return None if self._writer is None else self._writer.take_failure()
@@ -3513,7 +3684,7 @@ class Evaluator:
                 dep_memo = self._store.memos.get(dep_key)
             if dep_memo is None or dep_memo.changed_at != observed_changed_at:
                 return None  # pragma: no cover
-            return dep_memo.value_hash
+            return self._query_fingerprint(dep_memo)
         input_key = (dep_fid, dep_args)
         with self._store.lock:
             try:
@@ -3524,17 +3695,25 @@ class Evaluator:
                 # Materialized mid-run at a revision above verified_at, or never
                 # materialized at all (pull-based default read).
                 version = self._store.latest_input_version(input_key)
-        if version is not None:
-            if version.changed_at != observed_changed_at:
-                return None  # pragma: no cover
+        if version is not None and version.changed_at == observed_changed_at:
             return version.value_hash
         if observed_changed_at != -1:
             return None  # pragma: no cover
+        # The result read the default (-1), and a version stored since does
+        # not say what that was: a read at a newer revision kept the default
+        # while this result was computed at an older one. Without this the
+        # result was not stored at all.
         fn = self._store.lookup_input(dep_fid)
         if fn is None:
             return None  # pragma: no cover
+        default = _keys.call(fn, dep_args)
+        if isinstance(default, types.CoroutineType):
+            # An async default cannot be run from here (this may be the
+            # loop's thread): the result is not stored.
+            default.close()
+            return None
         try:
-            return self._store.stable_hash(_keys.call(fn, dep_args))
+            return self._store.stable_hash(default)
         except TypeError:  # pragma: no cover
             return None  # pragma: no cover
 
