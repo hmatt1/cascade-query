@@ -26,6 +26,9 @@ class RuntimeFrame:
     cycle_guess: Any = UNSET
     # Digest of ``cycle_guess``, once computed.
     cycle_guess_hash: str | None = None
+    # What the last run of this cycle head read from outside the cycle,
+    # with the ``changed_at`` each read saw (``Evaluator._next_iteration``).
+    cycle_outside: dict[QueryKey, int] | None = None
     is_cycle_root: bool = False
     cycle_heads: set[QueryKey] | None = None
     # The runtime this frame runs in (for async, the one made for it).
