@@ -65,3 +65,6 @@ class RuntimeState:
     # True for a runtime that brings a dependency up to date for a
     # verification (a shadow runtime), and for everything run inside it.
     verifying: bool = False
+    # (error, frame) of the last run here that raised an error which is not
+    # cached: what it read and pushed goes to the callers that joined it.
+    failed_run: Any = None

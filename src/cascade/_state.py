@@ -128,10 +128,14 @@ class InFlight:
     same revision; only then is a ``concurrent.futures.Future`` allocated.
     """
 
-    __slots__ = ("future", "owner", "owner_thread")
+    __slots__ = ("future", "owner", "owner_thread", "failed_run")
 
     def __init__(self, owner: Any = None, owner_thread: int | None = None) -> None:
         self.future: concurrent.futures.Future[MemoEntry] | None = None
+        # What a run that ended in an error which is not cached read and
+        # pushed before it raised: its waiters get it with the error, as
+        # the owner's callers did (Evaluator._join_failed_run).
+        self.failed_run: Any = None
         # Who runs it: a thread id for a synchronous run, else the asyncio
         # task; and the thread it runs on. See Evaluator._enter_wait_locked.
         self.owner = owner

@@ -1904,3 +1904,458 @@ def test_dNN_cancelling_the_task_that_runs_a_query_does_not_cancel_its_waiters(
     assert len(runs) == 2
     assert engine._internals.in_flight == {}  # noqa: SLF001
     assert waiting() == 0
+
+
+# --- Found by test_async_differential.py --------------------------------------
+
+
+@pytest.mark.parametrize("awaited", [False, True])
+def test_dNN_effects_of_a_dependency_rerun_to_an_equal_value_reach_its_dependents(
+    awaited: bool,
+) -> None:
+    # A dependent stores the effects replayed to it with its own result. A
+    # dependency that ran again and gave an equal value with other effects
+    # kept its stamp (early bail-out, G2), so the dependent was verified
+    # unchanged and kept replaying the old effects, where a fresh run gives
+    # the new ones (G1, G12). An equal value now keeps the stamp only if the
+    # effects are equal too.
+    engine = Engine()
+    log = engine.accumulator("log")
+
+    @engine.input(name="a")
+    def a() -> int:
+        return 1
+
+    if awaited:
+
+        @engine.query(name="child")
+        async def child() -> int:
+            log.push(("child", a()))
+            return 0
+
+        @engine.query(name="parent")
+        async def parent() -> int:
+            await child()
+            return 1
+
+    else:
+
+        @engine.query(name="child")
+        def child() -> int:
+            log.push(("child", a()))
+            return 0
+
+        @engine.query(name="parent")
+        def parent() -> int:
+            child()
+            return 1
+
+    def read() -> dict[str, list[Any]]:
+        effects: dict[str, list[Any]] = {}
+        if awaited:
+
+            async def main() -> int:
+                return await parent(effects=effects)
+
+            assert asyncio.run(main()) == 1
+        else:
+            assert parent(effects=effects) == 1
+        return effects
+
+    assert read() == {"log": [("child", 1)]}
+    a.set(2)
+    assert read() == {"log": [("child", 2)]}
+    a.set(2)
+    assert read() == {"log": [("child", 2)]}
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("awaited", [False, True])
+def test_dNN_stored_dependent_is_not_reused_when_a_dependency_has_other_effects(
+    tmp_path: Path, backend: str, awaited: bool
+) -> None:
+    # The same across a restart: a stored result recorded its query
+    # dependencies by the digest of their values only, so a new engine
+    # reused it with the effects of the old session. The digest of a
+    # dependency's effects is now part of what is recorded (G15, G16).
+    runs: list[str] = []
+
+    def session() -> tuple[Engine, Any, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+        log = engine.accumulator("log")
+
+        @engine.input(name="a")
+        def a() -> int:
+            return 1
+
+        if awaited:
+
+            @engine.query(name="child")
+            async def child() -> int:
+                log.push(("child", a()))
+                return 0
+
+            @engine.query(name="parent")
+            async def parent() -> int:
+                runs.append("parent")
+                await child()
+                return 1
+
+        else:
+
+            @engine.query(name="child")
+            def child() -> int:
+                log.push(("child", a()))
+                return 0
+
+            @engine.query(name="parent")
+            def parent() -> int:
+                runs.append("parent")
+                child()
+                return 1
+
+        return engine, a, parent
+
+    def read(parent: Any) -> dict[str, list[Any]]:
+        effects: dict[str, list[Any]] = {}
+        if awaited:
+
+            async def main() -> int:
+                return await parent(effects=effects)
+
+            assert asyncio.run(main()) == 1
+        else:
+            assert parent(effects=effects) == 1
+        return effects
+
+    engine, _, parent = session()
+    try:
+        assert read(parent) == {"log": [("child", 1)]}
+    finally:
+        engine.shutdown()
+    engine, a, parent = session()
+    try:
+        assert read(parent) == {"log": [("child", 1)]}
+        assert runs == ["parent"]  # served from disk
+    finally:
+        engine.shutdown()
+    engine, a, parent = session()
+    try:
+        a.set(2)
+        assert read(parent) == {"log": [("child", 2)]}
+        assert runs == ["parent", "parent"]
+    finally:
+        engine.shutdown()
+
+
+def test_dNN_threads_entering_a_cycle_of_async_queries_from_both_ends_do_not_hang() -> (
+    None
+):
+    # Two worker threads of compute_many each ran an async query of one
+    # fixed-point cycle from plain code: each thread blocks in an event loop
+    # of its own while the task on it awaits the other thread's query. The
+    # record of waits had the tasks' waits but not that each thread waits
+    # for its task, so neither saw the cycle (G7) and both waited for ever.
+    for _ in range(10):
+        engine = Engine()
+
+        @engine.input(name="limit")
+        def limit() -> int:
+            return 3
+
+        @engine.query(name="head", fixed_point=0)
+        async def head() -> int:
+            return min(await member(), limit())
+
+        @engine.query(name="member")
+        async def member() -> int:
+            return await head() + 1
+
+        finished, outcome = _run_with_timeout(
+            lambda: engine.compute_many([(head, ()), (member, ())])
+        )
+        try:
+            assert finished, "compute_many hung"
+            kind, value = outcome[0]
+            # Entered through the member while the other thread iterates the
+            # head: the fixed point or a CycleError (G7).
+            assert (kind, value) == ("ok", [3, 4]) or isinstance(
+                value, cascade.CycleError
+            ), outcome
+        finally:
+            engine.shutdown(wait=False)
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_dNN_submitted_run_that_raises_after_an_input_change_is_cancelled(
+    cached: bool,
+) -> None:
+    # A submitted call whose inputs change before it finishes raises
+    # QueryCancelled and stores nothing (G6). A body that raised instead of
+    # returning was not checked: the error of the stale run reached the
+    # caller, and a cached one was stored.
+    engine = Engine()
+    entered, release = threading.Event(), threading.Event()
+    runs: list[int] = []
+
+    @engine.input(name="x")
+    def x() -> int:
+        return 0
+
+    @engine.query(name="q", cache_exceptions=True if cached else (KeyError,))
+    def q() -> int:
+        value = x()
+        runs.append(value)
+        if len(runs) == 1:
+            entered.set()
+            release.wait(10)
+        raise ValueError(value)
+
+    future = engine.submit(q)
+    try:
+        assert entered.wait(10)
+        x.set(1)
+        release.set()
+        with pytest.raises(QueryCancelled):
+            future.result(10)
+        with pytest.raises(ValueError) as raised:
+            q()
+        assert raised.value.args == (1,)
+        assert runs == [0, 1]
+    finally:
+        release.set()
+        engine.shutdown()
+
+
+def _call_quietly(fn: Any) -> None:
+    with contextlib.suppress(ValueError):
+        fn()
+
+
+@pytest.mark.parametrize("callers", ["tasks", "threads"])
+def test_dNN_caller_that_joined_a_run_failing_uncached_gets_its_effects(
+    callers: str,
+) -> None:
+    # A query that raises keeps what it pushed, and a caller that catches
+    # the error has it (G12). A caller that joined the run instead of
+    # running it got the error without those effects when the error was
+    # not cached (G5: waiters get the run's result, effects and exception).
+    engine = Engine()
+    log = engine.accumulator("log")
+
+    if callers == "tasks":
+
+        @engine.query(name="failing", cache_exceptions=(KeyError,))
+        async def failing() -> int:
+            log.push("failing")
+            await gate.wait()
+            raise ValueError("no")
+
+        @engine.query(name="top")
+        async def top() -> int:
+            try:
+                await failing()
+            except ValueError:
+                return 1
+            return 0
+
+        async def main() -> tuple[Any, dict[str, list[Any]]]:
+            owner = asyncio.ensure_future(failing())
+            await asyncio.sleep(0)  # the owner runs up to the gate
+            effects: dict[str, list[Any]] = {}
+            joined = asyncio.ensure_future(top(effects=effects))
+            for _ in range(5):
+                await asyncio.sleep(0)  # top joins the owner's run
+            assert engine._store.waiting_on  # noqa: SLF001
+            gate.set()
+            with pytest.raises(ValueError):
+                await owner
+            return await joined, effects
+
+        gate: asyncio.Event
+        runner = asyncio.Runner()
+        try:
+
+            async def make_gate() -> asyncio.Event:
+                return asyncio.Event()
+
+            gate = runner.run(make_gate())
+            value, effects = runner.run(main())
+        finally:
+            runner.close()
+    else:
+        entered, release = threading.Event(), threading.Event()
+
+        @engine.query(name="failing", cache_exceptions=(KeyError,))
+        def failing() -> int:
+            log.push("failing")
+            entered.set()
+            release.wait(10)
+            raise ValueError("no")
+
+        @engine.query(name="top")
+        def top() -> int:
+            try:
+                failing()
+            except ValueError:
+                return 1
+            return 0
+
+        owner = threading.Thread(target=_call_quietly, args=(failing,), daemon=True)
+        owner.start()
+        assert entered.wait(10)
+        effects = {}
+        result: list[Any] = []
+        joined = threading.Thread(
+            target=lambda: result.append(top(effects=effects)), daemon=True
+        )
+        joined.start()
+        deadline = time.monotonic() + 10
+        while not engine._store.waiting_on and time.monotonic() < deadline:  # noqa: SLF001
+            time.sleep(0.001)
+        release.set()
+        owner.join(10)
+        joined.join(10)
+        value = result[0]
+    assert value == 1
+    assert effects == {"log": ["failing"]}
+    engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_dNN_result_that_read_a_default_kept_meanwhile_at_a_newer_revision_is_stored(
+    tmp_path: Path, backend: str
+) -> None:
+    # A task at an older revision read an input's default (nothing is kept
+    # there, G3); before it finished, a task at the newest revision read the
+    # input and kept the default. Storing the first task's result then found
+    # a version that did not match what it had read and stored nothing, so
+    # a new engine ran it again (G15). What it read was the default: that is
+    # what is recorded now.
+    runs: list[str] = []
+
+    def session() -> tuple[Engine, Any, Any, Any]:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+
+        @engine.input(name="x")
+        def x() -> int:
+            return 7
+
+        @engine.input(name="y")
+        def y() -> int:
+            return 0
+
+        @engine.query(name="old")
+        async def old() -> int:
+            runs.append("old")
+            value = x()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return value
+
+        @engine.query(name="new")
+        async def new() -> int:
+            return x() + y()
+
+        return engine, y, old, new
+
+    engine, y, old, new = session()
+    try:
+        snapshot = engine.snapshot()
+        y.set(1)
+
+        async def main() -> list[int]:
+            return list(await asyncio.gather(old(snapshot=snapshot), new()))
+
+        assert asyncio.run(main()) == [7, 8]
+        snapshot.release()
+    finally:
+        engine.shutdown()
+    assert runs == ["old"]
+    engine, _, old, _ = session()
+    try:
+        assert old() == 7
+        assert runs == ["old"]  # served from disk
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("callers", ["tasks", "threads"])
+def test_dNN_caller_that_joined_a_run_failing_uncached_depends_on_what_it_read(
+    callers: str,
+) -> None:
+    # A caller that catches an error which is not cached, or caches its
+    # own error from it, still depends on what the failed query read (G8).
+    # The owner's caller took that over; a caller that joined the run got
+    # only the error, so it stored its own result with no dependency on
+    # it and served it for ever, also after the input changed (G1, G5).
+    engine = Engine()
+
+    @engine.input(name="x")
+    def x() -> int:
+        return 0
+
+    if callers == "tasks":
+
+        @engine.query(name="failing", cache_exceptions=(KeyError,))
+        async def failing() -> int:
+            await asyncio.sleep(0)  # the other task joins this run here
+            if x() == 0:
+                raise ValueError("zero")
+            return x()
+
+        @engine.query(name="top")
+        async def top() -> int:
+            return await failing() + 1
+
+        async def both() -> list[Any]:
+            async def one(handle: Any) -> Any:
+                try:
+                    return await handle()
+                except ValueError as exc:
+                    return exc.args
+
+            return list(await asyncio.gather(one(failing), one(top)))
+
+        assert asyncio.run(both()) == [("zero",), ("zero",)]
+        x.set(5)
+        assert asyncio.run(both()) == [5, 6]
+    else:
+        entered, release = threading.Event(), threading.Event()
+
+        @engine.query(name="failing", cache_exceptions=(KeyError,))
+        def failing() -> int:
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+            if x() == 0:
+                raise ValueError("zero")
+            return x()
+
+        @engine.query(name="top")
+        def top() -> int:
+            return failing() + 1
+
+        owner = threading.Thread(target=_call_quietly, args=(failing,), daemon=True)
+        owner.start()
+        assert entered.wait(10)
+        outcome: list[Any] = []
+
+        def joined() -> None:
+            try:
+                outcome.append(top())
+            except ValueError as exc:
+                outcome.append(exc.args)
+
+        waiter = threading.Thread(target=joined, daemon=True)
+        waiter.start()
+        deadline = time.monotonic() + 10
+        while not engine._store.waiting_on and time.monotonic() < deadline:  # noqa: SLF001
+            time.sleep(0.001)
+        release.set()
+        owner.join(10)
+        waiter.join(10)
+        assert outcome == [("zero",)]
+        x.set(5)
+        assert top() == 6
+    engine.shutdown()
