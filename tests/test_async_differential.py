@@ -41,8 +41,9 @@ Allowed differences, each from a documented limit, never in a value:
 
 * run counts, in a gather whose tasks read at different revisions (a set
   between them, snapshots): a run at one revision serves no caller at
-  another (G5); and later, of what ran in it, since a task at an older
-  revision that finishes last replaces the newer rows (G4);
+  another (G5); and later, of what ran or was verified in it, since a
+  task at an older revision that finishes last replaces the newer rows
+  (G4), also on disk, across restarts;
 * run counts of ``memoize=False`` queries, of queries whose errors are not
   cached and of their callers that do not catch them, and of the cycle,
   when several tasks or ``compute_many`` threads read at once: whether
@@ -74,13 +75,7 @@ Allowed differences, each from a documented limit, never in a value:
 * a member of the cycle read while another task or thread iterates the
   head gets the fixed point or ``CycleError`` (G7), and a member's effects
   depend on whether it was stored from the head's last run (G12);
-* which error ``compute_many`` raises when several calls fail;
-* the effects of queries that read the head, once ``compute_many``
-  threads met in the cycle. This one is an open finding, not a documented limit: in one
-  example (three ``compute_many`` threads, an LRU bound of 6, sqlite) the
-  sync engine stored the head as an ordinary result that depends on the
-  member, with its last run's effects twice, and served them to every
-  caller (G12). Values still agree with the model.
+* which error ``compute_many`` raises when several calls fail.
 
 ``CASCADE_ASYNC_DIFF_EXAMPLES`` sets the number of examples, and
 ``CASCADE_ASYNC_DIFF_SHRINK=0`` reports a failure without shrinking it.
@@ -235,19 +230,6 @@ class Program:
                     uncached.add(q.name)
                     grew = True
         return uncached
-
-    def reaches_head(self) -> set[str]:
-        """The cycle's queries and every query that calls the head, at any depth."""
-        found = {"H", "M"}
-        grew = True
-        while grew:
-            grew = False
-            for q in self.queries:
-                calls = _calls(q.ops, "call") | _calls(q.ops, "try")
-                if q.name not in found and (_calls(q.ops, "fix") or calls & found):
-                    found.add(q.name)
-                    grew = True
-        return found
 
     def volatile(self) -> set[str]:
         """Queries whose run count may differ between the paths in a gather.
@@ -966,8 +948,6 @@ class Pair:
         self.next_snap = 0
         self.volatile = prog.volatile()
         self.uncached = prog.uncached()
-        self.head_effects_unsure = False
-        self.head_readers = prog.reaches_head()
         self.step_no = 0
         # Queries, and query keys, whose run counts are no longer compared.
         self.loose: set[str] = set()
@@ -1006,19 +986,9 @@ class Pair:
         got_async: Any,
         want: Any | None,
         member: bool = False,
-        name: str = "",
     ) -> None:
         (out_s, eff_s), (out_a, eff_a) = got_sync, got_async
         assert same_outcome(out_s, out_a), f"{what}: sync {out_s!r} but async {out_a!r}"
-        if name in self.head_readers and self.head_effects_unsure:
-            # Open finding: after tasks or threads met in the cycle, the
-            # head's stored effects can hold its last run twice (see the
-            # module docstring). Values are still compared.
-            if want is not None:
-                assert same_outcome(out_s, want[0]), (
-                    f"{what}: engines {out_s!r} but model {want[0]!r}"
-                )
-            return
         # A member's effects are those of the run that stored it: in the
         # head's last iteration it pushed only its own; run on its own it
         # replays the head's too (G12). Which happened depends on what was
@@ -1328,9 +1298,7 @@ class Pair:
                             )
                     continue
                 want = None
-            self.check_outcomes(
-                what, got_s, got_a, want, member=read.name == "M", name=read.name
-            )
+            self.check_outcomes(what, got_s, got_a, want, member=read.name == "M")
         if lenient:
             self.resync_revisions()
         self.check_revisions()
@@ -1456,9 +1424,6 @@ class Pair:
         if len(calls) > 1 and {"H", "M"} & {r.name for r in calls}:
             # As for tasks in a gather (do_reads).
             self.loose.add("M")
-        if len(calls) > 1 and self.head_readers & {r.name for r in calls}:
-            # The open finding of the module docstring, seen after threads.
-            self.head_effects_unsure = True
         got = []
         for side in self.sides:
             effects: dict[str, list[Any]] = {}
@@ -1505,10 +1470,7 @@ class Pair:
                 assert same_outcome(out_a, values), (
                     f"{what}: async {out_a!r} but model {values!r}"
                 )
-                head = any(r.name in self.head_readers for r in calls)
-                if not any(r.name == "M" for r in calls) and not (
-                    head and self.head_effects_unsure
-                ):
+                if not any(r.name == "M" for r in calls):
                     merged: dict[str, list[Any]] = {}
                     for w in wants:
                         for name, items in (w[1] or {}).items():
@@ -1553,7 +1515,8 @@ class Pair:
         for side in self.sides:
             side.restart()
         self.model_snaps.clear()
-        self.tainted.clear()
+        # Rows touched by a gather at mixed revisions stay suspect: which of
+        # their runs was written to disk last is up to the tasks' order.
         self.rev_offset = 0
         # A disk that differs makes a load on one engine a run on the other.
         self.defaults_may_differ = self.disk_diverged
