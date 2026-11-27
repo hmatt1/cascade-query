@@ -2724,3 +2724,233 @@ def test_d63_a_nan_made_by_a_stage_is_a_new_object_each_time() -> None:
     assert q() == 2
     xs.append(1.0)
     assert q() == 2
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("callers", ["threads", "tasks"])
+def test_d64_head_whose_member_another_caller_finished_keeps_its_last_runs_effects(
+    tmp_path: Path, backend: str, callers: str
+) -> None:
+    # Caller A runs the head and waits for the member, which caller B runs.
+    # B, checking the member's stored result, reaches the head, finds A
+    # waiting for it, iterates the cycle on its own stack (G7) and stores
+    # head and member. A then took B's member result: the head stored an
+    # ordinary result that depends on its member, with the member's
+    # effects, which replay the head's last run, before its own push. Every
+    # reader got that run twice where a fresh run gives it once (G12).
+    # Found by test_async_differential.py, three compute_many threads on
+    # sqlite. B is held inside the disk check here so that A waits first.
+    from types import SimpleNamespace
+
+    from cascade import _evaluator
+
+    asynchronous = callers == "tasks"
+    ns = SimpleNamespace()
+
+    def limit() -> int:
+        return 2
+
+    if asynchronous:
+
+        async def head() -> int:
+            result = min(await ns.member(), ns.limit())
+            ns.log.push(("head", result))
+            return result
+
+        async def member() -> int:
+            result = await ns.head() + 1
+            ns.log.push(("member", result))
+            return result
+
+    else:
+
+        def head() -> int:
+            result = min(ns.member(), ns.limit())
+            ns.log.push(("head", result))
+            return result
+
+        def member() -> int:
+            result = ns.head() + 1
+            ns.log.push(("member", result))
+            return result
+
+    def session() -> Engine:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+        ns.log = engine.accumulator("log")
+        ns.limit = engine.input(name="limit")(limit)
+        ns.head = engine.query(name="head", fixed_point=0)(head)
+        ns.member = engine.query(name="member")(member)
+        return engine
+
+    def call(handle: Any, effects: dict[str, list[Any]] | None = None) -> Any:
+        if asynchronous:
+
+            async def main() -> Any:
+                return await handle(effects=effects)
+
+            return asyncio.run(main())
+        return handle(effects=effects)
+
+    engine = session()
+    call(ns.head)
+    engine.shutdown()
+    engine = session()
+    call(ns.head)  # loaded from disk, without its member
+    call(ns.member)  # so the member runs alone, stored as reading the head
+    engine.shutdown()
+
+    engine = session()
+    ns.limit.set(1)  # the stored head no longer matches
+    held = threading.Event()
+    go = threading.Event()
+    check, check_async = (
+        _evaluator.Evaluator._verify_disk_deps,
+        _evaluator.Evaluator._verify_disk_deps_async,
+    )
+
+    def hold(key: Any) -> bool:
+        if key[1] == "member" and not held.is_set():
+            held.set()
+            return True
+        return False
+
+    def held_check(self: Any, key: Any, record: Any, runtime: Any) -> Any:
+        if hold(key):
+            go.wait(10)
+        return check(self, key, record, runtime)
+
+    async def held_check_async(self: Any, key: Any, record: Any, runtime: Any) -> Any:
+        if hold(key):
+            while not go.is_set():
+                await asyncio.sleep(0.001)
+        return await check_async(self, key, record, runtime)
+
+    def a_waits() -> None:
+        deadline = time.monotonic() + 10
+        while not engine._store.waiting_on and time.monotonic() < deadline:  # noqa: SLF001
+            time.sleep(0.001)
+        go.set()
+
+    _evaluator.Evaluator._verify_disk_deps = held_check  # type: ignore[method-assign]
+    _evaluator.Evaluator._verify_disk_deps_async = held_check_async  # type: ignore[method-assign]
+    try:
+        if asynchronous:
+
+            async def both() -> list[Any]:
+                b = asyncio.ensure_future(ns.member())
+                while not held.is_set():
+                    await asyncio.sleep(0)
+                a = asyncio.ensure_future(ns.head())
+                releaser = threading.Thread(target=a_waits, daemon=True)
+                releaser.start()
+                return list(await asyncio.gather(a, b))
+
+            values = asyncio.run(both())
+        else:
+            out: dict[str, Any] = {}
+            b = threading.Thread(target=lambda: out.setdefault("member", ns.member()))
+            b.start()
+            assert held.wait(10)
+            a = threading.Thread(target=lambda: out.setdefault("head", ns.head()))
+            a.start()
+            a_waits()
+            a.join(10)
+            b.join(10)
+            values = [out.get("head"), out.get("member")]
+    finally:
+        _evaluator.Evaluator._verify_disk_deps = check  # type: ignore[method-assign]
+        _evaluator.Evaluator._verify_disk_deps_async = check_async  # type: ignore[method-assign]
+    try:
+        assert go.is_set() and values == [1, 2]
+        effects: dict[str, list[Any]] = {}
+        assert call(ns.head, effects) == 1
+        assert effects == {"log": [("member", 2), ("head", 1)]}
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("awaited", [False, True])
+def test_d64_head_rerun_at_a_snapshot_does_not_serve_its_member_run_alone(
+    tmp_path: Path, backend: str, awaited: bool
+) -> None:
+    # One thread, the same mistake as above. The member, read through a
+    # snapshot, ran alone on the head loaded from disk; a read at the
+    # newest revision then kept the head's row there, so a read through
+    # the snapshot ran the head again. Its run called the member, whose
+    # row was current at the snapshot, and served it: the head's run did
+    # not reach itself, stored an ordinary result depending on the member,
+    # and replayed the member's effects, which hold the head's last run,
+    # before its own push (G12). A head's run now runs every query that
+    # depends on that head again, as a member, on its guess.
+    from types import SimpleNamespace
+
+    ns = SimpleNamespace()
+
+    def step() -> int:
+        return 1
+
+    if awaited:
+
+        async def head() -> int:
+            result = min(await ns.member(), 2)
+            ns.log.push(("head", result))
+            return result
+
+        async def member() -> int:
+            result = await ns.head() + ns.step()
+            ns.log.push(("member", result))
+            return result
+
+        async def top() -> int:
+            return await ns.head()
+
+    else:
+
+        def head() -> int:
+            result = min(ns.member(), 2)
+            ns.log.push(("head", result))
+            return result
+
+        def member() -> int:
+            result = ns.head() + ns.step()
+            ns.log.push(("member", result))
+            return result
+
+        def top() -> int:
+            return ns.head()
+
+    def session() -> Engine:
+        engine = Engine(cache_dir=tmp_path, cache_backend=backend)
+        ns.log = engine.accumulator("log")
+        ns.step = engine.input(name="step")(step)
+        ns.head = engine.query(name="head", fixed_point=0)(head)
+        ns.member = engine.query(name="member")(member)
+        ns.top = engine.query(name="top")(top)
+        return engine
+
+    def read(handle: Any, snapshot: Any = None) -> tuple[Any, Any]:
+        effects: dict[str, list[Any]] = {}
+        if awaited:
+
+            async def main() -> Any:
+                return await handle(snapshot=snapshot, effects=effects)
+
+            value = asyncio.run(main())
+        else:
+            value = handle(snapshot=snapshot, effects=effects)
+        return value, effects["log"]
+
+    engine = session()
+    read(ns.head)
+    engine.shutdown()
+    engine = session()
+    try:
+        snapshot = engine.snapshot()
+        ns.step.set(1)  # its default: a new version with the same value
+        assert read(ns.member, snapshot)[0] == 3
+        assert read(ns.head) == (2, [("member", 3), ("head", 2)])
+        assert read(ns.top, snapshot) == (2, [("member", 3), ("head", 2)])
+        snapshot.release()
+    finally:
+        engine.shutdown()

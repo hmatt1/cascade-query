@@ -1058,6 +1058,7 @@ class Evaluator:
                 return pending, True
         if runtime.outer is not None:
             self._refuse_reentry(runtime, key)
+        foreign = False
         with self._store.lock:
             existing = self._store.memos.get(key)
             is_memoized = self._store.lookup_query_memoize(key[1])
@@ -1072,13 +1073,18 @@ class Evaluator:
                 ) and self._store.is_current_locked(
                     existing, runtime.snapshot.revision
                 ):
-                    existing.verified_at = runtime.snapshot.revision
-                    self._store.trace_event("cache_hit", key)
-                    if is_memoized or not need_value:
-                        return existing, True
+                    if self._from_another_run(existing, runtime):
+                        foreign = True
+                    else:
+                        existing.verified_at = runtime.snapshot.revision
+                        self._store.trace_event("cache_hit", key)
+                        if is_memoized or not need_value:
+                            return existing, True
+                if not foreign:
+                    self._store.pin_memo_verification_locked(key)
 
-                self._store.pin_memo_verification_locked(key)
-
+        if foreign:
+            return self.recompute(key, fn, runtime), False
         if existing is not None:
             # The dependency walk runs WITHOUT the store lock. It can reach a
             # dependency another thread is computing and block on that
@@ -1148,6 +1154,8 @@ class Evaluator:
             elif failed is not None:
                 self._joined_run_failed(key, runtime, failed)
                 failed = None
+            elif self._from_another_run(result, runtime):
+                return self._run_instead_of_waiting(key, fn, runtime, slot), False
             else:
                 return result, True
             return self.compute_or_get_memo(key, fn, runtime, need_value=need_value)
@@ -1205,6 +1213,7 @@ class Evaluator:
                 return pending, True
         if runtime.outer is not None:
             self._refuse_reentry(runtime, key)
+        foreign = False
         with self._store.lock:
             existing = self._store.memos.get(key)
             is_memoized = self._store.lookup_query_memoize(key[1])
@@ -1219,12 +1228,18 @@ class Evaluator:
                 ) and self._store.is_current_locked(
                     existing, runtime.snapshot.revision
                 ):
-                    existing.verified_at = runtime.snapshot.revision
-                    self._store.trace_event("cache_hit", key)
-                    if is_memoized or not need_value:
-                        return existing, True
-                self._store.pin_memo_verification_locked(key)
+                    if self._from_another_run(existing, runtime):
+                        foreign = True
+                    else:
+                        existing.verified_at = runtime.snapshot.revision
+                        self._store.trace_event("cache_hit", key)
+                        if is_memoized or not need_value:
+                            return existing, True
+                if not foreign:
+                    self._store.pin_memo_verification_locked(key)
 
+        if foreign:
+            return await self.recompute_async(key, fn, runtime), False
         if existing is not None:
             try:
                 green = await self.try_mark_green_async(key, existing, runtime.snapshot)
@@ -1289,6 +1304,8 @@ class Evaluator:
             elif failed is not None:
                 self._joined_run_failed(key, runtime, failed)
                 failed = None
+            elif self._from_another_run(result, runtime):
+                return await self._run_instead_of_waiting_async(key, fn, runtime), False
             else:
                 return result, True
             return await self.compute_or_get_memo_async(
@@ -1326,6 +1343,62 @@ class Evaluator:
             return result, False
         self._release_in_flight(in_flight_key, slot, result=result)
         return result, False
+
+    def _from_another_run(self, memo: MemoEntry, runtime: RuntimeState) -> bool:
+        """Whether a current row, or a joined run's result, was computed from
+        another run of a head running on this stack.
+
+        A query that a running head reaches and that depends on that head is
+        a member of its cycle: it must run here, on the head's guess. Its
+        stored row comes from another run of the head: one another thread or
+        task iterated meanwhile (see ``_reads_a_head_running_here``), or one
+        at another revision whose member row is still current here while the
+        head's own row was replaced (a snapshot read and a read at the newest
+        revision). Served, it ended the head's run with the member's stored
+        effects, which replay that other run, and the head was stored as an
+        ordinary result that depends on its own member (G12). Costs nothing
+        unless a ``fixed_point=`` query is registered. A row that is not
+        current is verified, and the walk meets the head running here.
+        """
+        if not self._store.query_fixed_points:
+            return False
+        return self._reads_a_head_running_here(memo, runtime)
+
+    def _reads_a_head_running_here(
+        self, entry: MemoEntry, runtime: RuntimeState
+    ) -> bool:
+        """Whether a joined run's result was computed from a head this caller runs.
+
+        A caller running a fixed-point head waits for a query another thread
+        or task runs; that one reaches the head, finds this caller waiting
+        for it, and so iterates the cycle on its own stack (G7), then
+        finishes the query from the head it stored. Its result already holds
+        the head's last run: its effects replay that run. Taken here, inside
+        a run of the same head, the head would store an ordinary result that
+        depends on its own member, with those effects again on top of the
+        member's (G12). Run the query on this stack instead, where it reaches
+        the head and the cycle is iterated here, as on one thread.
+        """
+        # A memoize=False head that reuses its cached members reads them on
+        # purpose (``reused_cycle``).
+        heads = {f.key for f in runtime.stack if f.is_head and f.reused_cycle is None}
+        if not heads:
+            return False
+        store = self._store
+        todo = [dep.key for dep in entry.deps if dep.key[0] == "query"]
+        seen: set[QueryKey] = set()
+        with store.lock:
+            while todo:
+                dep_key = todo.pop()
+                if dep_key in heads:
+                    return True
+                if dep_key in seen:
+                    continue
+                seen.add(dep_key)
+                memo = store.memos.get(dep_key)
+                if memo is not None:
+                    todo.extend(d.key for d in memo.deps if d.key[0] == "query")
+        return False
 
     @staticmethod
     def _failed_run(runtime: RuntimeState, exc: BaseException) -> _FailedRun | None:
@@ -2640,7 +2713,12 @@ class Evaluator:
         routed: bool = True,
         reuse_cycle: bool = True,
     ) -> MemoEntry:
-        frame = RuntimeFrame(key=key, runtime=runtime, routed=routed)
+        frame = RuntimeFrame(
+            key=key,
+            runtime=runtime,
+            routed=routed,
+            is_head=key[1] in self._store.query_fixed_points,
+        )
         runtime.stack.append(frame)
         start = self._store.monotonic_seconds()
         self._store.trace_event("recompute_start", key)
@@ -2732,7 +2810,12 @@ class Evaluator:
         routed: bool = True,
         reuse_cycle: bool = True,
     ) -> MemoEntry:
-        frame = RuntimeFrame(key=key, is_async_body=True, routed=routed)
+        frame = RuntimeFrame(
+            key=key,
+            is_async_body=True,
+            routed=routed,
+            is_head=key[1] in self._store.query_fixed_points,
+        )
         new_runtime = RuntimeState(
             snapshot=runtime.snapshot,
             stack=runtime.stack + [frame],

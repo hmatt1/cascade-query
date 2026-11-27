@@ -44,6 +44,9 @@ class RuntimeFrame:
     # revision runs once on its cached members instead of iterating from the
     # guess: this is that row (``Evaluator._reusable_cycle_locked``).
     reused_cycle: Any = None
+    # True for a query registered with ``fixed_point=``: a head, if it is
+    # reached again (``Evaluator._reads_a_head_running_here``).
+    is_head: bool = False
 
 
 @dataclass
