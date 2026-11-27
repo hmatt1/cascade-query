@@ -28,6 +28,34 @@ from ._errors import UnencodableValueError
 _encode_json_str = json.encoder.encode_basestring
 
 
+def _hash_const(const: Any, hash_code: Callable[[Any], bytes]) -> bytes:
+    """Deterministic digest for one entry in ``code.co_consts``.
+
+    ``repr`` on a ``frozenset`` (or a ``tuple`` holding one) iterates in hash
+    order, which varies with ``PYTHONHASHSEED`` across processes. CPython puts
+    ``frozenset`` constants into ``co_consts`` for constant membership tests
+    (``x in ("a", "b")``) and for every ``@dataclass(frozen=True)``'s generated
+    ``__setattr__`` / ``__delattr__``.
+    """
+    if hasattr(const, "co_code"):
+        return hashlib.sha256(b"code:" + hash_code(const)).digest()
+    t = type(const)
+    if t is tuple:
+        h = hashlib.sha256(b"tuple:")
+        for item in const:
+            h.update(_hash_const(item, hash_code))
+        return h.digest()
+    if t is frozenset or t is set:
+        tag = b"frozenset:" if t is frozenset else b"set:"
+        h = hashlib.sha256(tag)
+        for digest in sorted(_hash_const(item, hash_code) for item in const):
+            h.update(digest)
+        return h.digest()
+    return hashlib.sha256(
+        t.__name__.encode("utf-8") + b":" + repr(const).encode("utf-8")
+    ).digest()
+
+
 def hash_bytecode(fn: Any) -> str:
     """Recursively compute a stable hash of a function's bytecode logic."""
     if not hasattr(fn, "__code__"):
@@ -37,11 +65,7 @@ def hash_bytecode(fn: Any) -> str:
         h = hashlib.sha256()
         h.update(c.co_code)
         for const in c.co_consts:
-            if hasattr(const, "co_code"):
-                h.update(_hash_code(const))
-            else:
-                h.update(type(const).__name__.encode("utf-8"))
-                h.update(repr(const).encode("utf-8"))
+            h.update(_hash_const(const, _hash_code))
         for name in c.co_names:
             h.update(name.encode("utf-8"))
         for varname in c.co_varnames:

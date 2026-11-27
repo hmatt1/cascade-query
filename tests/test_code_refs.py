@@ -902,3 +902,119 @@ def test_a_long_wrapped_chain_stops_and_a_callable_layer_is_passed_over() -> Non
     )
     # The body two layers down, past the object, is part of the hash.
     assert refs_hash(namespace["outer"]) != refs_hash(edited["outer"])
+
+
+def test_hash_bytecode_distinguishes_and_normalizes_set_and_tuple_consts() -> None:
+    from cascade._serde import _hash_const, hash_bytecode
+
+    def noop(c: Any) -> bytes:
+        return b"code"
+
+    fs_a = frozenset({1, "a", None, (2, "b")})
+    fs_b = frozenset({(2, "b"), None, "a", 1})
+    assert _hash_const(fs_a, noop) == _hash_const(fs_b, noop)
+    assert _hash_const(fs_a, noop) != _hash_const(set(fs_a), noop)
+    assert _hash_const(("wrap", fs_a), noop) == _hash_const(("wrap", fs_b), noop)
+    assert _hash_const((1, 2), noop) != _hash_const((2, 1), noop)
+
+    def check_v1(x: str) -> bool:
+        return x in ("alpha", "beta", "gamma")
+
+    def check_v2(x: str) -> bool:
+        return x in ("alpha", "beta", "delta")
+
+    assert hash_bytecode(check_v1) != hash_bytecode(check_v2)
+
+
+def test_code_hash_and_disk_cache_survive_different_pythonhashseed(
+    tmp_path: Path,
+) -> None:
+    """Queries with frozenset constants or frozen dataclasses reuse disk cache
+    across separate Python processes with different PYTHONHASHSEED values.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    script = tmp_path / "probe.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import dataclasses
+            import json
+            import sys
+            from cascade import Engine
+            from cascade._code_refs import refs_hash
+            from cascade._serde import hash_bytecode
+
+            @dataclasses.dataclass(frozen=True)
+            class Token:
+                kind: str
+                value: str
+                line: int
+                column: int
+
+            def run(cache_dir: str) -> None:
+                engine = Engine(cache_dir=cache_dir)
+                runs = [0]
+
+                @engine.input
+                def raw() -> str:
+                    return ""
+
+                @engine.query
+                def classify() -> Token:
+                    runs[0] += 1
+                    text = raw()
+                    kind = "kw" if text in ("if", "else", "while", "return") else "id"
+                    return Token(kind=kind, value=text, line=1, column=1)
+
+                raw.set("while")
+                out = classify()
+                events = [t.event for t in engine.traces()]
+                result = {
+                    "kind": out.kind,
+                    "runs": runs[0],
+                    "bc": hash_bytecode(classify.raw),
+                    "refs": refs_hash(classify.raw),
+                    "disk_hits": events.count("disk_hit"),
+                    "disk_reds": events.count("disk_red"),
+                }
+                engine.shutdown()
+                print(json.dumps(result))
+
+            run(sys.argv[1])
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    cache_dir = tmp_path / "cache"
+    src_dir = str(Path(__file__).resolve().parents[1] / "src")
+
+    def invoke(seed: str) -> dict[str, Any]:
+        env = dict(os.environ)
+        env["PYTHONHASHSEED"] = seed
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing}" if existing else src_dir
+        proc = subprocess.run(
+            [sys.executable, str(script), str(cache_dir)],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(proc.stdout.strip())
+
+    first = invoke("1")
+    second = invoke("2")
+
+    assert first["kind"] == "kw"
+    assert first["runs"] == 1
+    assert first["bc"] == second["bc"]
+    assert first["refs"] == second["refs"]
+    assert second["kind"] == "kw"
+    assert second["runs"] == 0
+    assert second["disk_hits"] == 1
+    assert second["disk_reds"] == 0
