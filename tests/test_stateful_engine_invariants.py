@@ -81,6 +81,37 @@ Since 2026-11-26:
   head's last run, which hidden state may have made stale;
 - a pipeline whose stage calls a query that runs a pipeline of its own
   (``spread``, ``shifted``).
+
+Async in the lock step (2026-11-26, later):
+
+- asyncio tasks are agents of the lock step as threads are. A task stops
+  at the start of every async body and at awaits marked inside bodies by
+  awaiting a future of its own, which the lock step resolves when the
+  schedule picks it; in a sync body it stops as a thread does, holding its
+  loop. ``store.waiting_on`` records tasks too, so a task waiting for a
+  thread's run, a thread waiting for a task's, and a loop held by one of
+  its tasks are all seen. Several tasks run on one loop, one or two loops
+  on threads of their own, beside threads (``lockstep_tasks``); a task may
+  ``submit`` and await the future, and the sync bodies that an async
+  verification runs in the engine's executor run on helper threads that
+  take part;
+- one of several tasks asking for one query is cancelled at a point the
+  machine picks (``cancelled_task_leaves_the_others_alone``): the others
+  get the plain value and effects, and a cancelled waiter leaves the run
+  alone (one run per key, G5);
+- an async fixed point entered by tasks and threads through its head and
+  through a member whose result was dropped (D35 with tasks), the G2 check
+  on the async path, a sync query calling an async one (``bridge``, which
+  on a loop may raise ``EventLoopBlockedError``, G14), and a hidden head
+  that returns a value the engine cannot encode, so that its run on the
+  cached members has no digest (``Unencodable``);
+- a task through a snapshot and a live task asking for one query at once,
+  at two revisions (G4, G5), and a TTL result dropped while a hidden cycle
+  iterates over it (G7, G13).
+
+The rules with tasks cost more than most, so each does its work on one draw
+of its ``turn`` in two or three (``TURN_OF_2``). Event loops are kept for
+the session (``_take_loop``).
 """
 
 from __future__ import annotations
@@ -121,10 +152,12 @@ from cascade import (
     CascadeSet,
     CycleError,
     Engine,
+    EventLoopBlockedError,
     QueryCancelled,
     Snapshot,
     SnapshotExpiredError,
     StaleHandleError,
+    UnencodableValueError,
 )
 from tests.scale_helpers import assert_internal_dependents_consistent
 
@@ -154,6 +187,9 @@ QUERIES = (
     "spread",
     "wloop_head",
     "awloop_head",
+    "anoted",
+    "aloop_head",
+    "bridge",
 )
 # The heads of the cycles whose bodies read hidden state (``Hidden``).
 W_HEADS = ("wloop_head", "awloop_head")
@@ -173,10 +209,19 @@ NO_ARGS = (
     "nloop_head",
     "loop_member",
     "spread",
+    "aloop_head",
+    "aloop_member",
     *W_HEADS,
     *W_MEMBERS,
 )
-ASYNC_QUERIES = ("achoose", "amix", "awloop_head")
+ASYNC_QUERIES = (
+    "achoose",
+    "amix",
+    "awloop_head",
+    "anoted",
+    "aloop_head",
+    "aloop_member",
+)
 SYNC_QUERIES = tuple(q for q in QUERIES if q not in ASYNC_QUERIES)
 # compute_many returns values only; a raising call would end the batch.
 MANY_QUERIES = tuple(
@@ -269,6 +314,45 @@ SYNC_READS = st.lists(
 LOCKSTEP_READER = st.tuples(
     st.sampled_from(("live", "snapshot", "submit", "submit_snapshot", "many")),
     SYNC_READS,
+)
+# Agents of the lock-step rules with tasks: each task of a loop, and each
+# thread beside them, reads queries of every kind. A task may read through a
+# snapshot and ``submit`` (awaiting the future); a thread may also take the
+# sync path of an async query (``plain``).
+ANY_READS = st.lists(
+    st.tuples(st.sampled_from(QUERIES), INDEXES), min_size=1, max_size=3
+)
+TASK = st.tuples(
+    st.sampled_from(("task", "task_snapshot", "task_submit", "task_submit_snapshot")),
+    ANY_READS,
+)
+LOOP = st.lists(TASK, min_size=1, max_size=3)
+THREAD = st.tuples(
+    st.sampled_from(("live", "snapshot", "plain", "submit", "submit_snapshot", "many")),
+    ANY_READS,
+)
+# The rules with tasks cost more than most: each does its work on one draw
+# in two or three of ``turn`` and nothing on the others, which keeps the file
+# within its time budget on the free-threaded build. (A precondition on the
+# machine's state would do the same, but makes a replayed failure report
+# FlakyStrategyDefinition.)
+TURN_OF_2 = st.integers(min_value=0, max_value=1)
+TURN_OF_3 = st.integers(min_value=0, max_value=2)
+# Results that may be dropped before a lock-step rule.
+DROPPABLE = (*QUERIES, "loop_member", "aloop_member")
+# Async queries that count their runs and are in no cycle: at most one run
+# per key and revision while the revision stands still (G5).
+ONCE = ("achoose", "amix", "anoted")
+# What tasks ask for when one of them is cancelled.
+CANCELLED_QUERIES = (
+    "achoose",
+    "anoted",
+    "amix",
+    "aloop_head",
+    "awloop_head",
+    "choose",
+    "noted_pair",
+    "bridge",
 )
 # Writers that share what they change: the same inputs, the same list and
 # the same set, a step at a time or in transactions that commit or roll
@@ -393,15 +477,27 @@ class Hidden:
     """State the hidden-cycle bodies read that the engine does not track.
 
     ``drift`` shifts the value, ``detour`` sends the head through another
-    member, and ``fail`` makes it raise. A change to any of them leaves the
-    head's stored row current, so one run on the cached members does not give
-    the stored value (or reaches the head again, or raises), and the head
-    must fall back to iterating from the guess (0.4.2).
+    member, ``fail`` makes it raise, and ``opaque`` makes it return a value
+    the engine cannot encode (``Unencodable``). A change to any of them
+    leaves the head's stored row current, so one run on the cached members
+    does not give the stored value (or reaches the head again, or raises, or
+    gives a value with no digest), and the head must fall back to iterating
+    from the guess (0.4.2).
     """
 
     drift: int = 0
     detour: bool = False
     fail: bool = False
+    opaque: bool = False
+
+
+class Unencodable:
+    """A result no codec can encode: ``UnencodableValueError`` (G18).
+
+    A head that returns one raises that error on every engine. Run on its
+    cached members, on a disk engine the value has no digest at all
+    (``_reused_digest``); in memory it gets an opaque one, never the stored.
+    """
 
 
 def plain_noted(world: World, index: int) -> tuple[int, tuple[Any, ...]]:
@@ -498,22 +594,63 @@ class _TrackedLock:
         return self._inner._is_owned()  # type: ignore[attr-defined]
 
 
+# Event loops kept for the whole session. A loop may run on any thread, one
+# at a time; reusing them saves making a few for every example, which on
+# Windows opens a pair of sockets each time, and under load that has hung
+# (in ``socket.accept``).
+_LOOPS: list[asyncio.AbstractEventLoop] = []
+_LOOPS_LOCK = threading.Lock()
+
+
+def _take_loop() -> asyncio.AbstractEventLoop:
+    with _LOOPS_LOCK:
+        if _LOOPS:
+            return _LOOPS.pop()
+    return asyncio.new_event_loop()
+
+
+def _give_loop(loop: asyncio.AbstractEventLoop) -> None:
+    with _LOOPS_LOCK:
+        _LOOPS.append(loop)
+
+
+def _loop_thread(task: asyncio.Task[Any]) -> int | None:
+    """The thread running ``task``'s loop; None when it is not running."""
+    return getattr(task.get_loop(), "_thread_id", None)
+
+
+def _wake(future: asyncio.Future[Any]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
 class _Lockstep:
-    """Lets one thread at a time run, each until it stops.
+    """Lets one thread or task at a time run, each until it stops.
 
-    A thread taking part stops at the start of every query body it runs, and
-    a writer before each of its steps (``checkpoint``). A stopped thread goes
-    on only when every other one is still, and of the stopped threads the
-    drawn ``schedule`` picks which. So the interleaving is chosen by the
-    machine, not by the OS. A thread is still when it is stopped or finished,
-    or blocked on a thread that is still itself (``_quiet``): waiting for
-    another thread's run in the engine, or for one of the engine's locks.
-    Calls a thread hands to others (``submit``, ``compute_many``) run on
-    helper threads that take part as well, while the thread that waits for
-    them counts as still (``delegating``). A collection another thread's
-    transaction has changed is not a place to block: changing it raises.
+    The agents are threads and asyncio tasks. A thread taking part stops at
+    the start of every query body it runs, and a writer before each of its
+    steps (``checkpoint``). A task taking part stops at the start of every
+    async query body it runs and at the awaits marked in them
+    (``acheckpoint``) by awaiting a future of its own, which leaves its loop
+    to the other tasks; in a sync query body it calls, it stops as a thread
+    does, holding its whole loop. A stopped agent goes on only when every
+    other one is still, and of the stopped agents that can go on the drawn
+    ``schedule`` picks which. So the interleaving is chosen by the machine,
+    not by the OS or the event loop.
 
-    No thread should ever wait ``LOCKSTEP_PATIENCE`` for the others; one that
+    An agent is still when it is stopped or finished, or blocked on an agent
+    that is still itself (``_quiet``): waiting for another agent's run in the
+    engine (``store.waiting_on``, which records tasks as well as threads),
+    or for one of the engine's locks. A task is also still while its loop is
+    held by the code of another task on it that is still, and a thread that
+    runs a loop of tasks that take part is still while they all are. Calls
+    an agent hands to others (``submit``, ``compute_many``, the sync bodies
+    an async verification runs in an executor) run on helper threads that
+    take part as well, while the agent that waits for them counts as still
+    (``delegating``). A collection another thread's transaction has changed
+    is not a place to block: changing it raises.
+
+    No agent should ever wait ``LOCKSTEP_PATIENCE`` for the others; one that
     does goes on, and records why in ``timeouts``, which fails the rule.
     """
 
@@ -521,15 +658,36 @@ class _Lockstep:
         self.store = engine._internals._store  # noqa: SLF001
         self.schedule = itertools.cycle(schedule or [0])
         self.cond = threading.Condition()
-        # thread id -> running, stopped, delegating or done
-        self.state: dict[int, str] = {}
-        self.stopped: list[int] = []  # in the order they stopped
-        self.turn: int | None = None
+        # agent (a thread id or an asyncio task) -> running, stopped,
+        # delegating or done; a thread running a loop of tasks that take
+        # part is "loop" until they are all done
+        self.state: dict[Any, str] = {}
+        self.stopped: list[Any] = []  # in the order they stopped
+        self.turn: Any = None
         # Calls handed to helper threads that have not started yet.
         self.pending = 0
         self.timeouts: list[str] = []
         # Why the others were still when a turn was handed out.
         self.seen: Counter[str] = Counter()
+        # A loop thread -> its tasks that take part, and back.
+        self.tasks_of: dict[int, list[asyncio.Task[Any]]] = {}
+        self.thread_of: dict[asyncio.Task[Any], int] = {}
+        # Tasks stopped by awaiting: each one's loop and the future that
+        # wakes it.
+        self.wakers: dict[asyncio.Task[Any], tuple[Any, asyncio.Future[Any]]] = {}
+        # A loop thread -> the task stopped in sync code on it, which holds
+        # the loop until it goes on.
+        self.holding: dict[int, asyncio.Task[Any]] = {}
+        # When the turn was last handed (or the wake-up sent again) to a task.
+        self.woken = 0.0
+
+    def _agent(self) -> Any:
+        """The current task if it takes part, else the current thread."""
+        if asyncio._get_running_loop() is not None:  # noqa: SLF001
+            task = asyncio.current_task()
+            if task is not None and task in self.state:
+                return task
+        return threading.get_ident()
 
     def join(self) -> None:
         with self.cond:
@@ -544,8 +702,8 @@ class _Lockstep:
     @contextlib.contextmanager
     def delegating(self) -> Any:
         """Wait for helper threads, which take part themselves."""
-        me = threading.get_ident()
         with self.cond:
+            me = self._agent()
             taking_part = self.state.get(me) == "running"
             if taking_part:
                 self.state[me] = "delegating"
@@ -558,8 +716,13 @@ class _Lockstep:
                     self.state[me] = "running"
                     self.cond.notify_all()
 
-    def helper(self, fn: Any) -> Any:
-        """``fn``, to be run on a helper thread that takes part while it runs."""
+    def helper(self, fn: Any, wake: Any = None) -> Any:
+        """``fn``, to be run on a helper thread that takes part while it runs.
+
+        ``wake``, an agent delegating to this one call alone, counts as
+        running again from the moment the call ends, not from when it gets
+        round to noticing.
+        """
         with self.cond:
             self.pending += 1
 
@@ -574,66 +737,175 @@ class _Lockstep:
             finally:
                 with self.cond:
                     self.state[me] = "done"
+                    if wake is not None and self.state.get(wake) == "delegating":
+                        self.state[wake] = "running"
                     self.cond.notify_all()
 
         return run
 
-    def _quiet(self, ident: int, seen: set[int] | None = None) -> str | None:
-        """Why thread ``ident`` cannot move until a stopped one does, or None."""
-        state = self.state.get(ident)
-        if state is not None and state != "running":
+    async def run_tasks(self, programs: list[Any]) -> list[Any]:
+        """Run each program as a task on this thread's loop, all taking part.
+
+        A program is called with the list of all the tasks (so that one can
+        cancel another) and gives the coroutine to run. Gives each task's
+        result, or the exception it ended with.
+        """
+        me = threading.get_ident()
+        loop = asyncio.get_running_loop()
+        peers: list[asyncio.Task[Any]] = []
+        with self.cond:
+            for program in programs:
+                task = loop.create_task(program(peers))
+                peers.append(task)
+                self.state[task] = "running"
+                self.thread_of[task] = me
+                task.add_done_callback(self._task_done)
+            self.tasks_of[me] = peers
+            self.state[me] = "loop"
+            self.cond.notify_all()
+        return await asyncio.gather(*peers, return_exceptions=True)
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        with self.cond:
+            self.state[task] = "done"
+            thread = self.thread_of[task]
+            if all(self.state[t] == "done" for t in self.tasks_of[thread]):
+                self.state[thread] = "running"
+            self.cond.notify_all()
+
+    def _quiet(self, agent: Any, seen: set[Any] | None = None) -> str | None:
+        """Why ``agent`` cannot move until a stopped one does, or None."""
+        state = self.state.get(agent)
+        if state is not None and state not in ("running", "loop"):
             return state
-        # Running, or not taking part: still only while it waits for a
-        # thread that is still. A cycle of waits never ends (the join
-        # timeout reports it).
+        # Running, or not taking part: still only while it waits for an
+        # agent that is still. A cycle of waits never ends (the deadlock
+        # watch reports it).
         seen = set() if seen is None else seen
-        if ident in seen:
+        if agent in seen:
             return "deadlocked"
-        seen.add(ident)
-        slot = self.store.waiting_on.get(ident)
+        seen.add(agent)
+        if isinstance(agent, asyncio.Task):
+            if state is None:
+                # Not taking part (the task of ``asyncio.run`` on a thread
+                # that does): as still as its thread.
+                thread = _loop_thread(agent)
+                return None if thread is None else self._quiet(thread, seen)
+            slot = self.store.waiting_on.get(agent)
+            if slot is not None:
+                return "run" if self._quiet(slot.owner, seen) else None
+            return "loop" if self._held(self.thread_of[agent], seen) else None
+        if state == "loop":
+            if self._held(agent, seen):
+                return "loop"
+            tasks = self.tasks_of.get(agent, [])
+            return "loop" if all(self._quiet(t, set(seen)) for t in tasks) else None
+        return self._held(agent, seen)
+
+    def _held(self, thread: int, seen: set[Any]) -> str | None:
+        """Why ``thread``'s code cannot move until a still agent does, or None."""
+        if thread in self.holding:
+            return "stopped"
+        waits = self.store.waiting_on
+        slot = waits.get(thread)
         if slot is not None:
-            return "run" if self._quiet(slot.owner_thread, seen) else None
-        lock = _LOCK_WAITS.get(ident)
+            return "run" if self._quiet(slot.owner, seen) else None
+        lock = _LOCK_WAITS.get(thread)
         if lock is not None:
             owner = lock.owner
-            if owner is not None and owner != ident and self._quiet(owner, seen):
+            if owner is not None and owner != thread and self._quiet(owner, seen):
                 return "lock"
+            return None
+        # The task of ``asyncio.run`` on this thread, which does not take
+        # part itself, awaiting a run: the thread waits with it.
+        for waiter, slot in list(waits.items()):
+            if (
+                isinstance(waiter, asyncio.Task)
+                and waiter not in self.state
+                and _loop_thread(waiter) == thread
+            ):
+                return "run" if self._quiet(slot.owner, seen) else None
         return None
+
+    def _ready(self, agent: Any) -> bool:
+        """Whether stopped ``agent`` can go on: its loop is not held."""
+        if agent not in self.wakers:
+            return True
+        return not self._held(self.thread_of[agent], set())
+
+    def _dispatch_locked(self) -> bool:
+        """If everyone is still, hand the turn to a drawn stopped agent."""
+        if self.turn is not None or self.pending:
+            return False
+        reasons = [self._quiet(agent) for agent in list(self.state)]
+        if not all(reasons):
+            return False
+        ready = [agent for agent in self.stopped if self._ready(agent)]
+        if not ready:
+            return False
+        self.seen.update(r for r in reasons if r != "stopped")
+        self.turn = ready[next(self.schedule) % len(ready)]
+        self._wake_turn_locked()
+        self.cond.notify_all()
+        return True
+
+    def _wake_turn_locked(self) -> None:
+        """Wake the task that has the turn, if it stopped by awaiting.
+
+        Sent again by ``watch`` while the task has not gone on: a wake-up
+        is a callback handed to another thread's loop, and the waker stays
+        on record until the task takes it (``acheckpoint``).
+        """
+        waker = self.wakers.get(self.turn)
+        if waker is not None:
+            loop, future = waker
+            self.woken = time.monotonic()
+            loop.call_soon_threadsafe(_wake, future)
 
     def _describe(self) -> str:
         waits = self.store.waiting_on
         frames = sys._current_frames()  # noqa: SLF001
-        threads = "\n".join(
-            f"{ident}: {state}, waits for the run of "
-            f"{getattr(waits.get(ident), 'owner_thread', None)}, "
-            f"for the lock of {getattr(_LOCK_WAITS.get(ident), 'owner', None)}, at "
-            + " < ".join(
-                f"{f.name}:{f.lineno}"
-                for f in reversed(traceback.extract_stack(frames[ident])[-6:])
-            )
-            for ident, state in self.state.items()
-            if ident in frames
+        lines = []
+        for agent, state in list(self.state.items()):
+            run = getattr(waits.get(agent), "owner", None)
+            if isinstance(agent, asyncio.Task):
+                lines.append(f"{agent.get_name()}: {state}, waits for the run of {run}")
+            elif agent in frames:
+                lines.append(
+                    f"{agent}: {state}, waits for the run of {run}, for the lock "
+                    f"of {getattr(_LOCK_WAITS.get(agent), 'owner', None)}, at "
+                    + " < ".join(
+                        f"{f.name}:{f.lineno}"
+                        for f in reversed(traceback.extract_stack(frames[agent])[-6:])
+                    )
+                )
+            else:
+                lines.append(f"{agent}: {state}, ended, waits for the run of {run}")
+        agents = "\n".join(lines)
+        why = [self._quiet(agent) for agent in list(self.state)]
+        return (
+            f"{agents}\n{self.pending} calls not started, turn {self.turn}, "
+            f"stopped {self.stopped}, still {why}, holding {self.holding}, "
+            f"ready {[self._ready(agent) for agent in self.stopped]}"
         )
-        return f"{threads}\n{self.pending} calls not started"
 
     def _stuck(self) -> bool:
-        """Whether no thread can move: all still, and none stopped to go on."""
+        """Whether no agent can move: all still, and none stopped to go on."""
         with self.cond:
             if self.pending or self.turn is not None:
                 return False
-            reasons = [self._quiet(t) for t in list(self.state)]
-        return (
-            all(reasons)
-            and "stopped" not in reasons
-            and any(r != "done" for r in reasons)
-        )
+            reasons = [self._quiet(agent) for agent in list(self.state)]
+            ready = any(self._ready(agent) for agent in self.stopped)
+        return all(reasons) and not ready and any(r != "done" for r in reasons)
 
     def watch(self, threads: list[threading.Thread]) -> str | None:
         """Wait for ``threads``; describe a deadlock if they fall into one.
 
-        Every thread blocked on another that is blocked too, with none
-        stopped at a checkpoint that could be handed the turn, for
-        ``DEADLOCK_PATIENCE`` on end: none of them will ever move again.
+        Hands out turns as well, for when every agent stopped is a task (a
+        stopped thread hands them out itself). Every agent blocked on another
+        that is blocked too, with none stopped that could be handed the
+        turn, for ``DEADLOCK_PATIENCE`` on end: none of them will ever move
+        again.
         """
         deadline = time.monotonic() + JOIN_TIMEOUT
         stuck_since = None
@@ -641,7 +913,13 @@ class _Lockstep:
             alive = [t for t in threads if t.is_alive()]
             if not alive:
                 return None
-            alive[0].join(0.01)
+            # Only a task that stops waits for this thread to be handed the
+            # turn; threads hand it out themselves.
+            alive[0].join(0.001 if self.thread_of else 0.01)
+            with self.cond:
+                if not self._dispatch_locked() and self.turn in self.wakers:
+                    if time.monotonic() - self.woken > 0.1:
+                        self._wake_turn_locked()
             if not self._stuck():
                 stuck_since = None
             elif stuck_since is None:
@@ -651,24 +929,20 @@ class _Lockstep:
         return None
 
     def checkpoint(self) -> None:
-        me = threading.get_ident()
         with self.cond:
+            me = self._agent()
             if self.state.get(me) != "running" or self.timeouts:
                 return
             self.state[me] = "stopped"
             self.stopped.append(me)
+            thread = threading.get_ident()
+            if me != thread:
+                # A task stopped in sync code: its whole loop waits with it.
+                self.holding[thread] = me
             deadline = time.monotonic() + LOCKSTEP_PATIENCE
             while self.turn != me:
-                if self.turn is None and not self.pending:
-                    reasons = [self._quiet(t) for t in list(self.state)]
-                    if all(reasons):
-                        # Everyone is still: hand the turn to a drawn stopped one.
-                        self.seen.update(r for r in reasons if r != "stopped")
-                        self.turn = self.stopped[
-                            next(self.schedule) % len(self.stopped)
-                        ]
-                        self.cond.notify_all()
-                        continue
+                if self._dispatch_locked():
+                    continue
                 if time.monotonic() > deadline:
                     self.timeouts.append(self._describe())
                     break
@@ -676,19 +950,63 @@ class _Lockstep:
             if self.turn == me:
                 self.turn = None
             self.stopped.remove(me)
+            self.holding.pop(thread, None)
             self.state[me] = "running"
             self.cond.notify_all()
 
+    async def acheckpoint(self) -> None:
+        """Stop a task that takes part by awaiting; others stop as threads."""
+        task = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        with self.cond:
+            if task is None or task not in self.state:
+                stop = None
+            elif self.state[task] != "running" or self.timeouts:
+                return
+            else:
+                stop = loop.create_future()
+                self.state[task] = "stopped"
+                self.stopped.append(task)
+                self.wakers[task] = (loop, stop)
+                self._dispatch_locked()
+        if stop is None:
+            self.checkpoint()
+            return
+        try:
+            done, _ = await asyncio.wait([stop], timeout=LOCKSTEP_PATIENCE)
+            if not done:
+                with self.cond:
+                    self.timeouts.append(self._describe())
+        finally:
+            # Also when the task is cancelled while it is stopped.
+            with self.cond:
+                self.wakers.pop(task, None)
+                if self.turn is task:
+                    self.turn = None
+                if task in self.stopped:
+                    self.stopped.remove(task)
+                self.state[task] = "running"
+                self.cond.notify_all()
+
 
 class _ThreadPerTask(concurrent.futures.Executor):
-    """Runs each submitted call on a thread of its own, in the lock step."""
+    """Runs each submitted call on a thread of its own, in the lock step.
 
-    def __init__(self, lockstep: _Lockstep) -> None:
+    With ``wake_caller`` the agent that submits a call waits for that call
+    alone (``_Lockstep.helper``).
+    """
+
+    def __init__(self, lockstep: _Lockstep, *, wake_caller: bool = False) -> None:
         self.lockstep = lockstep
+        self.wake_caller = wake_caller
 
     def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
-        task = self.lockstep.helper(fn)
+        wake = None
+        if self.wake_caller:
+            with self.lockstep.cond:
+                wake = self.lockstep._agent()  # noqa: SLF001
+        task = self.lockstep.helper(fn, wake)
 
         def run() -> None:
             future.set_running_or_notify_cancel()
@@ -721,6 +1039,9 @@ class EngineStateMachine(RuleBasedStateMachine):
         self.variant = 0
         self.snapshots: list[_Held] = []
         self.runs: Counter[str] = Counter()
+        # Runs of the queries that count them, per (name, args, revision).
+        self.key_runs: Counter[Any] = Counter()
+        self.count_lock = threading.Lock()
         self.clock = _Clock()
         self.sensor_value = 0
         # (the time a value stopped being current, the value)
@@ -736,7 +1057,10 @@ class EngineStateMachine(RuleBasedStateMachine):
         # (``evict_while_a_head_runs``).
         self.inside: Any = None
         self.hidden = Hidden()
-        self.loop = asyncio.new_event_loop()
+        self.loop = _take_loop()
+        # Loops the lock-step rules run their tasks on, each on a thread of
+        # its own (``_loop_of``).
+        self.task_loops: list[asyncio.AbstractEventLoop] = []
         self._patches = [
             mock.patch.object(evaluator_module, "time", self.clock),
             # Small enough for the machine's handful of changes to reach
@@ -789,11 +1113,20 @@ class EngineStateMachine(RuleBasedStateMachine):
             return (node + 1) % NODES
 
         checkpoint = self._checkpoint
+        acheckpoint = self._acheckpoint
+
+        def count(name: str, *args: Any) -> None:
+            """Count a run of ``name(*args)`` at the revision it runs at (G5)."""
+            runtime = engine._evaluator.current_runtime()  # noqa: SLF001
+            assert runtime is not None
+            with self.count_lock:
+                self.runs[name] += 1
+                self.key_runs[(name, args, runtime.snapshot.revision)] += 1
 
         @engine.query(name="choose")
         def choose(index: int) -> int:
             checkpoint("choose")
-            self.runs["choose"] += 1
+            count("choose", index)
             active = left(index) if mode() == 0 else right(index)
             return (0 if active is None else active) + bias()
 
@@ -889,6 +1222,8 @@ class EngineStateMachine(RuleBasedStateMachine):
             member = wloop_detour() if hidden.detour else wloop_member()
             if hidden.fail:
                 raise ValueError("w")
+            if hidden.opaque:
+                return Unencodable()
             return member + bias() + hidden.drift + sensor()
 
         @engine.query(name="wloop_member")
@@ -903,24 +1238,37 @@ class EngineStateMachine(RuleBasedStateMachine):
 
         @engine.query(name="awloop_head", fixed_point=0, memoize=False)
         async def awloop_head() -> int:
-            checkpoint("awloop_head")
+            await acheckpoint("awloop_head")
             if hidden.detour:
                 member = await awloop_detour()
             else:
                 member = await awloop_member()
             if hidden.fail:
                 raise ValueError("w")
+            if hidden.opaque:
+                return Unencodable()
             return member + bias() + hidden.drift + sensor()
 
         @engine.query(name="awloop_member")
         async def awloop_member() -> int:
-            checkpoint("awloop_member")
+            await acheckpoint("awloop_member")
             return (await awloop_head()) // 2
 
         @engine.query(name="awloop_detour")
         async def awloop_detour() -> int:
-            checkpoint("awloop_detour")
+            await acheckpoint("awloop_detour")
             return (await awloop_head()) // 2
+
+        # The plain cycle once more, async: tasks and threads enter it (G7).
+        @engine.query(name="aloop_head", fixed_point=0)
+        async def aloop_head() -> int:
+            await acheckpoint("aloop_head")
+            return (await aloop_member()) + bias()
+
+        @engine.query(name="aloop_member")
+        async def aloop_member() -> int:
+            await acheckpoint("aloop_member")
+            return (await aloop_head()) // 2
 
         # A pipeline whose stage calls a query that runs a pipeline of its
         # own: a thread inside ``spread`` holds the pipelines' lock while it
@@ -956,6 +1304,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         @engine.query(name="noted")
         def noted(index: int) -> int:
             checkpoint("noted")
+            count("noted", index)
             value = choose(index)
             if value < 0:
                 notes.push((index, value))
@@ -968,19 +1317,43 @@ class EngineStateMachine(RuleBasedStateMachine):
 
         @engine.query(name="achoose")
         async def achoose(index: int) -> int:
+            await acheckpoint("achoose")
+            count("achoose", index)
             await asyncio.sleep(0)
             return choose(index)
 
         @engine.query(name="amix")
         async def amix(index: int) -> int:
+            await acheckpoint("amix")
+            count("amix", index)
             first = await achoose(index)
+            # An await inside the body: others may go on between the two.
+            await acheckpoint("amix:between")
             return first - noted(index + 1)
+
+        @engine.query(name="anoted")
+        async def anoted(index: int) -> int:
+            await acheckpoint("anoted")
+            count("anoted", index)
+            value = await achoose(index)
+            if value < 0:
+                notes.push((index, value))
+            return value
+
+        # A sync query calling an async one (G14, D21): the sync path. On
+        # the thread of a running loop it raises EventLoopBlockedError when
+        # ``achoose`` has to run there or is run by a task on that loop.
+        @engine.query(name="bridge")
+        def bridge(index: int) -> int:
+            checkpoint("bridge")
+            return achoose(index) + 1
 
         h.mode, h.left, h.right, h.bias, h.edge = mode, left, right, bias, edge
         h.choose, h.pair, h.sensor, h.reading = choose, pair, sensor, reading
         h.reach, h.total, h.above_bias = reach, total, above_bias
         h.strict, h.safe, h.noted, h.noted_pair = strict, safe, noted, noted_pair
-        h.achoose, h.amix = achoose, amix
+        h.achoose, h.amix, h.anoted, h.bridge = achoose, amix, anoted, bridge
+        h.aloop_head, h.aloop_member = aloop_head, aloop_member
         h.tag_total, h.tagged = tag_total, tagged
         h.loop_head, h.loop_member = loop_head, loop_member
         h.nloop_head, h.nloop_member = nloop_head, nloop_member
@@ -1017,6 +1390,18 @@ class EngineStateMachine(RuleBasedStateMachine):
         if inside is not None:
             inside(name)
 
+    async def _acheckpoint(self, name: str) -> None:
+        """``_checkpoint`` for async bodies: a task stops by awaiting."""
+        lockstep = self.lockstep
+        if lockstep is not None:
+            await lockstep.acheckpoint()
+        hold = self.hold
+        if hold is not None:
+            hold(name)
+        inside = self.inside
+        if inside is not None:
+            inside(name)
+
     def _register_scaled(self, variant: int) -> None:
         assert self.engine is not None
         self.h.scaled = self.engine.query(self.variants[variant], name="scaled")
@@ -1034,7 +1419,8 @@ class EngineStateMachine(RuleBasedStateMachine):
         try:
             self._close_engine()
         finally:
-            self.loop.close()
+            for loop in [self.loop, *self.task_loops]:
+                _give_loop(loop)
             for patch in self._patches:
                 patch.stop()
             if self.cache_dir is not None:
@@ -1084,17 +1470,27 @@ class EngineStateMachine(RuleBasedStateMachine):
             return {index + len(world.tags)}
         if query == "spread":
             return {plain_spread(world)}
-        if query == "loop_member":
+        if query in ("loop_member", "aloop_member"):
             return {plain_loop_head(world) // 2}
+        if query == "aloop_head":
+            return {plain_loop_head(world)}
+        if query == "bridge":
+            return {plain_choose(world, index) + 1}
         return {value for value, _ in self._outcomes(world, query, index)}
 
-    def _outcomes(self, world: World, query: str, index: int) -> set[Any]:
+    def _outcomes(
+        self, world: World, query: str, index: int, on_loop: bool = False
+    ) -> set[Any]:
         """Each correct ``(outcome, notes)`` of a call.
 
         The outcome is the value, or ``("raise", value)`` for the
         ``ValueError`` of ``strict``; ``notes`` is what the call collects in
-        ``effects["notes"]``, in order (G12).
+        ``effects["notes"]``, in order (G12). ``on_loop``: the call is made
+        on the thread of a running event loop, where a sync query that has
+        to run an async one raises ``EventLoopBlockedError`` (G14).
         """
+        if query == "bridge" and on_loop:
+            return {(plain_choose(world, index) + 1, ()), (("blocked",), ())}
         if query in ("strict", "safe", "achoose"):
             value = plain_choose(world, index)
             if query == "strict" and value < 0:
@@ -1102,7 +1498,7 @@ class EngineStateMachine(RuleBasedStateMachine):
             if query == "safe" and value < 0:
                 return {(100 + value, ())}
             return {(value, ())}
-        if query == "noted":
+        if query in ("noted", "anoted"):
             return {plain_noted(world, index)}
         if query == "noted_pair":
             (first, a), (second, b) = (
@@ -1116,12 +1512,14 @@ class EngineStateMachine(RuleBasedStateMachine):
         if query in W_HEADS:
             if self.hidden.fail:
                 return {(("raise", "w"), ())}
+            if self.hidden.opaque:
+                return {(("unencodable",), ())}
             bias = world.get("bias")
             assert bias is not None
             shift = bias + self.hidden.drift
             return {(plain_fixed_point(shift + v), ()) for v in self._sensor_values()}
         outcomes = {(value, ()) for value in self._expected(world, query, index)}
-        if query == "loop_member" and self.max_entries != 10_000:
+        if query in ("loop_member", "aloop_member") and self.max_entries != 10_000:
             # Entered through a member, a cycle whose head has no result
             # may raise (G7); a small LRU bound can drop the head's result
             # while the member runs.
@@ -1129,23 +1527,49 @@ class EngineStateMachine(RuleBasedStateMachine):
         return outcomes
 
     def _args(self, query: str, index: int) -> tuple[int, ...]:
-        if query in NO_ARGS or query == "loop_member":
+        if query in NO_ARGS:
             return ()
         if query == "reach":
             return (index % NODES,)
         return (index,)
 
     @staticmethod
-    def _outcome(effects: dict[str, list[Any]], call: Any) -> Any:
+    def _failure(exc: BaseException) -> Any:
+        """The outcome of a call that raised ``exc``; None to re-raise it."""
+        if isinstance(exc, UnencodableValueError):
+            return ("unencodable",)
+        if isinstance(exc, ValueError):
+            return ("raise", *exc.args)
+        if isinstance(exc, CycleError):
+            # Allowed only where the model says so (``loop_member``).
+            return ("cycle",)
+        if isinstance(exc, EventLoopBlockedError):
+            # Allowed only on the thread of a running loop (``bridge``).
+            return ("blocked",)
+        return None
+
+    @classmethod
+    def _outcome(cls, effects: dict[str, list[Any]], call: Any) -> Any:
         """Run ``call``; give its outcome and the notes it collected."""
         try:
             value = call()
-        except ValueError as exc:
-            value = ("raise", *exc.args)
-        except CycleError:
-            # Allowed only where the model says so (``loop_member``).
-            value = ("cycle",)
+        except (ValueError, TypeError, CycleError, EventLoopBlockedError) as exc:
+            value = cls._failure(exc)
+            if value is None:
+                raise
         return value, tuple(effects.get("notes", ()))
+
+    @staticmethod
+    def _run_on_a_loop(coroutine: Any) -> Any:
+        """Run ``coroutine`` on a loop no other thread is running.
+
+        Like ``asyncio.run``, but on a loop of the pool (``_take_loop``).
+        """
+        loop = _take_loop()
+        try:
+            return loop.run_until_complete(coroutine)
+        finally:
+            _give_loop(loop)
 
     def _call(self, query: str, index: int, snapshot: Snapshot | None) -> Any:
         if query in ASYNC_QUERIES:
@@ -1155,7 +1579,7 @@ class EngineStateMachine(RuleBasedStateMachine):
             call = self._acall(query, index, snapshot)
             if threading.current_thread() is threading.main_thread():
                 return self.loop.run_until_complete(call)
-            return asyncio.run(call)
+            return self._run_on_a_loop(call)
         handle = getattr(self.h, query)
         effects: dict[str, list[Any]] = {}
         options: dict[str, Any] = {"effects": effects}
@@ -1174,8 +1598,10 @@ class EngineStateMachine(RuleBasedStateMachine):
             result = handle(*self._args(query, index), **options)
             if inspect.isawaitable(result):
                 result = await result
-        except ValueError as exc:
-            result = ("raise", *exc.args)
+        except (ValueError, TypeError, CycleError, EventLoopBlockedError) as exc:
+            result = self._failure(exc)
+            if result is None:
+                raise
         return result, tuple(effects.get("notes", ()))
 
     def _read(
@@ -1253,7 +1679,7 @@ class EngineStateMachine(RuleBasedStateMachine):
 
         results = self.loop.run_until_complete(gather())
         for (query, index), actual in zip(reads, results, strict=True):
-            expected = self._outcomes(world, query, index)
+            expected = self._outcomes(world, query, index, on_loop=True)
             assert actual in expected, (query, index, actual, expected, snapshot)
 
     def _many(
@@ -1484,6 +1910,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         for query, index in calls:
             effects: dict[str, list[Any]] = {}
             handle = getattr(self.h, query)
+            revision = self.engine.revision
             future = self.engine.submit(
                 handle,
                 *self._args(query, index),
@@ -1491,19 +1918,21 @@ class EngineStateMachine(RuleBasedStateMachine):
                 effects=effects,
                 executor=executor,
             )
-            pending.append((effects, future))
+            pending.append((effects, future, revision))
         out = []
         waiting = (
             contextlib.nullcontext() if lockstep is None else lockstep.delegating()
         )
         with waiting:
-            for call, (effects, future) in zip(calls, pending, strict=True):
+            for call, (effects, future, revision) in zip(calls, pending, strict=True):
                 try:
                     outcome = self._outcome(
                         effects, lambda f=future: f.result(timeout=JOIN_TIMEOUT)
                     )
                 except QueryCancelled:
-                    outcome = ("cancelled",)
+                    # With the revision before the call: a change must come
+                    # after it (G6).
+                    outcome = ("cancelled", revision)
                 out.append((call, outcome))
         return out
 
@@ -1521,12 +1950,95 @@ class EngineStateMachine(RuleBasedStateMachine):
                     *(self._acall(q, i, snapshot) for q, i in reads)
                 )
 
-            return list(zip(reads, asyncio.run(gather()), strict=True))
+            return list(zip(reads, self._run_on_a_loop(gather()), strict=True))
         if kind == "many":
             return list(self._many(reads, snapshot))
         if kind in ("submit", "submit_snapshot"):
             return self._submit(reads, snapshot, lockstep)
+        if kind == "plain":
+            return [((q, i), self._plain(q, i)) for q, i in reads]
         return [((q, i), self._call(q, i, snapshot)) for q, i in reads]
+
+    def _plain(self, query: str, index: int) -> Any:
+        """A call from plain code: an async query takes the sync path (G14)."""
+        effects: dict[str, list[Any]] = {}
+        handle = getattr(self.h, query)
+        args = self._args(query, index)
+        return self._outcome(effects, lambda: handle(*args, effects=effects))
+
+    async def _asubmit(
+        self,
+        query: str,
+        index: int,
+        snapshot: Snapshot | None,
+        lockstep: _Lockstep,
+    ) -> Any:
+        """``submit`` from a task, which awaits the future meanwhile."""
+        assert self.engine is not None
+        effects: dict[str, list[Any]] = {}
+        revision = self.engine.revision
+        with lockstep.delegating():
+            future = self.engine.submit(
+                getattr(self.h, query),
+                *self._args(query, index),
+                snapshot=snapshot,
+                effects=effects,
+                executor=_ThreadPerTask(lockstep, wake_caller=True),
+            )
+            try:
+                result = await asyncio.wrap_future(future)
+            except QueryCancelled:
+                return ("cancelled", revision)
+            except (ValueError, TypeError, CycleError, EventLoopBlockedError) as exc:
+                result = self._failure(exc)
+                if result is None:
+                    raise
+        return result, tuple(effects.get("notes", ()))
+
+    def _task_reader(
+        self, kind: str, held: _Held | None, reads: list[tuple[str, int]]
+    ) -> Any:
+        """A task of a loop (``_loop_of``): each read in turn, awaited or submitted.
+
+        The task stops before each read, so that the machine picks which of
+        the callers of one query gets to run it.
+        """
+        snapshot = None if held is None else held.snapshot
+
+        def task(lockstep: _Lockstep) -> Any:
+            async def run() -> Any:
+                out = []
+                for query, index in reads:
+                    await lockstep.acheckpoint()
+                    if "submit" in kind:
+                        outcome = await self._asubmit(query, index, snapshot, lockstep)
+                    else:
+                        outcome = await self._acall(query, index, snapshot)
+                    out.append(((query, index), outcome))
+                return (kind, held, out)
+
+            return lambda _peers: run()
+
+        return task
+
+    def _loop_of(self, tasks: list[Any], slot: int = 0) -> Any:
+        """A thread running a loop of its own with ``tasks``, all in the lock step.
+
+        Each of ``tasks`` is called with the ``_Lockstep`` and gives a task's
+        program (``_Lockstep.run_tasks``). Gives what each task gave, or the
+        exception it ended with. Programs that run at once take loops of
+        different ``slot``s.
+        """
+        while len(self.task_loops) <= slot:
+            self.task_loops.append(_take_loop())
+        loop = self.task_loops[slot]
+
+        def program(lockstep: _Lockstep) -> list[Any]:
+            return loop.run_until_complete(
+                lockstep.run_tasks([task(lockstep) for task in tasks])
+            )
+
+        return program
 
     # --- writers that share what they change --------------------------------
 
@@ -1787,8 +2299,10 @@ class EngineStateMachine(RuleBasedStateMachine):
         the snapshot's state; a submitted call may be cancelled only if the
         revision moved (G6).
         """
+        assert self.engine is not None
         for kind, held, reads in results:
             candidates = worlds if held is None else [held.world]
+            on_loop = kind.startswith("task") or kind == "async"
             for (query, index), actual in reads:
                 if kind == "many":  # compute_many: the value alone
                     allowed = {
@@ -1796,11 +2310,19 @@ class EngineStateMachine(RuleBasedStateMachine):
                     }
                     assert actual in allowed, (query, index, actual, allowed)
                     continue
-                if actual == ("cancelled",):
-                    assert kind.startswith("submit") and moved > 0, (query, kind)
+                if actual[0] == "cancelled":
+                    # Only a submitted call, and only after a change.
+                    assert "submit" in kind, (query, kind)
+                    assert moved > 0 and self.engine.revision > actual[1], (
+                        query,
+                        kind,
+                        actual,
+                    )
                     continue
                 allowed = {
-                    o for w in candidates for o in self._outcomes(w, query, index)
+                    o
+                    for w in candidates
+                    for o in self._outcomes(w, query, index, on_loop)
                 }
                 assert actual in allowed, (query, index, actual, allowed, held)
 
@@ -1934,6 +2456,14 @@ class EngineStateMachine(RuleBasedStateMachine):
         failures: list[BaseException] = []
         executor = scheduler_module.WorkStealingExecutor
         submit_indexed, run_tasks = executor.submit_indexed, executor.run
+        evaluator = self.engine._evaluator  # noqa: SLF001
+        in_executor = evaluator._run_sync_in_executor  # noqa: SLF001
+
+        async def run_sync_delegating(fn: Any, args: tuple[Any, ...]) -> Any:
+            # A sync body that an async verification runs in the engine's
+            # executor: on a helper thread that takes part.
+            with lockstep.delegating():
+                return await in_executor(fn, args)
 
         def submit_helper(pool: Any, index: int, fn: Any) -> None:
             submit_indexed(pool, index, lockstep.helper(fn))
@@ -1961,6 +2491,14 @@ class EngineStateMachine(RuleBasedStateMachine):
             with (
                 mock.patch.object(executor, "submit_indexed", submit_helper),
                 mock.patch.object(executor, "run", run_delegating),
+                mock.patch.object(
+                    evaluator, "_run_sync_in_executor", run_sync_delegating
+                ),
+                mock.patch.object(
+                    evaluator,
+                    "_get_executor",
+                    lambda: _ThreadPerTask(lockstep, wake_caller=True),
+                ),
             ):
                 for thread in threads:
                     thread.start()
@@ -1968,19 +2506,34 @@ class EngineStateMachine(RuleBasedStateMachine):
         finally:
             self.lockstep = None
         assert deadlock is None, f"deadlocked:\n{deadlock}"
-        assert not any(t.is_alive() for t in threads), "a thread hung"
+        if any(t.is_alive() for t in threads):
+            with lockstep.cond:
+                hung = lockstep._describe()  # noqa: SLF001
+            raise AssertionError(f"a thread hung:\n{hung}")
         if failures:
             raise failures[0]
-        assert not lockstep.timeouts, lockstep.timeouts
+        assert not lockstep.timeouts, "\n\n".join(lockstep.timeouts)
         return results
 
     def _lockstep_reader(
-        self, kind: str, held: _Held | None, reads: list[tuple[str, int]]
+        self,
+        kind: str,
+        held: _Held | None,
+        reads: list[tuple[str, int]],
+        *,
+        pause: bool = False,
     ) -> Any:
+        """A reader thread; with ``pause`` it stops before each read."""
         snapshot = None if held is None else held.snapshot
 
         def program(lockstep: _Lockstep) -> Any:
-            return (kind, held, self._reader(kind, reads, snapshot, lockstep))
+            if not pause:
+                return (kind, held, self._reader(kind, reads, snapshot, lockstep))
+            out = []
+            for read in reads:
+                lockstep.checkpoint()
+                out += self._reader(kind, [read], snapshot, lockstep)
+            return (kind, held, out)
 
         return program
 
@@ -2104,6 +2657,7 @@ class EngineStateMachine(RuleBasedStateMachine):
             st.lists(SHARED_STEP, min_size=1, max_size=3), min_size=2, max_size=3
         ),
         readers=st.lists(LOCKSTEP_READER, max_size=2),
+        loops=st.lists(LOOP, max_size=1),
         schedule=SCHEDULE,
         pick=PICK,
     )
@@ -2111,6 +2665,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         self,
         writers: list[list[tuple[Any, ...]]],
         readers: list[tuple[str, list[tuple[str, int]]]],
+        loops: list[list[tuple[str, list[tuple[str, int]]]]],
         schedule: list[int],
         pick: int,
     ) -> None:
@@ -2123,7 +2678,10 @@ class EngineStateMachine(RuleBasedStateMachine):
         the set the engine ends with, and how far its revision moved, must
         be those of some serial order of the steps that agrees with what
         each writer saw (``_settle``); a live read of a reader running among
-        them must match a state one such order passes through.
+        them must match a state one such order passes through. Readers may be
+        tasks on a loop of their own (``loops``), whose awaited and submitted
+        reads are held to the same: never half a transaction, and
+        ``QueryCancelled`` only for a ``submit`` that a change came after.
         """
         assert self.engine is not None
         before = self.engine.revision
@@ -2141,10 +2699,25 @@ class EngineStateMachine(RuleBasedStateMachine):
 
         programs = [writer(steps) for steps in writers]
         programs += self._lockstep_readers(readers, pick)
+        slot = itertools.count()
+        programs += [
+            self._loop_of(
+                [
+                    self._task_reader(
+                        kind, self._held_for(kind, next(slot), pick), reads
+                    )
+                    for kind, reads in tasks
+                ],
+                number,
+            )
+            for number, tasks in enumerate(loops)
+        ]
         results = self._lockstep(programs, schedule)
         moved = self.engine.revision - before
         worlds = self._settle(base, results[: len(writers)], before)
-        self._check_reads(results[len(writers) :], worlds, moved)
+        last = len(writers) + len(readers)
+        reads = results[len(writers) : last] + self._flatten(results[last:])
+        self._check_reads(reads, worlds, moved)
         for query, index in [
             *(read for _, reads in readers for read in reads),
             ("choose", 0),
@@ -2296,38 +2869,360 @@ class EngineStateMachine(RuleBasedStateMachine):
             expected = self._outcomes(held.world, query, index)
             assert actual in expected, (query, index, actual, expected)
 
+    # --- rules: tasks in the lock step (G5, G6, G7, G12, G14) ----------------
+
+    def _held_for(self, kind: str, slot: int, pick: int) -> _Held | None:
+        live = [held for held in self.snapshots if not held.released]
+        if "snapshot" in kind and live:
+            return live[(pick + slot) % len(live)]
+        return None
+
+    @staticmethod
+    def _flatten(loops: list[Any]) -> list[Any]:
+        """What the tasks of each loop gave; an exception one ended with is raised."""
+        out = []
+        for results in loops:
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+                out.append(result)
+        return out
+
+    def _runs_beyond(self, before: Counter[Any], limit: int) -> dict[Any, int]:
+        """Keys of ``ONCE`` that ran more than ``limit`` times at one revision."""
+        return {
+            key: n - before[key]
+            for key, n in self.key_runs.items()
+            if key[0] in ONCE and n - before[key] > limit
+        }
+
+    @rule(
+        loops=st.lists(LOOP, min_size=1, max_size=2),
+        threads=st.lists(THREAD, max_size=2),
+        drops=st.lists(st.tuples(st.sampled_from(DROPPABLE), INDEXES), max_size=3),
+        evictions=st.lists(IN_RUN_EVICTION, max_size=2),
+        schedule=SCHEDULE,
+        pick=PICK,
+        turn=TURN_OF_2,
+    )
+    def lockstep_tasks(
+        self,
+        loops: list[list[tuple[str, list[tuple[str, int]]]]],
+        threads: list[tuple[str, list[tuple[str, int]]]],
+        drops: list[tuple[str, int]],
+        evictions: list[tuple[Any, ...]],
+        schedule: list[int],
+        pick: int,
+        turn: int,
+    ) -> None:
+        """Tasks on one or two loops, threads beside them, in lock step.
+
+        Several tasks on a loop, each on its own loop thread, read every kind
+        of query: async ones awaited, sync ones called from the task, a sync
+        query that calls an async one (``bridge``, which on a loop may raise
+        ``EventLoopBlockedError``, G14), fixed points sync and async with the
+        hidden cycles, through snapshots and through ``submit`` awaited by
+        the task. Threads read beside them, also on the sync path of an
+        async query, and an evictor may drop results between their steps.
+        The machine picks the interleaving at each body's start and at the
+        awaits marked in bodies, so a task meets the runs of other tasks and
+        threads, for the same keys (G5), at the points it picks. Every read
+        must give the plain value and effects of its revision; with nothing
+        dropped while they run and only live reads, no async query runs
+        twice for one key (G5).
+        """
+        if turn:
+            return  # not its turn (``TURN_OF_2``)
+        assert self.engine is not None
+        before = self.engine.revision
+        for query, index in drops:
+            self._drop(query, index)
+        slot = itertools.count()
+        programs = [
+            self._loop_of(
+                [
+                    self._task_reader(
+                        kind, self._held_for(kind, next(slot), pick), reads
+                    )
+                    for kind, reads in tasks
+                ],
+                number,
+            )
+            for number, tasks in enumerate(loops)
+        ]
+        programs += [
+            self._lockstep_reader(
+                kind, self._held_for(kind, next(slot), pick), reads, pause=True
+            )
+            for kind, reads in threads
+        ]
+        if evictions:
+            programs.append(self._evictor(evictions))
+        runs = Counter(self.key_runs)
+        results = self._lockstep(programs, schedule)
+        assert self.engine.revision == before
+        reads = self._flatten(results[: len(loops)])
+        reads += results[len(loops) : len(loops) + len(threads)]
+        self._check_reads(reads, [self.world], 0)
+        if (
+            self.max_entries == 10_000
+            and not evictions
+            and all(held is None for _, held, _ in reads)
+        ):
+            assert not self._runs_beyond(runs, 1)
+
+    def _waits_for(self, task: asyncio.Task[Any], key: Any) -> bool:
+        """Whether ``task`` waits for the run of ``key`` (at any revision)."""
+        assert self.engine is not None
+        store = self.engine._internals._store  # noqa: SLF001
+        with store.lock:
+            slot = store.waiting_on.get(task)
+            return slot is not None and any(
+                s is slot and k[0] == key for k, s in store.in_flight.items()
+            )
+
+    @rule(
+        query=st.sampled_from(CANCELLED_QUERIES),
+        index=INDEXES,
+        tasks=st.integers(min_value=2, max_value=3),
+        thread=st.booleans(),
+        victim=st.integers(min_value=0, max_value=2),
+        delay=st.integers(min_value=0, max_value=4),
+        schedule=SCHEDULE,
+        turn=TURN_OF_2,
+    )
+    def cancelled_task_leaves_the_others_alone(
+        self,
+        query: str,
+        index: int,
+        tasks: int,
+        thread: bool,
+        victim: int,
+        delay: int,
+        schedule: list[int],
+        turn: int,
+    ) -> None:
+        """G5, G6, D34: of tasks asking for one query, one is cancelled.
+
+        Tasks on one loop, and maybe a thread, ask for the same query, whose
+        result (and what it reads) was dropped, so one of them runs it and
+        the others wait for that run. Another task stops ``delay`` times and
+        then cancels one of them: before it started, while it runs the
+        query, while it waits for another's run, or once it is done. That
+        one gives ``CancelledError`` or its value; every other caller gives
+        the plain value and effects. A cancelled waiter leaves the run alone
+        (one run per key, G5); a cancelled owner's run is taken over by the
+        others, not handed to them as their own cancellation. Afterwards no
+        wait stays on record and the value is cached.
+        """
+        if turn:
+            return  # not its turn (``TURN_OF_2``)
+        assert self.engine is not None
+        key = self.engine._key_root(("query", query, self._args(query, index)))  # noqa: SLF001
+        for name in {query, "achoose", "choose"}:
+            self._drop(name, index)
+        target = victim % tasks
+        seen: dict[str, Any] = {}
+
+        def caller(_lockstep: _Lockstep) -> Any:
+            return lambda _peers: self._acall(query, index, None)
+
+        def canceller(lockstep: _Lockstep) -> Any:
+            async def run(peers: list[asyncio.Task[Any]]) -> None:
+                for _ in range(delay):
+                    await lockstep.acheckpoint()
+                task = peers[target]
+                seen["waiting"] = self._waits_for(task, key)
+                if task.done():
+                    seen["state"] = "done"
+                else:
+                    seen["state"] = inspect.getcoroutinestate(task.get_coro())
+                task.cancel()
+
+            return run
+
+        programs = [self._loop_of([caller] * tasks + [canceller])]
+        if thread:
+            programs.append(
+                self._lockstep_reader("live", None, [(query, index)], pause=True)
+            )
+        runs = Counter(self.key_runs)
+        results = self._lockstep(programs, schedule)
+        expected = self._outcomes(self.world, query, index, on_loop=True)
+        for slot, outcome in enumerate(results[0][:tasks]):
+            if slot == target and isinstance(outcome, asyncio.CancelledError):
+                continue
+            if isinstance(outcome, BaseException):
+                raise outcome
+            assert outcome in expected, (slot, query, index, outcome, expected, seen)
+        if thread:
+            _, _, [(_, outcome)] = results[1]
+            assert outcome in self._outcomes(self.world, query, index), (outcome, seen)
+        if self.max_entries == 10_000:
+            # Only a cancelled owner leaves its run to be done again.
+            alone = seen["waiting"] or seen["state"] in ("done", inspect.CORO_CREATED)
+            beyond = self._runs_beyond(runs, 1 if alone else 2)
+            assert not beyond, (beyond, seen)
+        self._read(query, index, self.world)
+
+    @rule(
+        query=st.sampled_from((*ONCE, "choose", "bridge")),
+        index=INDEXES,
+        bias=SMALL_INTS,
+        thread=st.booleans(),
+        schedule=SCHEDULE,
+        turn=TURN_OF_3,
+    )
+    def tasks_at_two_revisions_ask_for_one_query(
+        self,
+        query: str,
+        index: int,
+        bias: int,
+        thread: bool,
+        schedule: list[int],
+        turn: int,
+    ) -> None:
+        """G4, G5: a task through a snapshot and a live task ask for one query.
+
+        The query's result was dropped and ``bias``, which it reads, changed
+        since the snapshot, so the two run it at different revisions, at
+        once; a live thread may ask too. None may take the result of a run
+        at the other revision: the task through the snapshot gets the
+        snapshot's value, the others the head's.
+        """
+        if turn:
+            return  # not its turn (``TURN_OF_2``)
+        assert self.engine is not None
+        held = self._take_snapshot()
+        before = held.world.get("bias")
+        assert before is not None
+        self._set("bias", (), bias if bias != before else bias + 1)
+        for name in {query, "achoose", "choose"}:
+            self._drop(name, index)
+        tasks = [
+            self._task_reader("task_snapshot", held, [(query, index)]),
+            self._task_reader("task", None, [(query, index)]),
+        ]
+        programs = [self._loop_of(tasks)]
+        if thread:
+            programs.append(
+                self._lockstep_reader("live", None, [(query, index)], pause=True)
+            )
+        results = self._lockstep(programs, schedule)
+        reads = self._flatten(results[:1]) + results[1:]
+        self._check_reads(reads, [self.world], 0)
+
+    @rule(
+        bias=SMALL_INTS,
+        callers=st.lists(
+            st.tuples(st.booleans(), st.sampled_from(("aloop_member", "aloop_head"))),
+            min_size=1,
+            max_size=2,
+        ),
+        schedule=SCHEDULE,
+        turn=TURN_OF_3,
+    )
+    def dropped_async_cycle_member_read_by_tasks(
+        self, bias: int, callers: list[tuple[bool, str]], schedule: list[int], turn: int
+    ) -> None:
+        """D35 with tasks: an async fixed-point member whose result was dropped.
+
+        Tasks on one loop and threads ask for the member or the head, which
+        has a result, so any member can be called (G7); the cycle converges,
+        and no caller may get ``CycleError``.
+        """
+        if turn:
+            return  # not its turn (``TURN_OF_2``)
+        self._read("aloop_head", 0, self.world)
+        self._read("aloop_member", 0, self.world)
+        self._drop("aloop_member", 0)
+        self._set("bias", (), bias)
+        callers = [(True, "aloop_member"), *callers]
+        tasks = [self._task_reader("task", None, [(c, 0)]) for on, c in callers if on]
+        programs = [self._loop_of(tasks)]
+        programs += [
+            self._lockstep_reader("live", None, [(c, 0)], pause=True)
+            for on, c in callers
+            if not on
+        ]
+        results = self._lockstep(programs, schedule)
+        reads = self._flatten(results[:1]) + results[1:]
+        self._check_reads(reads, [self.world], 0)
+        self._read("aloop_head", 0, self.world)
+        self._read("aloop_member", 0, self.world)
+
+    @rule(
+        index=INDEXES,
+        value=MAYBE_INT,
+        turn=TURN_OF_3,
+    )
+    def inactive_branch_write_does_not_rerun_async(
+        self, index: int, value: int | None, turn: int
+    ) -> None:
+        """G2 on the async path: a write ``choose`` did not read re-runs nothing.
+
+        ``anoted`` awaits ``achoose``, which calls ``choose``; verified on the
+        async path, none of the three may run again. Each is read first,
+        after one such write, so that each has a result in memory checked
+        against the others at a revision of its own: a result loaded from
+        disk may have left its dependencies there, and a read through an
+        old snapshot replaces a row, which costs a run at the next revision
+        (G4). A small LRU bound may still drop one, which then runs again
+        (G13).
+        """
+        if turn:
+            return  # not its turn (``TURN_OF_2``)
+        names = ("choose", "achoose", "anoted")
+        inactive = "right" if self.world.get("mode") == 0 else "left"
+        self._set(inactive, (index,), value)
+        for name in names:
+            self._read(name, index, self.world)
+        runs = [self.runs[name] for name in names]
+        self._set(inactive, (index,), 8 if value is None else None)
+        self._read("anoted", index, self.world)
+        if self.max_entries == 10_000:
+            assert [self.runs[name] for name in names] == runs
+
     # --- rules: hidden cycles (0.4.2) ----------------------------------------
 
     @rule(
         drift=st.integers(min_value=-3, max_value=3),
         detour=st.booleans(),
         fail=st.integers(min_value=0, max_value=3).map(lambda n: n == 0),
+        opaque=st.integers(min_value=0, max_value=3).map(lambda n: n == 0),
     )
-    def change_hidden(self, drift: int, detour: bool, fail: bool) -> None:
+    def change_hidden(
+        self, drift: int, detour: bool, fail: bool, opaque: bool = False
+    ) -> None:
         """Change what the hidden cycles read, which the engine does not see."""
         self.hidden.drift = drift
         self.hidden.detour = detour
         self.hidden.fail = fail
+        self.hidden.opaque = opaque
 
     @rule(
         head=st.sampled_from(W_HEADS),
         drift=st.integers(min_value=-3, max_value=3),
         detour=st.booleans(),
         fail=st.booleans(),
+        opaque=st.booleans(),
     )
     def hidden_change_falls_back(
-        self, head: str, drift: int, detour: bool, fail: bool
+        self, head: str, drift: int, detour: bool, fail: bool, opaque: bool
     ) -> None:
         """0.4.2: one run on the cached members disagrees; iterate instead.
 
         With the head's row in place, a change the engine cannot see makes
         the run on the cached members give another value, reach the head
-        again through ``detour``, or raise; each time the head must iterate
-        from the guess and give the plain value. And back.
+        again through ``detour``, raise, or give a value that cannot be
+        encoded; each time the head must iterate from the guess and give the
+        plain value (or raise ``UnencodableValueError``, stored nowhere).
+        And back.
         """
         self._read(head, 0, self.world)
-        before = (self.hidden.drift, self.hidden.detour, self.hidden.fail)
-        self.change_hidden(drift, detour, fail)
+        hidden = self.hidden
+        before = (hidden.drift, hidden.detour, hidden.fail, hidden.opaque)
+        self.change_hidden(drift, detour, fail, opaque)
         self._read(head, 0, self.world)
         self.change_hidden(*before)
         self._read(head, 0, self.world)
@@ -2364,6 +3259,42 @@ class EngineStateMachine(RuleBasedStateMachine):
         for query, index in reads:
             self._read(query, index, self.world)
         self._read(head, 0, self.world)
+
+    @rule(
+        head=st.sampled_from(W_HEADS),
+        value=SMALL_INTS,
+        on_run=st.integers(min_value=2, max_value=3),
+    )
+    def reading_dropped_while_a_head_iterates(
+        self, head: str, value: int, on_run: int
+    ) -> None:
+        """G7, G13: the TTL result a cycle reads is dropped while it iterates.
+
+        The cycle starts afresh while the old reading is still served; on
+        the head's ``on_run``-th run the reading's result is dropped, so it
+        runs again and gives the new value. The head must give the fixed
+        point of one reading, iterated from the guess: going on from the
+        guesses computed with the old one can stop at a fixed point no run
+        from the guess reaches.
+        """
+        prefix = head.removesuffix("_head")
+        for query in (head, f"{prefix}_member", f"{prefix}_detour"):
+            self._drop(query, 0)
+        self.change_sensor(value)
+        runs = [0]
+        main = threading.get_ident()
+
+        def inside(name: str) -> None:
+            if name == head and threading.get_ident() == main:
+                runs[0] += 1
+                if runs[0] == on_run:
+                    self._drop("sensor", 0)
+
+        self.inside = inside
+        try:
+            self._read(head, 0, self.world)
+        finally:
+            self.inside = None
 
     @rule(head=st.sampled_from(W_HEADS), value=SMALL_INTS)
     def expired_cycle_row_is_not_reused(self, head: str, value: int) -> None:
@@ -2410,7 +3341,7 @@ class EngineStateMachine(RuleBasedStateMachine):
         if not expire:
             self._drop("sensor", 0)
             self._drop(head, 0)
-        elif not member_first or self.hidden.fail:
+        elif not member_first or self.hidden.fail or self.hidden.opaque:
             self.clock.now += TTL + 1.0
             self._drop(head, 0)
         else:
@@ -2650,6 +3581,12 @@ class EngineStateMachine(RuleBasedStateMachine):
     def in_flight_map_is_empty_after_operations(self) -> None:
         assert self.engine is not None
         assert self.engine._internals.in_flight == {}  # noqa: SLF001
+
+    @invariant()
+    def no_wait_stays_on_record(self) -> None:
+        """Every thread and task that waited for a run has stopped waiting."""
+        assert self.engine is not None
+        assert self.engine._internals._store.waiting_on == {}  # noqa: SLF001
 
 
 class MdbxEngineStateMachine(EngineStateMachine):

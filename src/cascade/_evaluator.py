@@ -80,6 +80,17 @@ class _ProvisionalResult(Exception):
         self.heads = heads
 
 
+class _OwnerStopped(Exception):
+    """Handed to callers that joined a run whose owner stopped for its own reasons.
+
+    Internal. In place of the owner's ``asyncio.CancelledError`` (its task
+    was cancelled) or ``EventLoopBlockedError`` (it ran on the thread of an
+    event loop, where an async query cannot run): neither says anything
+    about the callers waiting for the run, which claim the query again and
+    run it themselves (G5, G14). Travels through the in-flight future only.
+    """
+
+
 # An unencodable result is the engine refusing a value, not the body
 # failing; caching it would make one bad run stick.
 class _EnterThroughHead(CycleError):
@@ -1065,7 +1076,7 @@ class Evaluator:
                 result = waiter_future.result()
             except _ProvisionalResult as pending_cycle:
                 pending_heads = pending_cycle.heads
-            except (QueryCancelled, CycleError, _ReenteredQuery) as exc:
+            except (QueryCancelled, CycleError, _ReenteredQuery, _OwnerStopped) as exc:
                 if not self._retry_after(exc, runtime):
                     raise
                 failed = exc
@@ -1204,7 +1215,7 @@ class Evaluator:
                 result = await _wait_for_joined_run(waiter_future)
             except _ProvisionalResult as pending_cycle:
                 pending_heads = pending_cycle.heads
-            except (QueryCancelled, CycleError, _ReenteredQuery) as exc:
+            except (QueryCancelled, CycleError, _ReenteredQuery, _OwnerStopped) as exc:
                 if not self._retry_after(exc, runtime):
                     raise
                 failed = exc
@@ -1480,6 +1491,8 @@ class Evaluator:
                     del waiting_on[waiter]
         if future is None:
             return
+        if isinstance(exc, (asyncio.CancelledError, EventLoopBlockedError)):
+            exc = _OwnerStopped(type(exc).__name__)
         if exc is not None:
             future.set_exception(exc)
         else:
@@ -2161,7 +2174,17 @@ class Evaluator:
                     guess,
                     exc,
                 ) from exc
-        if value_hash == frame.cycle_guess_hash:
+        # Something the cycle read from outside it may have another value
+        # than in the run before (a TTL result run again once dropped). The
+        # guess was then computed from the old value, and a run that gives
+        # it back, or going on from it, can end on a fixed point that no
+        # run from the initial guess reaches: start again from that guess.
+        outside = self._reads_outside_cycle(runtime, frame, key)
+        before, frame.cycle_outside = frame.cycle_outside, outside
+        moved = before is not None and any(
+            before.get(dep, seen) != seen for dep, seen in outside.items()
+        )
+        if value_hash == frame.cycle_guess_hash and not moved:
             return False
         self._discard_provisional(runtime, key)
         limit = self._store.lookup_fixed_point_limit(key[1])
@@ -2172,6 +2195,10 @@ class Evaluator:
                 "different from the one before. Make the query converge, or "
                 "raise the limit with max_iterations= if it only needs longer"
             )
+        if moved:
+            self._store.trace_event("cycle_restart", key, detail="outside read")
+            result = self._store.lookup_query_fixed_point(key[1])[1]
+            value_hash = None
         frame.cycle_guess = result
         frame.cycle_guess_hash = value_hash
         frame.is_cycle_root = False
@@ -2189,6 +2216,29 @@ class Evaluator:
         frame.expires_at = None
         frame.cycle_heads = None
         return True
+
+    @staticmethod
+    def _reads_outside_cycle(
+        runtime: RuntimeState, frame: RuntimeFrame, head: QueryKey
+    ) -> dict[QueryKey, int]:
+        """What a run of cycle ``head`` read from outside its cycle, and when.
+
+        The head's own reads and those of the provisional results computed
+        from its guess, with the ``changed_at`` each saw; not the cycle's
+        members (provisional) or the head itself.
+        """
+        overlay = runtime.provisional or {}
+        reads = {
+            dep: seen
+            for dep, seen in frame.deps.items()
+            if dep != head and dep not in overlay and seen != _NEVER_CHANGED_AT
+        }
+        for entry in overlay.values():
+            if head in entry.cycle_heads:
+                for dep in entry.deps:
+                    if dep.key != head and dep.key not in overlay:
+                        reads.setdefault(dep.key, dep.observed_changed_at)
+        return reads
 
     def _refuse_reentry(self, runtime: RuntimeState, key: QueryKey) -> None:
         """Raise if ``key`` belongs to a query run that is waiting for this check.

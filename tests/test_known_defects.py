@@ -1825,3 +1825,191 @@ def test_d51_setting_the_default_after_a_result_reused_from_disk_is_no_change(
         assert call(q) == 6
     finally:
         engine.shutdown()
+
+
+def test_dNN_cancelling_the_task_that_runs_a_query_leaves_its_waiters_to_run_it() -> (
+    None
+):
+    # A task runs slow(); another task and a thread wait for that run. The
+    # task that runs it is cancelled. That is its own business (G5): the
+    # waiters used to get its asyncio.CancelledError as the outcome of the
+    # run, so the other task ended as if it had been cancelled and the
+    # thread's plain call raised CancelledError. They must take the run over
+    # and get the value; one of them runs slow() again, the other waits.
+    engine = Engine()
+    runs: list[int] = []
+    release = threading.Event()
+    from_thread: list[Any] = []
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    async def poll(condition: Any) -> None:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.002)
+
+    @engine.query
+    async def slow() -> int:
+        runs.append(1)
+        await poll(release.is_set)
+        return 42
+
+    def call_from_thread() -> None:
+        try:
+            from_thread.append(slow())
+        except BaseException as exc:  # noqa: BLE001
+            from_thread.append(exc)
+
+    async def main() -> list[Any]:
+        owner = asyncio.create_task(slow())
+        await poll(lambda: runs)
+        waiter = asyncio.create_task(slow())
+        thread = threading.Thread(target=call_from_thread, daemon=True)
+        thread.start()
+        await poll(lambda: waiting() == 2)
+        owner.cancel()
+        cancelled = (await asyncio.gather(owner, return_exceptions=True))[0]
+        release.set()
+        other = (await asyncio.gather(waiter, return_exceptions=True))[0]
+        await asyncio.to_thread(thread.join, HANG_TIMEOUT)
+        return [cancelled, other]
+
+    cancelled, other = asyncio.run(asyncio.wait_for(main(), 4 * HANG_TIMEOUT))
+    assert isinstance(cancelled, asyncio.CancelledError)
+    assert other == 42
+    assert from_thread == [42]
+    assert len(runs) == 2
+    assert slow() == 42
+    assert len(runs) == 2
+    assert not engine._store.waiting_on  # noqa: SLF001
+
+
+def test_dNN_a_caller_that_joined_a_run_blocked_on_an_event_loop_runs_it_itself() -> (
+    None
+):
+    # bridge() is a sync query calling the async aval(). Called from a
+    # coroutine, on the thread of a running loop, its run cannot run aval()
+    # and raises EventLoopBlockedError (G14). A thread that joined that run
+    # used to get the same error, though it waits on a thread with no loop,
+    # where aval() runs fine. It must run bridge() itself and get the value.
+    engine = Engine()
+    entered = threading.Event()
+    release = threading.Event()
+    from_thread: list[Any] = []
+
+    @engine.query
+    async def aval() -> int:
+        return 5
+
+    @engine.query
+    def bridge() -> int:
+        entered.set()
+        assert release.wait(HANG_TIMEOUT)
+        return aval() + 1
+
+    def waiting() -> int:
+        with engine._internals.lock:  # noqa: SLF001
+            return len(engine._store.waiting_on)  # noqa: SLF001
+
+    def call_from_thread() -> None:
+        assert entered.wait(HANG_TIMEOUT)
+        try:
+            from_thread.append(bridge())
+        except BaseException as exc:  # noqa: BLE001
+            from_thread.append(exc)
+
+    def release_once_joined() -> None:
+        deadline = time.monotonic() + HANG_TIMEOUT
+        while waiting() < 1 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        release.set()
+
+    thread = threading.Thread(target=call_from_thread, daemon=True)
+    thread.start()
+    threading.Thread(target=release_once_joined, daemon=True).start()
+
+    async def on_the_loop() -> Any:
+        try:
+            return bridge()
+        except cascade.EventLoopBlockedError as exc:
+            return exc
+
+    assert isinstance(asyncio.run(on_the_loop()), cascade.EventLoopBlockedError)
+    thread.join(HANG_TIMEOUT)
+    assert not thread.is_alive(), "the joined caller hung"
+    assert from_thread == [6]
+    assert bridge() == 6
+
+
+# (reading before, reading after, the run that drops it, the fixed point)
+_OUTSIDE_READ_CASES = [
+    # From 0 with -2: 0, -2 (dropped here, now 0), then -1 from the guess
+    # -2 used to be taken as converged on: -1 // 2 + 0 == -1.
+    (-2, 0, 2, 0),
+    # From 0 with 11: 11, 16 (dropped here, now 8): 16 // 2 + 8 == 16, the
+    # guess, so that run used to count as converged though it read 8 and
+    # the guess came from 11.
+    (11, 8, 3, 15),
+]
+
+
+@pytest.mark.parametrize("awaited", [False, True])
+@pytest.mark.parametrize(("before", "after", "on_run", "expected"), _OUTSIDE_READ_CASES)
+def test_dNN_a_fixed_point_whose_outside_read_changes_while_it_iterates_starts_again(
+    awaited: bool, before: int, after: int, on_run: int, expected: int
+) -> None:
+    # head = member + reading and member = head // 2, iterated from the guess
+    # 0. reading is a TTL query. Its result is dropped while the head
+    # iterates (sweep_unaccessed) and runs again with a new value. The head
+    # used to go on from the guesses computed with the old value and stop
+    # at a fixed point of head = head // 2 + after that no run from the
+    # guess 0 reaches. It must start again from the guess and give the
+    # fixed point a run with the new value gives. Found by the state
+    # machine (evict_while_a_head_runs, reading_dropped_while_a_head_iterates),
+    # sync and async alike.
+    engine = Engine()
+    value = {"now": before}
+    runs = {"head": 0}
+
+    @engine.query(ttl=60)
+    def reading() -> int:
+        return value["now"]
+
+    def drop_on_a_later_run() -> None:
+        runs["head"] += 1
+        if runs["head"] == on_run:
+            engine.sweep_unaccessed(engine.access_id)
+            value["now"] = after
+
+    if awaited:
+
+        @engine.query(fixed_point=0)
+        async def head() -> int:
+            drop_on_a_later_run()
+            return (await member()) + reading()
+
+        @engine.query
+        async def member() -> int:
+            return (await head()) // 2
+
+        async def main() -> int:
+            return await head()
+
+        result = asyncio.run(main())
+    else:
+
+        @engine.query(fixed_point=0)
+        def head() -> int:
+            drop_on_a_later_run()
+            return member() + reading()
+
+        @engine.query
+        def member() -> int:
+            return head() // 2
+
+        result = head()
+    assert result == expected
+    assert "outside read" in [t.detail for t in engine.traces()]
